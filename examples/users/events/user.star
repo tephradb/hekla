@@ -27,3 +27,13 @@ user_welcomed = event(
     },
     tags = ["user_id"],
 )
+
+reminder_scheduled = event(
+    type = "reminder.scheduled",
+    fields = {
+        "user_id": uuid(),
+        # Domain time, set from the request's pinned clock by the command.
+        "due_at": timestamp(),
+    },
+    tags = ["user_id"],
+)

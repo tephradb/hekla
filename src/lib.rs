@@ -1,9 +1,15 @@
 pub mod cli;
 pub mod config;
+pub mod context;
 pub mod dispatch;
+pub mod envelope;
 pub mod fmt;
 pub mod loader;
 pub mod opdb;
+pub mod openapi;
 pub mod read_model;
+pub mod runtime;
+pub mod server;
 pub mod starlark_builtins;
+pub mod testing;
 pub mod validate;

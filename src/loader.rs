@@ -117,9 +117,12 @@ impl LoadedProject {
         };
 
         let base = starlark_builtins::globals();
+        let command = starlark_builtins::command_globals();
         let effect = starlark_builtins::effect_globals();
         let mut parsed = discover_and_parse(root, &mut findings);
 
+        // Libraries (`events/`, `lib/`) are pure, so they evaluate against the
+        // base globals regardless of who imports them.
         let mut cache: HashMap<String, FrozenModule> = HashMap::new();
         let mut collector = EventCollector::default();
         evaluate_libraries(
@@ -131,7 +134,7 @@ impl LoadedProject {
         );
 
         let (commands, projectors, effects) =
-            evaluate_units(&mut parsed, &base, &effect, &cache, &mut findings);
+            evaluate_units(&mut parsed, &base, &command, &effect, &cache, &mut findings);
 
         check_name_collisions(&commands, &projectors, &effects, &mut findings);
 
@@ -153,6 +156,22 @@ impl LoadedProject {
         self.findings
             .iter()
             .any(|finding| finding.severity == Severity::Error)
+    }
+
+    /// Evaluate an extra module (a `kiln test` file) against this project's
+    /// library cache, so it can `load()` from `events/` and `lib/` exactly as a
+    /// command would. The module is frozen against `globals` (the test globals).
+    pub fn eval_against_libraries(
+        &self,
+        filename: &str,
+        src: String,
+        globals: &Globals,
+    ) -> anyhow::Result<FrozenModule> {
+        let ast = parse_module(filename, src).map_err(|err| anyhow::anyhow!("{err}"))?;
+        let loader = LibraryLoader {
+            cache: &self.events.library,
+        };
+        eval_frozen(ast, globals, Some(&loader)).map_err(|err| anyhow::anyhow!("{err}"))
     }
 }
 
@@ -435,6 +454,7 @@ fn register_events(
 fn evaluate_units(
     parsed: &mut [ParsedFile],
     base_globals: &Globals,
+    command_globals: &Globals,
     effect_globals: &Globals,
     cache: &HashMap<String, FrozenModule>,
     findings: &mut Vec<Finding>,
@@ -456,10 +476,12 @@ fn evaluate_units(
         };
         let rel = file.rel_path.clone();
 
-        // Effects get the impure builtins; everything else stays pure.
+        // Commands get `now()`, effects get the impure builtins, projectors stay
+        // pure. Selecting per kind is what keeps purity structural.
         let globals = match kind {
+            ModuleKind::Command => command_globals,
             ModuleKind::Effect => effect_globals,
-            ModuleKind::Command | ModuleKind::Projector => base_globals,
+            ModuleKind::Projector => base_globals,
         };
         let frozen = match eval_frozen(ast, globals, Some(&loader)) {
             Ok(frozen) => frozen,

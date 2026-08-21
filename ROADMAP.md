@@ -47,19 +47,36 @@ Phase 2, so it is scoped honestly as "toolchain, no server" rather than a runnab
   whitespace normaliser; AST-level reflow is deferred, since starlark-rust 0.14 exposes no
   pretty-printer).
 
-## Phase 2: command runtime and HTTP API
+## Phase 2: command runtime and HTTP API (done)
 
-The first runnable server: execute commands over HTTP.
+The first runnable server: execute commands over HTTP. `kiln serve` opens the tephra store and the
+operational DB, loads the project (refusing to serve if `kiln check` would fail), and runs the
+decision cycle behind Axum.
 
-- Command context: correlation (generated if absent), fresh causation, optional triggering-event.
-  Pinned `now()` in `handle` only, forbidden in `query` and `fold`.
-- Client-supplied ids; host-stamped envelope and append timestamp.
-- Built-in per-command idempotency (operational-DB key table, returns the original outcome including
-  rejections).
-- Axum HTTP API: `POST /commands/{name}` (public commands only), `GET /status`, and health.
-- Public vs internal commands (`commands/internal/` invokable by effects but not HTTP-routed);
-  honest generated OpenAPI.
-- `kiln test` (events in, assert events out).
+- Command context: correlation id (from the `x-correlation-id` header or generated), a fresh causation
+  id, optional triggering event; every response echoes correlation and causation. Pinned `now()` is
+  in scope only during `handle` (carried on the evaluator via `eval.extra`); `query` and `fold` run
+  without it, so calling `now()` there is an error.
+- Client-supplied ids need no new code (the schema's `uuid()` fields already carry them). Each emitted
+  event is wrapped at the append seam in a host-stamped envelope (event id, timestamp, correlation,
+  causation, optional triggering event); tags stay outside the envelope as tephra tags, and every
+  store read unwraps the payload. The idempotency key is kept in the operational DB, never on an event.
+- Built-in per-command idempotency: a `pending` reservation is the mutual-exclusion token for
+  concurrent duplicates, moved to `done` with the full response body so a replay returns the original
+  status and body verbatim (including rejections). Startup clears stale reservations; the crash window
+  between append and finalize is documented and bounded by DCB for natural-id creates.
+- Outcome to status: committed to 200 (with positions and emitted events), `reject` to 422,
+  `invalid_input` (and host-side input validation) to 400, a DCB conflict that survives bounded retry
+  to 409, unknown or internal command to 404. The runtime re-runs the whole cycle on a conflict so a
+  fresh read rebuilds the decision model.
+- Axum HTTP API: `POST /commands/{name}` (public commands only), `GET /status` (log head and the loaded
+  module inventory, no fabricated projector or effect lag yet), `GET /health`, a generated
+  `GET /openapi.json`, and a Scalar reference UI over it at `GET /docs`. Graceful shutdown drains
+  in-flight work, then joins the writer.
+- Public vs internal commands: `commands/internal/` are invokable by effects (a later phase) but return
+  404 over HTTP and are absent from the generated OpenAPI.
+- `kiln test`: `tests/*.star` scenarios seed a throwaway store through the same append path and run the
+  real command, asserting emitted events (type, data, tags) or the rejection.
 
 ## Phase 3: projectors and generated read API
 

@@ -31,6 +31,8 @@ use starlark::values::{
 };
 use starlark::{starlark_module, starlark_simple_value};
 
+use crate::context::HandleCtx;
+
 // ---------------------------------------------------------------------------
 // Field types
 // ---------------------------------------------------------------------------
@@ -384,6 +386,28 @@ impl<'v> StarlarkValue<'v> for Rejection {}
 starlark_simple_value!(Rejection);
 
 // ---------------------------------------------------------------------------
+// Invalid input
+// ---------------------------------------------------------------------------
+
+/// A command's third terminal outcome: the input is malformed regardless of
+/// state (a shape or parse-level problem, distinct from a state-dependent
+/// [`Rejection`]). Maps to HTTP 400.
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
+pub struct InvalidInput {
+    pub message: String,
+}
+
+impl fmt::Display for InvalidInput {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "invalid_input({})", self.message)
+    }
+}
+
+#[starlark_value(type = "invalid_input")]
+impl<'v> StarlarkValue<'v> for InvalidInput {}
+starlark_simple_value!(InvalidInput);
+
+// ---------------------------------------------------------------------------
 // Entity operations (projectors): what a projector's `handle` emits per event
 // ---------------------------------------------------------------------------
 
@@ -678,6 +702,13 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] message: String,
     ) -> anyhow::Result<Rejection> {
         Ok(Rejection { code, message })
+    }
+
+    /// Refuse a command because the input is malformed regardless of state (a
+    /// shape or parse-level problem). Distinct from `reject`, which refuses
+    /// well-formed input the current state forbids. Maps to HTTP 400.
+    fn invalid_input(#[starlark(require = pos)] message: String) -> anyhow::Result<InvalidInput> {
+        Ok(InvalidInput { message })
     }
 
     /// Collect the events a command's `handle` appends. Accepts one constructed
@@ -1022,10 +1053,52 @@ pub fn call_handler<'v>(
     eval.eval_function(func, args, &[])
 }
 
-/// The globals for pure modules (commands, projectors, and the `events/` and
-/// `lib/` files they import). No clock, no randomness, no I/O.
+/// Call a handler with a [`HandleCtx`] in scope, so `now()` resolves. Used only
+/// for a command's `handle`; `query` and `fold` go through [`call_handler`] with
+/// no context, which is why `now()` is unavailable there.
+pub fn call_handler_with_ctx<'v>(
+    module: &Module<'v>,
+    func: Value<'v>,
+    args: &[Value<'v>],
+    max_instructions: u64,
+    ctx: &HandleCtx,
+) -> starlark::Result<Value<'v>> {
+    let mut eval = Evaluator::new(module);
+    eval.set_max_tick_count(max_instructions)?;
+    eval.extra = Some(ctx);
+    eval.eval_function(func, args, &[])
+}
+
+/// The globals for pure modules (projectors, and the `events/` and `lib/` files
+/// every kind imports). No clock, no randomness, no I/O.
 pub fn globals() -> Globals {
     GlobalsBuilder::standard().with(runtime_builtins).build()
+}
+
+/// Builtins available only to commands. `now()` is the request's pinned append
+/// time, in scope during `handle` (where a [`HandleCtx`] is set on the evaluator)
+/// and an error elsewhere. It exists as a global so a `handle` naming it resolves
+/// at load; the `handle`-only guard is enforced at call time by the presence of
+/// the context, so `query` and `fold` (evaluated without one) cannot read a clock.
+#[starlark_module]
+pub fn command_builtins(builder: &mut GlobalsBuilder) {
+    fn now(eval: &mut Evaluator) -> anyhow::Result<String> {
+        match eval
+            .extra
+            .and_then(|extra| extra.downcast_ref::<HandleCtx>())
+        {
+            Some(ctx) => Ok(ctx.now.clone()),
+            None => anyhow::bail!("now() is only available in handle()"),
+        }
+    }
+}
+
+/// Globals for commands: the base builtins plus `now()`.
+pub fn command_globals() -> Globals {
+    GlobalsBuilder::standard()
+        .with(runtime_builtins)
+        .with(command_builtins)
+        .build()
 }
 
 /// Builtins available only to effects: the impure, journaled capabilities. In
@@ -1105,12 +1178,13 @@ pub fn effect_globals() -> Globals {
         .build()
 }
 
-/// The globals a module of `kind` is evaluated against. Effects get the impure
-/// capabilities; everything else stays pure.
+/// The globals a module of `kind` is evaluated against. Commands get `now()`,
+/// effects get the impure capabilities, projectors stay pure.
 pub fn globals_for(kind: ModuleKind) -> Globals {
     match kind {
+        ModuleKind::Command => command_globals(),
         ModuleKind::Effect => effect_globals(),
-        ModuleKind::Command | ModuleKind::Projector => globals(),
+        ModuleKind::Projector => globals(),
     }
 }
 
@@ -1148,11 +1222,14 @@ pub fn check_fold_result(val: Value<'_>) -> anyhow::Result<()> {
 /// `handle` must return `emit([...])` (possibly empty) or `reject(...)`. An
 /// empty `emit` means "nothing to do" and is valid for idempotent commands.
 pub fn check_handle_result(val: Value<'_>) -> anyhow::Result<()> {
-    if val.downcast_ref::<Rejection>().is_some() || val.downcast_ref::<EmitOutcome>().is_some() {
+    if val.downcast_ref::<Rejection>().is_some()
+        || val.downcast_ref::<InvalidInput>().is_some()
+        || val.downcast_ref::<EmitOutcome>().is_some()
+    {
         return Ok(());
     }
     anyhow::bail!(
-        "handle() must return emit([...]) or reject(...), got {}",
+        "handle() must return emit([...]), reject(...) or invalid_input(...), got {}",
         val.get_type()
     );
 }
@@ -1220,8 +1297,10 @@ pub fn parse_tags(tags: Value<'_>) -> anyhow::Result<Vec<(String, Option<String>
 // ---------------------------------------------------------------------------
 
 /// Build the `input` struct a command's handlers see: one field per declared
-/// schema field, so handlers read `input.email`. Unknown payload keys are
-/// ignored; a missing declared field is an error. Allocated on `module`'s heap.
+/// schema field, so handlers read `input.email`. An absent `optional` field is
+/// `None`; an absent required field is an error (the runtime validates the body
+/// against the schema first, so this only guards direct callers). Allocated on
+/// `module`'s heap.
 pub fn alloc_input<'v>(
     module: &Module<'v>,
     schema: &InputSchema,
@@ -1231,11 +1310,13 @@ pub fn alloc_input<'v>(
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("command input must be a JSON object"))?;
     let mut fields: Vec<(&str, Value<'v>)> = Vec::with_capacity(schema.fields.len());
-    for (name, _kind) in &schema.fields {
-        let value = obj
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("input is missing declared field `{name}`"))?;
-        fields.push((name.as_str(), module.heap().alloc(value.clone())));
+    for (name, kind) in &schema.fields {
+        let value = match obj.get(name) {
+            Some(value) => module.heap().alloc(value.clone()),
+            None if kind.is_nullable() => Value::new_none(),
+            None => anyhow::bail!("input is missing declared field `{name}`"),
+        };
+        fields.push((name.as_str(), value));
     }
     Ok(module.heap().alloc(AllocStruct(fields)))
 }
@@ -1266,17 +1347,22 @@ pub struct EmittedEvent {
 
 /// What `handle` decided.
 pub enum HandleOutcome {
-    /// `reject(...)`: nothing is written.
+    /// `reject(...)`: state-dependent refusal, nothing is written.
     Reject(Rejection),
+    /// `invalid_input(...)`: the input is malformed, nothing is written.
+    InvalidInput(InvalidInput),
     /// A list of events to append (possibly empty = "nothing to do").
     Emit(Vec<EmittedEvent>),
 }
 
-/// Interpret the value `handle` returned: a `reject(...)` or the events an
-/// `emit(...)` collected, lowered to plain data for the store.
+/// Interpret the value `handle` returned: `reject(...)`, `invalid_input(...)`, or
+/// the events an `emit(...)` collected, lowered to plain data for the store.
 pub fn parse_handle_result(val: Value<'_>) -> anyhow::Result<HandleOutcome> {
     if let Some(rejection) = val.downcast_ref::<Rejection>() {
         return Ok(HandleOutcome::Reject(rejection.clone()));
+    }
+    if let Some(invalid) = val.downcast_ref::<InvalidInput>() {
+        return Ok(HandleOutcome::InvalidInput(invalid.clone()));
     }
     if let Some(emit) = val.downcast_ref::<EmitOutcome>() {
         let events = emit
@@ -1291,7 +1377,7 @@ pub fn parse_handle_result(val: Value<'_>) -> anyhow::Result<HandleOutcome> {
         return Ok(HandleOutcome::Emit(events));
     }
     anyhow::bail!(
-        "handle() must return emit([...]) or reject(...), got {}",
+        "handle() must return emit([...]), reject(...) or invalid_input(...), got {}",
         val.get_type()
     );
 }
@@ -1347,29 +1433,53 @@ fn validate_row(
     Ok(())
 }
 
-/// Validate a constructed event's payload against its declared fields: no unknown
-/// fields, every non-`optional` field present and non-null, and each value
-/// well-typed for its `FieldKind`. This is the check the event constructor runs
-/// at emit time, so a malformed event fails where it is built.
-pub fn validate_event_payload(
-    event_type: &str,
+/// Validate a JSON object against a set of declared fields: no unknown fields,
+/// every non-`optional` field present and non-null, and each value well-typed for
+/// its `FieldKind`. `what` names the subject in error messages (e.g. an event
+/// type, or "input"). Shared by event-payload and command-input validation.
+pub fn check_fields(
+    what: &str,
     fields: &[(String, FieldKind)],
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<()> {
     for key in obj.keys() {
         if !fields.iter().any(|(name, _)| name == key) {
-            anyhow::bail!("event `{event_type}`: unknown field `{key}`");
+            anyhow::bail!("{what}: unknown field `{key}`");
         }
     }
     for (name, kind) in fields {
         match obj.get(name) {
             Some(value) => check_value(kind, value)
-                .map_err(|err| anyhow::anyhow!("event `{event_type}` field `{name}`: {err}"))?,
+                .map_err(|err| anyhow::anyhow!("{what} field `{name}`: {err}"))?,
             None if kind.is_nullable() => {}
-            None => anyhow::bail!("event `{event_type}`: missing required field `{name}`"),
+            None => anyhow::bail!("{what}: missing required field `{name}`"),
         }
     }
     Ok(())
+}
+
+/// Validate a constructed event's payload against its declared fields. This is the
+/// check the event constructor runs at emit time, so a malformed event fails where
+/// it is built.
+pub fn validate_event_payload(
+    event_type: &str,
+    fields: &[(String, FieldKind)],
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    check_fields(&format!("event `{event_type}`"), fields, obj)
+}
+
+/// Validate a command's request body against its input schema before the decision
+/// cycle runs. A failure is the host-side equivalent of `invalid_input(...)`: the
+/// body is malformed regardless of state, so it maps to HTTP 400.
+pub fn validate_command_input(
+    schema: &InputSchema,
+    input: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let obj = input
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("input: must be a JSON object"))?;
+    check_fields("input", &schema.fields, obj)
 }
 
 /// Type-check one JSON value against a field kind. `optional` allows null and
@@ -1574,5 +1684,27 @@ mod tests {
         assert!(!is_decimal_string(".5"));
         assert!(!is_decimal_string("1,000"));
         assert!(!is_decimal_string(""));
+    }
+
+    #[test]
+    fn now_needs_a_handle_context() {
+        use starlark::environment::Module;
+
+        use crate::context::HandleCtx;
+
+        let ast = parse_module("t.star", "def f():\n    return now()\n".to_owned()).unwrap();
+        let frozen = eval_frozen(ast, &command_globals(), None).unwrap();
+        Module::with_temp_heap(|module| {
+            let func = frozen.get_option("f").unwrap().unwrap();
+            // Without a context (as in `query`/`fold`), `now()` errors.
+            assert!(call_handler(&module, thaw(&func, &module), &[], 1_000_000).is_err());
+            // With one (as in `handle`), it returns the pinned instant.
+            let ctx = HandleCtx {
+                now: "2026-08-21T00:00:00Z".to_owned(),
+            };
+            let value =
+                call_handler_with_ctx(&module, thaw(&func, &module), &[], 1_000_000, &ctx).unwrap();
+            assert_eq!(value.unpack_str(), Some("2026-08-21T00:00:00Z"));
+        });
     }
 }

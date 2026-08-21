@@ -116,7 +116,8 @@ only writer.
 - `handle(input, state)` decides and returns one of three terminal outcomes:
   - `emit([...])` appends events.
   - `reject(code, message)` is a state-dependent refusal: the input was well-formed but the current
-    state forbids it (for example, email already taken). Maps to HTTP 409/422.
+    state forbids it (for example, email already taken). Maps to HTTP 422, kept distinct from the 409
+    a concurrency conflict returns, so the status alone tells a client whether a retry can help.
   - `invalid_input(message)` means the input is malformed regardless of state, a shape or parse-level
     problem. Maps to HTTP 400.
 
@@ -279,8 +280,9 @@ consistent copy is not required for them.
 
 - `POST /commands/{name}` executes a command (public commands only), accepting idempotency-key and
   correlation-id headers, and echoes correlation and causation. The outcome maps to status: committed
-  to 2xx (with the appended positions), `reject` to 409/422, `invalid_input` to 400. A replayed
-  idempotency key returns the original outcome and status.
+  to 200 (with the appended positions), `reject` to 422, `invalid_input` to 400, and a DCB
+  concurrency conflict that survives retries to 409. A replayed idempotency key returns the original
+  outcome and status.
 - **Read API generated from entity schemas**: `GET /read/{projector}/{entity}/{key}` and an indexed
   filter/scan endpoint. Only declared indexes are filterable; an unindexed filter is a 400 telling
   the author to declare the index, never a table scan. Pagination is cursor-based, not offset. Every
