@@ -118,6 +118,7 @@ impl LoadedProject {
 
         let base = starlark_builtins::globals();
         let command = starlark_builtins::command_globals();
+        let projector = starlark_builtins::projector_globals();
         let effect = starlark_builtins::effect_globals();
         let mut parsed = discover_and_parse(root, &mut findings);
 
@@ -133,8 +134,14 @@ impl LoadedProject {
             &mut findings,
         );
 
-        let (commands, projectors, effects) =
-            evaluate_units(&mut parsed, &base, &command, &effect, &cache, &mut findings);
+        let (commands, projectors, effects) = evaluate_units(
+            &mut parsed,
+            &command,
+            &projector,
+            &effect,
+            &cache,
+            &mut findings,
+        );
 
         check_name_collisions(&commands, &projectors, &effects, &mut findings);
 
@@ -453,8 +460,8 @@ fn register_events(
 /// Evaluate command, projector and effect modules against the library cache.
 fn evaluate_units(
     parsed: &mut [ParsedFile],
-    base_globals: &Globals,
     command_globals: &Globals,
+    projector_globals: &Globals,
     effect_globals: &Globals,
     cache: &HashMap<String, FrozenModule>,
     findings: &mut Vec<Finding>,
@@ -476,12 +483,12 @@ fn evaluate_units(
         };
         let rel = file.rel_path.clone();
 
-        // Commands get `now()`, effects get the impure builtins, projectors stay
-        // pure. Selecting per kind is what keeps purity structural.
+        // Commands get `now()`, projectors get `get()`, effects get the impure
+        // builtins. Selecting per kind is what keeps purity structural.
         let globals = match kind {
             ModuleKind::Command => command_globals,
             ModuleKind::Effect => effect_globals,
-            ModuleKind::Projector => base_globals,
+            ModuleKind::Projector => projector_globals,
         };
         let frozen = match eval_frozen(ast, globals, Some(&loader)) {
             Ok(frozen) => frozen,

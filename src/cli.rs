@@ -126,8 +126,8 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>) -> ExitCode {
         }
     };
     let data = runtime::resolve_data_dir(dir, data_dir);
-    let (rt, coordinator) = match runtime::Runtime::open(project, &data) {
-        Ok(pair) => pair,
+    let (rt, coordinator, projectors) = match runtime::Runtime::open(project, &data) {
+        Ok(parts) => parts,
         Err(err) => {
             eprintln!("error: {err:#}");
             return ExitCode::FAILURE;
@@ -144,7 +144,7 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match tokio_rt.block_on(server::serve(rt, coordinator, addr)) {
+    match tokio_rt.block_on(server::serve(rt, coordinator, projectors, addr)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");

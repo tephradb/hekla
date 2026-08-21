@@ -37,3 +37,20 @@ pub struct HandleCtx {
     /// The request's pinned append time, RFC 3339.
     pub now: String,
 }
+
+/// Read access a projector's `handle` has to its own read model, through the
+/// current batch's uncommitted writes. The storage-backed implementation lives in
+/// the runtime; the trait sits here so the builtins layer stays independent of it.
+pub trait EntityReader {
+    /// The current row for `entity_id`'s entity, keyed by `key`, as a JSON object,
+    /// or `None`. Reflects writes from earlier events in the same batch.
+    fn get(&self, entity_id: u64, key: &str) -> anyhow::Result<Option<serde_json::Value>>;
+}
+
+/// Host context passed to a projector's `handle` via `eval.extra`, giving `get()`
+/// a reader over the read model. Present only for the `handle` call, so `get()`
+/// resolves there and errors anywhere a projector context is absent.
+#[derive(ProvidesStaticType)]
+pub struct ProjectorCtx<'a> {
+    pub reader: &'a dyn EntityReader,
+}

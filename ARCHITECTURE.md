@@ -175,12 +175,15 @@ out of order). The checkpoint is written in the same SQLite transaction as the s
 so a crash cannot leave state and position disagreeing and silently skip events.
 
 **Storage**: one SQLite database per projector, holding both the read-model tables and the
-checkpoint. Co-location is what makes the single-transaction commit possible. Replay is
-rebuild-and-swap: build a fresh database from position 0 and rename it in, so state and position move
-together atomically.
+checkpoint. Co-location is what makes the single-transaction commit possible. The projector thread is
+the only writer, running the database in WAL so the read API can open read-only connections
+concurrently. Replay is rebuild-and-swap: build a fresh database from position 0, seal it (fold its
+WAL back into the file and drop to rollback mode so it is self-contained), then rename it in, so state
+and position move together atomically and a reader that opens the file mid-swap never sees a torn one.
 
 **Read model access** is only ever through the generated read API (section 10), never by opening the
-SQLite file directly. The table layout stays private.
+SQLite file directly. Each read opens its own read-only connection and reads the projector position in
+the same snapshot as the rows. The table layout stays private.
 
 ## 7. Effects (durable execution)
 

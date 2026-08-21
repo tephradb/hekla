@@ -31,7 +31,7 @@ use starlark::values::{
 };
 use starlark::{starlark_module, starlark_simple_value};
 
-use crate::context::HandleCtx;
+use crate::context::{HandleCtx, ProjectorCtx};
 
 // ---------------------------------------------------------------------------
 // Field types
@@ -1069,6 +1069,21 @@ pub fn call_handler_with_ctx<'v>(
     eval.eval_function(func, args, &[])
 }
 
+/// Call a projector's `handle` with a [`ProjectorCtx`] in scope, so `get()` can
+/// read the read model. Used only for a projector's `handle`.
+pub fn call_handler_with_projector_ctx<'v>(
+    module: &Module<'v>,
+    func: Value<'v>,
+    args: &[Value<'v>],
+    max_instructions: u64,
+    ctx: &ProjectorCtx,
+) -> starlark::Result<Value<'v>> {
+    let mut eval = Evaluator::new(module);
+    eval.set_max_tick_count(max_instructions)?;
+    eval.extra = Some(ctx);
+    eval.eval_function(func, args, &[])
+}
+
 /// The globals for pure modules (projectors, and the `events/` and `lib/` files
 /// every kind imports). No clock, no randomness, no I/O.
 pub fn globals() -> Globals {
@@ -1098,6 +1113,44 @@ pub fn command_globals() -> Globals {
     GlobalsBuilder::standard()
         .with(runtime_builtins)
         .with(command_builtins)
+        .build()
+}
+
+/// Builtins available only to projectors. `get(entity, key)` reads the current
+/// row from the projector's own read model, through the current batch's
+/// uncommitted writes (a [`ProjectorCtx`] on the evaluator carries the reader).
+/// It exists as a global so a `handle` naming it resolves at load; the guard is
+/// the presence of the context, so it errors anywhere but a projector `handle`.
+#[starlark_module]
+pub fn projector_builtins(builder: &mut GlobalsBuilder) {
+    fn get<'v>(
+        #[starlark(require = pos)] entity: Value<'v>,
+        #[starlark(require = pos)] key: String,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        let def = entity.downcast_ref::<EntityDef>().ok_or_else(|| {
+            anyhow::anyhow!(
+                "get() first argument must be an entity(...), got {}",
+                entity.get_type()
+            )
+        })?;
+        let ctx = eval
+            .extra
+            .and_then(|extra| extra.downcast_ref::<ProjectorCtx>())
+            .ok_or_else(|| anyhow::anyhow!("get() is only available in a projector's handle()"))?;
+        match ctx.reader.get(def.id, &key)? {
+            Some(row) => Ok(eval.heap().alloc(row)),
+            None => Ok(Value::new_none()),
+        }
+    }
+}
+
+/// Globals for projectors: the base builtins plus `get()`. Still no clock, no
+/// randomness, and no I/O beyond reading the projector's own read model.
+pub fn projector_globals() -> Globals {
+    GlobalsBuilder::standard()
+        .with(runtime_builtins)
+        .with(projector_builtins)
         .build()
 }
 
@@ -1184,7 +1237,7 @@ pub fn globals_for(kind: ModuleKind) -> Globals {
     match kind {
         ModuleKind::Command => command_globals(),
         ModuleKind::Effect => effect_globals(),
-        ModuleKind::Projector => globals(),
+        ModuleKind::Projector => projector_globals(),
     }
 }
 

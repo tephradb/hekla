@@ -6,6 +6,7 @@ use std::path::Path;
 
 use kiln::context::CommandContext;
 use kiln::loader::LoadedProject;
+use kiln::projector::ProjectorSet;
 use kiln::runtime::Runtime;
 use serde_json::json;
 use tempfile::TempDir;
@@ -13,7 +14,7 @@ use tephra::WriteCoordinator;
 use uuid::Uuid;
 
 /// Open the example project against a throwaway data directory.
-fn open() -> (Runtime, WriteCoordinator, TempDir) {
+fn open() -> (Runtime, WriteCoordinator, ProjectorSet, TempDir) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/users");
     let project = LoadedProject::load(&root);
     assert!(
@@ -22,8 +23,14 @@ fn open() -> (Runtime, WriteCoordinator, TempDir) {
         project.findings
     );
     let data = tempfile::tempdir().unwrap();
-    let (runtime, coordinator) = Runtime::open(project, data.path()).unwrap();
-    (runtime, coordinator, data)
+    let (runtime, coordinator, projectors) = Runtime::open(project, data.path()).unwrap();
+    (runtime, coordinator, projectors, data)
+}
+
+/// Stop the projector threads, then drain and join the writer.
+fn shutdown(projectors: ProjectorSet, coord: WriteCoordinator) {
+    projectors.shutdown_and_join();
+    coord.shutdown();
 }
 
 fn ctx() -> CommandContext {
@@ -39,7 +46,7 @@ const BOB: &str = "22222222-2222-2222-2222-222222222222";
 
 #[test]
 fn commits_a_new_registration() {
-    let (rt, coord, _data) = open();
+    let (rt, coord, projectors, _data) = open();
     let ctx = ctx();
     let result = rt
         .execute(
@@ -57,12 +64,12 @@ fn commits_a_new_registration() {
     );
     assert_eq!(result.body["causation_id"], ctx.causation_id.to_string());
     assert!(result.body["positions"]["first"].is_number());
-    coord.shutdown();
+    shutdown(projectors, coord);
 }
 
 #[test]
 fn rejects_a_taken_email_with_422() {
-    let (rt, coord, _data) = open();
+    let (rt, coord, projectors, _data) = open();
     rt.execute(
         "register-user",
         register(ALICE, "dup@example.com", "Alice"),
@@ -80,12 +87,12 @@ fn rejects_a_taken_email_with_422() {
         .unwrap();
     assert_eq!(result.status, 422);
     assert_eq!(result.body["error"]["code"], "email_taken");
-    coord.shutdown();
+    shutdown(projectors, coord);
 }
 
 #[test]
 fn missing_required_field_is_400() {
-    let (rt, coord, _data) = open();
+    let (rt, coord, projectors, _data) = open();
     let result = rt
         .execute(
             "register-user",
@@ -96,12 +103,12 @@ fn missing_required_field_is_400() {
         .unwrap();
     assert_eq!(result.status, 400);
     assert_eq!(result.body["error"]["code"], "invalid_input");
-    coord.shutdown();
+    shutdown(projectors, coord);
 }
 
 #[test]
 fn wrong_typed_field_is_400() {
-    let (rt, coord, _data) = open();
+    let (rt, coord, projectors, _data) = open();
     let result = rt
         .execute(
             "register-user",
@@ -111,32 +118,32 @@ fn wrong_typed_field_is_400() {
         )
         .unwrap();
     assert_eq!(result.status, 400);
-    coord.shutdown();
+    shutdown(projectors, coord);
 }
 
 #[test]
 fn unknown_command_is_404() {
-    let (rt, coord, _data) = open();
+    let (rt, coord, projectors, _data) = open();
     let result = rt
         .execute("does-not-exist", json!({}), &ctx(), None)
         .unwrap();
     assert_eq!(result.status, 404);
-    coord.shutdown();
+    shutdown(projectors, coord);
 }
 
 #[test]
 fn internal_command_is_not_routed() {
-    let (rt, coord, _data) = open();
+    let (rt, coord, projectors, _data) = open();
     let result = rt
         .execute("record-welcome", json!({ "user_id": ALICE }), &ctx(), None)
         .unwrap();
     assert_eq!(result.status, 404);
-    coord.shutdown();
+    shutdown(projectors, coord);
 }
 
 #[test]
 fn idempotent_replay_returns_the_original_outcome() {
-    let (rt, coord, _data) = open();
+    let (rt, coord, projectors, _data) = open();
     let ctx1 = ctx();
     let body = register(ALICE, "alice@example.com", "Alice");
     let first = rt
@@ -157,12 +164,12 @@ fn idempotent_replay_returns_the_original_outcome() {
         replay.body["correlation_id"],
         ctx1.correlation_id.to_string()
     );
-    coord.shutdown();
+    shutdown(projectors, coord);
 }
 
 #[test]
 fn now_is_available_in_handle() {
-    let (rt, coord, _data) = open();
+    let (rt, coord, projectors, _data) = open();
     let result = rt
         .execute(
             "schedule-reminder",
@@ -175,5 +182,5 @@ fn now_is_available_in_handle() {
     // event committed; had now() errored, the command would have failed.
     assert_eq!(result.status, 200);
     assert_eq!(result.body["events"][0]["type"], "reminder.scheduled");
-    coord.shutdown();
+    shutdown(projectors, coord);
 }

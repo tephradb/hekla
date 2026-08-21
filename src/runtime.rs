@@ -27,8 +27,9 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::context::CommandContext;
 use crate::dispatch::{self, CommandOutcome};
-use crate::loader::{CommandUnit, LoadedProject};
+use crate::loader::{CommandUnit, LoadedProject, ProjectorUnit};
 use crate::opdb::{OpDb, Reserve};
+use crate::projector::{self, ProjectorSet, ProjectorShared};
 use crate::starlark_builtins::{EmittedEvent, InputSchema, ModuleDef};
 
 /// Individual event segments before rolling to a new file. 256 MiB matches
@@ -52,20 +53,20 @@ pub struct Runtime {
     store: WriteHandle,
     opdb: Arc<Mutex<OpDb>>,
     started: Instant,
-    projector_names: Vec<String>,
+    projectors: HashMap<String, Arc<ProjectorShared>>,
     effect_names: Vec<String>,
     event_count: usize,
 }
 
 impl Runtime {
-    /// Open the store and operational DB under `data_dir` and build the runtime
-    /// from an already-loaded, error-free project. Returns the runtime and the
-    /// write coordinator, which the caller keeps to drain and join the writer on
-    /// shutdown.
+    /// Open the store and operational DB under `data_dir`, start one thread per
+    /// projector, and build the runtime from an already-loaded, error-free
+    /// project. Returns the runtime, the write coordinator, and the projector set;
+    /// the caller keeps the last two to drain and join on shutdown.
     pub fn open(
         project: LoadedProject,
         data_dir: &Path,
-    ) -> anyhow::Result<(Runtime, WriteCoordinator)> {
+    ) -> anyhow::Result<(Runtime, WriteCoordinator, ProjectorSet)> {
         let events_dir = data_dir.join("events");
         fs::create_dir_all(&events_dir)
             .with_context(|| format!("creating {}", events_dir.display()))?;
@@ -85,12 +86,17 @@ impl Runtime {
             let name = unit.loaded.def.name().to_owned();
             commands.insert(name, Arc::new(unit));
         }
-        let mut projector_names: Vec<String> = project
-            .projectors
-            .iter()
-            .map(|unit| unit.loaded.def.name().to_owned())
+
+        let projectors_dir = data_dir.join("projectors");
+        fs::create_dir_all(&projectors_dir)
+            .with_context(|| format!("creating {}", projectors_dir.display()))?;
+        let units: Vec<Arc<ProjectorUnit>> = project.projectors.into_iter().map(Arc::new).collect();
+        let (shared, projector_set) = projector::start_all(units, &store, &projectors_dir)?;
+        let projectors: HashMap<String, Arc<ProjectorShared>> = shared
+            .into_iter()
+            .map(|handle| (handle.name.clone(), handle))
             .collect();
-        projector_names.sort();
+
         let mut effect_names: Vec<String> = project
             .effects
             .iter()
@@ -103,11 +109,11 @@ impl Runtime {
             store,
             opdb: Arc::new(Mutex::new(opdb)),
             started: Instant::now(),
-            projector_names,
+            projectors,
             effect_names,
             event_count: project.events.by_type.len(),
         };
-        Ok((runtime, coordinator))
+        Ok((runtime, coordinator, projector_set))
     }
 
     /// Execute a command by name. Resolves public commands only; applies
@@ -200,9 +206,9 @@ impl Runtime {
         })
     }
 
-    /// A JSON snapshot for `GET /status`. Honest for this phase: it reports the
-    /// log head and the loaded-module inventory, but no projector or effect lag,
-    /// since neither runs yet.
+    /// A JSON snapshot for `GET /status`. Reports the log head, the loaded-module
+    /// inventory, and each projector's committed position and lag (head minus
+    /// position). Effect lag lands with the effect runtime in a later phase.
     pub fn status(&self) -> Value {
         let (public, internal): (Vec<&str>, Vec<&str>) = self
             .commands
@@ -220,14 +226,35 @@ impl Runtime {
         let mut internal = internal;
         public.sort();
         internal.sort();
+
+        let head = self.store.head().get();
+        let mut handles: Vec<&Arc<ProjectorShared>> = self.projectors.values().collect();
+        handles.sort_by(|a, b| a.name.cmp(&b.name));
+        let projectors: Vec<Value> = handles
+            .iter()
+            .map(|handle| {
+                let position = handle.position();
+                json!({
+                    "name": handle.name,
+                    "position": position,
+                    "lag": head.saturating_sub(position),
+                })
+            })
+            .collect();
+
         json!({
-            "log_head": self.store.head().get(),
+            "log_head": head,
             "uptime_seconds": self.started.elapsed().as_secs(),
             "commands": { "public": public, "internal": internal },
-            "projectors": self.projector_names,
+            "projectors": projectors,
             "effects": self.effect_names,
             "events": self.event_count,
         })
+    }
+
+    /// The running projector by name, for the read API and the replay endpoint.
+    pub fn projector(&self, name: &str) -> Option<&Arc<ProjectorShared>> {
+        self.projectors.get(name)
     }
 
     /// The public commands and their input schemas, for OpenAPI generation.

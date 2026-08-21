@@ -7,6 +7,8 @@ pub mod fmt;
 pub mod loader;
 pub mod opdb;
 pub mod openapi;
+pub mod projector;
+pub mod read_api;
 pub mod read_model;
 pub mod runtime;
 pub mod server;

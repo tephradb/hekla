@@ -1,5 +1,7 @@
 # A read model of users by id, with a secondary index on email. Entities are
 # collected implicitly from module scope; the table is named after this binding.
+# Read one by key at `GET /read/users/users/{user_id}`, or filter on the indexed
+# email at `GET /read/users/users?email=alice@example.com`.
 
 users = entity(
     key = "user_id",

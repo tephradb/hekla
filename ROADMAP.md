@@ -78,18 +78,38 @@ decision cycle behind Axum.
 - `kiln test`: `tests/*.star` scenarios seed a throwaway store through the same append path and run the
   real command, asserting emitted events (type, data, tags) or the rejection.
 
-## Phase 3: projectors and generated read API
+## Phase 3: projectors and generated read API (done)
 
-Read models and the query surface over them.
+Read models and the query surface over them. `kiln serve` now runs one thread per projector and serves
+a generated read API over the materialised state.
 
-- One sequential task per projector; checkpoint as watermark plus completed-set, committed in the
-  same transaction as the state.
-- `get(entity, key)` reading through uncommitted writes in the current batch; `put` / `patch` /
-  `delete`.
-- Generated read API: `GET /read/{projector}/{entity}/{key}` plus indexed filter/scan (400 on an
-  unindexed filter), cursor pagination, projector position in every response.
-- Projector replay (rebuild-and-swap via rename) and `POST /projectors/{name}/replay`.
-- Admin-only, read-only SQL endpoint (off in production). Status shows position and lag.
+- One sequential thread per projector, subscribing to its `source` from a persisted checkpoint. Each
+  batch's ops and the checkpoint it advances to commit in one SQLite transaction, so state and position
+  can never disagree and a crash resumes without skipping events. The checkpoint is a watermark plus a
+  completed-set; the set is always empty under the sequential model, reserved so parallel lanes need no
+  migration.
+- `get(entity, key)` reads the current row through the batch's own uncommitted writes (every read and
+  write runs on the projector's one connection), so read-modify-write stays in Starlark; `put` /
+  `patch` / `delete` unchanged. Projectors stay pure otherwise: no clock, no randomness, no network.
+- One SQLite database per projector at `data/projectors/{name}.db`, holding the read-model tables and
+  the checkpoint together. The read API opens it read-only per request (WAL), reading the position in
+  the same snapshot as the rows.
+- Generated read API: `GET /read/{projector}/{entity}/{key}`, and `GET /read/{projector}/{entity}` with
+  an indexed filter and cursor pagination. A filter on anything but the key or a declared index is a
+  400, never a table scan. Every response carries the projector's log position.
+- Projector replay is rebuild-and-swap: `POST /projectors/{name}/replay` builds a fresh database from
+  position 0 and renames it in, so a crash mid-rebuild leaves the live model untouched. It returns 202;
+  progress shows as lag in `GET /status`, which now reports each projector's position and lag.
+
+Honest scope for this phase:
+
+- The admin-only read-only SQL endpoint is deferred to a later phase.
+- Read-API `money` output is the raw stored integer minor units: `money` carries no scale, and no
+  entity uses it yet, so the decimal-string wire form is deferred with the scale decision.
+- A scan supports a single indexed filter field; multi-field (composite-prefix) filters are deferred.
+- The checkpoint's completed-set is always empty under the sequential model; the format is built for
+  parallel lanes, but no lane runs yet.
+- Reads return the projector position but do not yet block on it, so read-your-writes remains deferred.
 
 ## Phase 4: effects (durable execution)
 

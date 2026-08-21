@@ -11,8 +11,6 @@
 //! host-stamped [`envelope`] at the append seam, and every read unwraps it, so
 //! handlers only ever see the payload.
 
-use std::collections::HashMap;
-
 use starlark::environment::Module;
 use tephra::{
     AppendCondition, AppendError, Event, EventType, Position, PositionRange, Query, QueryItem, Tag,
@@ -22,11 +20,10 @@ use uuid::Uuid;
 
 use crate::context::{CommandContext, HandleCtx};
 use crate::envelope::{self, Envelope};
-use crate::read_model::ReadModel;
 use crate::starlark_builtins::{
-    EmittedEvent, EntityDef, EventSpec, HandleOutcome, LoadedModule, ModuleDef, alloc_event,
-    alloc_input, call_handler, call_handler_with_ctx, check_fold_result, initial_state,
-    parse_entity_ops, parse_event_specs, parse_handle_result, thaw, validate_command_input,
+    EmittedEvent, EventSpec, HandleOutcome, LoadedModule, ModuleDef, alloc_event, alloc_input,
+    call_handler, call_handler_with_ctx, check_fold_result, initial_state, parse_event_specs,
+    parse_handle_result, thaw, validate_command_input,
 };
 
 /// Per-handler instruction budget. Bounds a runaway script at dispatch time.
@@ -163,59 +160,11 @@ pub fn run_command(
     })
 }
 
-/// Run a projector across the store: read every event in its `source`, hand each
-/// to `handle`, and apply the emitted `put`/`patch`/`delete` ops to the SQLite
-/// read model. Returns the number of events processed.
-pub fn run_projector(
-    store: &WriteHandle,
-    loaded: &LoadedModule,
-    model: &ReadModel,
-) -> anyhow::Result<usize> {
-    let ModuleDef::Projector {
-        entities, sources, ..
-    } = &loaded.def
-    else {
-        anyhow::bail!("run_projector called on a non-projector module");
-    };
-    let frozen = &loaded.module;
-    let query = to_query(sources)?;
-
-    // Resolve the by-value references in `put`/`patch`/`delete` back to entities.
-    let by_id: HashMap<u64, &EntityDef> =
-        entities.iter().map(|entity| (entity.id, entity)).collect();
-
-    let mut events_seen = 0usize;
-    Module::with_temp_heap(|module| {
-        let handle_fn = frozen
-            .get_option("handle")?
-            .ok_or_else(|| anyhow::anyhow!("projector has no handle() function"))?;
-        let mut reads = store.read(&query, Position::ZERO, None);
-        while let Some(item) = reads.next() {
-            let seq = item.map_err(|err| anyhow::anyhow!("read failed: {err}"))?;
-            events_seen += 1;
-            let (_envelope, data) = envelope::decode(seq.event.data())
-                .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-            let event = alloc_event(&module, seq.event.event_type(), &data);
-            let result = call_handler(&module, thaw(&handle_fn, &module), &[event], MAX_TICKS)
-                .map_err(|err| anyhow::anyhow!("handle() failed: {err}"))?;
-            for op in parse_entity_ops(result)? {
-                let entity = by_id.get(&op.entity_id).ok_or_else(|| {
-                    anyhow::anyhow!("op references an entity the projector didn't declare")
-                })?;
-                model.apply(entity, op.kind)?;
-            }
-        }
-        anyhow::Ok(())
-    })?;
-
-    Ok(events_seen)
-}
-
 /// Lower one or more event specs into a tephra query. `all_events()` becomes
 /// `Query::All` (a full scan that bypasses the index); otherwise each filter is
 /// a query item and the items are OR'd together (`parse_event_specs` guarantees
 /// `all_events()` never appears alongside filters).
-fn to_query(specs: &[EventSpec]) -> anyhow::Result<Query> {
+pub(crate) fn to_query(specs: &[EventSpec]) -> anyhow::Result<Query> {
     let mut items = Vec::with_capacity(specs.len());
     for spec in specs {
         match spec {

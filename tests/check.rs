@@ -50,7 +50,7 @@ fn example_project_checks_clean() {
     let errs = errors(&project);
     assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     assert_eq!(project.commands.len(), 4);
-    assert_eq!(project.projectors.len(), 1);
+    assert_eq!(project.projectors.len(), 2);
     assert_eq!(project.effects.len(), 1);
     assert_eq!(project.events.by_type.len(), 4);
 

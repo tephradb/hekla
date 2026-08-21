@@ -1,0 +1,174 @@
+//! The generated read API over projector read models.
+//!
+//! Reads open a fresh read-only connection to the projector's database per
+//! request (WAL lets them run concurrently with the projector's single writer)
+//! and read the projector's log position in the same snapshot as the rows, so a
+//! response's `position` is consistent with its data. Filters are restricted to
+//! declared indexes, and pagination is by an opaque key cursor, never an offset.
+
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::Context;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde_json::Value;
+
+use crate::read_model::ReadModel;
+use crate::starlark_builtins::EntityDef;
+
+/// Default page size for a scan when the request does not set `limit`.
+pub const DEFAULT_LIMIT: usize = 50;
+/// Largest page a scan will return; a larger `limit` is clamped to this.
+pub const MAX_LIMIT: usize = 500;
+
+/// One page of a scan: the rows, the cursor to resume after them (absent at the
+/// end), and the projector's log position at read time.
+pub struct Page {
+    pub items: Vec<Value>,
+    pub next_cursor: Option<String>,
+    pub position: u64,
+}
+
+/// The entity named `name` in a projector's declared set.
+pub fn find_entity<'a>(entities: &'a [EntityDef], name: &str) -> Option<&'a EntityDef> {
+    entities.iter().find(|entity| entity.name == name)
+}
+
+/// Whether `field` can be filtered on: the primary key, or the leftmost column of
+/// some declared index. Anything else would be a table scan, which the read API
+/// refuses; the caller returns a 400 telling the author to declare the index.
+pub fn is_filterable(entity: &EntityDef, field: &str) -> bool {
+    if field == entity.key {
+        return true;
+    }
+    entity
+        .indexes
+        .iter()
+        .any(|index| index.columns.first().map(String::as_str) == Some(field))
+}
+
+/// Encode a row key as an opaque forward cursor.
+pub fn encode_cursor(key: &str) -> String {
+    URL_SAFE_NO_PAD.encode(key.as_bytes())
+}
+
+/// Decode an opaque cursor back to a row key.
+pub fn decode_cursor(cursor: &str) -> anyhow::Result<String> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .context("cursor is not valid base64url")?;
+    String::from_utf8(bytes).context("cursor is not valid UTF-8")
+}
+
+/// Read one row by key, plus the projector position, in one read snapshot.
+pub fn get_one(
+    db_path: &Path,
+    entity: &EntityDef,
+    key: &str,
+) -> anyhow::Result<(Option<Value>, u64)> {
+    let model = open_with_retry(db_path)?;
+    let snapshot = model.begin()?;
+    let position = model.read_checkpoint()?.get();
+    let item = model.get(entity, key)?;
+    drop(snapshot);
+    Ok((item, position))
+}
+
+/// Scan an entity, optionally filtered by one indexed column and resumed after a
+/// cursor, plus the projector position, in one read snapshot. `filter`'s column
+/// must already be validated as filterable.
+pub fn scan(
+    db_path: &Path,
+    entity: &EntityDef,
+    filter: Option<(&str, &str)>,
+    after_key: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Page> {
+    let model = open_with_retry(db_path)?;
+    let snapshot = model.begin()?;
+    let position = model.read_checkpoint()?.get();
+    // Over-fetch one row to learn whether another page follows.
+    let mut items = model.scan(entity, filter, after_key, limit + 1)?;
+    drop(snapshot);
+
+    let next_cursor = if items.len() > limit {
+        items.truncate(limit);
+        items
+            .last()
+            .and_then(|row| row.get(&entity.key))
+            .and_then(key_string)
+            .map(|key| encode_cursor(&key))
+    } else {
+        None
+    };
+    Ok(Page {
+        items,
+        next_cursor,
+        position,
+    })
+}
+
+/// The string form of a key value for cursor encoding: strings as-is, numbers by
+/// their canonical decimal form (so integer-keyed entities paginate too).
+fn key_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Open the read model read-only, retrying once after a brief pause. The `.db`
+/// path is always present (a replay swaps it in atomically), so this only guards
+/// the vanishing window around the rename. Runs on a blocking thread.
+fn open_with_retry(db_path: &Path) -> anyhow::Result<ReadModel> {
+    match ReadModel::open_readonly(db_path) {
+        Ok(model) => Ok(model),
+        Err(_) => {
+            thread::sleep(Duration::from_millis(5));
+            ReadModel::open_readonly(db_path)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entity_with_index() -> EntityDef {
+        use crate::starlark_builtins::{FieldKind, IndexDef};
+        EntityDef {
+            id: 1,
+            name: "users".to_owned(),
+            key: "user_id".to_owned(),
+            fields: vec![
+                ("user_id".to_owned(), FieldKind::Uuid),
+                ("email".to_owned(), FieldKind::Text { max_length: None }),
+                ("name".to_owned(), FieldKind::Text { max_length: None }),
+            ],
+            indexes: vec![IndexDef {
+                name: "by_email".to_owned(),
+                columns: vec!["email".to_owned()],
+            }],
+        }
+    }
+
+    #[test]
+    fn only_the_key_and_indexed_columns_are_filterable() {
+        let entity = entity_with_index();
+        assert!(is_filterable(&entity, "user_id"));
+        assert!(is_filterable(&entity, "email"));
+        assert!(!is_filterable(&entity, "name"));
+        assert!(!is_filterable(&entity, "nonexistent"));
+    }
+
+    #[test]
+    fn cursor_round_trips() {
+        let cursor = encode_cursor("u1");
+        assert_ne!(cursor, "u1");
+        assert_eq!(decode_cursor(&cursor).unwrap(), "u1");
+        assert!(decode_cursor("not valid base64!!").is_err());
+    }
+}
