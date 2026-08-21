@@ -111,20 +111,51 @@ Honest scope for this phase:
   parallel lanes, but no lane runs yet.
 - Reads return the projector position but do not yet block on it, so read-your-writes remains deferred.
 
-## Phase 4: effects (durable execution)
+## Phase 4: effects (durable execution) (done)
 
-The durable-execution model.
+The durable-execution model. `kiln serve` now runs one thread per effect: it subscribes to the effect's
+`source`, and for each event runs the straight-line `handle` whose impure builtins are journaled, so a
+crash mid-handler resumes by replaying journaled calls and running only the unjournaled tail live.
 
-- Effect task, sequential per effect, strict position order.
-- Journal in the operational DB: content-hash keys, recorded script hash, retention sweep, terminal
-  record journaled.
-- Builtins: journaled `http.*`, `invoke_command` (public or internal), `now()`, `log()`, and
-  journaled `read(projector, entity, key)` plus filter/scan.
-- Runtime retry (transport and 5xx with backoff); `status >= 400` terminal to the script.
-- Graceful-shutdown draining; restart hash-mismatch warning; effect lag in status.
-- Retention sweeper task (lazy GC) for effect journals and command idempotency keys, with
-  configurable windows in `kiln.toml`.
-- Explicit blocking-pool size with a saturation-waits-not-spawns policy in `kiln.toml`.
+- One sequential thread per effect, strict position order, one invocation per event. The durable resume
+  point is a per-effect watermark (a new `effect_cursor` table) advanced only once a batch's events are
+  all terminal; the `effect_invocation` rows are the completed-set (the watermark-plus-completed-set
+  format the design calls for).
+- Journal in the operational DB, keyed by the content hash of the call plus a per-run disambiguator.
+  Each call's journal row and the terminal record commit call-by-call in autocommit (never one
+  per-invocation transaction), so journaled side effects survive a crash and replay skips them; a
+  failed invocation replays completed calls and fails at the same point without re-firing. The script
+  hash is recorded on each invocation, and a restart warns when in-flight code changed under it.
+- Builtins: journaled `http.*`, `invoke_command` (public or internal, deterministic idempotency key plus
+  the target command's DCB boundary), `now()`, journaled `read(projector, entity, key)` plus a `scan`
+  filter/paginate, and `log()` (not journaled).
+- Retry split: the runtime absorbs transport errors and 5xx (they never reach the script) by wedging the
+  invocation and retrying with capped backoff; a 2xx/3xx/4xx result reaches the script, so `status >= 400`
+  is a real decide-what-to-do outcome. A handler error wedges the same way (retry forever, never skip).
+- Graceful-shutdown draining (effects first, then projectors, then the writer), with a bounded join so a
+  wedged effect cannot hang shutdown. `/status` reports each effect's position, lag, consecutive-failure
+  count, and last error, so a wedge reads as broken rather than merely slow.
+- `POST /effects/{name}/skip/{position}`: an explicit, manual operator action to advance a wedged effect
+  past a genuinely unprocessable event. Never automatic.
+- Retention sweeper task (lazy GC) for effect journals and command idempotency keys, with configurable
+  windows in `kiln.toml`, sweeping in bounded chunks.
+
+Honest scope for this phase:
+
+- `effects.pool_size` is validated but not enforced: v1 runs one thread per effect, which already bounds
+  concurrency. A real shared blocking pool is reserved for partition-key parallel lanes (a later phase),
+  which the watermark-plus-completed-set format already supports.
+- `invoke_command` lands the domain fact exactly-once when the target command is idempotent under replay
+  (a natural-id create or an explicit DCB boundary, like the example's `record-welcome`): the
+  deterministic idempotency key deduplicates in the common path, but across the narrow append-then-
+  finalize crash window the key is cleared on restart (as every pending key is), so the boundary is what
+  dedupes the replay, exactly as for HTTP commands. Raw `http.*` is at-least-once (a crash between a
+  successful request and its journal write re-fires on replay).
+- `read()`/`scan()` are journaled, so a replayed effect sees point-in-time-stale data by design; at cold
+  start an effect can also outrun a projector and journal an empty read that then replays empty forever.
+- One explicit skip endpoint; no automatic dead-lettering, and no per-event retry endpoint beyond
+  fix-the-code-and-restart (which replays the running invocation). The script hash is recorded and
+  mismatch-warned but not pinned.
 
 ## Phase 5 and beyond (deferred, with triggers)
 

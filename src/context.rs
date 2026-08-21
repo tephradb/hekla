@@ -28,6 +28,17 @@ impl CommandContext {
             triggering_event_id: None,
         }
     }
+
+    /// A context for a command invoked by an effect: it keeps the flow's
+    /// `correlation_id` and records the event that triggered the effect as the
+    /// causing event, with a fresh causation id for this execution.
+    pub fn from_effect(correlation_id: Uuid, triggering_event_id: Uuid) -> CommandContext {
+        CommandContext {
+            correlation_id,
+            causation_id: Uuid::new_v4(),
+            triggering_event_id: Some(triggering_event_id),
+        }
+    }
 }
 
 /// Host context passed to a command's `handle` via `eval.extra`. Present only for
@@ -53,4 +64,61 @@ pub trait EntityReader {
 #[derive(ProvidesStaticType)]
 pub struct ProjectorCtx<'a> {
     pub reader: &'a dyn EntityReader,
+}
+
+/// The impure capabilities an effect's `handle` reaches through its builtins. The
+/// runtime's implementation journals each call so a replay after a crash returns
+/// the recorded result instead of performing the side effect again. The trait
+/// sits here so the builtins layer stays independent of the runtime that backs it.
+///
+/// Every method but [`log`](EffectHost::log) is journaled; `log` writes a trace
+/// line and may repeat on replay, which is why it returns nothing that could
+/// steer control flow.
+pub trait EffectHost {
+    /// Perform an HTTP request and return `{status, body, headers}`. A transport
+    /// failure or a 5xx is an `Err` (the runtime retries it, so it never reaches
+    /// the script); a 2xx/3xx/4xx response is a value the handler decides on.
+    fn http(
+        &self,
+        method: &str,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value>;
+
+    /// Invoke a public or internal command and return its `{status, body}`
+    /// outcome. Exactly-once across replays via a deterministic idempotency key.
+    fn invoke_command(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value>;
+
+    /// Read one row from a projector's read model by key (`null` when absent).
+    fn read(&self, projector: &str, entity: &str, key: &str) -> anyhow::Result<serde_json::Value>;
+
+    /// Scan a projector's read model with an optional single indexed filter and
+    /// cursor pagination, returning `{items, next_cursor}`.
+    fn scan(
+        &self,
+        projector: &str,
+        entity: &str,
+        filter: Option<(String, String)>,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<serde_json::Value>;
+
+    /// The wall clock at first run, recorded so a replay agrees, RFC 3339.
+    fn now(&self) -> anyhow::Result<String>;
+
+    /// Emit a trace line. Not journaled.
+    fn log(&self, message: &str);
+}
+
+/// Host context passed to an effect's `handle` via `eval.extra`. Present only for
+/// the `handle` call, so the impure builtins resolve there and error anywhere an
+/// effect context is absent (keeping commands and projectors pure).
+#[derive(ProvidesStaticType)]
+pub struct EffectCtx<'a> {
+    pub host: &'a dyn EffectHost,
 }

@@ -3,9 +3,10 @@
 //! A small, optional file for operational knobs that are not code: the effect
 //! blocking-pool size and the retention windows for effect journals and command
 //! idempotency keys. Defaults are sensible, so a project runs with no config.
-//! The values are consumed by the runtime in later phases; loading and
-//! validating them here means a malformed `kiln.toml` fails at load, not at the
-//! moment a sweeper or the effect pool first reaches for a setting.
+//! The retention windows drive the sweeper; the pool size is validated but
+//! reserved (v1 runs one thread per effect). Validating here means a malformed
+//! `kiln.toml` fails at load, not at the moment the sweeper first reaches for a
+//! setting.
 
 use std::path::Path;
 use std::{fs, io};
@@ -15,6 +16,10 @@ use serde::Deserialize;
 
 /// The config file name, resolved relative to the project root.
 pub const FILE_NAME: &str = "kiln.toml";
+
+/// The largest retention window we accept, in days (100 years). Bounds the
+/// sweeper's date arithmetic and turns an absurd typo into a clear error.
+const MAX_RETENTION_DAYS: u32 = 36_500;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -82,6 +87,22 @@ impl Config {
         if self.effects.pool_size == 0 {
             anyhow::bail!("effects.pool_size must be at least 1");
         }
+        // Retention windows feed date arithmetic, so a typo like a billion days is
+        // caught here rather than turning into a silently-infinite window.
+        for (field, days) in [
+            (
+                "retention.effect_journal_days",
+                self.retention.effect_journal_days,
+            ),
+            (
+                "retention.idempotency_key_days",
+                self.retention.idempotency_key_days,
+            ),
+        ] {
+            if days > MAX_RETENTION_DAYS {
+                anyhow::bail!("{field} must be at most {MAX_RETENTION_DAYS} (100 years)");
+            }
+        }
         Ok(())
     }
 }
@@ -108,6 +129,12 @@ mod tests {
     #[test]
     fn zero_pool_size_is_rejected() {
         assert!(Config::parse("[effects]\npool_size = 0\n").is_err());
+    }
+
+    #[test]
+    fn absurd_retention_window_is_rejected() {
+        assert!(Config::parse("[retention]\neffect_journal_days = 4000000000\n").is_err());
+        assert!(Config::parse("[retention]\nidempotency_key_days = 4000000000\n").is_err());
     }
 
     #[test]

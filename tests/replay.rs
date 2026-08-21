@@ -5,10 +5,12 @@
 //! or come back empty.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use kiln::context::CommandContext;
+use kiln::effect::{HttpClient, StubHttpClient};
 use kiln::loader::LoadedProject;
 use kiln::read_api;
 use kiln::runtime::Runtime;
@@ -55,7 +57,8 @@ fn replay_rebuilds_and_keeps_serving() {
     let project = LoadedProject::load(&root);
     assert!(!project.has_errors(), "{:?}", project.findings);
     let data = tempfile::tempdir().unwrap();
-    let (rt, coord, projectors) = Runtime::open(project, data.path()).unwrap();
+    let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
 
     register(&rt, A);
     register(&rt, B);
@@ -87,6 +90,7 @@ fn replay_rebuilds_and_keeps_serving() {
     assert_eq!(row.unwrap()["count"].as_i64(), Some(3));
     assert_eq!(position, 3);
 
+    effects.shutdown_and_join();
     projectors.shutdown_and_join();
     coord.shutdown();
 }

@@ -225,7 +225,13 @@ diverge from the original run. kiln journals `read()` for consistency with the r
 
 **Writing outcomes**: effects do not append events; they `invoke_command`, and that invoke is a
 journaled, idempotent side effect, so durable domain facts (tracking numbers, external ids) land
-exactly once across replays. A command rejection is a normal terminal outcome, not a retryable
+exactly once across replays. The idempotency key an effect passes is deterministic, so the common-path
+replay returns the recorded outcome without re-running the command. Across the narrow crash window
+between the command's append and its idempotency finalize, that key is cleared at startup (like every
+pending key), so exactly-once there rests on the command being idempotent under replay: a natural-id
+create, or an explicit DCB boundary that turns the re-append into a no-op reject. This is the same
+requirement, and the same guarantee, as for HTTP commands, so effect-completion commands carry a
+boundary just as any create does. A command rejection is a normal terminal outcome, not a retryable
 failure: if a completion command rejects because state moved on (the claim was already cancelled, the
 order already fulfilled), the runtime records the rejection in the journal and completes the
 invocation. Treating rejection as retryable would loop forever on legitimately-stale completions.
@@ -234,14 +240,25 @@ invocation. Treating rejection as retryable would loop forever on legitimately-s
 the script. A result that reaches Starlark is therefore always terminal, so `status >= 400` in a
 handler is a real, decide-what-to-do failure rather than something every effect re-implements.
 
+**Wedging and the skip hatch**: transport errors, 5xx, and a raised handler all wedge the invocation.
+The runtime retries the whole invocation with capped exponential backoff, forever, replaying journaled
+calls each attempt so completed side effects never re-fire, and never skipping. Because a wedge is not
+the same as ordinary lag, the status endpoint reports each effect's consecutive-failure count and last
+error alongside its position. The only way past a genuinely unprocessable event is fixing the code and
+restarting (which replays the running invocation) or an explicit, manual operator skip
+(`POST /effects/{name}/skip/{position}`); nothing is skipped automatically. The durable resume point is
+a per-effect watermark advanced only once a batch's invocations are all terminal, so a crash re-scans
+from the last completed batch and never skips an event; the journal rows and the terminal record commit
+call-by-call in autocommit, never in one per-invocation transaction, which is what lets journaled side
+effects survive a crash and be replayed.
+
 **Concurrency (v1)**: sequential per effect: one in-flight invocation, strict position order, no
-cross-lane watermark. With N active effects that is up to N concurrent blocking threads, so the
-blocking pool has an explicit configured size (`kiln.toml`) and a saturation policy: when the pool is
-full, effects wait rather than spawning without limit. Because processing is sequential but events
-are at-least-once, an effect whose handler is slower than its event arrival rate falls behind.
-Falling behind, visible as lag, is the correct behaviour, not an unbounded pending queue or unbounded
-thread growth. Partition-key parallel lanes are a clean fast-follow, enabled by the checkpoint format
-above.
+cross-lane watermark. v1 runs one dedicated thread per effect, which already bounds concurrency at the
+number of effects; the configured blocking-pool size (`kiln.toml`) is validated but reserved for a real
+shared pool once partition-key parallel lanes land (the watermark-plus-completed-set format enables
+them). Because processing is sequential but events are at-least-once, an effect whose handler is slower
+than its event arrival rate falls behind. Falling behind, visible as lag, is the correct behaviour, not
+an unbounded pending queue or unbounded thread growth.
 
 **Redeploy**: content-hash keying limits the blast radius. Unchanged calls replay from the journal
 regardless of edits elsewhere in the file, so the failure mode of editing during a deploy is "a
@@ -260,9 +277,9 @@ silent.
 - Lightweight tokio tasks with bespoke supervision. No actor framework in v1.
 - Commands run on `spawn_blocking`, because Starlark evaluation is synchronous.
 - One sequential task per projector.
-- Effects use one blocking-pool thread per in-flight invocation (one per effect under the sequential
-  v1 model). The pool has an explicit configured size; saturation makes effects wait, not spawn
-  unboundedly (section 7).
+- One dedicated thread per effect (the projector model), each running its invocations synchronously in
+  strict position order. The configured blocking-pool size is validated but reserved for a real shared
+  pool once partition-key parallel lanes land (section 7).
 - starlark-rust specifics: `FrozenModule` is `Send + Sync`, so a module is parsed and frozen once at
   load and shared across tasks. A fresh `Evaluator` per invocation with a tick budget bounds runaway
   scripts.
@@ -292,7 +309,10 @@ consistent copy is not required for them.
   read response includes the projector's log position, so read-your-writes can be added later without
   an API break.
 - `POST /projectors/{name}/replay`.
-- `GET /status` and health: per-module positions and lag (position vs log head).
+- `POST /effects/{name}/skip/{position}`: an explicit, manual operator action to advance a wedged effect
+  past a genuinely unprocessable event. Never automatic.
+- `GET /status` and health: per-module positions and lag (position vs log head), plus each effect's
+  consecutive-failure count and last error, so a wedge is distinguishable from ordinary lag.
 - An admin-only, read-only SQL endpoint behind a flag, off in production, for debugging.
 - Direct SQLite file access is not a supported surface. The table layout stays private behind the
   generated read API.

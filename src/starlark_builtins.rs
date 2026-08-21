@@ -31,7 +31,7 @@ use starlark::values::{
 };
 use starlark::{starlark_module, starlark_simple_value};
 
-use crate::context::{HandleCtx, ProjectorCtx};
+use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx};
 
 // ---------------------------------------------------------------------------
 // Field types
@@ -830,6 +830,9 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
 pub struct LoadedModule {
     pub def: ModuleDef,
     pub module: FrozenModule,
+    /// The source hash: the module's deployed identity, and an effect's script
+    /// hash on each invocation.
+    pub source_hash: String,
 }
 
 /// A module's name is its file stem, validated as a slug so it maps cleanly onto
@@ -949,10 +952,15 @@ pub fn load_script(
     kind: ModuleKind,
 ) -> starlark::Result<LoadedModule> {
     let name = module_name_from_path(filename)?;
+    let source_hash = crate::hash::sha256_hex(src.as_bytes());
     let ast = parse_module(filename, src)?;
     let module = eval_frozen(ast, &globals_for(kind), None)?;
     let def = module_def_from_frozen(kind, name, filename, &module)?;
-    Ok(LoadedModule { def, module })
+    Ok(LoadedModule {
+        def,
+        module,
+        source_hash,
+    })
 }
 
 /// Read the required `input = schema(...)` global off a command module.
@@ -1084,6 +1092,22 @@ pub fn call_handler_with_projector_ctx<'v>(
     eval.eval_function(func, args, &[])
 }
 
+/// Call an effect's `handle` with an [`EffectCtx`] in scope, so the impure
+/// builtins (`http.*`, `invoke_command`, `read`, `now`, `log`) resolve and journal
+/// through the host. Used only for an effect's `handle`.
+pub fn call_handler_with_effect_ctx<'v>(
+    module: &Module<'v>,
+    func: Value<'v>,
+    args: &[Value<'v>],
+    max_instructions: u64,
+    ctx: &EffectCtx,
+) -> starlark::Result<Value<'v>> {
+    let mut eval = Evaluator::new(module);
+    eval.set_max_tick_count(max_instructions)?;
+    eval.extra = Some(ctx);
+    eval.eval_function(func, args, &[])
+}
+
 /// The globals for pure modules (projectors, and the `events/` and `lib/` files
 /// every kind imports). No clock, no randomness, no I/O.
 pub fn globals() -> Globals {
@@ -1154,70 +1178,190 @@ pub fn projector_globals() -> Globals {
         .build()
 }
 
-/// Builtins available only to effects: the impure, journaled capabilities. In
-/// this phase they are stubs that error if called; the durable-execution runtime
-/// that gives them behaviour lands in a later phase. They exist now so effect
-/// modules resolve their names at load, and so purity stays structural: commands
-/// and projectors never see these globals, so they cannot reach a clock or the
-/// network even by mistake.
+/// The [`EffectHost`] in scope on the evaluator, or an error naming `what`. The
+/// host is present only during an effect's `handle`, so the impure builtins error
+/// anywhere else, keeping commands and projectors structurally pure.
+fn effect_host<'e>(eval: &'e Evaluator, what: &str) -> anyhow::Result<&'e dyn EffectHost> {
+    eval.extra
+        .and_then(|extra| extra.downcast_ref::<EffectCtx>())
+        .map(|ctx| ctx.host)
+        .ok_or_else(|| anyhow::anyhow!("{what} is only available in an effect's handle()"))
+}
+
+/// Read a Starlark dict of `str: str` into header pairs.
+fn header_pairs(value: Value<'_>) -> anyhow::Result<Vec<(String, String)>> {
+    let dict = DictRef::from_value(value)
+        .ok_or_else(|| anyhow::anyhow!("http headers must be a dict, got {}", value.get_type()))?;
+    let mut out = Vec::with_capacity(dict.len());
+    for (key, val) in dict.iter() {
+        let key = key
+            .unpack_str()
+            .ok_or_else(|| anyhow::anyhow!("http header name must be a string"))?;
+        let val = val
+            .unpack_str()
+            .ok_or_else(|| anyhow::anyhow!("http header `{key}` value must be a string"))?;
+        out.push((key.to_owned(), val.to_owned()));
+    }
+    Ok(out)
+}
+
+type HttpArgs = (String, Vec<(String, String)>, Option<serde_json::Value>);
+
+/// Pull `url` (required), `headers` (dict), and `body` (any JSON) out of an
+/// `http.*` call's keyword arguments.
+fn parse_http_args(method: &str, kwargs: SmallMap<String, Value<'_>>) -> anyhow::Result<HttpArgs> {
+    let verb = method.to_ascii_lowercase();
+    let mut url = None;
+    let mut headers = Vec::new();
+    let mut body = None;
+    for (key, value) in kwargs {
+        match key.as_str() {
+            "url" => {
+                url = Some(
+                    value
+                        .unpack_str()
+                        .ok_or_else(|| anyhow::anyhow!("http.{verb}() url must be a string"))?
+                        .to_owned(),
+                );
+            }
+            "headers" => headers = header_pairs(value)?,
+            "body" => {
+                if !value.is_none() {
+                    // The bodyless verbs never send a body, so accepting one would
+                    // silently drop it (and skew the journaled call). Reject it.
+                    if matches!(method, "GET" | "DELETE") {
+                        anyhow::bail!("http.{verb}() does not take a body");
+                    }
+                    body = Some(value.to_json_value().map_err(|err| {
+                        anyhow::anyhow!("http.{verb}() body must be JSON-serialisable: {err}")
+                    })?);
+                }
+            }
+            other => anyhow::bail!("http.{verb}() got unexpected argument `{other}`"),
+        }
+    }
+    let url = url.ok_or_else(|| anyhow::anyhow!("http.{verb}() requires url="))?;
+    Ok((url, headers, body))
+}
+
+/// The shared body of every `http.*` builtin: parse the arguments, then journal
+/// the call through the effect host.
+fn http_dispatch<'v>(
+    method: &str,
+    kwargs: SmallMap<String, Value<'v>>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> anyhow::Result<Value<'v>> {
+    let (url, headers, body) = parse_http_args(method, kwargs)?;
+    let host = effect_host(eval, &format!("http.{}()", method.to_ascii_lowercase()))?;
+    let result = host.http(method, &url, headers, body)?;
+    Ok(eval.heap().alloc(result))
+}
+
+/// Builtins available only to effects: the impure, journaled capabilities. Each
+/// call is recorded in the effect journal, so a replay after a crash returns the
+/// recorded result instead of performing the side effect again. They exist as
+/// globals so an effect naming them resolves at load; the guard is the presence of
+/// an [`EffectCtx`], so they error anywhere but an effect's `handle`. Commands and
+/// projectors never see these globals, so purity stays structural.
 #[starlark_module]
 pub fn effect_builtins(builder: &mut GlobalsBuilder) {
-    fn now() -> anyhow::Result<NoneType> {
-        anyhow::bail!("now() is not available until the effect runtime lands")
+    fn now(eval: &mut Evaluator) -> anyhow::Result<String> {
+        effect_host(eval, "now()")?.now()
     }
 
-    fn log(#[starlark(require = pos)] _message: String) -> anyhow::Result<NoneType> {
-        anyhow::bail!("log() is not available until the effect runtime lands")
+    fn log(
+        #[starlark(require = pos)] message: String,
+        eval: &mut Evaluator,
+    ) -> anyhow::Result<NoneType> {
+        effect_host(eval, "log()")?.log(&message);
+        Ok(NoneType)
     }
 
     fn invoke_command<'v>(
-        #[starlark(require = pos)] _name: String,
-        #[starlark(require = pos)] _input: Value<'v>,
-    ) -> anyhow::Result<NoneType> {
-        anyhow::bail!("invoke_command() is not available until the effect runtime lands")
+        #[starlark(require = pos)] name: String,
+        #[starlark(require = pos)] input: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        let input_json = input.to_json_value().map_err(|err| {
+            anyhow::anyhow!("invoke_command() input must be JSON-serialisable: {err}")
+        })?;
+        let host = effect_host(eval, "invoke_command()")?;
+        let result = host.invoke_command(&name, input_json)?;
+        Ok(eval.heap().alloc(result))
     }
 
     fn read<'v>(
-        #[starlark(require = pos)] _projector: String,
-        #[starlark(require = pos)] _entity: String,
-        #[starlark(require = pos)] _key: Value<'v>,
-    ) -> anyhow::Result<NoneType> {
-        anyhow::bail!("read() is not available until the effect runtime lands")
+        #[starlark(require = pos)] projector: String,
+        #[starlark(require = pos)] entity: String,
+        #[starlark(require = pos)] key: String,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        let host = effect_host(eval, "read()")?;
+        let result = host.read(&projector, &entity, &key)?;
+        Ok(eval.heap().alloc(result))
+    }
+
+    fn scan<'v>(
+        #[starlark(require = pos)] projector: String,
+        #[starlark(require = pos)] entity: String,
+        #[starlark(require = named)] field: Option<String>,
+        #[starlark(require = named)] value: Option<String>,
+        #[starlark(require = named)] cursor: Option<String>,
+        #[starlark(require = named)] limit: Option<i32>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        let filter = match (field, value) {
+            (Some(field), Some(value)) => Some((field, value)),
+            (None, None) => None,
+            _ => anyhow::bail!("scan() `field` and `value` must be given together"),
+        };
+        let limit = limit.map(|n| n.max(0) as usize);
+        let host = effect_host(eval, "scan()")?;
+        let result = host.scan(&projector, &entity, filter, cursor, limit)?;
+        Ok(eval.heap().alloc(result))
     }
 }
 
-/// The `http.*` namespace for effects. Stubs in this phase, like the rest of
-/// [`effect_builtins`].
+/// The `http.*` namespace for effects: journaled HTTP calls. Each takes `url=`,
+/// optional `headers=` (a dict), and (for the body-bearing verbs) `body=` (any
+/// JSON), and returns `{status, body, headers}`. Transport failures and 5xx never
+/// reach here (the runtime retries them); a `status >= 400` is a real result the
+/// handler decides on.
 #[starlark_module]
 pub fn http_builtins(builder: &mut GlobalsBuilder) {
     fn get<'v>(
-        #[starlark(kwargs)] _kwargs: SmallMap<String, Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        anyhow::bail!("http.get() is not available until the effect runtime lands")
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        http_dispatch("GET", kwargs, eval)
     }
 
     fn post<'v>(
-        #[starlark(kwargs)] _kwargs: SmallMap<String, Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        anyhow::bail!("http.post() is not available until the effect runtime lands")
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        http_dispatch("POST", kwargs, eval)
     }
 
     fn put<'v>(
-        #[starlark(kwargs)] _kwargs: SmallMap<String, Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        anyhow::bail!("http.put() is not available until the effect runtime lands")
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        http_dispatch("PUT", kwargs, eval)
     }
 
     fn delete<'v>(
-        #[starlark(kwargs)] _kwargs: SmallMap<String, Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        anyhow::bail!("http.delete() is not available until the effect runtime lands")
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        http_dispatch("DELETE", kwargs, eval)
     }
 
     fn patch<'v>(
-        #[starlark(kwargs)] _kwargs: SmallMap<String, Value<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        anyhow::bail!("http.patch() is not available until the effect runtime lands")
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        http_dispatch("PATCH", kwargs, eval)
     }
 }
 

@@ -25,6 +25,7 @@ use tokio::signal;
 use uuid::Uuid;
 
 use crate::context::CommandContext;
+use crate::effect::EffectRuntime;
 use crate::projector::ProjectorSet;
 use crate::read_api;
 use crate::runtime::Runtime;
@@ -32,17 +33,19 @@ use crate::{openapi, starlark_builtins::EntityDef};
 
 type Shared = Arc<Runtime>;
 
-/// Serve `runtime` on `addr` until a shutdown signal, then stop and join the
-/// projector threads (while the writer is still live, so each can commit its final
-/// batch), and finally drain and join the writer through `coordinator`.
+/// Serve `runtime` on `addr` until a shutdown signal, then drain in order: the
+/// effects first (they append through commands, and finish any in-flight
+/// invocation) while the writer is still live, then the projectors (so their read
+/// models reflect what the effects just wrote), and finally the writer through
+/// `coordinator`.
 pub async fn serve(
-    runtime: Runtime,
+    runtime: Arc<Runtime>,
     coordinator: WriteCoordinator,
     projectors: ProjectorSet,
+    effects: EffectRuntime,
     addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    let shared = Arc::new(runtime);
-    let app = router(shared);
+    let app = router(runtime);
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
@@ -51,7 +54,8 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving http")?;
-    tracing::info!("stopping projectors, then draining and shutting down the writer");
+    tracing::info!("draining effects, then projectors, then shutting down the writer");
+    effects.shutdown_and_join();
     projectors.shutdown_and_join();
     coordinator.shutdown();
     Ok(())
@@ -69,6 +73,7 @@ fn router(shared: Shared) -> Router {
         .route("/read/{projector}/{entity}/{key}", get(read_one))
         .route("/read/{projector}/{entity}", get(read_scan))
         .route("/projectors/{name}/replay", post(replay))
+        .route("/effects/{name}/skip/{position}", post(skip))
         .route("/status", get(status))
         .route("/health", get(health))
         .route("/openapi.json", get(openapi_doc))
@@ -262,6 +267,25 @@ async fn replay(State(runtime): State<Shared>, Path(name): Path<String>) -> Resp
             404,
             read_error("not_found", &format!("no projector `{name}`")),
         ),
+    }
+}
+
+/// `POST /effects/{name}/skip/{position}`: an explicit, manual operator action to
+/// advance a wedged effect past a genuinely unprocessable event. Never automatic.
+/// Returns 202; the driver marks the position terminal at its next backoff check.
+async fn skip(
+    State(runtime): State<Shared>,
+    Path((name, position)): Path<(String, u64)>,
+) -> Response {
+    match runtime.effect(&name) {
+        Some(effect) => {
+            effect.request_skip(position);
+            json_response(
+                202,
+                json!({ "status": "skip_scheduled", "effect": name, "position": position }),
+            )
+        }
+        None => json_response(404, read_error("not_found", &format!("no effect `{name}`"))),
     }
 }
 

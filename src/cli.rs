@@ -7,10 +7,12 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use crate::effect::{HttpClient, UreqClient};
 use crate::loader::{Finding, LoadedProject, Severity};
 use crate::{fmt, runtime, server, testing, validate};
 
@@ -126,7 +128,9 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>) -> ExitCode {
         }
     };
     let data = runtime::resolve_data_dir(dir, data_dir);
-    let (rt, coordinator, projectors) = match runtime::Runtime::open(project, &data) {
+    let http: Arc<dyn HttpClient> = Arc::new(UreqClient::new());
+    let (rt, coordinator, projectors, effects) = match runtime::Runtime::open(project, &data, http)
+    {
         Ok(parts) => parts,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -144,7 +148,7 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match tokio_rt.block_on(server::serve(rt, coordinator, projectors, addr)) {
+    match tokio_rt.block_on(server::serve(rt, coordinator, projectors, effects, addr)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");

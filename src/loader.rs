@@ -228,6 +228,9 @@ struct ParsedFile {
     /// when the stem is not a valid slug).
     name: Option<String>,
     ast: Option<AstModule>,
+    /// The source hash, recorded as the module's deployed identity and, for
+    /// effects, as the script hash on each invocation.
+    source_hash: String,
     /// Normalised library load paths this file imports.
     deps: Vec<String>,
     /// Load paths that break the `events/`-or-`lib/` restriction. A file with any
@@ -292,6 +295,7 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
         load_path,
         name,
         ast: None,
+        source_hash: String::new(),
         deps: Vec::new(),
         illegal_deps: Vec::new(),
     };
@@ -306,6 +310,7 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
             return file;
         }
     };
+    file.source_hash = crate::hash::sha256_hex(src.as_bytes());
     let ast = match parse_module(&file.rel_path, src) {
         Ok(ast) => ast,
         Err(err) => {
@@ -507,6 +512,7 @@ fn evaluate_units(
         let loaded = LoadedModule {
             def,
             module: frozen,
+            source_hash: file.source_hash.clone(),
         };
         match file.role {
             Role::Command { internal } => commands.push(CommandUnit {

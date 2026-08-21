@@ -10,6 +10,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use kiln::context::CommandContext;
+use kiln::effect::{EffectRuntime, HttpClient, StubHttpClient};
 use kiln::loader::LoadedProject;
 use kiln::projector::ProjectorSet;
 use kiln::runtime::Runtime;
@@ -28,11 +29,13 @@ struct Harness {
     rt: Arc<Runtime>,
     coord: WriteCoordinator,
     projectors: ProjectorSet,
+    effects: EffectRuntime,
     _data: TempDir,
 }
 
 impl Harness {
     fn shutdown(self) {
+        self.effects.shutdown_and_join();
         self.projectors.shutdown_and_join();
         self.coord.shutdown();
     }
@@ -43,11 +46,13 @@ fn boot() -> Harness {
     let project = LoadedProject::load(&root);
     assert!(!project.has_errors(), "{:?}", project.findings);
     let data = tempfile::tempdir().unwrap();
-    let (runtime, coord, projectors) = Runtime::open(project, data.path()).unwrap();
+    let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
     Harness {
-        rt: Arc::new(runtime),
+        rt,
         coord,
         projectors,
+        effects,
         _data: data,
     }
 }
