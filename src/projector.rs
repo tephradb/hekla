@@ -193,7 +193,18 @@ fn run_inner(
             continue;
         }
 
-        // Caught up. Stop only here, so a pending shutdown still drains to head.
+        // Caught up: no matching events remain, but the subscription's watermark may
+        // have advanced past a non-matching tail. Persist and publish it so a
+        // selective projector tracks head (honest /status lag, and a read-your-writes
+        // wait resolves) instead of stalling at its last matching event. The
+        // checkpoint is a watermark, so resuming past the tail skips nothing.
+        let watermark = sub.position();
+        if watermark.get() > shared.position() {
+            model.advance_checkpoint(watermark)?;
+            shared.position.store(watermark.get(), Ordering::Relaxed);
+        }
+
+        // Stop only here, so a pending shutdown still drains to head.
         if shared.shutdown.load(Ordering::Relaxed) {
             break;
         }

@@ -58,10 +58,19 @@ fn boot() -> Harness {
 }
 
 fn register(rt: &Runtime, user_id: &str, email: &str, name: &str) {
+    register_at(rt, user_id, email, name);
+}
+
+/// Register a user and return the log position of the appended `user.registered`,
+/// the value a client would pass back as `?after=` for read-your-writes.
+fn register_at(rt: &Runtime, user_id: &str, email: &str, name: &str) -> u64 {
     let ctx = CommandContext::new(Uuid::new_v4());
     let body = json!({ "user_id": user_id, "email": email, "name": name });
     let result = rt.execute("register-user", body, &ctx, None).unwrap();
     assert_eq!(result.status, 200, "register failed: {:?}", result.body);
+    result.body["positions"]["last"]
+        .as_u64()
+        .expect("a last position")
 }
 
 async fn wait_position(rt: &Runtime, projector: &str, target: u64) {
@@ -194,6 +203,171 @@ async fn replay_route_is_accepted() {
 
     let (status, _) = send(&app, Method::POST, "/projectors/ghost/replay").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn after_waits_for_the_projector_then_reads_your_write() {
+    let harness = boot();
+    // Deliberately no wait_position: the read must block until the projector
+    // catches up on its own, which is the whole point of `?after=`.
+    let pos = register_at(&harness.rt, ALICE, "alice@example.com", "Alice");
+    let app = server::app(Arc::clone(&harness.rt));
+
+    let (status, body) = get(&app, &format!("/read/users/users/{ALICE}?after={pos}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["item"]["user_id"], ALICE);
+    assert!(body["position"].as_u64().unwrap() >= pos);
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn after_waits_for_the_projector_on_a_scan() {
+    let harness = boot();
+    let pos = register_at(&harness.rt, ALICE, "alice@example.com", "Alice");
+    let app = server::app(Arc::clone(&harness.rt));
+
+    let (status, body) = get(&app, &format!("/read/users/users?after={pos}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"][0]["user_id"], ALICE);
+    assert!(body["position"].as_u64().unwrap() >= pos);
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn after_reserves_its_slot_and_does_not_shadow_a_filter() {
+    let harness = boot();
+    let pos = register_at(&harness.rt, ALICE, "alice@example.com", "Alice");
+    let app = server::app(Arc::clone(&harness.rt));
+
+    // `after` is a reserved param, not a filter field; the email filter still binds.
+    let (status, body) = get(
+        &app,
+        &format!("/read/users/users?email=alice@example.com&after={pos}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"][0]["user_id"], ALICE);
+    assert!(body["position"].as_u64().unwrap() >= pos);
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn after_resolves_on_a_selective_projector_past_a_non_matching_tail() {
+    // `user-stats` sources only user.registered, so a later user.renamed is a
+    // non-matching tail for it. Its watermark (hence reported position) must still
+    // advance to head, or `?after=<rename position>` would spuriously time out even
+    // though the data it wants is already visible.
+    let harness = boot();
+    register(&harness.rt, ALICE, "alice@example.com", "Alice");
+    let ctx = CommandContext::new(Uuid::new_v4());
+    let rename = harness
+        .rt
+        .execute(
+            "rename-user",
+            json!({ "user_id": ALICE, "name": "Alicia" }),
+            &ctx,
+            None,
+        )
+        .unwrap();
+    assert_eq!(rename.status, 200, "rename failed: {:?}", rename.body);
+    let pos = rename.body["positions"]["last"].as_u64().unwrap();
+    let app = server::app(Arc::clone(&harness.rt));
+
+    let (status, body) = get(
+        &app,
+        &format!("/read/user-stats/totals/all?after={pos}&timeout_ms=2000"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "selective projector must report caught up: {body:?}"
+    );
+    assert_eq!(body["item"]["count"].as_i64(), Some(1));
+    assert!(body["position"].as_u64().unwrap() >= pos);
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn timeout_ms_zero_is_an_immediate_check() {
+    let harness = boot();
+    let pos = register_at(&harness.rt, ALICE, "alice@example.com", "Alice");
+    wait_position(&harness.rt, "users", pos).await;
+    let app = server::app(Arc::clone(&harness.rt));
+
+    // Already caught up: a 0ms wait still succeeds on the first check.
+    let (status, _) = get(
+        &app,
+        &format!("/read/users/users/{ALICE}?after={pos}&timeout_ms=0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Not caught up: a 0ms wait fails closed immediately rather than blocking.
+    let (status, body) = get(
+        &app,
+        &format!(
+            "/read/users/users/{ALICE}?after={}&timeout_ms=0",
+            pos + 1000
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "not_caught_up");
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn a_non_numeric_after_is_a_400() {
+    let harness = boot();
+    register(&harness.rt, ALICE, "alice@example.com", "Alice");
+    wait_position(&harness.rt, "users", 1).await;
+    let app = server::app(Arc::clone(&harness.rt));
+
+    let (status, body) = get(&app, &format!("/read/users/users/{ALICE}?after=abc")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_after");
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn after_beyond_the_log_times_out_with_503_and_retry_after() {
+    let harness = boot();
+    let pos = register_at(&harness.rt, ALICE, "alice@example.com", "Alice");
+    wait_position(&harness.rt, "users", pos).await;
+    let app = server::app(Arc::clone(&harness.rt));
+
+    // A position the projector can never reach, with a short budget so the wait
+    // gives up fast and fails closed.
+    let unreachable = pos + 1000;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/read/users/users/{ALICE}?after={unreachable}&timeout_ms=100"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        response
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER),
+        "a 503 carries Retry-After"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["code"], "not_caught_up");
 
     harness.shutdown();
 }

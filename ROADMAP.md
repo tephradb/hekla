@@ -109,7 +109,7 @@ Honest scope for this phase:
 - A scan supports a single indexed filter field; multi-field (composite-prefix) filters are deferred.
 - The checkpoint's completed-set is always empty under the sequential model; the format is built for
   parallel lanes, but no lane runs yet.
-- Reads return the projector position but do not yet block on it, so read-your-writes remains deferred.
+- Reads return the projector position; blocking on it (read-your-writes) is delivered in Phase 5.
 
 ## Phase 4: effects (durable execution) (done)
 
@@ -157,7 +157,32 @@ Honest scope for this phase:
   fix-the-code-and-restart (which replays the running invocation). The script hash is recorded and
   mismatch-warned but not pinned.
 
-## Phase 5 and beyond (deferred, with triggers)
+## Phase 5: read-your-writes (done)
+
+A per-read consistency knob over the machinery Phase 3 already built. Command responses return the
+appended positions and every read returns its projector's position; this lets a read *wait* for a
+projector to catch up before serving, so a client can observe its own write.
+
+- `GET /read/...` accepts an optional `?after=<pos>` (typically the `positions.last` a command
+  returned). The async handler polls the target projector's in-memory position, published only after
+  the batch and checkpoint commit, then runs the normal single-snapshot read, so a satisfied wait is
+  guaranteed to see the write.
+- The wait is bounded by an optional `?timeout_ms=` (default 5s, capped at 30s). On timeout the read
+  fails closed with `503` and a `Retry-After` header, rather than silently serving stale data, so a
+  client that asked for a position and did not get it knows so and can retry.
+- Backward compatible: with no `after`, reads behave exactly as before. The `after` and `timeout_ms`
+  params are reserved, so neither is mistaken for an indexed filter on the scan endpoint.
+
+Honest scope for this phase:
+
+- The wait targets the single projector named in the read path; there is no cross-projector "wait for
+  all projectors" barrier.
+- The wait is a fixed server-side poll bounded by `timeout_ms`; there is no long-poll or streaming, and
+  no client-tunable poll interval.
+- The read endpoints are still absent from the generated OpenAPI (which documents only commands), so
+  `after`/`timeout_ms` are undocumented there for now.
+
+## Phase 6 and beyond (deferred, with triggers)
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
 warranted.
@@ -167,7 +192,6 @@ warranted.
   script hash for this.
 - **Partition-key parallel effect lanes**: when a single effect's throughput on slow APIs hurts. The
   checkpoint format (watermark plus completed-set) already supports it.
-- **Read-your-writes**: using the log position already returned by reads and command responses.
 - **Encryption and crypto-shredding**: when PII-at-rest requirements land.
 - **Metrics and Prometheus**: when there is something to operate at scale.
 - **Fold library** (`event_counter`, `latest_event`, `toggle`): only after roughly fifteen real
@@ -175,3 +199,23 @@ warranted.
   becoming a second execution path.
 - **Workspace crate split**: when kiln must be embeddable as a library, or when compile times
   actually hurt.
+
+### Carried-forward gaps from earlier phases
+
+Deferrals recorded in the "honest scope" of a completed phase that no trigger above already pulls
+forward. Collected here so they are not lost in the prose of the phase that introduced them.
+
+- **Admin read-only SQL endpoint** (Phase 3): a read-only query surface over the projector databases,
+  deferred with no successor phase named.
+- **`money` scale and decimal wire form** (Phase 3): read-API `money` is the raw stored integer minor
+  units; the decimal-string wire form waits on the scale decision, and no entity uses `money` yet.
+- **Multi-field (composite-prefix) scan filters** (Phase 3): a scan supports a single indexed filter
+  field only.
+- **Automatic dead-lettering** (Phase 4): the manual `POST /effects/{name}/skip/{position}` is the only
+  escape hatch; a wedged effect is never advanced automatically.
+- **Cold-start empty read** (Phase 4): an effect can outrun a projector and journal an empty
+  `read()`/`scan()` that then replays empty forever; accepted, not yet guarded.
+
+Inherent design properties, listed for completeness (not future work): `invoke_command` is exactly-once
+only when the target is idempotent under replay, raw `http.*` is at-least-once, and `read()`/`scan()`
+are journaled (point-in-time-stale on replay).

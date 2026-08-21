@@ -105,6 +105,17 @@ impl ReadModel {
         Ok(())
     }
 
+    /// Persist `position` as the checkpoint on its own, with no ops. Used when a
+    /// selective projector's watermark advances past a non-matching tail: there is
+    /// nothing to apply, but the resume point (and reported position) should still
+    /// track head rather than stall at the last matching event.
+    pub fn advance_checkpoint(&self, position: Position) -> anyhow::Result<()> {
+        let tx = self.begin()?;
+        self.write_checkpoint(position, &tx)?;
+        tx.commit().context("advancing the projector checkpoint")?;
+        Ok(())
+    }
+
     /// Seal the database for a replay swap: fold the WAL back into the main file
     /// and drop to rollback journal mode, removing the `-wal`/`-shm` sidecars. The
     /// file becomes self-contained, so after the rename a reader that opens it

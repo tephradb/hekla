@@ -172,7 +172,11 @@ concurrent writers for an atomic increment to protect against.
 set is always empty under the sequential model, but building the format now means parallel lanes
 never require a live migration ("resume from position N" stops being expressible once lanes complete
 out of order). The checkpoint is written in the same SQLite transaction as the state it describes,
-so a crash cannot leave state and position disagreeing and silently skip events.
+so a crash cannot leave state and position disagreeing and silently skip events. The watermark is the
+subscription's, which jumps past a non-matching tail: a caught-up projector advances its checkpoint to
+head even when the latest events are ones its `source` does not select, so a selective projector reads
+as caught up (honest `/status` lag, and read-your-writes resolves against it) rather than stalling at
+its last matching event. That empty-batch advance persists on its own, outside any op transaction.
 
 **Storage**: one SQLite database per projector, holding both the read-model tables and the
 checkpoint. Co-location is what makes the single-transaction commit possible. The projector thread is
@@ -184,6 +188,14 @@ and position move together atomically and a reader that opens the file mid-swap 
 **Read model access** is only ever through the generated read API (section 10), never by opening the
 SQLite file directly. Each read opens its own read-only connection and reads the projector position in
 the same snapshot as the rows. The table layout stays private.
+
+**Read-your-writes** is opt-in per read: a client passes `?after=<pos>` (the `positions.last` a command
+returned) and the read blocks until that projector's committed position reaches it, then serves the
+normal snapshot read. This is safe because the projector publishes its in-memory position only after the
+batch and checkpoint commit, so once the wait observes it, a fresh read-only connection is guaranteed to
+see the write. The wait is bounded by `timeout_ms` (default 5s, capped at 30s); on timeout it fails
+closed with 503 and `Retry-After` rather than silently serving stale data, so a client that asked for a
+position and did not get it knows so.
 
 ## 7. Effects (durable execution)
 
@@ -306,8 +318,9 @@ consistent copy is not required for them.
 - **Read API generated from entity schemas**: `GET /read/{projector}/{entity}/{key}` and an indexed
   filter/scan endpoint. Only declared indexes are filterable; an unindexed filter is a 400 telling
   the author to declare the index, never a table scan. Pagination is cursor-based, not offset. Every
-  read response includes the projector's log position, so read-your-writes can be added later without
-  an API break.
+  read response includes the projector's log position, and an optional `?after=<pos>` waits for the
+  projector to reach that position before reading (read-your-writes), failing closed with 503 on
+  timeout (section 6).
 - `POST /projectors/{name}/replay`.
 - `POST /effects/{name}/skip/{position}`: an explicit, manual operator action to advance a wedged effect
   past a genuinely unprocessable event. Never automatic.
@@ -340,7 +353,7 @@ toolchain, no compile cache, parse-and-freeze in milliseconds.
 
 **Deferred** (see the roadmap, each with a trigger): encryption and crypto-shredding; metrics and
 Prometheus; partition-key parallel effect lanes; an upload API with versioning, pinning, and
-retention; hot reload; read-your-writes; a fold library; a workspace crate split.
+retention; hot reload; a fold library; a workspace crate split.
 
 **Permanent commitments** (not deferrals, and not to be reopened): Starlark is the only authoring
 surface. There is no Rust, TypeScript, or WASM SDK path now or later. This is deliberate: a single

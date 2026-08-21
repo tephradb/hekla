@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::context::CommandContext;
 use crate::effect::EffectRuntime;
-use crate::projector::ProjectorSet;
+use crate::projector::{ProjectorSet, ProjectorShared};
 use crate::read_api;
 use crate::runtime::Runtime;
 use crate::{openapi, starlark_builtins::EntityDef};
@@ -150,15 +150,26 @@ async fn docs() -> Html<&'static str> {
 }
 
 /// `GET /read/{projector}/{entity}/{key}`: one row by key, with the projector's
-/// log position. 404 for an unknown projector, entity, or missing row.
+/// log position. 404 for an unknown projector, entity, or missing row. An optional
+/// `?after=<pos>` first waits for the projector to reach that position (503 if it
+/// cannot within `timeout_ms`, default 5s), for read-your-writes.
 async fn read_one(
     State(runtime): State<Shared>,
     Path((projector, entity, key)): Path<(String, String, String)>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let (db_path, entity_def) = match resolve_entity(&runtime, &projector, &entity) {
+    let (shared, entity_def) = match resolve_entity(&runtime, &projector, &entity) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
+    let wait = match parse_wait(&params) {
+        Ok(wait) => wait,
+        Err(response) => return *response,
+    };
+    if let Some(response) = honor_wait(&shared, &projector, wait).await {
+        return response;
+    }
+    let db_path = shared.db_path.clone();
     let task = tokio::task::spawn_blocking(move || read_api::get_one(&db_path, &entity_def, &key));
     match task.await {
         Ok(Ok((Some(item), position))) => {
@@ -172,14 +183,22 @@ async fn read_one(
 
 /// `GET /read/{projector}/{entity}?<field>=<value>&limit=&cursor=`: an ordered,
 /// cursor-paginated scan. A filter on anything but the key or a declared index is
-/// a 400, never a table scan.
+/// a 400, never a table scan. An optional `?after=<pos>` first waits for the
+/// projector to reach that position (503 if it cannot within `timeout_ms`, default
+/// 5s), for read-your-writes.
 async fn read_scan(
     State(runtime): State<Shared>,
     Path((projector, entity)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let (db_path, entity_def) = match resolve_entity(&runtime, &projector, &entity) {
+    let (shared, entity_def) = match resolve_entity(&runtime, &projector, &entity) {
         Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    // Parse the wait up front (cheap), but honor it only after the scan params are
+    // validated below, so a malformed scan fails fast instead of blocking first.
+    let wait = match parse_wait(&params) {
+        Ok(wait) => wait,
         Err(response) => return *response,
     };
 
@@ -198,6 +217,8 @@ async fn read_scan(
                 }
             },
             "cursor" => cursor = Some(value),
+            // Consumed by parse_wait, so never a filter field.
+            _ if RESERVED_WAIT_PARAMS.contains(&name.as_str()) => {}
             _ => filters.push((name, value)),
         }
     }
@@ -232,6 +253,11 @@ async fn read_scan(
         None => None,
     };
 
+    // Every cheap param is validated: now honor the read-your-writes wait.
+    if let Some(response) = honor_wait(&shared, &projector, wait).await {
+        return response;
+    }
+    let db_path = shared.db_path.clone();
     let task = tokio::task::spawn_blocking(move || {
         let filter = filter
             .as_ref()
@@ -289,14 +315,15 @@ async fn skip(
     }
 }
 
-/// Resolve a projector and one of its entities to the read model's path and the
-/// entity definition, or a 404 response (boxed, since it is the rare variant of a
-/// hot path's result).
+/// Resolve a projector and one of its entities to the projector's shared handle
+/// and the entity definition, or a 404 response (boxed, since it is the rare
+/// variant of a hot path's result). Handlers reuse the handle for both the
+/// read-your-writes wait and the read model's path, avoiding a second lookup.
 fn resolve_entity(
     runtime: &Runtime,
     projector: &str,
     entity: &str,
-) -> Result<(PathBuf, EntityDef), Box<Response>> {
+) -> Result<(Arc<ProjectorShared>, EntityDef), Box<Response>> {
     let Some(shared) = runtime.projector(projector) else {
         return Err(Box::new(json_response(
             404,
@@ -304,7 +331,7 @@ fn resolve_entity(
         )));
     };
     match read_api::find_entity(&shared.entities, entity) {
-        Some(entity_def) => Ok((shared.db_path.clone(), entity_def.clone())),
+        Some(entity_def) => Ok((Arc::clone(shared), entity_def.clone())),
         None => Err(Box::new(json_response(
             404,
             read_error(
@@ -327,6 +354,102 @@ fn read_failed(err: anyhow::Error) -> Response {
 fn task_panicked(err: tokio::task::JoinError) -> Response {
     tracing::error!("read task panicked: {err}");
     json_response(500, read_error("internal", "internal error"))
+}
+
+/// How often the read-your-writes wait re-checks the projector's position.
+const READ_WAIT_TICK: Duration = Duration::from_millis(10);
+/// The wait budget when a read passes `after` without a `timeout_ms`.
+const READ_WAIT_DEFAULT: Duration = Duration::from_millis(5_000);
+/// The ceiling on a client-supplied `timeout_ms`, so one read cannot pin a request
+/// for longer than this.
+const READ_WAIT_MAX: Duration = Duration::from_millis(30_000);
+
+/// Query params the read endpoints consume as read-your-writes controls, so the
+/// scan handler never mistakes one for an indexed filter. Must list every key
+/// `parse_wait` reads.
+const RESERVED_WAIT_PARAMS: [&str; 2] = ["after", "timeout_ms"];
+
+/// A read-your-writes wait parsed off the query string: block until the projector
+/// reaches `after`, giving up after `timeout`.
+struct Wait {
+    after: u64,
+    timeout: Duration,
+}
+
+/// Parse the optional `after` / `timeout_ms` read-your-writes params. No `after`
+/// means no wait (`Ok(None)`); a malformed value is a 400 (the `Err` response,
+/// boxed since it is the rare variant of a hot path's result).
+fn parse_wait(params: &HashMap<String, String>) -> Result<Option<Wait>, Box<Response>> {
+    let Some(raw) = params.get("after") else {
+        return Ok(None);
+    };
+    let after = raw.parse::<u64>().map_err(|_| {
+        Box::new(json_response(
+            400,
+            read_error("invalid_after", "after must be a non-negative integer"),
+        ))
+    })?;
+    let timeout = match params.get("timeout_ms") {
+        Some(raw) => {
+            let ms = raw.parse::<u64>().map_err(|_| {
+                Box::new(json_response(
+                    400,
+                    read_error("invalid_input", "timeout_ms must be a non-negative integer"),
+                ))
+            })?;
+            // 0 means "check once, do not wait"; the ceiling bounds a held request.
+            Duration::from_millis(ms.min(READ_WAIT_MAX.as_millis() as u64))
+        }
+        None => READ_WAIT_DEFAULT,
+    };
+    Ok(Some(Wait { after, timeout }))
+}
+
+/// Honor a parsed read-your-writes wait against an already-resolved projector.
+/// Returns `None` to proceed with the read, or `Some(503)` when the projector did
+/// not catch up in time. No wait (`None`) proceeds immediately.
+async fn honor_wait(
+    shared: &ProjectorShared,
+    projector: &str,
+    wait: Option<Wait>,
+) -> Option<Response> {
+    let wait = wait?;
+    if await_position(shared, wait.after, wait.timeout).await {
+        None
+    } else {
+        Some(not_caught_up(projector, wait.after, wait.timeout))
+    }
+}
+
+/// Wait until the projector's committed position reaches `after`, or `timeout`
+/// elapses; returns whether it was reached. The projector publishes its in-memory
+/// position only after committing its batch and checkpoint, so a satisfied wait
+/// means a fresh snapshot read sees the data.
+async fn await_position(shared: &ProjectorShared, after: u64, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, async {
+        while shared.position() < after {
+            tokio::time::sleep(READ_WAIT_TICK).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// A 503 for a read-your-writes wait that timed out, with a `Retry-After` so a
+/// client backs off rather than hammering a lagging projector.
+fn not_caught_up(projector: &str, after: u64, timeout: Duration) -> Response {
+    let body = read_error(
+        "not_caught_up",
+        &format!(
+            "projector `{projector}` did not reach position {after} within {}ms",
+            timeout.as_millis()
+        ),
+    );
+    let mut response = json_response(503, body);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 /// The request's correlation id: the `x-correlation-id` header when it is a valid
