@@ -1,0 +1,123 @@
+//! Project configuration (`kiln.toml`).
+//!
+//! A small, optional file for operational knobs that are not code: the effect
+//! blocking-pool size and the retention windows for effect journals and command
+//! idempotency keys. Defaults are sensible, so a project runs with no config.
+//! The values are consumed by the runtime in later phases; loading and
+//! validating them here means a malformed `kiln.toml` fails at load, not at the
+//! moment a sweeper or the effect pool first reaches for a setting.
+
+use std::path::Path;
+use std::{fs, io};
+
+use anyhow::Context;
+use serde::Deserialize;
+
+/// The config file name, resolved relative to the project root.
+pub const FILE_NAME: &str = "kiln.toml";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Config {
+    pub effects: Effects,
+    pub retention: Retention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Effects {
+    /// The size of the blocking pool effects run on. With N active effects that
+    /// is up to N concurrent blocking threads; when the pool is full, effects
+    /// wait rather than spawning without limit.
+    pub pool_size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Retention {
+    /// How long a completed effect invocation's journal is kept before the
+    /// sweeper reclaims it. Sweeping is lazy GC, so this only bounds disk use.
+    pub effect_journal_days: u32,
+    /// How long a command idempotency key is kept before the sweeper ages it out.
+    pub idempotency_key_days: u32,
+}
+
+impl Default for Effects {
+    fn default() -> Effects {
+        Effects { pool_size: 16 }
+    }
+}
+
+impl Default for Retention {
+    fn default() -> Retention {
+        Retention {
+            effect_journal_days: 7,
+            idempotency_key_days: 7,
+        }
+    }
+}
+
+impl Config {
+    /// Load `<root>/kiln.toml`, falling back to defaults when it is absent.
+    pub fn load(root: &Path) -> anyhow::Result<Config> {
+        let path = root.join(FILE_NAME);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        Config::parse(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Parse config from TOML text, then validate the values.
+    pub fn parse(text: &str) -> anyhow::Result<Config> {
+        let config: Config = toml::from_str(text).context("invalid kiln.toml")?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.effects.pool_size == 0 {
+            anyhow::bail!("effects.pool_size must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_sensible() {
+        let config = Config::default();
+        assert_eq!(config.effects.pool_size, 16);
+        assert_eq!(config.retention.effect_journal_days, 7);
+        assert_eq!(config.retention.idempotency_key_days, 7);
+    }
+
+    #[test]
+    fn partial_config_keeps_other_defaults() {
+        let config = Config::parse("[effects]\npool_size = 4\n").unwrap();
+        assert_eq!(config.effects.pool_size, 4);
+        assert_eq!(config.retention.idempotency_key_days, 7);
+    }
+
+    #[test]
+    fn zero_pool_size_is_rejected() {
+        assert!(Config::parse("[effects]\npool_size = 0\n").is_err());
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        assert!(Config::parse("[effects]\nnope = 1\n").is_err());
+    }
+
+    #[test]
+    fn missing_file_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(Config::load(dir.path()).unwrap(), Config::default());
+    }
+}

@@ -1,0 +1,9 @@
+# Operational config. Every value has a default, so this file is optional; it is
+# here to document the knobs a real project would tune.
+
+[effects]
+pool_size = 8
+
+[retention]
+effect_journal_days = 14
+idempotency_key_days = 30
