@@ -180,7 +180,10 @@ async fn read_one(
         return response;
     }
     let db_path = shared.db_path.clone();
-    let task = tokio::task::spawn_blocking(move || read_api::get_one(&db_path, &entity_def, &key));
+    let keystore = runtime.keystore().cloned();
+    let task = tokio::task::spawn_blocking(move || {
+        read_api::get_one(&db_path, &entity_def, &key, keystore.as_ref())
+    });
     match task.await {
         Ok(Ok((Some(item), position))) => {
             json_response(200, json!({ "item": item, "position": position }))
@@ -274,11 +277,19 @@ async fn read_scan(
         return response;
     }
     let db_path = shared.db_path.clone();
+    let keystore = runtime.keystore().cloned();
     let task = tokio::task::spawn_blocking(move || {
         let filter = filter
             .as_ref()
             .map(|(field, value)| (field.as_str(), value.as_str()));
-        read_api::scan(&db_path, &entity_def, filter, after_key.as_deref(), limit)
+        read_api::scan(
+            &db_path,
+            &entity_def,
+            filter,
+            after_key.as_deref(),
+            limit,
+            keystore.as_ref(),
+        )
     });
     match task.await {
         Ok(Ok(page)) => json_response(

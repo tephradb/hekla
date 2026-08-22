@@ -49,6 +49,14 @@ pub struct HandleCtx {
     pub now: String,
 }
 
+/// Marker set on the evaluator while a command's `query` runs and while a
+/// projector's or effect's `source` is evaluated at load. Its presence tells an
+/// event-definition call it is being used as a query filter (a subset match) rather
+/// than to construct an event to emit (which requires every field). It is distinct
+/// from [`HandleCtx`], so `now()` still errors in `query`.
+#[derive(ProvidesStaticType)]
+pub struct QueryCtx;
+
 /// Read access a projector's `handle` has to its own read model, through the
 /// current batch's uncommitted writes. The storage-backed implementation lives in
 /// the runtime; the trait sits here so the builtins layer stays independent of it.
@@ -113,6 +121,25 @@ pub trait EffectHost {
 
     /// Emit a trace line. Not journaled.
     fn log(&self, message: &str);
+
+    /// Decrypt a subject-encrypted handle to its plaintext, the explicit boundary an
+    /// effect crosses to act on personal data (e.g. to send mail). Deterministic, so
+    /// it is re-run rather than cached on replay: if the subject was erased in the
+    /// meantime this fails, and the failure is terminal (the data is gone; no retry
+    /// can recover it). Every call is logged.
+    ///
+    /// Call `reveal()` before any journaled side effect (an `http` call,
+    /// `invoke_command`): a terminal `reveal` completes the invocation, so a side
+    /// effect that already fired stays done while the reveal-dependent work does not
+    /// run. Revealing first means an erased subject aborts the handler before any
+    /// external action.
+    fn reveal(
+        &self,
+        subject_field: &str,
+        subject_value: &str,
+        field: &str,
+        ciphertext: &str,
+    ) -> anyhow::Result<String>;
 }
 
 /// Host context passed to an effect's `handle` via `eval.extra`. Present only for

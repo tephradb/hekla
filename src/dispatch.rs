@@ -11,6 +11,8 @@
 //! host-stamped [`envelope`] at the append seam, and every read unwraps it, so
 //! handlers only ever see the payload.
 
+use std::collections::HashMap;
+
 use starlark::environment::Module;
 use tephra::{
     AppendCondition, AppendError, ConflictClause, Event, EventType, Position, PositionRange, Query,
@@ -19,13 +21,37 @@ use tephra::{
 use uuid::Uuid;
 
 use crate::context::{CommandContext, HandleCtx};
+use crate::crypto::KeyStore;
 use crate::envelope::{self, Envelope};
 use crate::hash;
 use crate::starlark_builtins::{
-    EmittedEvent, EventSpec, HandleOutcome, LoadedModule, ModuleDef, alloc_event, alloc_input,
-    call_handler, call_handler_with_ctx, check_fold_result, initial_state, parse_event_specs,
-    parse_handle_result, thaw, validate_command_input,
+    EmittedEvent, EventDef, EventSpec, HandleOutcome, LoadedModule, ModuleDef, alloc_event,
+    alloc_input, call_handler, call_handler_with_ctx, call_handler_with_query_ctx,
+    check_fold_result, initial_state, parse_event_specs, parse_handle_result, scalar_to_string,
+    thaw, validate_command_input,
 };
+
+/// The reserved tag-key prefix for the global uniqueness tag of a `unique` field:
+/// `_kiln_uniq_<field>`. Host-stamped, so it lives in the reserved namespace a user
+/// field can never occupy.
+const UNIQUE_TAG_PREFIX: &str = "_kiln_uniq_";
+
+/// The global uniqueness tag key for `field`.
+fn unique_tag_key(field: &str) -> String {
+    format!("{UNIQUE_TAG_PREFIX}{field}")
+}
+
+/// A reserved tag no event ever carries, added to a query clause whose subject key is
+/// absent so the clause matches nothing (rather than minting a key on the read path).
+const NOMATCH_TAG: &str = "_kiln_nomatch";
+
+/// The event definitions the dispatch layer needs: type name to its declared field
+/// metadata, for encryption and for wrapping subject fields as opaque handles.
+pub type EventDefs = HashMap<String, EventDef>;
+
+/// Derived tags as `(key, Some(value))` / `(key, None)` pairs, before lowering to
+/// tephra tags.
+type TagPairs = Vec<(String, Option<String>)>;
 
 /// Per-handler instruction budget. Bounds a runaway script at dispatch time.
 const MAX_TICKS: u64 = 10_000_000;
@@ -128,9 +154,12 @@ pub fn validate_input(loaded: &LoadedModule, input: &serde_json::Value) -> anyho
 /// `handle` but its events never land. The one gap the append can't catch is a
 /// concurrent duplicate whose folded state makes `handle` *reject* before appending;
 /// that reject is checked against the tag too (see the `Reject` arm).
+#[allow(clippy::too_many_arguments)]
 pub fn run_command(
     store: &WriteHandle,
     loaded: &LoadedModule,
+    events: &EventDefs,
+    keystore: Option<&KeyStore>,
     input: &serde_json::Value,
     ctx: &CommandContext,
     now: &str,
@@ -148,11 +177,16 @@ pub fn run_command(
         //    a list of them, OR'd into the boundary.
         let boundary = match frozen.get_option("query")? {
             Some(func) => {
-                let result = call_handler(&module, thaw(&func, &module), &[input_value], MAX_TICKS)
-                    .map_err(|err| anyhow::anyhow!("query() failed: {err}"))?;
+                let result = call_handler_with_query_ctx(
+                    &module,
+                    thaw(&func, &module),
+                    &[input_value],
+                    MAX_TICKS,
+                )
+                .map_err(|err| anyhow::anyhow!("query() failed: {err}"))?;
                 let specs =
                     parse_event_specs(result).map_err(|err| anyhow::anyhow!("query() {err}"))?;
-                Some(to_query(&specs)?)
+                Some(to_query(&specs, events, keystore)?)
             }
             None => None,
         };
@@ -170,7 +204,8 @@ pub fn run_command(
                 if let Some(fold) = &fold {
                     let (_envelope, data) = envelope::decode(seq.event.data())
                         .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-                    let event = alloc_event(&module, seq.event.event_type(), &data);
+                    let def = events.get(seq.event.event_type());
+                    let event = alloc_event(&module, seq.event.event_type(), &data, def);
                     state = call_handler(&module, thaw(fold, &module), &[state, event], MAX_TICKS)
                         .map_err(|err| anyhow::anyhow!("fold() failed: {err}"))?;
                     check_fold_result(state)?;
@@ -205,7 +240,7 @@ pub fn run_command(
                 // recover the committed outcome if it is present.
                 if boundary.is_some()
                     && let Some(tag) = idem_tag
-                    && let Some(recovered) = find_committed_outcome(store, tag)?
+                    && let Some(recovered) = find_committed_outcome(store, events, tag)?
                 {
                     return Ok(CommandOutcome::AlreadyCommitted(recovered));
                 }
@@ -217,21 +252,30 @@ pub fn run_command(
             HandleOutcome::InvalidInput(invalid) => Ok(CommandOutcome::InvalidInput {
                 message: invalid.message,
             }),
-            HandleOutcome::Emit(events) => {
-                if events.is_empty() {
+            HandleOutcome::Emit(emitted) => {
+                if emitted.is_empty() {
                     return Ok(CommandOutcome::Committed {
-                        events,
+                        events: emitted,
                         positions: None,
                     });
                 }
-                let packed = events
+                let packed = emitted
                     .iter()
-                    .map(|event| build_event(event, ctx, now, idem_tag))
+                    .map(|event| {
+                        build_event(
+                            event,
+                            events.get(&event.event_type),
+                            keystore,
+                            ctx,
+                            now,
+                            idem_tag,
+                        )
+                    })
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 let condition = build_condition(boundary, after, idem_tag)?;
                 match store.append(packed, condition) {
                     Ok(positions) => Ok(CommandOutcome::Committed {
-                        events,
+                        events: emitted,
                         positions: Some(positions),
                     }),
                     // The existence clause fired: this request already committed (a
@@ -242,7 +286,7 @@ pub fn run_command(
                         ..
                     }) => {
                         let tag = idem_tag.expect("the existence clause is only set when keyed");
-                        match find_committed_outcome(store, tag)? {
+                        match find_committed_outcome(store, events, tag)? {
                             Some(recovered) => Ok(CommandOutcome::AlreadyCommitted(recovered)),
                             None => Err(anyhow::anyhow!(
                                 "idempotency existence guard fired but no committed outcome was found"
@@ -280,24 +324,106 @@ pub fn run_command(
     })
 }
 
-/// Lower one or more event specs into a tephra query. `all_events()` becomes
-/// `Query::All` (a full scan that bypasses the index); otherwise each filter is
-/// a query item and the items are OR'd together (`parse_event_specs` guarantees
-/// `all_events()` never appears alongside filters).
-pub(crate) fn to_query(specs: &[EventSpec]) -> anyhow::Result<Query> {
+/// Lower one or more typed query clauses into a tephra query. `all_events()`
+/// becomes `Query::All`; otherwise each clause is a query item (its type AND its
+/// constrained fields as tags), and the items are OR'd (`parse_event_specs`
+/// guarantees `all_events()` never appears alongside clauses).
+///
+/// A constraint on a subject-scoped field is encrypted so it matches the ciphertext
+/// tag the emit path stored. The key follows the constraint's shape: if the field's
+/// subject is also constrained in the clause, the scoped key; otherwise, for a
+/// `unique` field, the global key (matching the `_kiln_uniq_<field>` tag that
+/// survives erasure). A subject field constrained with neither is an error, because
+/// no key can be derived. Plaintext fields (including subject ids) match verbatim.
+pub(crate) fn to_query(
+    specs: &[EventSpec],
+    events: &EventDefs,
+    keystore: Option<&KeyStore>,
+) -> anyhow::Result<Query> {
     let mut items = Vec::with_capacity(specs.len());
     for spec in specs {
         match spec {
             EventSpec::All => return Ok(Query::all()),
-            EventSpec::Filter { types, tags } => {
-                let types = types
-                    .iter()
-                    .map(|t| {
-                        EventType::new(t.as_str())
-                            .map_err(|err| anyhow::anyhow!("invalid event type `{t}`: {err}"))
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                items.push(QueryItem::new(types, to_tags(tags, &[])?));
+            EventSpec::Filter {
+                event_type,
+                constraints,
+            } => {
+                let ty = EventType::new(event_type.as_str())
+                    .map_err(|err| anyhow::anyhow!("invalid event type `{event_type}`: {err}"))?;
+                // Fail closed: the constructor came from a declared event, so its def
+                // must be in the registry, and every constrained field must exist and
+                // be indexed. This backstops the static check, whose input-branch blind
+                // spot could otherwise let an undeclared, non-indexed, or reserved-name
+                // constraint through as a tag that silently matches nothing (or injects
+                // into the host namespace).
+                let def = events.get(event_type).ok_or_else(|| {
+                    anyhow::anyhow!("query references unknown event type `{event_type}`")
+                })?;
+                let mut tags = Vec::with_capacity(constraints.len());
+                let mut unmatchable = false;
+                for (field, value) in constraints {
+                    let meta = def.field(field).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "query filters `{event_type}` on undeclared field `{field}`"
+                        )
+                    })?;
+                    if !meta.indexed {
+                        anyhow::bail!(
+                            "query filters `{event_type}` on `{field}`, which is not indexed"
+                        );
+                    }
+                    match &meta.subject {
+                        Some(subject_field) => {
+                            let ks = keystore.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "filtering encrypted field `{field}` needs a master key (set KILN_MASTER_KEY)"
+                                )
+                            })?;
+                            let subject_value = constraints
+                                .iter()
+                                .find(|(f, _)| f == subject_field)
+                                .map(|(_, v)| v.clone());
+                            let resolved = match subject_value {
+                                // Scoped: encrypt with an existing per-subject key only,
+                                // so a query never mints or resurrects one. An absent key
+                                // means no matchable events, so the clause matches nothing.
+                                Some(subject_value) => ks
+                                    .encrypt_subject_existing(
+                                        subject_field,
+                                        &subject_value,
+                                        field,
+                                        value,
+                                    )?
+                                    .map(|ct| (field.clone(), ct)),
+                                // Global (uniqueness): use the global key, creating it if
+                                // this is the first-ever use. The global key is a
+                                // never-erased singleton, so creating it on a query is
+                                // safe (no resurrection), and a deterministic tag is what
+                                // makes concurrent first-writers of the same value conflict
+                                // at the DCB boundary instead of both committing.
+                                None if meta.unique => {
+                                    Some((unique_tag_key(field), ks.encrypt_global(field, value)?))
+                                }
+                                None => anyhow::bail!(
+                                    "cannot filter subject-encrypted field `{field}`: also constrain its subject `{subject_field}` (scoped), or the field is not `unique` for a global match"
+                                ),
+                            };
+                            match resolved {
+                                Some((tag_key, ciphertext)) => {
+                                    tags.push((tag_key, Some(ciphertext)))
+                                }
+                                None => unmatchable = true,
+                            }
+                        }
+                        None => tags.push((field.clone(), Some(value.clone()))),
+                    }
+                }
+                if unmatchable {
+                    // No key for a constrained subject: require a reserved tag no event
+                    // carries, so this clause matches nothing without minting a key.
+                    tags.push((NOMATCH_TAG.to_owned(), None));
+                }
+                items.push(QueryItem::new(vec![ty], to_tags(&tags, &[])?));
             }
         }
     }
@@ -311,14 +437,17 @@ pub(crate) fn to_query(specs: &[EventSpec]) -> anyhow::Result<Query> {
 /// This is the only place enveloping happens.
 pub fn build_event(
     event: &EmittedEvent,
+    event_def: Option<&EventDef>,
+    keystore: Option<&KeyStore>,
     ctx: &CommandContext,
     now: &str,
     idem_tag: Option<&str>,
 ) -> anyhow::Result<Event> {
     let ty = EventType::new(event.event_type.as_str())
         .map_err(|err| anyhow::anyhow!("invalid event type `{}`: {err}", event.event_type))?;
+    let (data, derived) = lower_event(event, event_def, keystore)?;
     let extra = idem_tag.as_slice();
-    let tags = to_tags(&event.tags, extra)?;
+    let tags = to_tags(&derived, extra)?;
     let envelope = Envelope {
         event_id: Uuid::new_v4(),
         timestamp: now.to_owned(),
@@ -326,9 +455,81 @@ pub fn build_event(
         causation_id: ctx.causation_id,
         triggering_event_id: ctx.triggering_event_id,
     };
-    let payload = envelope::encode(&envelope, &event.data)?;
+    let payload = envelope::encode(&envelope, &data)?;
     Event::new(&ty, &tags, &payload)
         .map_err(|err| anyhow::anyhow!("encoding event `{}`: {err}", event.event_type))
+}
+
+/// Lower an emitted event to its stored form: encrypt every subject-scoped field
+/// (in the payload and in its tag), add the global-key tag for a `unique` field, and
+/// derive the plaintext tags of the remaining indexed fields. Returns the payload to
+/// envelope and the tag pairs. Without a schema (an event type not in the registry)
+/// the plaintext data and the constructor-derived tags pass through unchanged.
+fn lower_event(
+    event: &EmittedEvent,
+    event_def: Option<&EventDef>,
+    keystore: Option<&KeyStore>,
+) -> anyhow::Result<(serde_json::Value, TagPairs)> {
+    let (Some(def), Some(obj)) = (event_def, event.data.as_object()) else {
+        return Ok((event.data.clone(), event.tags.clone()));
+    };
+    if !def.fields.iter().any(|(_, meta)| meta.subject.is_some()) {
+        // No subjects: the constructor's plaintext tags are already correct.
+        return Ok((event.data.clone(), event.tags.clone()));
+    }
+    let mut payload = obj.clone();
+    let mut tags = Vec::with_capacity(def.fields.len());
+    for (name, meta) in &def.fields {
+        let Some(value) = obj.get(name) else { continue };
+        if value.is_null() {
+            continue;
+        }
+        match &meta.subject {
+            Some(subject_field) => {
+                let plaintext = scalar_to_string(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "event `{}`: subject field `{name}` must be a scalar",
+                        event.event_type
+                    )
+                })?;
+                let subject_value = obj.get(subject_field).and_then(scalar_to_string).ok_or_else(
+                    || {
+                        anyhow::anyhow!(
+                            "event `{}`: subject id `{subject_field}` for `{name}` is missing or not scalar",
+                            event.event_type
+                        )
+                    },
+                )?;
+                let ks = keystore.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "event `{}` has subject-encrypted field `{name}` but no master key is configured (set KILN_MASTER_KEY)",
+                        event.event_type
+                    )
+                })?;
+                let ciphertext =
+                    ks.encrypt_subject(subject_field, &subject_value, name, &plaintext)?;
+                payload.insert(name.clone(), serde_json::Value::String(ciphertext.clone()));
+                if meta.indexed {
+                    tags.push((name.clone(), Some(ciphertext)));
+                }
+                if meta.unique {
+                    let global = ks.encrypt_global(name, &plaintext)?;
+                    tags.push((unique_tag_key(name), Some(global)));
+                }
+            }
+            None if meta.indexed => {
+                let text = scalar_to_string(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "event `{}`: indexed field `{name}` must be a scalar",
+                        event.event_type
+                    )
+                })?;
+                tags.push((name.clone(), Some(text)));
+            }
+            None => {}
+        }
+    }
+    Ok((serde_json::Value::Object(payload), tags))
 }
 
 /// The append guard for one attempt: the DCB boundary check (fail if a matching event
@@ -375,6 +576,7 @@ fn idem_item(tag: &str) -> anyhow::Result<QueryItem> {
 /// segment, no posting-list decode (the single position inlines into the FST value).
 fn find_committed_outcome(
     store: &WriteHandle,
+    event_defs: &EventDefs,
     idem_tag: &str,
 ) -> anyhow::Result<Option<RecoveredOutcome>> {
     let query = Query::item(idem_item(idem_tag)?);
@@ -401,10 +603,19 @@ fn find_committed_outcome(
             }
             Some(_) => {}
         }
+        // Report the same tags a fresh commit does: plaintext, non-subject indexed
+        // fields only. Subject fields are stored as ciphertext (and the recovery path
+        // deliberately cannot decrypt), and the reserved host tags (`_kiln_idem`, the
+        // `_kiln_uniq_` global tags) are internal, so both are dropped.
+        let def = event_defs.get(seq.event.event_type());
         let mut tags: Vec<String> = seq
             .event
             .tags()
             .filter(|tag| !tag.starts_with(RESERVED_TAG_PREFIX))
+            .filter(|tag| {
+                let key = tag.split(':').next().unwrap_or(tag);
+                !def.is_some_and(|def| def.is_subject(key))
+            })
             .map(str::to_owned)
             .collect();
         // Stored tag sets are sorted; sorting the response tags too keeps recovery

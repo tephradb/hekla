@@ -7,7 +7,9 @@
 # `status >= 400` is a real 4xx to decide on. A crash after the POST but before
 # the journal write replays the POST; the `invoke_command` is exactly-once.
 
-source = events(types = ["user.registered"])
+load("events/user.star", "user_registered")
+
+source = [user_registered()]
 
 def handle(event):
     response = http.post(

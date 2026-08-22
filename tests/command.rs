@@ -5,6 +5,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
 
 use kiln::context::CommandContext;
 use kiln::effect::{EffectRuntime, HttpClient, StubHttpClient};
@@ -44,7 +45,7 @@ fn open_at(data_dir: &Path) -> Parts {
         project.findings
     );
     let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    Runtime::open(project, data_dir, http).unwrap()
+    Runtime::open(project, data_dir, http, None).unwrap()
 }
 
 /// Delete `kiln.db` (and its WAL sidecars) while the event log survives, then reopen.
@@ -329,7 +330,7 @@ fn concurrent_same_key_requests_commit_once_and_all_recover() {
     // existence clause serializes them atomically: exactly one commits, and every
     // other loses either at the append (existence conflict) or at a re-fold reject,
     // and recovers the winner's outcome. No double-commit (#1), no spurious 422 (#2).
-    let outcomes: Vec<(u16, serde_json::Value)> = std::thread::scope(|scope| {
+    let outcomes: Vec<(u16, serde_json::Value)> = thread::scope(|scope| {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let rt = &rt;

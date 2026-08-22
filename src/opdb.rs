@@ -9,13 +9,14 @@
 //! a shared lock.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The current schema version, tracked in SQLite's `user_version`. Bump it and
 /// add a migration arm when the schema changes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// How many rows a single sweep statement deletes, so a retention sweep never
 /// holds the connection across a long scan. The sweeper loops until a call
@@ -26,6 +27,15 @@ pub const SWEEP_CHUNK: usize = 1000;
 pub struct OpDb {
     conn: Connection,
 }
+
+/// One subject-key row: `(subject_field, subject_value, wrapped_key, master_key_id)`.
+pub type SubjectKeyRow = (String, String, Vec<u8>, String);
+
+/// One rewrap for a master rotation: a [`SubjectKeyRow`] with the new wrapped key and
+/// new master id, plus the master id the row was expected to be under (a compare-and-set
+/// guard so a concurrent erase-then-recreate of the same subject is not clobbered).
+/// `(subject_field, subject_value, new_wrapped_key, new_master_id, expected_master_id)`.
+pub type RewrapUpdate = (String, String, Vec<u8>, String, String);
 
 /// The state of an effect invocation after reserving it, deciding whether the
 /// driver runs (or replays) the handler or skips a position already completed.
@@ -61,6 +71,10 @@ impl OpDb {
         // for the in-memory database used in tests.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_row| Ok(()))
             .context("enabling WAL")?;
+        // A second connection (the `kiln erase`/`rotate` CLI against a live server)
+        // waits for the write lock rather than failing immediately with SQLITE_BUSY.
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("setting busy timeout")?;
         let mut db = OpDb { conn };
         db.migrate()?;
         Ok(db)
@@ -276,6 +290,150 @@ impl OpDb {
         Ok(deleted)
     }
 
+    // --- subject keys (field-level erasure) --------------------------------
+
+    /// The wrapped key material and the id of the master that wrapped it for a
+    /// subject, or `None` if the subject has no key (never created, or erased).
+    pub fn get_subject_key(
+        &self,
+        subject_field: &str,
+        subject_value: &str,
+    ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+        self.conn
+            .query_row(
+                "SELECT wrapped_key, master_key_id FROM subject_key \
+                 WHERE subject_field = ?1 AND subject_value = ?2",
+                params![subject_field, subject_value],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .context("reading a subject key")
+    }
+
+    /// Get a subject's wrapped key, inserting the caller's candidate if none exists,
+    /// and return whichever now persists. The insert and the read happen under the one
+    /// connection lock the caller holds, so a concurrent create races cleanly (first
+    /// writer wins, both encrypt under the winner) and a concurrent erase cannot slip
+    /// between them and leave the caller with nothing.
+    pub fn get_or_insert_subject_key(
+        &self,
+        subject_field: &str,
+        subject_value: &str,
+        candidate_wrapped: &[u8],
+        master_key_id: &str,
+    ) -> anyhow::Result<(Vec<u8>, String)> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO subject_key \
+                 (subject_field, subject_value, wrapped_key, master_key_id) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    subject_field,
+                    subject_value,
+                    candidate_wrapped,
+                    master_key_id
+                ],
+            )
+            .context("inserting a subject key")?;
+        // The row is guaranteed present under the held lock after insert-or-ignore.
+        self.get_subject_key(subject_field, subject_value)?
+            .ok_or_else(|| anyhow::anyhow!("subject key missing immediately after insert"))
+    }
+
+    /// Delete a subject's key, shredding every value encrypted under it. Returns
+    /// whether a row was removed (`false` if it was already absent).
+    pub fn delete_subject_key(
+        &self,
+        subject_field: &str,
+        subject_value: &str,
+    ) -> anyhow::Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM subject_key WHERE subject_field = ?1 AND subject_value = ?2",
+                params![subject_field, subject_value],
+            )
+            .context("deleting a subject key")?;
+        Ok(changed == 1)
+    }
+
+    /// Every distinct master-key id referenced by a stored subject key. Boot checks
+    /// each is configured before serving: a missing one means those rows cannot be
+    /// unwrapped (a wrong or rotated-away master), which should fail fast rather than
+    /// surface later as a read error.
+    pub fn distinct_master_key_ids(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT master_key_id FROM subject_key")
+            .context("preparing master-key id scan")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("scanning master key ids")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting master key ids")
+    }
+
+    /// Every subject key, for a master-rotation rewrap. Returns
+    /// `(subject_field, subject_value, wrapped_key, master_key_id)` rows.
+    pub fn all_subject_keys(&self) -> anyhow::Result<Vec<SubjectKeyRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT subject_field, subject_value, wrapped_key, master_key_id FROM subject_key",
+            )
+            .context("preparing subject-key scan")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .context("scanning subject keys")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting subject keys")
+    }
+
+    /// Replace many subjects' wrapped key material and wrapping master id in one
+    /// transaction, so a master rotation is all-or-nothing (a crash mid-rotation
+    /// leaves every row on its original master, still unwrappable) and costs one
+    /// fsync rather than one per row.
+    ///
+    /// Each update is a compare-and-set on the expected master id: if the subject was
+    /// erased and recreated between the rotation's snapshot and this write (so the row
+    /// now sits under a different master, holding a fresh secret), the `WHERE` misses
+    /// and the stale rewrap is skipped rather than clobbering the new secret. Returns
+    /// the number of rows actually rewrapped, which is below `updates.len()` when a CAS
+    /// skips a concurrently recreated row.
+    pub fn rewrap_subject_keys(&self, updates: &[RewrapUpdate]) -> anyhow::Result<usize> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("beginning a rotation transaction")?;
+        let mut rewrapped = 0;
+        for (subject_field, subject_value, wrapped_key, master_key_id, expected_master_id) in
+            updates
+        {
+            rewrapped += tx
+                .execute(
+                    "UPDATE subject_key SET wrapped_key = ?3, master_key_id = ?4 \
+                     WHERE subject_field = ?1 AND subject_value = ?2 AND master_key_id = ?5",
+                    params![
+                        subject_field,
+                        subject_value,
+                        wrapped_key,
+                        master_key_id,
+                        expected_master_id
+                    ],
+                )
+                .context("rewrapping a subject key")?;
+        }
+        tx.commit().context("committing a rotation")?;
+        Ok(rewrapped)
+    }
+
     fn migrate(&mut self) -> anyhow::Result<()> {
         let mut version: i64 = self.schema_version()?;
         while version < SCHEMA_VERSION {
@@ -288,6 +446,10 @@ impl OpDb {
                     .conn
                     .execute_batch(SCHEMA_V2)
                     .context("applying schema v2")?,
+                2 => self
+                    .conn
+                    .execute_batch(SCHEMA_V3)
+                    .context("applying schema v3")?,
                 other => anyhow::bail!("no migration from schema version {other}"),
             }
             version += 1;
@@ -371,6 +533,26 @@ CREATE TABLE effect_journal (
 );
 ";
 
+/// Schema v3 adds the per-subject key store for field-level erasure. Each row holds
+/// one subject's key material, wrapped under a master key (identified by
+/// `master_key_id` so masters can rotate online). Deleting a row shreds every value
+/// encrypted under it, across the log, the tag index, and every read model at once.
+/// The subject id itself stays plaintext (it is needed to find the key). A reserved
+/// row holds the global secret behind `unique` uniqueness tags.
+const SCHEMA_V3: &str = "
+CREATE TABLE subject_key (
+    subject_field TEXT NOT NULL,
+    subject_value TEXT NOT NULL,
+    wrapped_key   BLOB NOT NULL,  -- AEAD-wrapped subject secret (nonce || ciphertext)
+    master_key_id TEXT NOT NULL,  -- which master wrapped this row
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (subject_field, subject_value)
+);
+-- The boot-time master check and a rotation both group by master_key_id, which the
+-- primary key does not cover; this keeps those from full-scanning subject_key.
+CREATE INDEX subject_key_by_master ON subject_key (master_key_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,7 +566,13 @@ mod tests {
     #[test]
     fn creates_every_table() {
         let db = OpDb::open_in_memory().unwrap();
-        for table in ["effect_invocation", "effect_journal", "module_metadata"] {
+        for table in [
+            "effect_invocation",
+            "effect_journal",
+            "module_metadata",
+            "effect_cursor",
+            "subject_key",
+        ] {
             let count: i64 = db
                 .connection()
                 .query_row(
@@ -462,6 +650,61 @@ mod tests {
         db.begin_invocation("e", 3, "old", "t0").unwrap();
         db.complete_invocation("e", 3, "t1").unwrap(); // terminal, ignored
         assert_eq!(db.running_with_hash_mismatch("e", "new").unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn rewrap_is_a_compare_and_set_on_the_master_id() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.get_or_insert_subject_key("customer_id", "1", b"wrapped-under-A", "master-A")
+            .unwrap();
+        // A rotation snapshots the row under master-A, but the subject is erased and
+        // recreated under a different master before the rewrap lands. The rewrap expects
+        // master-A, so its compare-and-set misses and the recreated secret is preserved
+        // rather than clobbered by the stale rewrap.
+        let rewrapped = db
+            .rewrap_subject_keys(&[(
+                "customer_id".into(),
+                "1".into(),
+                b"stale-rewrap".to_vec(),
+                "master-C".into(),
+                "master-B".into(),
+            )])
+            .unwrap();
+        assert_eq!(rewrapped, 0, "a mismatched expected master rewraps nothing");
+        let (wrapped, master) = db.get_subject_key("customer_id", "1").unwrap().unwrap();
+        assert_eq!(
+            master, "master-A",
+            "a mismatched expected master is a no-op"
+        );
+        assert_eq!(wrapped, b"wrapped-under-A");
+        // A rewrap that expects the row's real current master applies.
+        let rewrapped = db
+            .rewrap_subject_keys(&[(
+                "customer_id".into(),
+                "1".into(),
+                b"wrapped-under-C".to_vec(),
+                "master-C".into(),
+                "master-A".into(),
+            )])
+            .unwrap();
+        assert_eq!(rewrapped, 1, "a matching expected master rewraps the row");
+        let (wrapped, master) = db.get_subject_key("customer_id", "1").unwrap().unwrap();
+        assert_eq!(master, "master-C");
+        assert_eq!(wrapped, b"wrapped-under-C");
+    }
+
+    #[test]
+    fn distinct_master_key_ids_lists_each_once() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.get_or_insert_subject_key("customer_id", "1", b"w", "master-A")
+            .unwrap();
+        db.get_or_insert_subject_key("customer_id", "2", b"w", "master-A")
+            .unwrap();
+        db.get_or_insert_subject_key("customer_id", "3", b"w", "master-B")
+            .unwrap();
+        let mut ids = db.distinct_master_key_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["master-A".to_owned(), "master-B".to_owned()]);
     }
 
     #[test]

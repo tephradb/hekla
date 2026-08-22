@@ -1,4 +1,4 @@
-load("events/user.star", "user_renamed")
+load("events/user.star", "user_registered", "user_renamed")
 load("lib/validation.star", "is_blank")
 
 input = schema(
@@ -6,13 +6,14 @@ input = schema(
     name = text(),
 )
 
-# Both event types carry a `user_id` tag, so the boundary sees this user's whole
-# history and can tell whether they exist before renaming.
+# Both event types carry `user_id`, so the boundary sees this user's whole history
+# and can tell whether they exist before renaming. Each clause is one event type
+# constrained on `user_id`; the clauses OR together.
 def query(input):
-    return events(
-        types = ["user.registered", "user.renamed"],
-        tags = {"user_id": input.user_id},
-    )
+    return [
+        user_registered(user_id = input.user_id),
+        user_renamed(user_id = input.user_id),
+    ]
 
 def initial():
     return {"exists": False}

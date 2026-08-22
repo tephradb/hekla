@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod crypto;
 pub mod dispatch;
 pub mod effect;
 pub mod envelope;

@@ -25,6 +25,7 @@ const MAX_RETENTION_DAYS: u32 = 36_500;
 pub struct Config {
     pub effects: Effects,
     pub retention: Retention,
+    pub projectors: Projectors,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -42,6 +43,21 @@ pub struct Retention {
     /// How long a completed effect invocation's journal is kept before the
     /// sweeper reclaims it. Sweeping is lazy GC, so this only bounds disk use.
     pub effect_journal_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Projectors {
+    /// Whether a projector rebuilds automatically when its source set or entity
+    /// schema changes (the event set it was built from is now different). On by
+    /// default; a large deployment can turn it off to schedule rebuilds by hand.
+    pub auto_rebuild: bool,
+}
+
+impl Default for Projectors {
+    fn default() -> Projectors {
+        Projectors { auto_rebuild: true }
+    }
 }
 
 impl Default for Effects {

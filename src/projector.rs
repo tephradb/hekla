@@ -24,12 +24,12 @@ use starlark::environment::{FrozenModule, Module};
 use tephra::{Event, Position, WaitOutcome, WriteHandle};
 
 use crate::context::{EntityReader, ProjectorCtx};
-use crate::dispatch;
+use crate::dispatch::{self, EventDefs};
 use crate::envelope;
 use crate::loader::ProjectorUnit;
 use crate::read_model::ReadModel;
 use crate::starlark_builtins::{
-    EntityDef, LoadedModule, ModuleDef, alloc_event, call_handler_with_projector_ctx,
+    EntityDef, EventSpec, LoadedModule, ModuleDef, alloc_event, call_handler_with_projector_ctx,
     parse_entity_ops, thaw,
 };
 
@@ -130,11 +130,19 @@ pub fn start_all(
     projectors: Vec<Arc<ProjectorUnit>>,
     store: &WriteHandle,
     projectors_dir: &Path,
+    events: Arc<EventDefs>,
+    auto_rebuild: bool,
 ) -> anyhow::Result<(Vec<Arc<ProjectorShared>>, ProjectorSet)> {
     let mut shared = Vec::with_capacity(projectors.len());
     let mut set = ProjectorSet::default();
     for unit in projectors {
-        let (handle, join) = spawn(unit, store.clone(), projectors_dir)?;
+        let (handle, join) = spawn(
+            unit,
+            store.clone(),
+            projectors_dir,
+            events.clone(),
+            auto_rebuild,
+        )?;
         shared.push(Arc::clone(&handle));
         set.push(handle, join);
     }
@@ -145,11 +153,19 @@ fn spawn(
     unit: Arc<ProjectorUnit>,
     store: WriteHandle,
     projectors_dir: &Path,
+    events: Arc<EventDefs>,
+    auto_rebuild: bool,
 ) -> anyhow::Result<(Arc<ProjectorShared>, JoinHandle<()>)> {
-    let ModuleDef::Projector { name, entities, .. } = &unit.loaded.def else {
+    let ModuleDef::Projector {
+        name,
+        entities,
+        sources,
+    } = &unit.loaded.def
+    else {
         anyhow::bail!("spawn called on a non-projector module");
     };
     let name = name.clone();
+    let definition = definition_hash(sources, entities);
     let entities = entities.clone();
 
     let db_path = projectors_dir.join(format!("{name}.db"));
@@ -171,18 +187,40 @@ fn spawn(
     let task_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
         .name(format!("projector-{name}"))
-        .spawn(move || run(task_shared, unit, store, model))
+        .spawn(move || {
+            run(
+                task_shared,
+                unit,
+                store,
+                model,
+                events,
+                definition,
+                auto_rebuild,
+            )
+        })
         .with_context(|| format!("spawning projector `{name}`"))?;
     Ok((shared, join))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     shared: Arc<ProjectorShared>,
     unit: Arc<ProjectorUnit>,
     store: WriteHandle,
     model: ReadModel,
+    events: Arc<EventDefs>,
+    definition: String,
+    auto_rebuild: bool,
 ) {
-    if let Err(err) = run_inner(&shared, &unit, &store, model) {
+    if let Err(err) = run_inner(
+        &shared,
+        &unit,
+        &store,
+        model,
+        &events,
+        &definition,
+        auto_rebuild,
+    ) {
         let message = format!("{err:#}");
         tracing::error!("projector `{}` stopped: {message}", shared.name);
         shared.record_failure(&message);
@@ -194,18 +232,78 @@ fn run_inner(
     unit: &ProjectorUnit,
     store: &WriteHandle,
     mut model: ReadModel,
+    events: &EventDefs,
+    definition: &str,
+    auto_rebuild: bool,
 ) -> anyhow::Result<()> {
     let ModuleDef::Projector { sources, .. } = &unit.loaded.def else {
         anyhow::bail!("run called on a non-projector module");
     };
-    let query = dispatch::to_query(sources)?;
+    let query = dispatch::to_query(sources, events, None)?;
     let by_id = by_id_map(&shared.entities);
     let frozen = &unit.loaded.module;
+
+    // Before processing anything, reconcile the read model's recorded definition with
+    // the current one. A changed definition (a different source set or entity schema)
+    // means the read model was built from a different event set, so it must be rebuilt
+    // *before* any batch lands, or a reader could briefly see stale data. The
+    // definition hash lives in the read model and is written by the rebuild's atomic
+    // swap, so this is crash-safe: a crash mid-rebuild leaves the old hash, and the
+    // next boot rebuilds again.
+    match model.read_definition()? {
+        Some(previous) if previous != definition => {
+            if auto_rebuild {
+                tracing::info!(
+                    "projector `{}` definition changed; rebuilding its read model",
+                    shared.name
+                );
+                model = rebuild(shared, unit, store, model, events, definition)?;
+                shared
+                    .position
+                    .store(model.read_checkpoint()?.get(), Ordering::Relaxed);
+            } else {
+                tracing::warn!(
+                    "projector `{}` definition changed but auto-rebuild is off; run a manual replay to reprocess history",
+                    shared.name
+                );
+            }
+        }
+        Some(_) => {}
+        // No recorded definition. A fresh model (checkpoint 0) simply records the
+        // baseline and builds forward. A *populated* model with no recorded definition
+        // predates this field (a legacy read model), and we cannot tell whether its
+        // definition changed, so rebuild it to be safe rather than serve possibly-stale
+        // data at a possibly-old shape.
+        None => {
+            if model.read_checkpoint()?.get() == 0 {
+                model.set_definition(definition)?;
+            } else if auto_rebuild {
+                tracing::info!(
+                    "projector `{}` read model has no recorded definition; rebuilding",
+                    shared.name
+                );
+                model = rebuild(shared, unit, store, model, events, definition)?;
+                shared
+                    .position
+                    .store(model.read_checkpoint()?.get(), Ordering::Relaxed);
+            } else {
+                // A populated legacy model whose shape we cannot verify, and auto-rebuild
+                // is off. Do not stamp the current definition onto it: that would bless
+                // possibly-stale data as current and silence this warning forever. Leave
+                // the hash unrecorded so the mismatch stays visible on every boot until a
+                // manual replay rebuilds and records it.
+                tracing::warn!(
+                    "projector `{}` read model has no recorded definition and auto-rebuild is off; run a manual replay to rebuild it",
+                    shared.name
+                );
+            }
+        }
+    }
 
     let mut sub = store.subscribe(query.clone(), model.read_checkpoint()?);
     loop {
         if shared.replay.swap(false, Ordering::Relaxed) {
-            model = rebuild(shared, unit, store, model)?;
+            model = rebuild(shared, unit, store, model, events, definition)?;
             let resume = model.read_checkpoint()?;
             shared.position.store(resume.get(), Ordering::Relaxed);
             sub = store.subscribe(query.clone(), resume);
@@ -216,7 +314,7 @@ fn run_inner(
             .poll_batch()
             .map_err(|err| anyhow::anyhow!("reading events: {err}"))?;
         if !batch.is_empty() {
-            apply_batch(&model, frozen, &by_id, &batch, sub.position())?;
+            apply_batch(&model, frozen, &by_id, &batch, sub.position(), events)?;
             shared
                 .position
                 .store(sub.position().get(), Ordering::Relaxed);
@@ -252,6 +350,7 @@ pub fn project_to_head(
     store: &WriteHandle,
     unit: &LoadedModule,
     model: &ReadModel,
+    events: &EventDefs,
 ) -> anyhow::Result<usize> {
     let ModuleDef::Projector {
         entities, sources, ..
@@ -259,7 +358,7 @@ pub fn project_to_head(
     else {
         anyhow::bail!("project_to_head called on a non-projector module");
     };
-    let query = dispatch::to_query(sources)?;
+    let query = dispatch::to_query(sources, events, None)?;
     let by_id = by_id_map(entities);
     let mut sub = store.subscribe(query, model.read_checkpoint()?);
     let mut seen = 0usize;
@@ -271,7 +370,7 @@ pub fn project_to_head(
             break;
         }
         seen += batch.len();
-        apply_batch(model, &unit.module, &by_id, &batch, sub.position())?;
+        apply_batch(model, &unit.module, &by_id, &batch, sub.position(), events)?;
     }
     Ok(seen)
 }
@@ -285,6 +384,7 @@ fn apply_batch(
     by_id: &HashMap<u64, EntityDef>,
     batch: &[(Position, Event)],
     checkpoint: Position,
+    events: &EventDefs,
 ) -> anyhow::Result<()> {
     let tx = model.begin()?;
     Module::with_temp_heap(|module| {
@@ -294,7 +394,12 @@ fn apply_batch(
         for (_position, event) in batch {
             let (_envelope, data) = envelope::decode(event.data())
                 .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-            let value = alloc_event(&module, event.event_type(), &data);
+            let value = alloc_event(
+                &module,
+                event.event_type(),
+                &data,
+                events.get(event.event_type()),
+            );
             let reader = BatchReader { model, by_id };
             let ctx = ProjectorCtx { reader: &reader };
             let result = call_handler_with_projector_ctx(
@@ -327,13 +432,19 @@ fn rebuild(
     unit: &ProjectorUnit,
     store: &WriteHandle,
     model: ReadModel,
+    events: &EventDefs,
+    definition: &str,
 ) -> anyhow::Result<ReadModel> {
     let db_path = &shared.db_path;
     let rebuild_path = db_path.with_extension("rebuild.db");
     remove_db_files(&rebuild_path)?;
 
     let fresh = ReadModel::open(&rebuild_path, &shared.entities)?;
-    let count = project_to_head(store, &unit.loaded, &fresh)?;
+    let count = project_to_head(store, &unit.loaded, &fresh, events)?;
+    // Stamp the definition the fresh model was built under, so it swaps in atomically
+    // with the data (and a crash before the swap leaves the old model and its old
+    // definition intact).
+    fresh.set_definition(definition)?;
     // Fold the WAL back into the main file and drop to rollback mode, so the file
     // is self-contained: a reader that opens it mid-swap ignores any stale `-wal`.
     fresh.seal()?;
@@ -348,6 +459,60 @@ fn rebuild(
     let reopened = ReadModel::open(db_path, &shared.entities)?;
     tracing::info!("projector `{}` replayed {count} events", shared.name);
     Ok(reopened)
+}
+
+/// A stable hash of a projector's *definition* (its source set and entity schema),
+/// not its handler logic, so a restart can tell when the event set it was built from
+/// has changed and rebuild it. The entity's process-unique `id` and the handler body
+/// are deliberately excluded: an id changes every run, and a handler fix is the
+/// author's call to replay, not an automatic one.
+pub fn definition_hash(sources: &[EventSpec], entities: &[EntityDef]) -> String {
+    let mut canonical = String::new();
+    for spec in sources {
+        match spec {
+            EventSpec::All => canonical.push_str("all;"),
+            EventSpec::Filter {
+                event_type,
+                constraints,
+            } => {
+                canonical.push_str(event_type);
+                canonical.push('(');
+                for (field, value) in constraints {
+                    canonical.push_str(field);
+                    canonical.push('=');
+                    canonical.push_str(value);
+                    canonical.push(',');
+                }
+                canonical.push_str(");");
+            }
+        }
+    }
+    canonical.push('|');
+    for entity in entities {
+        canonical.push_str(&entity.name);
+        canonical.push(':');
+        canonical.push_str(&entity.key);
+        canonical.push('{');
+        for (name, meta) in &entity.fields {
+            canonical.push_str(name);
+            canonical.push('=');
+            canonical.push_str(&format!("{:?}", meta.kind));
+            if let Some(subject) = &meta.subject {
+                canonical.push('@');
+                canonical.push_str(subject);
+            }
+            canonical.push(',');
+        }
+        canonical.push('}');
+        for index in &entity.indexes {
+            canonical.push_str(&index.name);
+            canonical.push('(');
+            canonical.push_str(&index.columns.join(","));
+            canonical.push(')');
+        }
+        canonical.push(';');
+    }
+    crate::hash::sha256_hex(canonical.as_bytes())
 }
 
 /// Resolve `put`/`patch`/`delete`/`get` entity references (which carry only an id)

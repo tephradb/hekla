@@ -42,7 +42,7 @@ fn boot() -> Harness {
     assert!(!project.has_errors(), "{:?}", project.findings);
     let data = tempfile::tempdir().unwrap();
     let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http, None).unwrap();
     Harness {
         rt,
         coord,

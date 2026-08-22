@@ -46,7 +46,7 @@ fn wait_position(rt: &Runtime, projector: &str, target: u64) {
 fn read_user(rt: &Runtime, user_id: &str) -> Option<serde_json::Value> {
     let shared = rt.projector("users").unwrap();
     let entity = read_api::find_entity(&shared.entities, "users").unwrap();
-    read_api::get_one(&shared.db_path, entity, user_id)
+    read_api::get_one(&shared.db_path, entity, user_id, None)
         .unwrap()
         .0
 }
@@ -58,7 +58,7 @@ fn replay_rebuilds_and_keeps_serving() {
     assert!(!project.has_errors(), "{:?}", project.findings);
     let data = tempfile::tempdir().unwrap();
     let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http, None).unwrap();
 
     register(&rt, A);
     register(&rt, B);
@@ -86,7 +86,7 @@ fn replay_rebuilds_and_keeps_serving() {
     // the rebuilt checkpoint position.
     let stats = rt.projector("user-stats").unwrap();
     let totals = read_api::find_entity(&stats.entities, "totals").unwrap();
-    let (row, position) = read_api::get_one(&stats.db_path, totals, "all").unwrap();
+    let (row, position) = read_api::get_one(&stats.db_path, totals, "all", None).unwrap();
     assert_eq!(row.unwrap()["count"].as_i64(), Some(3));
     assert_eq!(position, 3);
 

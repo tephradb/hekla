@@ -12,26 +12,28 @@
 //! command's `handle` returns `emit([...])` or `reject(...)`.
 
 use std::fmt;
+use std::hash::Hash;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use allocative::Allocative;
 use anyhow::Context;
+use serde::Serializer;
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallMap;
+use starlark::collections::{SmallMap, StarlarkHasher};
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator, FileLoader};
 use starlark::syntax::{AstModule, Dialect};
-use starlark::values::dict::DictRef;
+use starlark::values::dict::{AllocDict, DictRef};
 use starlark::values::list::{ListRef, UnpackList};
 use starlark::values::none::NoneType;
 use starlark::values::structs::AllocStruct;
 use starlark::values::{
-    NoSerialize, OwnedFrozenValue, StarlarkValue, Value, ValueLike, starlark_value,
+    Heap, NoSerialize, OwnedFrozenValue, StarlarkValue, Value, ValueLike, starlark_value,
 };
 use starlark::{starlark_module, starlark_simple_value};
 
-use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx};
+use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx, QueryCtx};
 use crate::dispatch::RESERVED_TAG_PREFIX;
 use crate::read_api::RESERVED_QUERY_PARAMS;
 
@@ -61,7 +63,11 @@ impl FieldKind {
     pub fn sql_type(&self) -> &'static str {
         match self {
             FieldKind::Text { .. } | FieldKind::Uuid | FieldKind::OneOf(_) => "TEXT",
-            FieldKind::I64 | FieldKind::U64 | FieldKind::Money => "INTEGER",
+            FieldKind::I64 | FieldKind::U64 => "INTEGER",
+            // Money is a decimal string on the wire; store it verbatim so a value like
+            // "10.50" round-trips and reads back the same JSON type whether or not the
+            // field is subject-encrypted.
+            FieldKind::Money => "TEXT",
             FieldKind::Bool => "INTEGER",
             FieldKind::Timestamp => "TEXT", // ISO-8601, sorts lexicographically
             FieldKind::Json => "TEXT",
@@ -82,8 +88,50 @@ impl FieldKind {
     }
 }
 
+/// A declared field: its type plus the per-field policy that governs tagging and
+/// subject-scoped encryption. `indexed` decides whether the field becomes a store
+/// tag; `subject` names a sibling field whose per-subject key encrypts this field's
+/// value (in the tag, the payload, and any read-model column); `unique` additionally
+/// emits a global-key tag so a global uniqueness check survives erasure.
+#[derive(Debug, Clone, PartialEq, Allocative)]
+pub struct FieldMeta {
+    pub kind: FieldKind,
+    pub indexed: bool,
+    pub subject: Option<String>,
+    pub unique: bool,
+}
+
+impl FieldMeta {
+    /// A plain field: indexed, no subject, not unique. The default for every field
+    /// that opts into nothing.
+    pub fn plain(kind: FieldKind) -> FieldMeta {
+        FieldMeta {
+            kind,
+            indexed: true,
+            subject: None,
+            unique: false,
+        }
+    }
+
+    pub fn is_nullable(&self) -> bool {
+        self.kind.is_nullable()
+    }
+
+    /// The SQLite column type for this field in a read model. A subject-scoped
+    /// field stores its opaque ciphertext, so its column is always `TEXT`
+    /// regardless of the underlying kind; the read API decrypts and re-types it on
+    /// the way out.
+    pub fn sql_type(&self) -> &'static str {
+        if self.subject.is_some() {
+            "TEXT"
+        } else {
+            self.kind.sql_type()
+        }
+    }
+}
+
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
-pub struct FieldType(pub FieldKind);
+pub struct FieldType(pub FieldMeta);
 
 impl fmt::Display for FieldType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -94,6 +142,78 @@ impl fmt::Display for FieldType {
 #[starlark_value(type = "field_type")]
 impl<'v> StarlarkValue<'v> for FieldType {}
 starlark_simple_value!(FieldType);
+
+/// Assemble a [`FieldType`] from a base kind and the shared `indexed`/`subject`/
+/// `unique` policy arguments, applying the kind-independent rules: `unique` implies
+/// `subject` and indexing, and neither `subject` nor `unique` is meaningful on an
+/// opaque `json` blob or an unbounded `text` (whose ciphertext tag must stay
+/// bounded). Sibling-reference rules (the subject naming a real, non-encrypted
+/// field) need the whole field set and are checked where fields are assembled.
+fn field_type(
+    kind: FieldKind,
+    indexed: Option<bool>,
+    subject: Option<String>,
+    unique: Option<bool>,
+) -> anyhow::Result<FieldType> {
+    let indexed = indexed.unwrap_or(true);
+    let unique = unique.unwrap_or(false);
+    if unique && subject.is_none() {
+        anyhow::bail!(
+            "unique = True requires subject = \"...\"; a global uniqueness index is opt-in on a subject-scoped field"
+        );
+    }
+    if unique && !indexed {
+        anyhow::bail!("unique = True cannot be combined with indexed = False");
+    }
+    if subject.is_some() || unique {
+        match kind.base() {
+            FieldKind::Json => {
+                anyhow::bail!("a json field cannot be subject-encrypted or unique")
+            }
+            FieldKind::Text { max_length: None } => anyhow::bail!(
+                "a subject-encrypted or unique text field needs max_length so its ciphertext tag stays bounded"
+            ),
+            _ => {}
+        }
+    }
+    Ok(FieldType(FieldMeta {
+        kind,
+        indexed,
+        subject,
+        unique,
+    }))
+}
+
+/// Check every `subject = "sibling"` reference against the sibling set: the named
+/// field must exist, must not itself be subject-encrypted (subjects do not chain),
+/// and must be a scalar id rather than an opaque `json` blob. `context` names the
+/// event or entity in the error. Shared by the `event()` and `entity()` builtins,
+/// which both know their complete field set.
+fn validate_subject_refs(context: &str, fields: &[(String, FieldMeta)]) -> anyhow::Result<()> {
+    for (name, meta) in fields {
+        let Some(subject) = &meta.subject else {
+            continue;
+        };
+        match fields.iter().find(|(n, _)| n == subject) {
+            None => anyhow::bail!(
+                "{context}: field `{name}` is scoped to subject `{subject}`, which is not a declared field"
+            ),
+            Some((_, sm)) if sm.subject.is_some() => anyhow::bail!(
+                "{context}: subject `{subject}` for field `{name}` is itself subject-encrypted (subjects cannot chain)"
+            ),
+            Some((_, sm)) if matches!(sm.kind.base(), FieldKind::Json) => anyhow::bail!(
+                "{context}: subject `{subject}` for field `{name}` must be a scalar id, not json"
+            ),
+            // The key is derived from the subject id, so it must always be present; an
+            // optional (null-able) id would leave the value un-keyable.
+            Some((_, sm)) if sm.is_nullable() => anyhow::bail!(
+                "{context}: subject `{subject}` for field `{name}` must not be optional (it keys the encryption)"
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Input schema (commands)
@@ -152,7 +272,7 @@ pub struct EntityDef {
     /// host fills it from the global binding at load.
     pub name: String,
     pub key: String,
-    pub fields: Vec<(String, FieldKind)>,
+    pub fields: Vec<(String, FieldMeta)>,
     pub indexes: Vec<IndexDef>,
 }
 
@@ -178,14 +298,14 @@ impl EntityDef {
         let cols: Vec<String> = self
             .fields
             .iter()
-            .map(|(name, kind)| {
-                let null = if kind.is_nullable() { "" } else { " NOT NULL" };
+            .map(|(name, meta)| {
+                let null = if meta.is_nullable() { "" } else { " NOT NULL" };
                 let pk = if *name == self.key {
                     " PRIMARY KEY"
                 } else {
                     ""
                 };
-                format!("  {} {}{}{}", name, kind.sql_type(), pk, null)
+                format!("  {} {}{}{}", name, meta.sql_type(), pk, null)
             })
             .collect();
         format!(
@@ -211,7 +331,7 @@ impl EntityDef {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        let Some((_, key_kind)) = self.fields.iter().find(|(n, _)| *n == self.key) else {
+        let Some((_, key_meta)) = self.fields.iter().find(|(n, _)| *n == self.key) else {
             anyhow::bail!(
                 "entity `{}`: key `{}` is not a declared field",
                 self.name,
@@ -221,31 +341,58 @@ impl EntityDef {
         // The read API paginates by the key as an opaque cursor and binds it as a
         // typed filter, so the key must be a present, orderable scalar. An optional
         // key could be null; a bool (two values) or json (unordered) key would
-        // silently truncate cursor pagination.
-        if key_kind.is_nullable() {
+        // silently truncate cursor pagination; money is stored as its decimal string
+        // (so `ORDER BY` and the `key > ?` cursor would compare lexicographically:
+        // `"2" > "10"`), so it cannot key the ordered scan either.
+        if key_meta.is_nullable() {
             anyhow::bail!(
                 "entity `{}`: key `{}` may not be optional",
                 self.name,
                 self.key
             );
         }
-        if matches!(key_kind.base(), FieldKind::Bool | FieldKind::Json) {
+        if matches!(
+            key_meta.kind.base(),
+            FieldKind::Bool | FieldKind::Json | FieldKind::Money
+        ) {
             anyhow::bail!(
                 "entity `{}`: key `{}` must be an orderable scalar, not {:?}",
                 self.name,
                 self.key,
-                key_kind.base()
+                key_meta.kind.base()
             );
         }
+        if key_meta.subject.is_some() {
+            anyhow::bail!(
+                "entity `{}`: key `{}` may not be subject-encrypted (the key is a plaintext cursor)",
+                self.name,
+                self.key
+            );
+        }
+        // A subject-scoped column needs its sibling subject-id column present so the
+        // read API can find the key to decrypt it; the `entity()` builtin's
+        // `validate_subject_refs` already enforces that (and rejects a chained or
+        // json subject), so it holds by the time we get here.
         for ix in &self.indexes {
             for col in &ix.columns {
-                if !self.fields.iter().any(|(n, _)| n == col) {
-                    anyhow::bail!(
+                match self.fields.iter().find(|(n, _)| n == col) {
+                    None => anyhow::bail!(
                         "entity `{}`: index `{}` references unknown field `{}`",
                         self.name,
                         ix.name,
                         col
-                    );
+                    ),
+                    // A subject column holds ciphertext, so a filter (which arrives
+                    // as plaintext, and without the subject cannot derive the key)
+                    // could never match it. Reject the index rather than surprise the
+                    // author with a silent no-op. Filter by the plaintext subject id.
+                    Some((_, meta)) if meta.subject.is_some() => anyhow::bail!(
+                        "entity `{}`: index `{}` covers subject-encrypted column `{}`; filter by the plaintext subject id instead",
+                        self.name,
+                        ix.name,
+                        col
+                    ),
+                    Some(_) => {}
                 }
             }
         }
@@ -280,9 +427,23 @@ impl EntityDef {
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct EventDef {
     pub event_type: String,
-    pub fields: Vec<(String, FieldKind)>,
-    /// Fields that are indexed as key-value tags in the event store.
-    pub tags: Vec<String>,
+    /// Every field, with its per-field tagging and encryption policy. Under
+    /// automatic tagging each `indexed` field becomes a store tag; there is no
+    /// separate tag list to keep in sync.
+    pub fields: Vec<(String, FieldMeta)>,
+}
+
+impl EventDef {
+    /// The declared field metadata for `name`, if any.
+    pub fn field(&self, name: &str) -> Option<&FieldMeta> {
+        self.fields.iter().find(|(n, _)| n == name).map(|(_, m)| m)
+    }
+
+    /// Whether `name` is a subject-scoped (encrypted) field. The single authority both
+    /// command-response paths use to drop subject tags, so they cannot drift.
+    pub fn is_subject(&self, name: &str) -> bool {
+        self.field(name).is_some_and(|meta| meta.subject.is_some())
+    }
 }
 
 impl fmt::Display for EventDef {
@@ -305,11 +466,29 @@ impl<'v> StarlarkValue<'v> for EventDef {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         let heap = eval.heap();
+        // A `QueryCtx` on the evaluator means this call is a query/source clause (a
+        // subset match), not an event to emit (which needs every field).
+        let query_mode = eval
+            .extra
+            .and_then(|extra| extra.downcast_ref::<QueryCtx>())
+            .is_some();
         args.no_positional_args(heap)?;
         let named = args.names_map()?;
 
         let mut payload = serde_json::Map::with_capacity(named.len());
         for (name, value) in &named {
+            // A subject-encrypted value read from an event (a handle) must never be
+            // fed back into a constructor: it would serialise to its ciphertext and be
+            // re-encrypted, storing ciphertext-of-ciphertext. A derivation must be
+            // built from the plaintext the command already holds.
+            if value.downcast_ref::<CipherHandle>().is_some() {
+                return Err(anyhow::anyhow!(
+                    "event `{}` field `{}`: a subject-encrypted value from an event cannot be re-emitted; supply the plaintext",
+                    self.event_type,
+                    name.as_str()
+                )
+                .into());
+            }
             let json = value.to_json_value().map_err(|err| {
                 anyhow::anyhow!(
                     "event `{}` field `{}` must be JSON-serialisable: {err}",
@@ -320,8 +499,16 @@ impl<'v> StarlarkValue<'v> for EventDef {
             payload.insert(name.as_str().to_owned(), json);
         }
 
+        if query_mode {
+            let constraints = build_query_constraints(&self.event_type, &payload)?;
+            return Ok(heap.alloc(EventSpec::Filter {
+                event_type: self.event_type.clone(),
+                constraints,
+            }));
+        }
+
         validate_event_payload(&self.event_type, &self.fields, &payload)?;
-        let tags = derive_tags(&self.event_type, &self.tags, &payload)?;
+        let tags = derive_tags(&self.event_type, &self.fields, &payload)?;
         Ok(heap.alloc(ConstructedEvent {
             event_type: self.event_type.clone(),
             data_json: serde_json::Value::Object(payload).to_string(),
@@ -355,6 +542,64 @@ impl fmt::Display for ConstructedEvent {
 impl<'v> StarlarkValue<'v> for ConstructedEvent {}
 starlark_simple_value!(ConstructedEvent);
 
+// ---------------------------------------------------------------------------
+// Opaque handle for a subject-encrypted value read from event data
+// ---------------------------------------------------------------------------
+
+/// A subject-scoped field, as a `fold` or projector `handle` sees it: an opaque
+/// wrapper around the ciphertext, never the plaintext. It can be compared for
+/// equality (deterministic encryption makes ciphertext equality mean plaintext
+/// equality) and used as a dict key, and it can be stored with `put`/`patch` (which
+/// persist the ciphertext). It cannot be concatenated, sliced, case-changed, or
+/// otherwise turned into an inspectable string: those operations are simply not
+/// defined on it, so they error. Its `str()` form is a fixed token, so even
+/// interpolating it into a log line or error leaks nothing. Plaintext never enters a
+/// handler; a derivation must be computed by the command and emitted as its own
+/// subject-scoped field.
+#[derive(Debug, Clone, ProvidesStaticType, Allocative)]
+pub struct CipherHandle {
+    /// The base64url ciphertext, the only thing this yields (to `put`, and to a tag).
+    pub ciphertext: String,
+    /// The originating event field name, bound into the ciphertext as its associated
+    /// data. A handle may only be stored into an identically-named subject column.
+    pub field: String,
+    /// The subject field this value is scoped to (its key's identity), for the
+    /// `put`/`patch` consistency check.
+    pub subject_field: String,
+    /// The plaintext subject id (not secret), for the `put`/`patch` consistency check.
+    pub subject_value: String,
+}
+
+impl fmt::Display for CipherHandle {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "<encrypted:{}>", self.field)
+    }
+}
+
+impl serde::Serialize for CipherHandle {
+    /// Serialises to its ciphertext, so `put`'s `row.to_json_value()` stores the
+    /// opaque ciphertext in the read-model column. This is the one place a handle
+    /// yields its bytes, and they are ciphertext, never plaintext.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.ciphertext)
+    }
+}
+
+#[starlark_value(type = "encrypted")]
+impl<'v> StarlarkValue<'v> for CipherHandle {
+    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<CipherHandle>()
+            .is_some_and(|o| o.ciphertext == self.ciphertext))
+    }
+
+    fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
+        self.ciphertext.hash(hasher);
+        Ok(())
+    }
+}
+starlark_simple_value!(CipherHandle);
+
 /// What a command's `handle` returns to append events: the ordered events an
 /// `emit(...)` call collected. A sibling of `reject(...)`, the other terminal
 /// outcome.
@@ -383,13 +628,17 @@ starlark_simple_value!(EmitOutcome);
 pub enum EventSpec {
     /// Every event. Lowers to `Query::All`, a full scan that bypasses the index.
     All,
-    /// A single query item: the event type is one of `types` (empty = any type)
-    /// AND the event carries all of `tags`.
+    /// One typed query clause: events of `event_type` that satisfy every field
+    /// `constraint` (ANDed). An empty `constraints` matches all events of that type.
+    /// Produced by calling an event definition in query position, e.g.
+    /// `OrderPlaced(shop_id = 42)`.
     Filter {
-        types: Vec<String>,
-        /// `(key, Some(value))` for keyed tags, `(key, None)` for bare tags.
-        /// Bare `"premium"` and keyed `"premium:"` are distinct; they never collide.
-        tags: Vec<(String, Option<String>)>,
+        event_type: String,
+        /// Field name to its constrained value, as a scalar string (type-checked
+        /// against the field's kind when the clause was built). The lowering to a
+        /// tephra query encrypts a subject-scoped field's value; plaintext fields
+        /// match verbatim.
+        constraints: Vec<(String, String)>,
     },
 }
 
@@ -397,7 +646,7 @@ impl fmt::Display for EventSpec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             EventSpec::All => write!(f, "all_events()"),
-            EventSpec::Filter { types, .. } => write!(f, "events({types:?})"),
+            EventSpec::Filter { event_type, .. } => write!(f, "{event_type}(...)"),
         }
     }
 }
@@ -556,52 +805,98 @@ impl ModuleDef {
 pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     // --- field types -------------------------------------------------------
 
-    fn text(#[starlark(require = named)] max_length: Option<u32>) -> anyhow::Result<FieldType> {
-        Ok(FieldType(FieldKind::Text { max_length }))
+    fn text(
+        #[starlark(require = named)] max_length: Option<u32>,
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
+        field_type(FieldKind::Text { max_length }, indexed, subject, unique)
     }
 
-    fn i64_() -> anyhow::Result<FieldType> {
-        Ok(FieldType(FieldKind::I64))
+    fn i64_(
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
+        field_type(FieldKind::I64, indexed, subject, unique)
     }
 
-    fn u64_() -> anyhow::Result<FieldType> {
-        Ok(FieldType(FieldKind::U64))
+    fn u64_(
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
+        field_type(FieldKind::U64, indexed, subject, unique)
     }
 
-    fn boolean() -> anyhow::Result<FieldType> {
-        Ok(FieldType(FieldKind::Bool))
+    fn boolean(
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
+        field_type(FieldKind::Bool, indexed, subject, unique)
     }
 
-    fn uuid() -> anyhow::Result<FieldType> {
-        Ok(FieldType(FieldKind::Uuid))
+    fn uuid(
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
+        field_type(FieldKind::Uuid, indexed, subject, unique)
     }
 
-    fn timestamp() -> anyhow::Result<FieldType> {
-        Ok(FieldType(FieldKind::Timestamp))
+    fn timestamp(
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
+        field_type(FieldKind::Timestamp, indexed, subject, unique)
     }
 
-    fn money() -> anyhow::Result<FieldType> {
-        Ok(FieldType(FieldKind::Money))
+    fn money(
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
+        field_type(FieldKind::Money, indexed, subject, unique)
     }
 
-    fn json() -> anyhow::Result<FieldType> {
-        Ok(FieldType(FieldKind::Json))
+    fn json(
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
+        field_type(FieldKind::Json, indexed, subject, unique)
     }
 
     /// Named `one_of` rather than `enum` because starlark-rust's extended
     /// dialect already defines `enum`.
-    fn one_of(variants: UnpackList<String>) -> anyhow::Result<FieldType> {
+    fn one_of(
+        #[starlark(require = pos)] variants: UnpackList<String>,
+        #[starlark(require = named)] indexed: Option<bool>,
+        #[starlark(require = named)] subject: Option<String>,
+        #[starlark(require = named)] unique: Option<bool>,
+    ) -> anyhow::Result<FieldType> {
         if variants.items.is_empty() {
             anyhow::bail!("one_of() needs at least one variant");
         }
-        Ok(FieldType(FieldKind::OneOf(variants.items)))
+        field_type(FieldKind::OneOf(variants.items), indexed, subject, unique)
     }
 
-    fn optional(inner: &FieldType) -> anyhow::Result<FieldType> {
-        if matches!(inner.0, FieldKind::Optional(_)) {
+    /// A nullable field. Inherits the inner field's `indexed`/`subject`/`unique`
+    /// policy, so `optional(text(subject = "customer_id", max_length = 200))` is an
+    /// optional subject-scoped field.
+    fn optional(#[starlark(require = pos)] inner: &FieldType) -> anyhow::Result<FieldType> {
+        if matches!(inner.0.kind, FieldKind::Optional(_)) {
             anyhow::bail!("optional(optional(...)) is not meaningful");
         }
-        Ok(FieldType(FieldKind::Optional(Box::new(inner.0.clone()))))
+        Ok(FieldType(FieldMeta {
+            kind: FieldKind::Optional(Box::new(inner.0.kind.clone())),
+            indexed: inner.0.indexed,
+            subject: inner.0.subject.clone(),
+            unique: inner.0.unique,
+        }))
     }
 
     // --- schema ------------------------------------------------------------
@@ -618,7 +913,14 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
                     value.get_type()
                 )
             })?;
-            out.push((name, ft.0.clone()));
+            // Command input is plaintext at the boundary; subject/unique are event
+            // and entity concerns, not input ones.
+            if ft.0.subject.is_some() || ft.0.unique {
+                anyhow::bail!(
+                    "schema field `{name}`: subject/unique are not valid on command input (input is plaintext)"
+                );
+            }
+            out.push((name, ft.0.kind.clone()));
         }
         Ok(InputSchema { fields: out })
     }
@@ -656,6 +958,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
                 .ok_or_else(|| anyhow::anyhow!("entity field `{fname}` must be a field type"))?;
             field_defs.push((fname, ft.0.clone()));
         }
+        validate_subject_refs("entity", &field_defs)?;
 
         let mut index_defs = Vec::new();
         for value in indexes.unwrap_or_default() {
@@ -676,19 +979,20 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
 
     // --- event definition --------------------------------------------------
 
+    /// Declare an event type. Every field is automatically indexed as a store tag
+    /// unless it opts out with `indexed = False`; there is no `tags = [...]` list.
     fn event<'v>(
         #[starlark(require = named)] r#type: String,
         #[starlark(require = named)] fields: SmallMap<String, Value<'v>>,
-        #[starlark(require = named)] tags: UnpackList<String>,
     ) -> anyhow::Result<EventDef> {
         let mut field_defs = Vec::with_capacity(fields.len());
         for (name, value) in fields {
             let ft = value.downcast_ref::<FieldType>().ok_or_else(|| {
                 anyhow::anyhow!("event `{}` field `{}` must be a field type", r#type, name)
             })?;
-            // The host stamps its own tags in the `_kiln_` namespace (idempotency
-            // today, auto-tagged fields later). Reserving the prefix here keeps a
-            // handler from forging a host tag, and so an append condition.
+            // The host stamps its own tags in the `_kiln_` namespace (the
+            // idempotency tag, and the global uniqueness tag). Reserving the prefix
+            // keeps a handler from forging a host tag, and so an append condition.
             if name.starts_with(RESERVED_TAG_PREFIX) {
                 anyhow::bail!(
                     "event `{}`: field `{name}` uses the reserved `{RESERVED_TAG_PREFIX}` prefix",
@@ -697,50 +1001,21 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
             }
             field_defs.push((name, ft.0.clone()));
         }
-        for tag in &tags.items {
-            if !field_defs.iter().any(|(n, _)| n == tag) {
-                anyhow::bail!("event `{}`: tag `{}` is not a declared field", r#type, tag);
-            }
-        }
+        validate_subject_refs(&format!("event `{}`", r#type), &field_defs)?;
         Ok(EventDef {
             event_type: r#type,
             fields: field_defs,
-            tags: tags.items,
         })
     }
 
     // --- DCB query ---------------------------------------------------------
 
-    /// A query over specific event types and/or tags. Both are optional, but at
-    /// least one must be given; use `all_events()` to match every event.
-    ///
-    /// `tags` accepts a dict or a list.
-    ///
-    /// Dict form, `None` value means bare tag:
-    ///   `{"task_id": input.task_id, "premium": None}`
-    ///
-    /// List form, split on first `:`, no colon means bare:
-    ///   `["task_id:abc-123", "premium"]`
-    fn events<'v>(
-        #[starlark(require = named)] types: Option<UnpackList<String>>,
-        #[starlark(require = named)] tags: Option<Value<'v>>,
-    ) -> anyhow::Result<EventSpec> {
-        let types = types.map(|t| t.items).unwrap_or_default();
-        let tags = match tags {
-            Some(value) => parse_tags(value)?,
-            None => Vec::new(),
-        };
-        if types.is_empty() && tags.is_empty() {
-            anyhow::bail!(
-                "events() needs at least a type or a tag; use all_events() to match every event"
-            );
-        }
-        Ok(EventSpec::Filter { types, tags })
-    }
-
-    /// The catch-all query: every event, regardless of type or tags. Lowers to
-    /// tephra's `Query::All` (a full scan that bypasses the index). Projectors
-    /// that build a global read model use this; commands rarely do.
+    /// The catch-all query: every event, regardless of type. Lowers to tephra's
+    /// `Query::All` (a full scan that bypasses the index). Projectors that build a
+    /// global read model use this; commands rarely do. Typed queries and sources
+    /// otherwise name event types by calling their definitions, e.g.
+    /// `OrderPlaced(shop_id = 42)` (a subset match), or `OrderPlaced()` for every
+    /// event of that type.
     fn all_events() -> anyhow::Result<EventSpec> {
         Ok(EventSpec::All)
     }
@@ -805,6 +1080,10 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
                 entity.get_type()
             )
         })?;
+        if let Some(dict) = DictRef::from_value(row) {
+            enforce_subject_columns(def, &dict, None)
+                .map_err(|err| anyhow::anyhow!("put(): {err}"))?;
+        }
         let json = row
             .to_json_value()
             .map_err(|err| anyhow::anyhow!("put() row must be JSON-serialisable: {err}"))?;
@@ -832,6 +1111,10 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
                 entity.get_type()
             )
         })?;
+        if let Some(dict) = DictRef::from_value(changes) {
+            enforce_subject_columns(def, &dict, Some(&key))
+                .map_err(|err| anyhow::anyhow!("patch(): {err}"))?;
+        }
         let json = changes
             .to_json_value()
             .map_err(|err| anyhow::anyhow!("patch() changes must be JSON-serialisable: {err}"))?;
@@ -939,12 +1222,20 @@ pub fn eval_frozen(
     ast: AstModule,
     globals: &Globals,
     loader: Option<&dyn FileLoader>,
+    query_mode: bool,
 ) -> starlark::Result<FrozenModule> {
     Module::with_temp_heap(|module| {
         {
+            let query_ctx = QueryCtx;
             let mut eval = Evaluator::new(&module);
             if let Some(loader) = loader {
                 eval.set_loader(loader);
+            }
+            // A projector's or effect's top-level `source` calls event definitions as
+            // query clauses, so those calls must see query mode; a command's module
+            // body only defines functions, so it is evaluated without it.
+            if query_mode {
+                eval.extra = Some(&query_ctx);
             }
             eval.set_max_tick_count(LOAD_MAX_TICKS)?;
             eval.eval_module(ast, globals)?;
@@ -1004,7 +1295,10 @@ pub fn load_script(
     let name = module_name_from_path(filename)?;
     let source_hash = crate::hash::sha256_hex(src.as_bytes());
     let ast = parse_module(filename, src)?;
-    let module = eval_frozen(ast, &globals_for(kind), None)?;
+    // A projector's or effect's `source` is evaluated in query mode; a command's
+    // body only defines functions.
+    let query_mode = matches!(kind, ModuleKind::Projector | ModuleKind::Effect);
+    let module = eval_frozen(ast, &globals_for(kind), None, query_mode)?;
     let def = module_def_from_frozen(kind, name, filename, &module)?;
     Ok(LoadedModule {
         def,
@@ -1127,6 +1421,22 @@ pub fn call_handler_with_ctx<'v>(
     eval.eval_function(func, args, &[])
 }
 
+/// Call a command's `query` with a [`QueryCtx`] in scope, so an event-definition
+/// call inside it builds a query clause (a subset match) rather than an event to
+/// emit. `now()` still errors, because it needs a [`HandleCtx`], not this.
+pub fn call_handler_with_query_ctx<'v>(
+    module: &Module<'v>,
+    func: Value<'v>,
+    args: &[Value<'v>],
+    max_instructions: u64,
+) -> starlark::Result<Value<'v>> {
+    let query_ctx = QueryCtx;
+    let mut eval = Evaluator::new(module);
+    eval.set_max_tick_count(max_instructions)?;
+    eval.extra = Some(&query_ctx);
+    eval.eval_function(func, args, &[])
+}
+
 /// Call a projector's `handle` with a [`ProjectorCtx`] in scope, so `get()` can
 /// read the read model. Used only for a projector's `handle`.
 pub fn call_handler_with_projector_ctx<'v>(
@@ -1213,7 +1523,18 @@ pub fn projector_builtins(builder: &mut GlobalsBuilder) {
             .and_then(|extra| extra.downcast_ref::<ProjectorCtx>())
             .ok_or_else(|| anyhow::anyhow!("get() is only available in a projector's handle()"))?;
         match ctx.reader.get(def.id, &key)? {
-            Some(row) => Ok(eval.heap().alloc(row)),
+            // Wrap subject columns as handles, exactly as an event is materialised, so
+            // a read-modify-write (`get()` then `put()`) round-trips: the ciphertext
+            // stays opaque and re-storing it is a valid handle, not a raw string.
+            Some(row) => {
+                let value = match row.as_object() {
+                    Some(obj) if def.fields.iter().any(|(_, m)| m.subject.is_some()) => {
+                        alloc_row_with_handles(eval.heap(), &def.fields, obj)
+                    }
+                    _ => eval.heap().alloc(row),
+                };
+                Ok(value)
+            }
             None => Ok(Value::new_none()),
         }
     }
@@ -1325,6 +1646,27 @@ pub fn effect_builtins(builder: &mut GlobalsBuilder) {
     ) -> anyhow::Result<NoneType> {
         effect_host(eval, "log()")?.log(&message);
         Ok(NoneType)
+    }
+
+    /// Decrypt a subject-encrypted value read from an event to its plaintext. The
+    /// explicit boundary an effect crosses to act on personal data; only effects have
+    /// it. Fails (terminally) if the subject has been erased.
+    fn reveal<'v>(
+        #[starlark(require = pos)] handle: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<String> {
+        let handle = handle.downcast_ref::<CipherHandle>().ok_or_else(|| {
+            anyhow::anyhow!(
+                "reveal() expects a subject-encrypted value from an event, got {}",
+                handle.get_type()
+            )
+        })?;
+        effect_host(eval, "reveal()")?.reveal(
+            &handle.subject_field,
+            &handle.subject_value,
+            &handle.field,
+            &handle.ciphertext,
+        )
     }
 
     fn invoke_command<'v>(
@@ -1497,61 +1839,6 @@ pub fn thaw<'v>(func: &OwnedFrozenValue, module: &Module<'v>) -> Value<'v> {
 // Tag parsing: shared by the `events` builtin and emitted events
 // ---------------------------------------------------------------------------
 
-/// Parse a starlark tags value into `(key, Option<value>)` pairs.
-///
-/// Dict form, a `None` value means a bare tag:
-///   `{"task_id": input.task_id, "premium": None}`
-/// List form, split on the first `:`, no colon means bare:
-///   `["task_id:abc-123", "premium"]`
-pub fn parse_tags(tags: Value<'_>) -> anyhow::Result<Vec<(String, Option<String>)>> {
-    if let Some(dict) = DictRef::from_value(tags) {
-        let mut pairs = Vec::with_capacity(dict.len());
-        for (k, v) in dict.iter() {
-            let key = k
-                .unpack_str()
-                .ok_or_else(|| anyhow::anyhow!("tag keys must be strings, got {}", k.get_type()))?;
-            reject_reserved_tag(key)?;
-            let val = if v.is_none() {
-                None
-            } else {
-                Some(match v.unpack_str() {
-                    Some(s) => s.to_owned(),
-                    None => v.to_string(),
-                })
-            };
-            pairs.push((key.to_owned(), val));
-        }
-        Ok(pairs)
-    } else if let Some(list) = ListRef::from_value(tags) {
-        let mut pairs = Vec::with_capacity(list.len());
-        for v in list.iter() {
-            let s = v.unpack_str().ok_or_else(|| {
-                anyhow::anyhow!("tag list items must be strings, got {}", v.get_type())
-            })?;
-            // split on first ':'; no colon → bare tag
-            let (key, val) = match s.find(':') {
-                Some(i) => (s[..i].to_owned(), Some(s[i + 1..].to_owned())),
-                None => (s.to_owned(), None),
-            };
-            reject_reserved_tag(&key)?;
-            pairs.push((key, val));
-        }
-        Ok(pairs)
-    } else {
-        anyhow::bail!("tags must be a dict or list, got {}", tags.get_type());
-    }
-}
-
-/// Reject a query/event tag key in the host's reserved `_kiln_` namespace, so a
-/// handler cannot read (or fold over) other requests' host tags such as the
-/// idempotency tag. The write side is already gated by the event-field check.
-fn reject_reserved_tag(key: &str) -> anyhow::Result<()> {
-    if key.starts_with(RESERVED_TAG_PREFIX) {
-        anyhow::bail!("tag `{key}` uses the reserved `{RESERVED_TAG_PREFIX}` prefix");
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Materialising inputs and events for the handlers
 // ---------------------------------------------------------------------------
@@ -1581,17 +1868,85 @@ pub fn alloc_input<'v>(
     Ok(module.heap().alloc(AllocStruct(fields)))
 }
 
-/// Build the `event` struct passed to `fold`: `event.type` and `event.data`.
+/// Build the `event` struct passed to `fold` and to a projector/effect `handle`:
+/// `event.type` and `event.data`. When `event_def` is known and declares any
+/// subject-scoped field, those fields in `event.data` are wrapped as opaque
+/// [`CipherHandle`]s (the stored value is ciphertext) rather than exposed as
+/// strings, so plaintext never enters a handler.
 pub fn alloc_event<'v>(
     module: &Module<'v>,
     event_type: &str,
     data: &serde_json::Value,
+    event_def: Option<&EventDef>,
 ) -> Value<'v> {
-    let fields: Vec<(&str, Value<'v>)> = vec![
-        ("type", module.heap().alloc(event_type)),
-        ("data", module.heap().alloc(data.clone())),
-    ];
-    module.heap().alloc(AllocStruct(fields))
+    let heap = module.heap();
+    let data_value = match (event_def, data.as_object()) {
+        (Some(def), Some(obj)) if def.fields.iter().any(|(_, m)| m.subject.is_some()) => {
+            alloc_row_with_handles(heap, &def.fields, obj)
+        }
+        _ => heap.alloc(data.clone()),
+    };
+    let fields: Vec<(&str, Value<'v>)> =
+        vec![("type", heap.alloc(event_type)), ("data", data_value)];
+    heap.alloc(AllocStruct(fields))
+}
+
+/// Materialise a stored row (event data, or a projector read-model row) as a Starlark
+/// dict, wrapping every subject-scoped field's ciphertext as an opaque
+/// [`CipherHandle`] so a handler sees a handle, never plaintext or raw ciphertext.
+/// The subject id (a sibling plaintext column) scopes the handle; a present ciphertext
+/// whose subject id is absent or non-scalar is still wrapped (with an empty subject id)
+/// so it survives a read-modify-write, never silently dropped. A null (unset optional)
+/// subject field stays absent. Shared by `alloc_event` and the projector `get()`
+/// builtin, so both read paths wrap identically.
+pub fn alloc_row_with_handles<'v>(
+    heap: Heap<'v>,
+    fields: &[(String, FieldMeta)],
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Value<'v> {
+    let meta_of = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, m)| m);
+    let mut pairs: Vec<(String, Value<'v>)> = Vec::with_capacity(obj.len());
+    for (key, value) in obj {
+        let wrapped = match meta_of(key).and_then(|meta| meta.subject.as_ref()) {
+            Some(subject_field) => match value.as_str() {
+                Some(ciphertext) => {
+                    // A ciphertext is always wrapped so it stays opaque and is preserved
+                    // across a read-modify-write. When the subject id is present the
+                    // handle is fully scoped; when it is absent or non-scalar (a corrupt
+                    // or legacy row the write path could not produce) the handle carries
+                    // an empty subject id, so a `put` that rewrites the row fails loudly
+                    // in `enforce_subject_columns` (the id cannot be reconciled) rather
+                    // than silently nulling the stored ciphertext.
+                    let subject_value = obj
+                        .get(subject_field)
+                        .and_then(scalar_to_string)
+                        .unwrap_or_default();
+                    heap.alloc(CipherHandle {
+                        ciphertext: ciphertext.to_owned(),
+                        field: key.clone(),
+                        subject_field: subject_field.clone(),
+                        subject_value,
+                    })
+                }
+                // A null (unset optional) subject field stays absent/None.
+                None => heap.alloc(value.clone()),
+            },
+            None => heap.alloc(value.clone()),
+        };
+        pairs.push((key.clone(), wrapped));
+    }
+    heap.alloc(AllocDict(pairs))
+}
+
+/// The scalar string form of a JSON value for a tag or a subject id: strings as-is,
+/// numbers and bools by their canonical text. `None` for null or a composite.
+pub(crate) fn scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1670,7 +2025,7 @@ pub fn parse_entity_ops(val: Value<'_>) -> anyhow::Result<Vec<EntityOp>> {
 /// (a `put`, which replaces the whole row) every non-`optional` field must also
 /// be present; a `patch` only touches the fields it names, so `full` is false.
 fn validate_row(
-    fields: &[(String, FieldKind)],
+    fields: &[(String, FieldMeta)],
     obj: &serde_json::Map<String, serde_json::Value>,
     full: bool,
 ) -> anyhow::Result<()> {
@@ -1679,15 +2034,104 @@ fn validate_row(
             anyhow::bail!("unknown field `{key}`");
         }
     }
-    for (name, kind) in fields {
+    for (name, meta) in fields {
         match obj.get(name) {
-            Some(value) if value.is_null() && !kind.is_nullable() => {
+            Some(value) if value.is_null() && !meta.is_nullable() => {
                 anyhow::bail!("field `{name}` is not optional and cannot be null");
             }
-            None if full && !kind.is_nullable() => {
+            None if full && !meta.is_nullable() => {
                 anyhow::bail!("required field `{name}` is missing");
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Enforce that every subject-scoped entity column receives a matching
+/// [`CipherHandle`] (the ciphertext read from an event), not a plaintext value a
+/// handler fabricated. A handle must carry the column's own name (its associated
+/// data), the column's declared subject field, and a subject value that agrees with
+/// the row's subject-id column. This is what keeps a read model from ever holding
+/// plaintext, and keeps one subject's data from being filed under another's id. Runs
+/// on the Starlark row before it is flattened to JSON, where handle provenance is
+/// lost. `patch_key` is the patched row's key, used when the subject id is the entity
+/// key and so not present in the changes.
+fn enforce_subject_columns<'v>(
+    def: &EntityDef,
+    dict: &DictRef<'v>,
+    patch_key: Option<&str>,
+) -> anyhow::Result<()> {
+    let entry = |name: &str| -> Option<Value<'v>> {
+        dict.iter()
+            .find_map(|(k, v)| (k.unpack_str() == Some(name)).then_some(v))
+    };
+    let string_of = |value: Value<'v>| -> Option<String> {
+        value
+            .to_json_value()
+            .ok()
+            .as_ref()
+            .and_then(scalar_to_string)
+    };
+    // A handle may only be stored into a subject-scoped column. Anywhere else it would
+    // be filed as opaque ciphertext the read API never decrypts and `reveal()` cannot
+    // reach: a silent, permanent loss. Reject it.
+    for (key, value) in dict.iter() {
+        if value.downcast_ref::<CipherHandle>().is_some() {
+            let name = key.unpack_str().unwrap_or_default();
+            let subject_column = def
+                .fields
+                .iter()
+                .any(|(field, meta)| field == name && meta.subject.is_some());
+            if !subject_column {
+                anyhow::bail!(
+                    "column `{name}` is not subject-encrypted, so it cannot store an encrypted value read from an event"
+                );
+            }
+        }
+    }
+    for (col, meta) in &def.fields {
+        let Some(subject_field) = &meta.subject else {
+            continue;
+        };
+        let Some(value) = entry(col) else {
+            continue; // absent: `validate_row` enforces presence for a `put`
+        };
+        if value.is_none() {
+            continue; // explicit null on an optional column
+        }
+        let handle = value.downcast_ref::<CipherHandle>().ok_or_else(|| {
+            anyhow::anyhow!(
+                "column `{col}` is subject-encrypted; store the value read from the event (an encrypted handle), not a {}",
+                value.get_type()
+            )
+        })?;
+        if handle.field != *col {
+            anyhow::bail!(
+                "column `{col}` received a value encrypted for field `{}`; a handle may only be stored into its own column",
+                handle.field
+            );
+        }
+        if handle.subject_field != *subject_field {
+            anyhow::bail!(
+                "column `{col}` is scoped to subject `{subject_field}`, but the value is scoped to `{}`",
+                handle.subject_field
+            );
+        }
+        let expected = match entry(subject_field).and_then(string_of) {
+            Some(id) => id,
+            None => match patch_key {
+                Some(key) if def.key == *subject_field => key.to_owned(),
+                _ => anyhow::bail!(
+                    "column `{col}` needs its subject id `{subject_field}` present in the same row to store"
+                ),
+            },
+        };
+        if handle.subject_value != expected {
+            anyhow::bail!(
+                "column `{col}` holds data for `{subject_field}` = `{}`, but the row's `{subject_field}` is `{expected}`",
+                handle.subject_value
+            );
         }
     }
     Ok(())
@@ -1723,10 +2167,24 @@ pub fn check_fields(
 /// it is built.
 pub fn validate_event_payload(
     event_type: &str,
-    fields: &[(String, FieldKind)],
+    fields: &[(String, FieldMeta)],
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<()> {
-    check_fields(&format!("event `{event_type}`"), fields, obj)
+    let what = format!("event `{event_type}`");
+    for key in obj.keys() {
+        if !fields.iter().any(|(name, _)| name == key) {
+            anyhow::bail!("{what}: unknown field `{key}`");
+        }
+    }
+    for (name, meta) in fields {
+        match obj.get(name) {
+            Some(value) => check_value(&meta.kind, value)
+                .map_err(|err| anyhow::anyhow!("{what} field `{name}`: {err}"))?,
+            None if meta.is_nullable() => {}
+            None => anyhow::bail!("{what}: missing required field `{name}`"),
+        }
+    }
+    Ok(())
 }
 
 /// Validate a command's request body against its input schema before the decision
@@ -1806,29 +2264,58 @@ fn is_decimal_string(text: &str) -> bool {
     digits(whole) && parts.next().map(digits).unwrap_or(true)
 }
 
-/// Build the tags for a constructed event from its declared tag fields. A tag's
-/// value is the field's scalar value stringified; a null (an `optional` tag field
-/// left unset) contributes no tag.
+/// Build the tags for a constructed event under automatic tagging: every `indexed`
+/// field becomes a keyed tag whose value is its scalar stringified. A null (an
+/// `optional` field left unset) and an `indexed = False` field contribute no tag.
+///
+/// Subject-scoped fields are left as their plaintext value here; the runtime's emit
+/// lowering ([`crate::dispatch::build_event`]) replaces them with ciphertext (and
+/// adds the global-key tag for a `unique` field), because only the runtime holds the
+/// key store. In pure contexts (a projector fold, `kiln test`) that never reach the
+/// store, the plaintext form is what is compared.
 fn derive_tags(
     event_type: &str,
-    tag_fields: &[String],
+    fields: &[(String, FieldMeta)],
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<Vec<(String, Option<String>)>> {
-    let mut tags = Vec::with_capacity(tag_fields.len());
-    for field in tag_fields {
-        let text = match obj.get(field) {
+    let mut tags = Vec::with_capacity(fields.len());
+    for (name, meta) in fields {
+        if !meta.indexed {
+            continue;
+        }
+        let text = match obj.get(name) {
             None | Some(serde_json::Value::Null) => continue,
             Some(serde_json::Value::String(value)) => value.clone(),
             Some(serde_json::Value::Number(value)) => value.to_string(),
             Some(serde_json::Value::Bool(value)) => value.to_string(),
             Some(other) => anyhow::bail!(
-                "event `{event_type}`: tag field `{field}` must be a scalar, got a {}",
+                "event `{event_type}`: indexed field `{name}` must be a scalar, got a {}",
                 json_kind(other)
             ),
         };
-        tags.push((field.clone(), Some(text)));
+        tags.push((name.clone(), Some(text)));
     }
     Ok(tags)
+}
+
+/// Build a typed query clause's constraints from the fields a query-position event
+/// call provided: `(field, value-as-string)` pairs, in the order given. A constraint
+/// value must be a scalar; the deeper checks (the field exists, is indexed, is
+/// well-typed, and a subject field's key is derivable) are deploy-time concerns in
+/// [`crate::validate`], which reports them as errors rather than as an evaluation
+/// failure. Fields not named are simply unconstrained (a subset match).
+fn build_query_constraints(
+    event_type: &str,
+    provided: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut constraints = Vec::with_capacity(provided.len());
+    for (name, value) in provided {
+        let text = scalar_to_string(value).ok_or_else(|| {
+            anyhow::anyhow!("event `{event_type}`: filter `{name}` must be a scalar")
+        })?;
+        constraints.push((name.clone(), text));
+    }
+    Ok(constraints)
 }
 
 fn json_kind(value: &serde_json::Value) -> &'static str {
@@ -1877,17 +2364,19 @@ pub fn parse_event_specs(val: Value<'_>) -> anyhow::Result<Vec<EventSpec>> {
 mod tests {
     use super::*;
 
-    fn fields() -> Vec<(String, FieldKind)> {
+    fn fields() -> Vec<(String, FieldMeta)> {
         vec![
-            ("id".to_owned(), FieldKind::Uuid),
-            ("amount".to_owned(), FieldKind::Money),
+            ("id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+            ("amount".to_owned(), FieldMeta::plain(FieldKind::Money)),
             (
                 "kind".to_owned(),
-                FieldKind::OneOf(vec!["a".to_owned(), "b".to_owned()]),
+                FieldMeta::plain(FieldKind::OneOf(vec!["a".to_owned(), "b".to_owned()])),
             ),
             (
                 "note".to_owned(),
-                FieldKind::Optional(Box::new(FieldKind::Text { max_length: None })),
+                FieldMeta::plain(FieldKind::Optional(Box::new(FieldKind::Text {
+                    max_length: None,
+                }))),
             ),
         ]
     }
@@ -1929,9 +2418,37 @@ mod tests {
     }
 
     #[test]
-    fn derives_tags_and_skips_null_optionals() {
+    fn auto_tags_indexed_fields_and_skips_null_optionals() {
+        // Auto-tagging: every present, indexed field becomes a tag; the absent
+        // optional `note` contributes none.
         let obj = object(serde_json::json!({"id": "u1", "amount": "1", "kind": "a"}));
-        let tags = derive_tags("t", &["id".to_owned(), "note".to_owned()], &obj).unwrap();
+        let tags = derive_tags("t", &fields(), &obj).unwrap();
+        assert_eq!(
+            tags,
+            vec![
+                ("id".to_owned(), Some("u1".to_owned())),
+                ("amount".to_owned(), Some("1".to_owned())),
+                ("kind".to_owned(), Some("a".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn indexed_false_field_produces_no_tag() {
+        let fields = vec![
+            ("id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+            (
+                "note".to_owned(),
+                FieldMeta {
+                    kind: FieldKind::Text { max_length: None },
+                    indexed: false,
+                    subject: None,
+                    unique: false,
+                },
+            ),
+        ];
+        let obj = object(serde_json::json!({"id": "u1", "note": "secret"}));
+        let tags = derive_tags("t", &fields, &obj).unwrap();
         assert_eq!(tags, vec![("id".to_owned(), Some("u1".to_owned()))]);
     }
 
@@ -1953,7 +2470,7 @@ mod tests {
         use crate::context::HandleCtx;
 
         let ast = parse_module("t.star", "def f():\n    return now()\n".to_owned()).unwrap();
-        let frozen = eval_frozen(ast, &command_globals(), None).unwrap();
+        let frozen = eval_frozen(ast, &command_globals(), None, false).unwrap();
         Module::with_temp_heap(|module| {
             let func = frozen.get_option("f").unwrap().unwrap();
             // Without a context (as in `query`/`fold`), `now()` errors.

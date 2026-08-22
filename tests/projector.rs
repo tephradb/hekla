@@ -50,12 +50,20 @@ fn projector_reads_through_the_envelope() {
             ("email".to_owned(), Some("alice@example.com".to_owned())),
         ],
     };
-    let event = build_event(&emitted, &ctx, "1970-01-01T00:00:00Z", None).unwrap();
+    let event = build_event(
+        &emitted,
+        project.events.by_type.get(&emitted.event_type),
+        None,
+        &ctx,
+        "1970-01-01T00:00:00Z",
+        None,
+    )
+    .unwrap();
     store.append(vec![event], None).unwrap();
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("users.db"), entities).unwrap();
-    let seen = project_to_head(&store, &projector.loaded, &model).unwrap();
+    let seen = project_to_head(&store, &projector.loaded, &model, &project.events.by_type).unwrap();
     assert_eq!(seen, 1);
     // The checkpoint advanced to the appended event.
     assert_eq!(model.read_checkpoint().unwrap().get(), 1);
@@ -92,7 +100,6 @@ fn get_reads_through_uncommitted_writes_in_a_batch() {
 happened = event(
     type = "thing.happened",
     fields = {"id": uuid()},
-    tags = ["id"],
 )
 "#,
     );
@@ -104,7 +111,7 @@ load("events/thing.star", "happened")
 
 totals = entity(key = "id", fields = {"id": text(), "count": i64_()})
 
-source = events(types = ["thing.happened"])
+source = [happened()]
 
 def handle(event):
     row = get(totals, "all")
@@ -136,13 +143,21 @@ def handle(event):
             data: json!({ "id": id }),
             tags: vec![("id".to_owned(), Some(id.clone()))],
         };
-        let event = build_event(&emitted, &ctx, "1970-01-01T00:00:00Z", None).unwrap();
+        let event = build_event(
+            &emitted,
+            project.events.by_type.get(&emitted.event_type),
+            None,
+            &ctx,
+            "1970-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap();
         store.append(vec![event], None).unwrap();
     }
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("counter.db"), entities).unwrap();
-    let seen = project_to_head(&store, &projector.loaded, &model).unwrap();
+    let seen = project_to_head(&store, &projector.loaded, &model, &project.events.by_type).unwrap();
     assert_eq!(seen, 2);
 
     let entity = entities.iter().find(|e| e.name == "totals").unwrap();

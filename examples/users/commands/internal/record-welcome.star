@@ -15,7 +15,7 @@ input = schema(
 )
 
 def query(input):
-    return events(types = ["user.welcomed"], tags = {"user_id": input.user_id})
+    return user_welcomed(user_id = input.user_id)
 
 def fold(state, event):
     return True

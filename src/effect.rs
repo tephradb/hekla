@@ -28,7 +28,7 @@
 //! `/status`. The only escape past a genuinely unprocessable event is an explicit
 //! operator skip.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
@@ -316,7 +316,9 @@ fn run_inner(
     let ModuleDef::Effect { name, sources } = &unit.loaded.def else {
         anyhow::bail!("run called on a non-effect module");
     };
-    let query = dispatch::to_query(sources)?;
+    // Sources filter on plaintext fields only (check-time rejects encrypted source
+    // constraints), so no key store is needed to lower them.
+    let query = dispatch::to_query(sources, runtime.events_map(), None)?;
     let resume = runtime.effect_resume_after(name)?;
     let mut sub = runtime.store().subscribe(query, Position::new(resume));
     loop {
@@ -422,12 +424,24 @@ fn run_invocation(
                 shared.clear_failures();
                 return Ok(Progress::Advanced);
             }
-            Err(err) => {
-                let message = format!("{err:#}");
-                shared.record_failure(&message);
+            // A terminal failure (an erased subject a `reveal()` needed) cannot be
+            // recovered by retrying, so complete the invocation and move on rather
+            // than wedge forever. Logged loudly, and left in `last_error` for /status.
+            Err(failure) if failure.terminal => {
                 tracing::error!(
-                    "effect `{effect}` invocation at position {position} failed (attempt {}): {message}",
-                    attempt + 1
+                    "effect `{effect}` invocation at position {position} failed terminally: {}",
+                    failure.message
+                );
+                shared.record_failure(&failure.message);
+                runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
+                return Ok(Progress::Advanced);
+            }
+            Err(failure) => {
+                shared.record_failure(&failure.message);
+                tracing::error!(
+                    "effect `{effect}` invocation at position {position} failed (attempt {}): {}",
+                    attempt + 1,
+                    failure.message
                 );
                 if wedge_wait(shared, position, backoff(attempt)) {
                     return Ok(Progress::Interrupted);
@@ -450,13 +464,8 @@ fn try_invocation(
     loaded: &LoadedModule,
     runtime: &Arc<Runtime>,
     http: &dyn HttpClient,
-) -> anyhow::Result<()> {
+) -> Result<(), InvocationFailure> {
     Module::with_temp_heap(|module| {
-        let handle_fn = loaded
-            .module
-            .get_option("handle")?
-            .ok_or_else(|| anyhow::anyhow!("effect has no handle() function"))?;
-        let value = alloc_event(&module, event_type, data);
         let host = EffectHostImpl {
             runtime,
             http,
@@ -464,18 +473,37 @@ fn try_invocation(
             effect: effect.to_owned(),
             position,
             disambiguators: RefCell::new(HashMap::new()),
+            terminal: Cell::new(false),
         };
         let ctx = EffectCtx { host: &host };
-        call_handler_with_effect_ctx(
-            &module,
-            thaw(&handle_fn, &module),
-            &[value],
-            MAX_TICKS,
-            &ctx,
-        )
-        .map_err(|err| anyhow::anyhow!("handle() failed: {err}"))?;
-        anyhow::Ok(())
+        let outcome = (|| -> anyhow::Result<()> {
+            let handle_fn = loaded
+                .module
+                .get_option("handle")?
+                .ok_or_else(|| anyhow::anyhow!("effect has no handle() function"))?;
+            let value = alloc_event(&module, event_type, data, runtime.event_def(event_type));
+            call_handler_with_effect_ctx(
+                &module,
+                thaw(&handle_fn, &module),
+                &[value],
+                MAX_TICKS,
+                &ctx,
+            )
+            .map_err(|err| anyhow::anyhow!("handle() failed: {err}"))?;
+            Ok(())
+        })();
+        outcome.map_err(|err| InvocationFailure {
+            message: format!("{err:#}"),
+            terminal: host.terminal.get(),
+        })
     })
+}
+
+/// A failed invocation attempt: its message, and whether the failure is terminal (no
+/// retry can succeed, e.g. a `reveal()` of an erased subject) rather than a wedge.
+struct InvocationFailure {
+    message: String,
+    terminal: bool,
 }
 
 /// The wedge backoff for `attempt`, doubling from [`BACKOFF_BASE`] up to
@@ -534,6 +562,10 @@ struct EffectHostImpl<'a> {
     /// Per-call-hash counters, reset for each invocation run, so identical
     /// repeated calls get 0, 1, 2 ... and a replay lines them up.
     disambiguators: RefCell<HashMap<String, u64>>,
+    /// Set when a `reveal()` hit an erased subject: the failure is terminal (the
+    /// data is gone, no retry recovers it), so the driver completes rather than
+    /// wedges the invocation.
+    terminal: Cell<bool>,
 }
 
 impl EffectHostImpl<'_> {
@@ -701,6 +733,35 @@ impl EffectHost for EffectHostImpl<'_> {
 
     fn log(&self, message: &str) {
         tracing::info!("effect `{}` @ {}: {message}", self.effect, self.position);
+    }
+
+    fn reveal(
+        &self,
+        subject_field: &str,
+        subject_value: &str,
+        field: &str,
+        ciphertext: &str,
+    ) -> anyhow::Result<String> {
+        // Auditable: every crossing of the decrypt boundary is traced.
+        tracing::debug!(
+            "effect `{}` @ {}: reveal {subject_field}={subject_value} field={field}",
+            self.effect,
+            self.position
+        );
+        let keystore = self.runtime.keystore().ok_or_else(|| {
+            anyhow::anyhow!("reveal() needs a master key, but none is configured")
+        })?;
+        match keystore.decrypt_subject(subject_field, subject_value, field, ciphertext)? {
+            Some(plaintext) => Ok(plaintext),
+            None => {
+                // The subject was erased. No retry can recover the data, so mark this
+                // invocation terminal rather than let it wedge forever.
+                self.terminal.set(true);
+                anyhow::bail!(
+                    "reveal() cannot decrypt `{field}`: subject `{subject_field}` = `{subject_value}` has been erased"
+                )
+            }
+        }
     }
 }
 

@@ -16,6 +16,7 @@ use kiln::projector::ProjectorSet;
 use kiln::runtime::Runtime;
 use kiln::server;
 use serde_json::{Value, json};
+use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 use tephra::WriteCoordinator;
@@ -47,8 +48,8 @@ fn write_project(files: &[(&str, &str)]) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     for (rel, content) in files {
         let path = dir.path().join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, content).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
     }
     dir
 }
@@ -59,7 +60,7 @@ fn boot() -> Harness {
     assert!(!project.has_errors(), "{:?}", project.findings);
     let data = tempfile::tempdir().unwrap();
     let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http, None).unwrap();
     Harness {
         rt,
         coord,
@@ -415,7 +416,7 @@ async fn status_reports_a_failed_projector() {
     let dir = write_project(&[
         (
             "events/e.star",
-            r#"boom = event(type = "boom.happened", fields = {"id": uuid()}, tags = ["id"])
+            r#"boom = event(type = "boom.happened", fields = {"id": uuid()})
 "#,
         ),
         (
@@ -432,9 +433,11 @@ def handle(input, state):
         (
             "projectors/watch.star",
             r#"
+load("events/e.star", "boom")
+
 things = entity(key = "id", fields = {"id": uuid()})
 
-source = events(types = ["boom.happened"])
+source = [boom()]
 
 def handle(event):
     fail("projector boom")
@@ -445,7 +448,7 @@ def handle(event):
     assert!(!project.has_errors(), "{:?}", project.findings);
     let data = tempfile::tempdir().unwrap();
     let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http, None).unwrap();
 
     let ctx = CommandContext::new(Uuid::new_v4());
     let result = rt
@@ -489,19 +492,21 @@ async fn a_filter_value_of_the_wrong_type_is_a_400() {
     let dir = write_project(&[
         (
             "events/e.star",
-            r#"scored = event(type = "scored", fields = {"id": uuid(), "n": i64_()}, tags = ["id"])
+            r#"scored = event(type = "scored", fields = {"id": uuid(), "n": i64_()})
 "#,
         ),
         (
             "projectors/nums.star",
             r#"
+load("events/e.star", "scored")
+
 scores = entity(
     key = "id",
     fields = {"id": uuid(), "n": i64_()},
     indexes = [index("by_n", ["n"])],
 )
 
-source = events(types = ["scored"])
+source = [scored()]
 
 def handle(event):
     return [put(scores, {"id": event.data["id"], "n": event.data["n"]})]
@@ -512,7 +517,7 @@ def handle(event):
     assert!(!project.has_errors(), "{:?}", project.findings);
     let data = tempfile::tempdir().unwrap();
     let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http, None).unwrap();
     let app = server::app(Arc::clone(&rt));
 
     let (status, body) = get(&app, "/read/nums/scores?n=abc").await;

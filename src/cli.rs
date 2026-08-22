@@ -7,14 +7,15 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::effect::{HttpClient, UreqClient};
 use crate::loader::{Finding, LoadedProject, Severity};
-use crate::{fmt, runtime, server, testing, validate};
+use crate::opdb::OpDb;
+use crate::{crypto, fmt, runtime, server, testing, validate};
 
 /// The default HTTP bind address when `--addr` is not given.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
@@ -66,6 +67,33 @@ enum Command {
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
+    /// Rewrap every subject key under the primary master key (`KILN_MASTER_KEY`),
+    /// unwrapping with the previous keys (`KILN_MASTER_KEY_PREVIOUS`) as needed. Run
+    /// after changing the master to migrate rows off the old key. Ciphertext is
+    /// unchanged, so reads keep working throughout.
+    Rotate {
+        /// The project directory (to resolve the data directory).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// The data directory (operational DB). Defaults to `<dir>/data`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Erase a subject: delete its encryption key, making every value scoped to it
+    /// unreadable and unmatchable across the log and every read model at once. This
+    /// is irreversible.
+    Erase {
+        /// The subject field (e.g. `customer_id`).
+        subject_field: String,
+        /// The subject id value (e.g. `42`).
+        subject_value: String,
+        /// The project directory (to resolve the data directory).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// The data directory (operational DB). Defaults to `<dir>/data`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 /// Parse arguments and run, returning the process exit code.
@@ -80,6 +108,82 @@ pub fn run() -> ExitCode {
             data_dir,
         } => serve(&dir, addr.as_deref(), data_dir.as_deref()),
         Command::Test { dir } => testing::run(&dir),
+        Command::Rotate { dir, data_dir } => rotate(&dir, data_dir.as_deref()),
+        Command::Erase {
+            subject_field,
+            subject_value,
+            dir,
+            data_dir,
+        } => erase(&subject_field, &subject_value, &dir, data_dir.as_deref()),
+    }
+}
+
+/// Rewrap every subject key under the primary master. Needs `KILN_MASTER_KEY` (and
+/// `KILN_MASTER_KEY_PREVIOUS` for the keys rows are currently wrapped under).
+fn rotate(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
+    let master = match crypto::master_keys_from_env() {
+        Ok(Some(master)) => master,
+        Ok(None) => {
+            eprintln!("error: KILN_MASTER_KEY must be set to rotate");
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("error: reading the master key: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let data = runtime::resolve_data_dir(dir, data_dir);
+    let opdb = match OpDb::open(&data.join("kiln.db")) {
+        Ok(opdb) => Arc::new(Mutex::new(opdb)),
+        Err(err) => {
+            eprintln!("error: opening the operational database: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let keystore = crypto::KeyStore::new(opdb, master);
+    match keystore.rotate() {
+        Ok(count) => {
+            println!("rewrapped {count} subject key(s) under the primary master");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Erase a subject by deleting its key from the operational DB. No master key is
+/// needed: this is a row delete that shreds the ciphertext everywhere at once.
+fn erase(
+    subject_field: &str,
+    subject_value: &str,
+    dir: &Path,
+    data_dir: Option<&Path>,
+) -> ExitCode {
+    let data = runtime::resolve_data_dir(dir, data_dir);
+    let opdb = match OpDb::open(&data.join("kiln.db")) {
+        Ok(opdb) => opdb,
+        Err(err) => {
+            eprintln!("error: opening the operational database: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match crypto::erase_subject(&opdb, subject_field, subject_value) {
+        Ok(true) => {
+            println!("erased subject `{subject_field}` = `{subject_value}`");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!(
+                "no key for subject `{subject_field}` = `{subject_value}` (already erased or never created)"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -129,14 +233,21 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>) -> ExitCode {
     };
     let data = runtime::resolve_data_dir(dir, data_dir);
     let http: Arc<dyn HttpClient> = Arc::new(UreqClient::new());
-    let (rt, coordinator, projectors, effects) = match runtime::Runtime::open(project, &data, http)
-    {
-        Ok(parts) => parts,
+    let master = match crypto::master_keys_from_env() {
+        Ok(master) => master,
         Err(err) => {
-            eprintln!("error: {err:#}");
+            eprintln!("error: reading the master key: {err:#}");
             return ExitCode::FAILURE;
         }
     };
+    let (rt, coordinator, projectors, effects) =
+        match runtime::Runtime::open(project, &data, http, master) {
+            Ok(parts) => parts,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let tokio_rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

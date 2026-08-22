@@ -1,5 +1,6 @@
 # Shared event definitions. Commands import these and emit them; the runtime
-# validates each payload against the fields and derives tags from the tag fields.
+# validates each payload against the fields and derives a tag from every indexed
+# field automatically (opt a field out with indexed = False).
 
 user_registered = event(
     type = "user.registered",
@@ -8,7 +9,6 @@ user_registered = event(
         "email": text(),
         "name": text(),
     },
-    tags = ["user_id", "email"],
 )
 
 user_renamed = event(
@@ -17,7 +17,6 @@ user_renamed = event(
         "user_id": uuid(),
         "name": text(),
     },
-    tags = ["user_id"],
 )
 
 user_welcomed = event(
@@ -25,7 +24,6 @@ user_welcomed = event(
     fields = {
         "user_id": uuid(),
     },
-    tags = ["user_id"],
 )
 
 reminder_scheduled = event(
@@ -35,5 +33,4 @@ reminder_scheduled = event(
         # Domain time, set from the request's pinned clock by the command.
         "due_at": timestamp(),
     },
-    tags = ["user_id"],
 )

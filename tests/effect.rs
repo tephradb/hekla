@@ -41,7 +41,7 @@ fn boot(data: &Path, http: Arc<dyn HttpClient>) -> Booted {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/users");
     let project = LoadedProject::load(&root);
     assert!(!project.has_errors(), "{:?}", project.findings);
-    let (rt, coord, projectors, effects) = Runtime::open(project, data, http).unwrap();
+    let (rt, coord, projectors, effects) = Runtime::open(project, data, http, None).unwrap();
     Booted {
         rt,
         coord,

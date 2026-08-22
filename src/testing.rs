@@ -10,6 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use allocative::Allocative;
 use anyhow::Context;
@@ -23,8 +24,10 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::context::CommandContext;
-use crate::dispatch::{self, CommandOutcome, build_event};
+use crate::crypto::{KeyStore, MasterKeys};
+use crate::dispatch::{self, CommandOutcome, EventDefs, build_event};
 use crate::loader::{CommandUnit, LoadedProject};
+use crate::opdb::OpDb;
 use crate::starlark_builtins::{
     ConstructedEvent, EmitOutcome, EmittedEvent, InvalidInput, Rejection, runtime_builtins,
 };
@@ -35,6 +38,10 @@ use std::fmt;
 const TEST_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 /// A fixed clock so a `now()`-using command is reproducible under test.
 const TEST_NOW: &str = "1970-01-01T00:00:00Z";
+/// A fixed, non-secret master key so `kiln test` can exercise subject-scoped
+/// encryption deterministically without any environment setup. Test assertions
+/// compare plaintext events, so the ciphertext values never surface.
+const TEST_MASTER_KEY: [u8; 32] = [0x2a; 32];
 
 /// What a scenario expects the command to do.
 #[derive(Debug, Clone, Allocative)]
@@ -247,13 +254,17 @@ fn run_case(project: &LoadedProject, case: &TestCase) -> Result<(), String> {
         .find(|unit| unit.loaded.def.name() == case.command)
         .ok_or_else(|| format!("no command named `{}`", case.command))?;
 
-    match execute_case(command, case) {
+    match execute_case(command, &project.events.by_type, case) {
         Ok(outcome) => compare(&case.expect, &outcome),
         Err(err) => Err(format!("{err:#}")),
     }
 }
 
-fn execute_case(command: &CommandUnit, case: &TestCase) -> anyhow::Result<CommandOutcome> {
+fn execute_case(
+    command: &CommandUnit,
+    events: &EventDefs,
+    case: &TestCase,
+) -> anyhow::Result<CommandOutcome> {
     let dir = tempfile::tempdir().context("creating a temp store")?;
     let set = SegmentSet::open(
         dir.path().join("events"),
@@ -262,6 +273,12 @@ fn execute_case(command: &CommandUnit, case: &TestCase) -> anyhow::Result<Comman
     .context("opening the temp store")?;
     let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default())
         .context("starting the temp writer")?;
+
+    // A per-case in-memory key store under the fixed test master key, so subject
+    // fields encrypt and match just as they would live. Assertions compare plaintext
+    // events, so the ciphertext never appears in a test.
+    let opdb = Arc::new(Mutex::new(OpDb::open_in_memory()?));
+    let keystore = KeyStore::new(opdb, MasterKeys::new(TEST_MASTER_KEY, vec![]));
 
     let seed_ctx = CommandContext::new(Uuid::new_v4());
     let mut packed = Vec::with_capacity(case.given.len());
@@ -272,7 +289,14 @@ fn execute_case(command: &CommandUnit, case: &TestCase) -> anyhow::Result<Comman
             data,
             tags: event.tags.clone(),
         };
-        packed.push(build_event(&emitted, &seed_ctx, TEST_NOW, None)?);
+        packed.push(build_event(
+            &emitted,
+            events.get(&emitted.event_type),
+            Some(&keystore),
+            &seed_ctx,
+            TEST_NOW,
+            None,
+        )?);
     }
     if !packed.is_empty() {
         store
@@ -286,7 +310,16 @@ fn execute_case(command: &CommandUnit, case: &TestCase) -> anyhow::Result<Comman
     // Host-side validation is a first-class outcome, and the runtime performs it
     // once before dispatch; mirror that split here so tests exercise the same path.
     let outcome = match dispatch::validate_input(&command.loaded, &input) {
-        Ok(()) => dispatch::run_command(&store, &command.loaded, &input, &ctx, TEST_NOW, None)?,
+        Ok(()) => dispatch::run_command(
+            &store,
+            &command.loaded,
+            events,
+            Some(&keystore),
+            &input,
+            &ctx,
+            TEST_NOW,
+            None,
+        )?,
         Err(err) => CommandOutcome::InvalidInput {
             message: format!("{err}"),
         },

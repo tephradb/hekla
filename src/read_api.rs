@@ -15,8 +15,9 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
 
+use crate::crypto::{KeyStore, RowDecryptor};
 use crate::read_model::ReadModel;
-use crate::starlark_builtins::EntityDef;
+use crate::starlark_builtins::{EntityDef, FieldKind, scalar_to_string};
 
 /// Default page size for a scan when the request does not set `limit`.
 pub const DEFAULT_LIMIT: usize = 50;
@@ -62,7 +63,7 @@ pub fn is_filterable(entity: &EntityDef, field: &str) -> bool {
 /// so it is a declared field; an unknown field is left for that check to reject.
 pub fn check_filter(entity: &EntityDef, field: &str, value: &str) -> anyhow::Result<()> {
     match entity.fields.iter().find(|(name, _)| name == field) {
-        Some((_, kind)) => crate::read_model::coerce_value(kind, value).map(|_| ()),
+        Some((_, meta)) => crate::read_model::coerce_value(&meta.kind, value).map(|_| ()),
         None => Ok(()),
     }
 }
@@ -81,17 +82,94 @@ pub fn decode_cursor(cursor: &str) -> anyhow::Result<String> {
 }
 
 /// Read one row by key, plus the projector position, in one read snapshot.
+/// Subject-encrypted columns are decrypted on the way out; a column whose subject
+/// key has been erased comes back absent.
 pub fn get_one(
     db_path: &Path,
     entity: &EntityDef,
     key: &str,
+    keystore: Option<&KeyStore>,
 ) -> anyhow::Result<(Option<Value>, u64)> {
     let model = open_with_retry(db_path)?;
     let snapshot = model.begin()?;
     let position = model.read_checkpoint()?.get();
-    let item = model.get(entity, key)?;
+    let mut item = model.get(entity, key)?;
     drop(snapshot);
+    if let (Some(row), Some(ks)) = (item.as_mut(), keystore) {
+        decrypt_row(entity, row, &ks.row_decryptor())?;
+    }
     Ok((item, position))
+}
+
+/// Decrypt every subject-encrypted column of a read-model row in place, using the
+/// sibling subject-id column's value to find the key (via a per-request cache). A
+/// column that is unreadable under the current key is removed (reads as absent) rather
+/// than erroring: the key is gone (erased or never created), or the ciphertext will not
+/// decrypt under the present key (a stale row left under a superseded key). Only a key
+/// that cannot be obtained at all (a missing or rotated-away master) is an error, so a
+/// misconfigured master surfaces loudly instead of silently blanking every column.
+fn decrypt_row(
+    entity: &EntityDef,
+    row: &mut Value,
+    decryptor: &RowDecryptor<'_>,
+) -> anyhow::Result<()> {
+    let Some(obj) = row.as_object_mut() else {
+        return Ok(());
+    };
+    for (name, meta) in &entity.fields {
+        let Some(subject_field) = &meta.subject else {
+            continue;
+        };
+        let Some(ciphertext) = obj.get(name).and_then(Value::as_str).map(str::to_owned) else {
+            continue; // absent / null column
+        };
+        let plaintext = match obj.get(subject_field).and_then(scalar_to_string) {
+            // `decrypt` returns `Ok(None)` when the value is unreadable under the current
+            // key (the key is gone, or the ciphertext will not decrypt under it: a stale
+            // row under a superseded key, or a tampered ciphertext, which are
+            // indistinguishable); that column reads as absent, the erasure guarantee.
+            // Only a key that cannot be obtained at all (a wrong or rotated-away master)
+            // returns `Err` and must surface, not silently blank every column.
+            Some(subject_value) => decryptor
+                .decrypt(subject_field, &subject_value, name, &ciphertext)
+                .with_context(|| format!("decrypting column `{name}`"))?,
+            // No subject id to key on: the value is unreadable.
+            None => None,
+        };
+        match plaintext {
+            Some(text) => {
+                obj.insert(name.clone(), typed_from_string(&meta.kind, text));
+            }
+            None => {
+                obj.remove(name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-type a decrypted plaintext string to the field's declared kind, so an
+/// encrypted integer reads back as a JSON number. `money` stays a decimal string (its
+/// wire form), and `u64` parses as unsigned so values above `i64::MAX` survive.
+fn typed_from_string(kind: &FieldKind, text: String) -> Value {
+    match kind.base() {
+        FieldKind::I64 => text
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or(Value::String(text)),
+        FieldKind::U64 => text
+            .parse::<u64>()
+            .map(Value::from)
+            .unwrap_or(Value::String(text)),
+        FieldKind::Bool => match text.as_str() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::String(text),
+        },
+        FieldKind::Json => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        // Money is a decimal string on the wire; Text/Uuid/Timestamp/OneOf are strings.
+        _ => Value::String(text),
+    }
 }
 
 /// Scan an entity, optionally filtered by one indexed column and resumed after a
@@ -103,6 +181,7 @@ pub fn scan(
     filter: Option<(&str, &str)>,
     after_key: Option<&str>,
     limit: usize,
+    keystore: Option<&KeyStore>,
 ) -> anyhow::Result<Page> {
     let model = open_with_retry(db_path)?;
     let snapshot = model.begin()?;
@@ -121,6 +200,15 @@ pub fn scan(
     } else {
         None
     };
+    // The cursor is computed from the plaintext key (a key is never encrypted), so
+    // decrypting the rows afterward does not affect pagination. One decryptor for the
+    // whole page unwraps each subject's key once, not per row.
+    if let Some(ks) = keystore {
+        let decryptor = ks.row_decryptor();
+        for row in &mut items {
+            decrypt_row(entity, row, &decryptor)?;
+        }
+    }
     Ok(Page {
         items,
         next_cursor,
@@ -156,15 +244,21 @@ mod tests {
     use super::*;
 
     fn entity_with_index() -> EntityDef {
-        use crate::starlark_builtins::{FieldKind, IndexDef};
+        use crate::starlark_builtins::{FieldKind, FieldMeta, IndexDef};
         EntityDef {
             id: 1,
             name: "users".to_owned(),
             key: "user_id".to_owned(),
             fields: vec![
-                ("user_id".to_owned(), FieldKind::Uuid),
-                ("email".to_owned(), FieldKind::Text { max_length: None }),
-                ("name".to_owned(), FieldKind::Text { max_length: None }),
+                ("user_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+                (
+                    "email".to_owned(),
+                    FieldMeta::plain(FieldKind::Text { max_length: None }),
+                ),
+                (
+                    "name".to_owned(),
+                    FieldMeta::plain(FieldKind::Text { max_length: None }),
+                ),
             ],
             indexes: vec![IndexDef {
                 name: "by_email".to_owned(),

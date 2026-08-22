@@ -17,7 +17,7 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, Row, Transaction, params_from_iter};
 use tephra::Position;
 
-use crate::starlark_builtins::{EntityDef, EntityOpKind, FieldKind};
+use crate::starlark_builtins::{EntityDef, EntityOpKind, FieldKind, FieldMeta};
 
 /// The projector checkpoint, co-located with the read-model tables so it commits
 /// in the same transaction as the state it describes. `completed_above` records
@@ -29,7 +29,12 @@ CREATE TABLE IF NOT EXISTS _kiln_checkpoint (
     position        INTEGER NOT NULL,
     completed_above TEXT    NOT NULL DEFAULT '[]'
 );
-INSERT OR IGNORE INTO _kiln_checkpoint (id, position) VALUES (0, 0);";
+INSERT OR IGNORE INTO _kiln_checkpoint (id, position) VALUES (0, 0);
+CREATE TABLE IF NOT EXISTS _kiln_definition (
+    id              INTEGER PRIMARY KEY CHECK (id = 0),
+    definition_hash TEXT
+);
+INSERT OR IGNORE INTO _kiln_definition (id, definition_hash) VALUES (0, NULL);";
 
 /// A projector's materialised read model: one SQLite table per entity.
 pub struct ReadModel {
@@ -116,6 +121,31 @@ impl ReadModel {
         Ok(())
     }
 
+    /// The definition hash (source set + entity schema) the read model was last built
+    /// under, or `None` for a fresh model. Co-located with the data so it moves with a
+    /// rebuild's atomic swap and survives a crash together with the rows it describes.
+    pub fn read_definition(&self) -> anyhow::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT definition_hash FROM _kiln_definition WHERE id = 0",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .context("reading the projector definition hash")
+    }
+
+    /// Record the definition hash this read model is built under. Committed on its own,
+    /// so during a rebuild it is set on the fresh model before the swap.
+    pub fn set_definition(&self, definition_hash: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE _kiln_definition SET definition_hash = ?1 WHERE id = 0",
+                [definition_hash],
+            )
+            .context("recording the projector definition hash")?;
+        Ok(())
+    }
+
     /// Seal the database for a replay swap: fold the WAL back into the main file
     /// and drop to rollback journal mode, removing the `-wal`/`-shm` sidecars. The
     /// file becomes self-contained, so after the rename a reader that opens it
@@ -147,9 +177,9 @@ impl ReadModel {
                     placeholders
                 );
                 let mut values = Vec::with_capacity(entity.fields.len());
-                for (name, kind) in &entity.fields {
+                for (name, meta) in &entity.fields {
                     let value = obj.get(name).unwrap_or(&serde_json::Value::Null);
-                    values.push(to_sql(kind, value).with_context(|| format!("column `{name}`"))?);
+                    values.push(to_sql(meta, value).with_context(|| format!("column `{name}`"))?);
                 }
                 self.conn.execute(&sql, params_from_iter(values))?;
             }
@@ -160,11 +190,11 @@ impl ReadModel {
                     .context("patch changes are not a JSON object")?;
                 let mut assignments = Vec::new();
                 let mut values = Vec::new();
-                for (name, kind) in &entity.fields {
+                for (name, meta) in &entity.fields {
                     if let Some(value) = obj.get(name) {
                         assignments.push(format!("{name} = ?"));
                         values
-                            .push(to_sql(kind, value).with_context(|| format!("column `{name}`"))?);
+                            .push(to_sql(meta, value).with_context(|| format!("column `{name}`"))?);
                     }
                 }
                 if assignments.is_empty() {
@@ -229,7 +259,7 @@ impl ReadModel {
                 .fields
                 .iter()
                 .find(|(name, _)| name == column)
-                .map(|(_, kind)| kind);
+                .map(|(_, meta)| &meta.kind);
             binds.push(match kind {
                 Some(kind) => coerce_value(kind, value).unwrap_or_else(|_| text(value)),
                 None => text(value),
@@ -274,8 +304,8 @@ fn column_list(entity: &EntityDef) -> String {
 /// the entity's declared kinds. Columns must be selected in `entity.fields` order.
 fn row_to_json(entity: &EntityDef, row: &Row) -> anyhow::Result<serde_json::Value> {
     let mut obj = serde_json::Map::new();
-    for (i, (name, kind)) in entity.fields.iter().enumerate() {
-        let value = from_sql(kind, row.get_ref(i)?)?;
+    for (i, (name, meta)) in entity.fields.iter().enumerate() {
+        let value = from_sql(meta, row.get_ref(i)?)?;
         if !value.is_null() {
             obj.insert(name.clone(), value);
         }
@@ -288,16 +318,26 @@ fn key_kind(entity: &EntityDef) -> &FieldKind {
         .fields
         .iter()
         .find(|(name, _)| name == &entity.key)
-        .map(|(_, kind)| kind)
+        .map(|(_, meta)| &meta.kind)
         .expect("the key is a declared field")
 }
 
-/// Bind a JSON value as a typed SQLite value per the field's declared kind.
-fn to_sql(kind: &FieldKind, value: &serde_json::Value) -> anyhow::Result<SqlValue> {
+/// Bind a JSON value as a typed SQLite value per the field's declared kind. A
+/// subject-scoped column stores its opaque ciphertext string verbatim (as `TEXT`),
+/// regardless of the underlying kind; the read API decrypts and re-types it on read.
+fn to_sql(meta: &FieldMeta, value: &serde_json::Value) -> anyhow::Result<SqlValue> {
     if value.is_null() {
         return Ok(SqlValue::Null);
     }
-    Ok(match kind.base() {
+    if meta.subject.is_some() {
+        return Ok(SqlValue::Text(
+            value
+                .as_str()
+                .context("a subject-scoped column stores ciphertext text")?
+                .to_owned(),
+        ));
+    }
+    Ok(match meta.kind.base() {
         FieldKind::Bool => {
             let n = value
                 .as_bool()
@@ -306,10 +346,15 @@ fn to_sql(kind: &FieldKind, value: &serde_json::Value) -> anyhow::Result<SqlValu
                 .context("expected a boolean")?;
             SqlValue::Integer(n)
         }
-        FieldKind::I64 | FieldKind::U64 | FieldKind::Money => {
+        FieldKind::I64 | FieldKind::U64 => {
             SqlValue::Integer(value.as_i64().context("expected an integer")?)
         }
-        FieldKind::Text { .. } | FieldKind::Uuid | FieldKind::Timestamp | FieldKind::OneOf(_) => {
+        // Money is a decimal string on the wire, stored verbatim as text.
+        FieldKind::Text { .. }
+        | FieldKind::Uuid
+        | FieldKind::Timestamp
+        | FieldKind::OneOf(_)
+        | FieldKind::Money => {
             SqlValue::Text(value.as_str().context("expected a string")?.to_owned())
         }
         FieldKind::Json => SqlValue::Text(value.to_string()),
@@ -331,9 +376,10 @@ pub(crate) fn coerce_value(kind: &FieldKind, raw: &str) -> anyhow::Result<SqlVal
             "false" | "0" => SqlValue::Integer(0),
             _ => anyhow::bail!("expected a boolean (`true` or `false`)"),
         },
-        FieldKind::I64 | FieldKind::U64 | FieldKind::Money => {
+        FieldKind::I64 | FieldKind::U64 => {
             SqlValue::Integer(raw.parse::<i64>().context("expected an integer")?)
         }
+        // Money and the text-shaped kinds bind as their string form.
         _ => SqlValue::Text(raw.to_owned()),
     })
 }
@@ -350,12 +396,25 @@ fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.to_owned())
 }
 
-/// Reconstruct a JSON value from a stored column per the field's declared kind.
-fn from_sql(kind: &FieldKind, value: ValueRef) -> anyhow::Result<serde_json::Value> {
+/// Reconstruct a JSON value from a stored column per the field's declared kind. A
+/// subject-scoped column returns its stored ciphertext string as-is; the read API
+/// layer decrypts it (and re-types it to the underlying kind) on the way out.
+fn from_sql(meta: &FieldMeta, value: ValueRef) -> anyhow::Result<serde_json::Value> {
     use serde_json::Value as J;
+    if meta.subject.is_some() {
+        return Ok(match value {
+            ValueRef::Null => J::Null,
+            ValueRef::Text(bytes) => J::String(
+                str::from_utf8(bytes)
+                    .context("non-UTF-8 ciphertext column")?
+                    .to_owned(),
+            ),
+            _ => J::Null,
+        });
+    }
     Ok(match value {
         ValueRef::Null => J::Null,
-        ValueRef::Integer(i) => match kind.base() {
+        ValueRef::Integer(i) => match meta.kind.base() {
             FieldKind::Bool => J::Bool(i != 0),
             _ => J::Number(i.into()),
         },
@@ -364,7 +423,7 @@ fn from_sql(kind: &FieldKind, value: ValueRef) -> anyhow::Result<serde_json::Val
             .unwrap_or(J::Null),
         ValueRef::Text(bytes) => {
             let text = str::from_utf8(bytes).context("non-UTF-8 text column")?;
-            match kind.base() {
+            match meta.kind.base() {
                 FieldKind::Json => serde_json::from_str(text).unwrap_or(J::Null),
                 _ => J::String(text.to_owned()),
             }
@@ -388,8 +447,11 @@ mod tests {
             name: "users".to_owned(),
             key: "user_id".to_owned(),
             fields: vec![
-                ("user_id".to_owned(), FieldKind::Uuid),
-                ("email".to_owned(), FieldKind::Text { max_length: None }),
+                ("user_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+                (
+                    "email".to_owned(),
+                    FieldMeta::plain(FieldKind::Text { max_length: None }),
+                ),
             ],
             indexes: vec![],
         }
@@ -478,8 +540,8 @@ mod tests {
             name: "flags".to_owned(),
             key: "user_id".to_owned(),
             fields: vec![
-                ("user_id".to_owned(), FieldKind::Uuid),
-                ("active".to_owned(), FieldKind::Bool),
+                ("user_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+                ("active".to_owned(), FieldMeta::plain(FieldKind::Bool)),
             ],
             indexes: vec![],
         };

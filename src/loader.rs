@@ -178,7 +178,9 @@ impl LoadedProject {
         let loader = LibraryLoader {
             cache: &self.events.library,
         };
-        eval_frozen(ast, globals, Some(&loader)).map_err(|err| anyhow::anyhow!("{err}"))
+        // Test files call event definitions in `given`/`expect` to construct events,
+        // not to filter, so this is not query mode.
+        eval_frozen(ast, globals, Some(&loader), false).map_err(|err| anyhow::anyhow!("{err}"))
     }
 }
 
@@ -413,7 +415,7 @@ fn evaluate_one_library(
         .clone()
         .expect("library files have a load path");
     let loader = LibraryLoader { cache };
-    match eval_frozen(ast, globals, Some(&loader)) {
+    match eval_frozen(ast, globals, Some(&loader), false) {
         Ok(frozen) => {
             if matches!(file.role, Role::Events) {
                 register_events(&file.rel_path, &frozen, collector, findings);
@@ -495,7 +497,10 @@ fn evaluate_units(
             ModuleKind::Effect => effect_globals,
             ModuleKind::Projector => projector_globals,
         };
-        let frozen = match eval_frozen(ast, globals, Some(&loader)) {
+        // A projector's or effect's `source` calls event definitions as query
+        // clauses at module top level, so evaluate those in query mode.
+        let query_mode = matches!(kind, ModuleKind::Projector | ModuleKind::Effect);
+        let frozen = match eval_frozen(ast, globals, Some(&loader), query_mode) {
             Ok(frozen) => frozen,
             Err(err) => {
                 findings.push(Finding::error(&rel, format!("{err}")));

@@ -3,6 +3,8 @@
 # Read one by key at `GET /read/users/users/{user_id}`, or filter on the indexed
 # email at `GET /read/users/users?email=alice@example.com`.
 
+load("events/user.star", "user_registered", "user_renamed")
+
 users = entity(
     key = "user_id",
     fields = {
@@ -13,7 +15,7 @@ users = entity(
     indexes = [index("by_email", ["email"])],
 )
 
-source = events(types = ["user.registered", "user.renamed"])
+source = [user_registered(), user_renamed()]
 
 def handle(event):
     if event.type == "user.registered":

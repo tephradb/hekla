@@ -3,6 +3,8 @@
 # uncommitted writes and still lands the right count. Query it at
 # `GET /read/user-stats/totals/all`.
 
+load("events/user.star", "user_registered")
+
 totals = entity(
     key = "id",
     fields = {
@@ -11,7 +13,7 @@ totals = entity(
     },
 )
 
-source = events(types = ["user.registered"])
+source = [user_registered()]
 
 def handle(event):
     row = get(totals, "all")

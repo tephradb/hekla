@@ -7,13 +7,11 @@ input = schema(
     name = text(),
 )
 
-# The consistency boundary: every prior registration for this email. Filtering
-# `user.registered` on `email` is valid because the event declares `email` a tag.
+# The consistency boundary: every prior registration for this email. A typed query
+# clause is the event definition called with the fields to match; `email` is
+# auto-indexed, so it is filterable.
 def query(input):
-    return events(
-        types = ["user.registered"],
-        tags = {"email": input.email},
-    )
+    return user_registered(email = input.email)
 
 def initial():
     return {"taken": False}

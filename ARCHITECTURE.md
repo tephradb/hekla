@@ -75,8 +75,17 @@ project/
 
 ## 4. Events and schema
 
-Event definitions live in `events/` and are imported with `load()`. An event declares its type, its
-typed fields, and which fields are tags.
+Event definitions live in `events/` and are imported with `load()`. An event declares its type and
+its typed fields; there is no `tags = [...]` list. **Every field is automatically indexed as a store
+tag** unless it opts out with `indexed = False`. Auto-tagging removes the old failure where a field
+forgotten from the tag list was unqueryable forever (and adding it later missed all prior events).
+
+**Per-field policy** (named arguments on any field constructor):
+
+- `indexed = False` opts a field out of tagging (a large blob, or free text where a tag is useless).
+- `subject = "sibling_field"` encrypts the field under a key scoped to that sibling's value; see
+  section 15. `unique = True` (which requires `subject`) additionally emits a global-key tag for a
+  uniqueness check that survives erasure.
 
 **Field type system** (shared across event schemas, command input `schema()`, and entity schemas):
 `text`, `i64`, `u64`, `bool`, `uuid`, `timestamp`, `money`, `json`, `one_of`, `optional`. This is
@@ -90,17 +99,18 @@ inconsistently in two places:
   needed, are the author's job in `handle`.
 
 **Emit via the event-def constructor**: `emit(user_registered(user_id = ..., email = ...))`. The
-runtime validates the payload against the field schema and auto-derives tags. Missing or extra
-fields fail fast.
+runtime validates the payload against the field schema and derives a tag from every indexed field.
+Missing or extra fields fail fast. The same constructor called in query position (a command's
+`query` or a projector/effect `source`) instead builds a filter clause; see section 5.
 
 **Envelope**: the tephra payload is a JSON envelope wrapping `data` with `correlation_id`,
 `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The host stamps these
 at append; Starlark never sets them.
 
 **Deploy-time validation** is the reason event definitions are shared. A query that filters an event
-type on a field that type does not declare as a tag is a hard error, never a silent empty result.
-Emit constructors are checked against field schemas, and projector indexes are checked against
-declared fields.
+type on a field that type does not declare (or declares `indexed = False`) is a hard error, never a
+silent empty result. Value types are checked against the field's kind, emit constructors against the
+field schema, and projector indexes against declared fields.
 
 ## 5. Commands
 
@@ -109,8 +119,12 @@ only writer.
 
 **Shape** (everything but `handle` is optional):
 
-- `query(input)` returns the boundary: event types plus structured tags, or a list of those OR-ed
-  together.
+- `query(input)` returns the boundary as **typed clauses**: an event definition called with the
+  fields to match, e.g. `user_registered(email = input.email)`, or a list of clauses OR-ed together.
+  Within a clause, fields AND; a bare `TaskCreated()` matches every event of that type; `all_events()`
+  matches everything. Constraining a field is a subset match, so over-constraining silently matches
+  nothing (which `kiln check` warns about). A subject-encrypted field can only be filtered when its
+  subject is also constrained (scoped) or it is `unique` (global); see section 15.
 - `initial` is a literal or a function producing the fold's starting state.
 - `fold(state, event)` reduces the boundary's events into decision state.
 - `handle(input, state)` decides and returns one of three terminal outcomes:
@@ -365,3 +379,57 @@ kiln is a single crate. The dependency direction is documented and enforced by d
 only when a seam proves real (embeddability, or compile times that actually hurt): `starlark_builtins`
 and `schema` depend on nothing internal; `dispatch` depends on those; `runtime` (projectors, effects,
 journal, storage) depends on `dispatch`; `api` and `cli` sit on top.
+
+## 15. Subject-scoped encryption and erasure
+
+A field marked `subject = "sibling_field"` is encrypted under a key scoped to that subject's identity
+`(subject_field, subject_value)`, in the tag index, the event payload, and any read-model column, all
+before it reaches tephra. **Erasing a subject is deleting its key** (`kiln erase <field> <value>`),
+one O(1) operation that makes every value scoped to it unmatchable and unreadable across the log and
+every read model at once, with no rewrite, compaction, or index rebuild.
+
+**Mechanism.** Encryption is deterministic (AES-SIV): the same plaintext under the same key and field
+yields the same ciphertext, so it works as an equality-matchable tag while staying decryptable. Each
+per-subject key is a random secret stored in `kiln.db`, wrapped with AES-256-GCM under a master key
+from `KILN_MASTER_KEY` and tagged with the wrapping master's id so masters can rotate online:
+`kiln rotate` rewraps every row under a new `KILN_MASTER_KEY`, unwrapping with
+`KILN_MASTER_KEY_PREVIOUS` as needed, without touching any ciphertext. The global uniqueness key
+behind `unique = True` is a wrapped reserved secret, so rotation never changes global tags.
+
+**Information flow.** Plaintext of a subject field exists only at the HTTP command input (the client
+supplied it) and at read-API output or an effect's `reveal()` (the runtime decrypted it). Everywhere
+between (log, tag index, read-model columns, and every `fold`/projector `handle` body) it is
+ciphertext. A handler reads a subject field as an opaque handle: it can store it (`put`/`patch` keep
+the ciphertext) and compare it for equality, but not concatenate, slice, or otherwise derive a
+plaintext string from it. Because read models store ciphertext and the read API decrypts on the way
+out, deleting the key shreds the log and every read model together. A derivation a handler wants must
+be computed by the command and emitted as its own subject field. An effect crosses the boundary
+explicitly with `reveal(handle)`; a `reveal` of an already-erased subject fails terminally (no retry
+can recover the data).
+
+**Per-field, not per-event.** An `order.placed` has both a customer and a shop, so scoping the whole
+event to one destroys the other's record on erasure. Per-field puts `email` under the customer key
+and `order_total` under the shop key, and leaves the ids plaintext.
+
+**Accepted limitations** (documented, not discovered):
+
+- **Subject id fields survive erasure.** A subject cannot be encrypted under its own key (you need it
+  to find the key), so after erasure the log still shows `customer_id:42` with the personal fields
+  unreadable. Standard crypto-shredding.
+- **Deterministic encryption is searchable encryption.** It leaks equality and frequency: an observer
+  with index access learns which events share a value. Fine for high-cardinality ids; do not give a
+  low-cardinality field (a status enum) a subject.
+- **`unique = True` keeps a global token past erasure.** After erasing a subject, a global-key tag
+  still proves "some subject once used this value" without revealing it, and the global index is
+  dictionary-attackable if the master key leaks. It is strictly weaker than the per-subject case, so
+  it is opt-in per field.
+- **A field appended without a subject cannot be erased** until a segment-rewrite tool exists (out of
+  scope): its plaintext is already in the log payload and tag index, and replaying projectors just
+  re-reads it. `kiln check` warns when a personal-looking field name has no subject.
+- **Range predicates over encrypted tags are foreclosed** (tags are equality-only anyway).
+- **One subject per field**; genuinely joint data (a message between two people) is deferred.
+- **Effect external sinks are outside the boundary.** Erasure shreds kiln's own store; it cannot
+  un-send an email an effect already delivered. The effect journal holds revealed plaintext only
+  transiently, until the retention sweeper reclaims the completed invocation.
+- **Losing `KILN_MASTER_KEY` is total, unrecoverable loss** of every subject-scoped value. Boot fails
+  fast with a subject-specific message when a project uses subjects and the key is absent or wrong.

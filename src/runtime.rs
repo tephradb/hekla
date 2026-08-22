@@ -29,14 +29,15 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::config::Config;
 use crate::context::CommandContext;
-use crate::dispatch::{self, CommandOutcome};
+use crate::crypto::{KeyStore, MasterKeys};
+use crate::dispatch::{self, CommandOutcome, EventDefs};
 use crate::effect::{self, EffectRuntime, EffectShared, HttpClient};
 use crate::loader::{CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::opdb::{InvocationState, OpDb};
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
 use crate::read_api;
-use crate::starlark_builtins::{EmittedEvent, InputSchema, ModuleDef};
+use crate::starlark_builtins::{EmittedEvent, EventDef, InputSchema, ModuleDef};
 
 /// Individual event segments before rolling to a new file. 256 MiB matches
 /// tephra's own default sizing.
@@ -57,6 +58,12 @@ pub struct Runtime {
     commands: HashMap<String, Arc<CommandUnit>>,
     store: WriteHandle,
     opdb: Arc<Mutex<OpDb>>,
+    /// Event type to its declared field metadata, for emit encryption and for
+    /// wrapping subject fields as opaque handles in a fold.
+    events: Arc<EventDefs>,
+    /// The subject-key store, present when a master key is configured. Required at
+    /// boot when the project uses subject-scoped encryption.
+    keystore: Option<KeyStore>,
     started: Instant,
     projectors: HashMap<String, Arc<ProjectorShared>>,
     /// The effect handles, for `/status` and the skip endpoint. Set once, right
@@ -80,6 +87,7 @@ impl Runtime {
         project: LoadedProject,
         data_dir: &Path,
         http: Arc<dyn HttpClient>,
+        master: Option<MasterKeys>,
     ) -> anyhow::Result<(Arc<Runtime>, WriteCoordinator, ProjectorSet, EffectRuntime)> {
         let events_dir = data_dir.join("events");
         fs::create_dir_all(&events_dir)
@@ -109,6 +117,7 @@ impl Runtime {
             .with_context(|| format!("creating {}", projectors_dir.display()))?;
         let projector_units: Vec<Arc<ProjectorUnit>> =
             project.projectors.into_iter().map(Arc::new).collect();
+        let auto_rebuild = project.config.projectors.auto_rebuild;
         for unit in &projector_units {
             opdb.upsert_module_metadata(
                 unit.loaded.def.name(),
@@ -117,8 +126,29 @@ impl Runtime {
                 &now,
             )?;
         }
-        let (shared, projector_set) =
-            projector::start_all(projector_units, &store, &projectors_dir)?;
+        // Event field metadata, shared with the projector and effect runtimes so a
+        // fold or a `handle` sees subject fields as opaque handles.
+        let events = Arc::new(project.events.by_type.clone());
+        let uses_subjects = events
+            .values()
+            .any(|def| def.fields.iter().any(|(_, meta)| meta.subject.is_some()));
+        if uses_subjects && master.is_none() {
+            anyhow::bail!(
+                "this project uses subject-scoped encryption (a field with subject = \"...\"), so KILN_MASTER_KEY must be set"
+            );
+        }
+
+        // Each projector reconciles its own definition hash (stored in its read model)
+        // against the current one at startup, rebuilding if it changed before applying
+        // any batch. Recording the hash with the rebuild's atomic swap makes this
+        // crash-safe, unlike recording it here at boot.
+        let (shared, projector_set) = projector::start_all(
+            projector_units,
+            &store,
+            &projectors_dir,
+            events.clone(),
+            auto_rebuild,
+        )?;
         let projectors: HashMap<String, Arc<ProjectorShared>> = shared
             .into_iter()
             .map(|handle| (handle.name.clone(), handle))
@@ -138,14 +168,26 @@ impl Runtime {
 
         let openapi_json = openapi::build(&public_command_schemas(&commands)).to_string();
 
+        let opdb = Arc::new(Mutex::new(opdb));
+        let keystore = master.map(|master| KeyStore::new(opdb.clone(), master));
+        // Fail fast if a stored subject key was wrapped under a master that is not
+        // configured now (a wrong or rotated-away KILN_MASTER_KEY), rather than
+        // surfacing it as a read error after boot.
+        if let Some(keystore) = &keystore {
+            keystore.verify_masters_present()?;
+        }
+        let event_count = events.len();
+
         let runtime = Arc::new(Runtime {
             commands,
             store,
-            opdb: Arc::new(Mutex::new(opdb)),
+            opdb,
+            events: events.clone(),
+            keystore,
             started: Instant::now(),
             projectors,
             effects: OnceLock::new(),
-            event_count: project.events.by_type.len(),
+            event_count,
             openapi_json,
         });
 
@@ -241,7 +283,16 @@ impl Runtime {
         }
 
         for attempt in 0..MAX_ATTEMPTS {
-            match dispatch::run_command(&self.store, &command.loaded, body, ctx, now, idem_tag)? {
+            match dispatch::run_command(
+                &self.store,
+                &command.loaded,
+                &self.events,
+                self.keystore.as_ref(),
+                body,
+                ctx,
+                now,
+                idem_tag,
+            )? {
                 CommandOutcome::Conflict => {
                     if attempt + 1 < MAX_ATTEMPTS {
                         thread::sleep(Duration::from_millis(1u64 << attempt));
@@ -250,7 +301,7 @@ impl Runtime {
                 CommandOutcome::Committed { events, positions } => {
                     return Ok(ExecResult {
                         status: 200,
-                        body: success_body(ctx, positions, &events),
+                        body: success_body(ctx, positions, &events, &self.events),
                     });
                 }
                 CommandOutcome::AlreadyCommitted(recovered) => {
@@ -457,7 +508,8 @@ impl Runtime {
         let entity_def = read_api::find_entity(&shared.entities, entity).ok_or_else(|| {
             anyhow::anyhow!("read(): no entity `{entity}` in projector `{projector}`")
         })?;
-        let (row, _position) = read_api::get_one(&shared.db_path, entity_def, key)?;
+        let (row, _position) =
+            read_api::get_one(&shared.db_path, entity_def, key, self.keystore.as_ref())?;
         Ok(row.unwrap_or(Value::Null))
     }
 
@@ -499,6 +551,7 @@ impl Runtime {
             filter_ref,
             after_key.as_deref(),
             limit,
+            self.keystore.as_ref(),
         )?;
         Ok(json!({ "items": page.items, "next_cursor": page.next_cursor }))
     }
@@ -511,6 +564,23 @@ impl Runtime {
     /// The OpenAPI document, serialized once at startup.
     pub fn openapi_json(&self) -> &str {
         &self.openapi_json
+    }
+
+    /// The declared field metadata for an event type. The effect runtime uses this
+    /// to materialise subject fields as opaque handles when a `handle` reads an event.
+    pub fn event_def(&self, event_type: &str) -> Option<&EventDef> {
+        self.events.get(event_type)
+    }
+
+    /// The full event-definition map, for lowering an effect's `source` to a query.
+    pub fn events_map(&self) -> &EventDefs {
+        &self.events
+    }
+
+    /// The subject-key store, if a master key is configured. The read API decrypts
+    /// subject columns through it, and an effect's `reveal()` reads plaintext.
+    pub fn keystore(&self) -> Option<&KeyStore> {
+        self.keystore.as_ref()
     }
 
     fn lock_opdb(&self) -> MutexGuard<'_, OpDb> {
@@ -566,15 +636,28 @@ fn conflict_body(ctx: &CommandContext) -> Value {
     )
 }
 
-/// The 200 body for a freshly committed command.
+/// The 200 body for a freshly committed command. Subject-encrypted (and `unique`)
+/// tags are omitted: their stored form is ciphertext, and the idempotent-recovery
+/// path cannot reconstruct them, so reporting only the plaintext non-subject tags
+/// keeps the fresh and recovered responses identical.
 fn success_body(
     ctx: &CommandContext,
     positions: Option<PositionRange>,
     events: &[EmittedEvent],
+    defs: &EventDefs,
 ) -> Value {
     let events: Vec<Value> = events
         .iter()
-        .map(|event| json!({ "type": event.event_type, "tags": tag_strings(&event.tags) }))
+        .map(|event| {
+            let def = defs.get(&event.event_type);
+            let tags: Vec<(String, Option<String>)> = event
+                .tags
+                .iter()
+                .filter(|(key, _)| !def.is_some_and(|def| def.is_subject(key)))
+                .cloned()
+                .collect();
+            json!({ "type": event.event_type, "tags": tag_strings(&tags) })
+        })
         .collect();
     committed_body(
         &ctx.correlation_id.to_string(),
