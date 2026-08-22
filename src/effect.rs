@@ -74,8 +74,16 @@ pub struct EffectShared {
     pub name: String,
     position: AtomicU64,
     shutdown: AtomicBool,
+    /// How many times the *current* position has failed in a row while retrying.
+    /// A terminal skip never touches this, so a non-zero value means a genuine wedge
+    /// and nothing else.
     consecutive_failures: AtomicU64,
     last_error: Mutex<Option<String>>,
+    /// Cumulative count of positions abandoned by a terminal (non-retryable) failure,
+    /// e.g. a `reveal()` of an erased subject. Distinct from `consecutive_failures`: a
+    /// terminal skip advances rather than wedges, so it must not read as a wedge.
+    terminal_skips: AtomicU64,
+    last_terminal_error: Mutex<Option<String>>,
     /// The position an operator asked to skip, or `0` for none (no event sits at
     /// position 0).
     skip_position: AtomicU64,
@@ -88,14 +96,32 @@ impl EffectShared {
     }
 
     /// How many times the current (stuck) invocation has failed in a row, `0`
-    /// when healthy. Distinguishes a wedge from ordinary lag.
+    /// when healthy. A terminal skip never bumps this, so any non-zero value is a
+    /// genuine wedge (a position retrying under backoff), not a skipped one.
     pub fn consecutive_failures(&self) -> u64 {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
 
-    /// The last error the current invocation hit, if it is failing.
+    /// The last error the current invocation hit, if it is wedged. Cleared on the next
+    /// success; a terminal skip records into `last_terminal_error` instead.
     pub fn last_error(&self) -> Option<String> {
         self.last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many positions this effect has abandoned to a terminal failure since boot.
+    /// Non-zero means data an invocation needed is permanently gone (an erased subject),
+    /// not that the effect is stuck.
+    pub fn terminal_skips(&self) -> u64 {
+        self.terminal_skips.load(Ordering::Relaxed)
+    }
+
+    /// The error from the most recent terminal skip, if any. Unlike `last_error` it is
+    /// not cleared on a later success: it is a durable record of an abandoned position.
+    pub fn last_terminal_error(&self) -> Option<String> {
+        self.last_terminal_error
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -125,6 +151,17 @@ impl EffectShared {
             .last_error
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Record a terminal skip: count it and keep its message, without touching the wedge
+    /// counter (the position is abandoned, not stuck). Pair with `clear_failures` so any
+    /// wedge state from earlier retries of the same position is reset.
+    fn record_terminal_skip(&self, message: &str) {
+        self.terminal_skips.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_terminal_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(message.to_owned());
     }
 }
 
@@ -256,6 +293,8 @@ fn spawn(
         shutdown: AtomicBool::new(false),
         consecutive_failures: AtomicU64::new(0),
         last_error: Mutex::new(None),
+        terminal_skips: AtomicU64::new(0),
+        last_terminal_error: Mutex::new(None),
         skip_position: AtomicU64::new(0),
     });
     let task_shared = Arc::clone(&shared);
@@ -426,13 +465,15 @@ fn run_invocation(
             }
             // A terminal failure (an erased subject a `reveal()` needed) cannot be
             // recovered by retrying, so complete the invocation and move on rather
-            // than wedge forever. Logged loudly, and left in `last_error` for /status.
+            // than wedge forever. Recorded as a terminal skip (not a wedge) and cleared
+            // of any earlier wedge state, so `consecutive_failures` stays unambiguous.
             Err(failure) if failure.terminal => {
                 tracing::error!(
                     "effect `{effect}` invocation at position {position} failed terminally: {}",
                     failure.message
                 );
-                shared.record_failure(&failure.message);
+                shared.record_terminal_skip(&failure.message);
+                shared.clear_failures();
                 runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
                 return Ok(Progress::Advanced);
             }

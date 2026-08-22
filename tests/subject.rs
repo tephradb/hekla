@@ -672,6 +672,71 @@ fn an_effect_reveals_the_plaintext_to_act_on_it() {
 }
 
 #[test]
+fn a_reveal_on_an_erased_subject_skips_terminally_without_wedging() {
+    let dir = orders_with_notify_effect();
+    // A persistent 5xx wedges the effect on http.post, which runs after reveal() has
+    // already succeeded. That gives a window to erase the customer; each retry re-runs
+    // handle from the top, so once the key is gone reveal() fails terminally.
+    let stub = Arc::new(StubHttpClient::status(500));
+    let harness = boot_http(dir.path(), Some(MasterKeys::new(MASTER, vec![])), stub).unwrap();
+
+    place_order(&harness.rt, ORDER, 42, "alice@example.com");
+    let effect = harness.rt.effect("notify").unwrap().clone();
+
+    // The 5xx wedges the effect: reveal() succeeded this attempt, http.post did not.
+    wait_until("the effect to wedge on the 5xx", || {
+        effect.consecutive_failures() > 0
+    });
+
+    // Erase the customer. The next retry's reveal() can no longer decrypt.
+    harness
+        .rt
+        .keystore()
+        .unwrap()
+        .erase("customer_id", "42")
+        .unwrap();
+
+    // The terminal skip advances past the position instead of wedging forever.
+    wait_until("the terminal skip to advance the effect", || {
+        effect.terminal_skips() > 0
+    });
+    assert_eq!(
+        effect.consecutive_failures(),
+        0,
+        "a terminal skip is not a wedge: consecutive_failures must be unambiguous"
+    );
+    assert_eq!(
+        effect.last_error(),
+        None,
+        "abandoning a wedged position clears its wedge error"
+    );
+    assert_eq!(effect.terminal_skips(), 1, "the skip is counted separately");
+    assert!(
+        effect
+            .last_terminal_error()
+            .expect("a terminal skip records its message")
+            .contains("erased"),
+        "the terminal skip records why the position was abandoned"
+    );
+    // The watermark advances just after the skip is recorded (at the end of the batch).
+    wait_until("the effect to advance past the erased event", || {
+        effect.position() >= 1
+    });
+
+    harness.shutdown();
+}
+
+fn wait_until<F: Fn() -> bool>(label: &str, cond: F) {
+    for _ in 0..1000 {
+        if cond() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {label}");
+}
+
+#[test]
 fn concurrent_plaintext_uniqueness_admits_only_one() {
     // Control: a plaintext-tag uniqueness boundary under the same concurrent load, to
     // confirm the DCB boundary itself catches concurrent first-writers.

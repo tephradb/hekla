@@ -339,8 +339,10 @@ impl Runtime {
     /// A JSON snapshot for `GET /status`. Reports the log head, the loaded-module
     /// inventory, each projector's committed position, lag, and health (whether its
     /// thread died on an error, with the message), and each effect's position, lag,
-    /// and health (its consecutive-failure count and last error), so a wedge reads
-    /// as broken rather than merely lagging.
+    /// and health, so a wedge reads as broken rather than merely lagging. An effect
+    /// reports `consecutive_failures`/`last_error` for a genuine wedge (a retrying
+    /// position) and, separately, `terminal_skips`/`last_terminal_error` for positions
+    /// abandoned to unrecoverable failures (an erased subject a `reveal()` needed).
     pub fn status(&self) -> Value {
         let (public, internal): (Vec<&str>, Vec<&str>) = self
             .commands
@@ -392,6 +394,8 @@ impl Runtime {
                     "lag": head.saturating_sub(position),
                     "consecutive_failures": handle.consecutive_failures(),
                     "last_error": handle.last_error(),
+                    "terminal_skips": handle.terminal_skips(),
+                    "last_terminal_error": handle.last_terminal_error(),
                 })
             })
             .collect();
