@@ -227,8 +227,8 @@ async fn read_scan(
                 }
             },
             "cursor" => cursor = Some(value),
-            // Consumed by parse_wait, so never a filter field.
-            _ if RESERVED_WAIT_PARAMS.contains(&name.as_str()) => {}
+            // `after`/`timeout_ms` are consumed by parse_wait, so never a filter.
+            _ if read_api::RESERVED_QUERY_PARAMS.contains(&name.as_str()) => {}
             _ => filters.push((name, value)),
         }
     }
@@ -242,16 +242,22 @@ async fn read_scan(
         );
     }
     let filter = filters.into_iter().next();
-    if let Some((field, _)) = &filter
-        && !read_api::is_filterable(&entity_def, field)
-    {
-        return json_response(
-            400,
-            read_error(
-                "unindexed_filter",
-                &format!("filter field `{field}` is not indexed; declare an index on it"),
-            ),
-        );
+    if let Some((field, value)) = &filter {
+        if !read_api::is_filterable(&entity_def, field) {
+            return json_response(
+                400,
+                read_error(
+                    "unindexed_filter",
+                    &format!("filter field `{field}` is not indexed; declare an index on it"),
+                ),
+            );
+        }
+        if let Err(err) = read_api::check_filter(&entity_def, field, value) {
+            return json_response(
+                400,
+                read_error("invalid_input", &format!("filter `{field}`: {err}")),
+            );
+        }
     }
     let after_key = match &cursor {
         Some(raw) => match read_api::decode_cursor(raw) {
@@ -373,11 +379,6 @@ const READ_WAIT_DEFAULT: Duration = Duration::from_millis(5_000);
 /// The ceiling on a client-supplied `timeout_ms`, so one read cannot pin a request
 /// for longer than this.
 const READ_WAIT_MAX: Duration = Duration::from_millis(30_000);
-
-/// Query params the read endpoints consume as read-your-writes controls, so the
-/// scan handler never mistakes one for an indexed filter. Must list every key
-/// `parse_wait` reads.
-const RESERVED_WAIT_PARAMS: [&str; 2] = ["after", "timeout_ms"];
 
 /// A read-your-writes wait parsed off the query string: block until the projector
 /// reaches `after`, giving up after `timeout`.

@@ -41,6 +41,18 @@ impl Harness {
     }
 }
 
+/// Write a throwaway project from `(relative path, contents)` pairs, for a case
+/// that needs a bespoke project rather than the shared example.
+fn write_project(files: &[(&str, &str)]) -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for (rel, content) in files {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    dir
+}
+
 fn boot() -> Harness {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/users");
     let project = LoadedProject::load(&root);
@@ -388,6 +400,130 @@ async fn status_reports_projector_position_and_lag() {
         .expect("users projector in status");
     assert!(users["position"].as_u64().unwrap() >= 1);
     assert!(users["lag"].is_number());
+    // A healthy projector reports no failure.
+    assert_eq!(users["failed"], json!(false));
+    assert_eq!(users["last_error"], Value::Null);
 
     harness.shutdown();
+}
+
+#[tokio::test]
+async fn status_reports_a_failed_projector() {
+    // A projector whose handle fails on its first event: the thread dies rather
+    // than silently freezing the read model, and /status must surface it as failed
+    // with the error, not merely as lagging behind head.
+    let dir = write_project(&[
+        (
+            "events/e.star",
+            r#"boom = event(type = "boom.happened", fields = {"id": uuid()}, tags = ["id"])
+"#,
+        ),
+        (
+            "commands/emit-boom.star",
+            r#"
+load("events/e.star", "boom")
+
+input = schema(id = uuid())
+
+def handle(input, state):
+    return emit(boom(id = input.id))
+"#,
+        ),
+        (
+            "projectors/watch.star",
+            r#"
+things = entity(key = "id", fields = {"id": uuid()})
+
+source = events(types = ["boom.happened"])
+
+def handle(event):
+    fail("projector boom")
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    assert!(!project.has_errors(), "{:?}", project.findings);
+    let data = tempfile::tempdir().unwrap();
+    let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
+
+    let ctx = CommandContext::new(Uuid::new_v4());
+    let result = rt
+        .execute("emit-boom", json!({ "id": ALICE }), &ctx, None)
+        .unwrap();
+    assert_eq!(result.status, 200, "emit failed: {:?}", result.body);
+
+    let app = server::app(Arc::clone(&rt));
+    let mut failed = None;
+    for _ in 0..200 {
+        let (_, body) = get(&app, "/status").await;
+        let watch = body["projectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "watch")
+            .cloned();
+        if let Some(entry) = watch
+            && entry["failed"] == json!(true)
+        {
+            failed = Some(entry);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let watch = failed.expect("watch projector should report failed in /status");
+    assert!(
+        watch["last_error"].as_str().unwrap().contains("boom"),
+        "expected the handle error in last_error: {watch:?}"
+    );
+
+    effects.shutdown_and_join();
+    projectors.shutdown_and_join();
+    coord.shutdown();
+}
+
+#[tokio::test]
+async fn a_filter_value_of_the_wrong_type_is_a_400() {
+    // A value that cannot be the indexed column's type is a 400 up front, not a scan
+    // that binds it as text and silently matches nothing.
+    let dir = write_project(&[
+        (
+            "events/e.star",
+            r#"scored = event(type = "scored", fields = {"id": uuid(), "n": i64_()}, tags = ["id"])
+"#,
+        ),
+        (
+            "projectors/nums.star",
+            r#"
+scores = entity(
+    key = "id",
+    fields = {"id": uuid(), "n": i64_()},
+    indexes = [index("by_n", ["n"])],
+)
+
+source = events(types = ["scored"])
+
+def handle(event):
+    return [put(scores, {"id": event.data["id"], "n": event.data["n"]})]
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    assert!(!project.has_errors(), "{:?}", project.findings);
+    let data = tempfile::tempdir().unwrap();
+    let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
+    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http).unwrap();
+    let app = server::app(Arc::clone(&rt));
+
+    let (status, body) = get(&app, "/read/nums/scores?n=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["error"]["code"], "invalid_input");
+
+    // A well-typed value is accepted (no rows yet, so it just scans empty).
+    let (ok, _) = get(&app, "/read/nums/scores?n=5").await;
+    assert_eq!(ok, StatusCode::OK);
+
+    effects.shutdown_and_join();
+    projectors.shutdown_and_join();
+    coord.shutdown();
 }

@@ -33,6 +33,7 @@ use starlark::{starlark_module, starlark_simple_value};
 
 use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx};
 use crate::dispatch::RESERVED_TAG_PREFIX;
+use crate::read_api::RESERVED_QUERY_PARAMS;
 
 // ---------------------------------------------------------------------------
 // Field types
@@ -210,11 +211,30 @@ impl EntityDef {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !self.fields.iter().any(|(n, _)| *n == self.key) {
+        let Some((_, key_kind)) = self.fields.iter().find(|(n, _)| *n == self.key) else {
             anyhow::bail!(
                 "entity `{}`: key `{}` is not a declared field",
                 self.name,
                 self.key
+            );
+        };
+        // The read API paginates by the key as an opaque cursor and binds it as a
+        // typed filter, so the key must be a present, orderable scalar. An optional
+        // key could be null; a bool (two values) or json (unordered) key would
+        // silently truncate cursor pagination.
+        if key_kind.is_nullable() {
+            anyhow::bail!(
+                "entity `{}`: key `{}` may not be optional",
+                self.name,
+                self.key
+            );
+        }
+        if matches!(key_kind.base(), FieldKind::Bool | FieldKind::Json) {
+            anyhow::bail!(
+                "entity `{}`: key `{}` must be an orderable scalar, not {:?}",
+                self.name,
+                self.key,
+                key_kind.base()
             );
         }
         for ix in &self.indexes {
@@ -227,6 +247,26 @@ impl EntityDef {
                         col
                     );
                 }
+            }
+        }
+        // A read filter targets the key or an index-leading column, so a field named
+        // like a reserved read query param could never be filtered. Reject at load
+        // rather than surprising the author with a silent no-op at request time.
+        let mut filterable = vec![self.key.as_str()];
+        filterable.extend(
+            self.indexes
+                .iter()
+                .filter_map(|ix| ix.columns.first())
+                .map(String::as_str),
+        );
+        for field in filterable {
+            if RESERVED_QUERY_PARAMS.contains(&field) {
+                anyhow::bail!(
+                    "entity `{}`: filterable field `{}` collides with a reserved read query param (one of: {})",
+                    self.name,
+                    field,
+                    RESERVED_QUERY_PARAMS.join(", ")
+                );
             }
         }
         Ok(())

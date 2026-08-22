@@ -184,6 +184,63 @@ def handle(event):
 }
 
 #[test]
+fn non_scalar_entity_key_is_an_error() {
+    let dir = write_project(&[
+        ("events/thing.star", EVENTS),
+        (
+            "projectors/things.star",
+            r#"
+things = entity(
+    key = "active",
+    fields = {"thing_id": uuid(), "active": boolean()},
+)
+
+source = events(types = ["thing.happened"])
+
+def handle(event):
+    return [put(things, {"thing_id": event.data["thing_id"], "active": True})]
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let errs = errors(&project);
+    assert!(
+        errs.iter()
+            .any(|err| err.contains("must be an orderable scalar")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn filterable_field_colliding_with_a_reserved_query_param_is_an_error() {
+    let dir = write_project(&[
+        ("events/thing.star", EVENTS),
+        (
+            "projectors/things.star",
+            r#"
+things = entity(
+    key = "thing_id",
+    fields = {"thing_id": uuid(), "cursor": text()},
+    indexes = [index("by_cursor", ["cursor"])],
+)
+
+source = events(types = ["thing.happened"])
+
+def handle(event):
+    return [put(things, {"thing_id": event.data["thing_id"]})]
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let errs = errors(&project);
+    assert!(
+        errs.iter()
+            .any(|err| err.contains("reserved read query param")),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn duplicate_event_type_is_an_error() {
     let dir = write_project(&[("events/a.star", EVENTS), ("events/b.star", EVENTS)]);
     let project = LoadedProject::load(dir.path());

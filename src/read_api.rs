@@ -23,6 +23,13 @@ pub const DEFAULT_LIMIT: usize = 50;
 /// Largest page a scan will return; a larger `limit` is clamped to this.
 pub const MAX_LIMIT: usize = 500;
 
+/// Query params the read endpoints consume as controls (pagination plus the
+/// read-your-writes wait), never as an indexed filter. The single source of truth
+/// for both the scan handler (which must not treat one as a filter) and `kiln
+/// check` (which rejects an entity field that would collide with one). Keep in sync
+/// with the keys the read handlers read off the query string.
+pub const RESERVED_QUERY_PARAMS: [&str; 4] = ["limit", "cursor", "after", "timeout_ms"];
+
 /// One page of a scan: the rows, the cursor to resume after them (absent at the
 /// end), and the projector's log position at read time.
 pub struct Page {
@@ -47,6 +54,17 @@ pub fn is_filterable(entity: &EntityDef, field: &str) -> bool {
         .indexes
         .iter()
         .any(|index| index.columns.first().map(String::as_str) == Some(field))
+}
+
+/// Validate that a filter value parses as its column's declared type, so a
+/// mismatch (`?count=abc`, `?active=maybe`) is a 400 up front rather than a scan
+/// that silently matches nothing. `field` must already be validated as filterable,
+/// so it is a declared field; an unknown field is left for that check to reject.
+pub fn check_filter(entity: &EntityDef, field: &str, value: &str) -> anyhow::Result<()> {
+    match entity.fields.iter().find(|(name, _)| name == field) {
+        Some((_, kind)) => crate::read_model::coerce_value(kind, value).map(|_| ()),
+        None => Ok(()),
+    }
 }
 
 /// Encode a row key as an opaque forward cursor.

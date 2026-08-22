@@ -286,9 +286,10 @@ impl Runtime {
     }
 
     /// A JSON snapshot for `GET /status`. Reports the log head, the loaded-module
-    /// inventory, each projector's committed position and lag, and each effect's
-    /// position, lag, and health (its consecutive-failure count and last error,
-    /// so a wedge reads as broken rather than merely lagging).
+    /// inventory, each projector's committed position, lag, and health (whether its
+    /// thread died on an error, with the message), and each effect's position, lag,
+    /// and health (its consecutive-failure count and last error), so a wedge reads
+    /// as broken rather than merely lagging.
     pub fn status(&self) -> Value {
         let (public, internal): (Vec<&str>, Vec<&str>) = self
             .commands
@@ -318,6 +319,8 @@ impl Runtime {
                     "name": handle.name,
                     "position": position,
                     "lag": head.saturating_sub(position),
+                    "failed": handle.failed(),
+                    "last_error": handle.last_error(),
                 })
             })
             .collect();

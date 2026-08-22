@@ -127,32 +127,26 @@ impl ReadModel {
         Ok(())
     }
 
-    /// Apply one entity op, autocommitting. For a batch, open a [`begin`] and call
-    /// [`apply_one`] per op instead, so they commit with the checkpoint.
+    /// Apply one entity op on `&self.conn`: `put` → `INSERT OR REPLACE`, `patch`
+    /// → `UPDATE` (a no-op when zero rows match), `delete` → `DELETE`. Autocommits
+    /// per op unless a transaction is open on this connection, in which case the op
+    /// participates in it. A batch opens a [`begin`] first, so its ops commit with
+    /// the checkpoint.
     ///
     /// [`begin`]: ReadModel::begin
-    /// [`apply_one`]: ReadModel::apply_one
-    pub fn apply(&self, entity: &EntityDef, op: EntityOpKind) -> anyhow::Result<()> {
-        self.apply_one(entity, op)
-    }
-
-    /// Apply one entity op on `&self.conn`: `put` → `INSERT OR REPLACE`, `patch`
-    /// → `UPDATE` (a no-op when zero rows match), `delete` → `DELETE`. When a
-    /// transaction is open on this connection, the op participates in it.
     pub fn apply_one(&self, entity: &EntityDef, op: EntityOpKind) -> anyhow::Result<()> {
         match op {
             EntityOpKind::Put(row_json) => {
                 let row: serde_json::Value = serde_json::from_str(&row_json)?;
                 let obj = row.as_object().context("put row is not a JSON object")?;
-                let columns: Vec<&str> = entity.fields.iter().map(|(n, _)| n.as_str()).collect();
-                let placeholders = vec!["?"; columns.len()].join(", ");
+                let placeholders = vec!["?"; entity.fields.len()].join(", ");
                 let sql = format!(
                     "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
                     entity.name,
-                    columns.join(", "),
+                    column_list(entity),
                     placeholders
                 );
-                let mut values = Vec::with_capacity(columns.len());
+                let mut values = Vec::with_capacity(entity.fields.len());
                 for (name, kind) in &entity.fields {
                     let value = obj.get(name).unwrap_or(&serde_json::Value::Null);
                     values.push(to_sql(kind, value).with_context(|| format!("column `{name}`"))?);
@@ -237,8 +231,8 @@ impl ReadModel {
                 .find(|(name, _)| name == column)
                 .map(|(_, kind)| kind);
             binds.push(match kind {
-                Some(kind) => key_to_sql(kind, value),
-                None => SqlValue::Text(value.to_owned()),
+                Some(kind) => coerce_value(kind, value).unwrap_or_else(|_| text(value)),
+                None => text(value),
             });
         }
         if let Some(after) = after_key {
@@ -323,15 +317,37 @@ fn to_sql(kind: &FieldKind, value: &serde_json::Value) -> anyhow::Result<SqlValu
     })
 }
 
-/// Bind an op's key string as the key column's type (keys arrive as strings).
+/// Coerce a string-form key or filter value to the column's SQLite type. Keys (from
+/// an op, a path segment, or a cursor) and filter values both arrive as strings;
+/// this binds them per the declared kind. Returns an error when the string cannot be
+/// the column's type (`abc` for an integer, `maybe` for a bool), so the read API can
+/// answer a bad filter with a 400 rather than a scan that silently matches nothing.
+pub(crate) fn coerce_value(kind: &FieldKind, raw: &str) -> anyhow::Result<SqlValue> {
+    Ok(match kind.base() {
+        // Bool columns are stored as INTEGER, so a `true`/`false` filter must bind
+        // as 1/0, not as text (which would match no integer row).
+        FieldKind::Bool => match raw {
+            "true" | "1" => SqlValue::Integer(1),
+            "false" | "0" => SqlValue::Integer(0),
+            _ => anyhow::bail!("expected a boolean (`true` or `false`)"),
+        },
+        FieldKind::I64 | FieldKind::U64 | FieldKind::Money => {
+            SqlValue::Integer(raw.parse::<i64>().context("expected an integer")?)
+        }
+        _ => SqlValue::Text(raw.to_owned()),
+    })
+}
+
+/// Bind an op's key string as the key column's type, falling back to text when it
+/// does not parse. Internal ops supply well-typed keys; the external filter path
+/// validates the value first (via [`coerce_value`]) so a mismatch 400s rather than
+/// reaching here.
 fn key_to_sql(kind: &FieldKind, key: &str) -> SqlValue {
-    match kind.base() {
-        FieldKind::I64 | FieldKind::U64 | FieldKind::Money => key
-            .parse::<i64>()
-            .map(SqlValue::Integer)
-            .unwrap_or_else(|_| SqlValue::Text(key.to_owned())),
-        _ => SqlValue::Text(key.to_owned()),
-    }
+    coerce_value(kind, key).unwrap_or_else(|_| text(key))
+}
+
+fn text(value: &str) -> SqlValue {
+    SqlValue::Text(value.to_owned())
 }
 
 /// Reconstruct a JSON value from a stored column per the field's declared kind.
@@ -387,7 +403,7 @@ mod tests {
 
     fn put(model: &ReadModel, entity: &EntityDef, id: &str, email: &str) {
         model
-            .apply(
+            .apply_one(
                 entity,
                 EntityOpKind::Put(json!({ "user_id": id, "email": email }).to_string()),
             )
@@ -451,5 +467,51 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["user_id"], "u1");
+    }
+
+    #[test]
+    fn scan_filters_on_a_bool_column() {
+        // A bool filter must bind as INTEGER 0/1, matching how the column is stored;
+        // binding it as the text `"true"` would match nothing (the phase-3 bug).
+        let entity = EntityDef {
+            id: 1,
+            name: "flags".to_owned(),
+            key: "user_id".to_owned(),
+            fields: vec![
+                ("user_id".to_owned(), FieldKind::Uuid),
+                ("active".to_owned(), FieldKind::Bool),
+            ],
+            indexes: vec![],
+        };
+        let (model, _dir) = open_temp(slice::from_ref(&entity));
+        for (id, active) in [("u1", true), ("u2", false), ("u3", true)] {
+            model
+                .apply_one(
+                    &entity,
+                    EntityOpKind::Put(json!({ "user_id": id, "active": active }).to_string()),
+                )
+                .unwrap();
+        }
+        let active = model
+            .scan(&entity, Some(("active", "true")), None, 50)
+            .unwrap();
+        assert_eq!(active.len(), 2);
+        let inactive = model
+            .scan(&entity, Some(("active", "false")), None, 50)
+            .unwrap();
+        assert_eq!(inactive.len(), 1);
+        assert_eq!(inactive[0]["user_id"], "u2");
+    }
+
+    #[test]
+    fn coerce_value_rejects_type_mismatches() {
+        assert!(coerce_value(&FieldKind::I64, "42").is_ok());
+        assert!(coerce_value(&FieldKind::I64, "abc").is_err());
+        assert!(coerce_value(&FieldKind::Bool, "true").is_ok());
+        assert!(coerce_value(&FieldKind::Bool, "maybe").is_err());
+        // Optional unwraps to the inner kind.
+        let opt_int = FieldKind::Optional(Box::new(FieldKind::I64));
+        assert!(coerce_value(&opt_int, "7").is_ok());
+        assert!(coerce_value(&opt_int, "seven").is_err());
     }
 }

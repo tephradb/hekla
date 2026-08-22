@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -49,12 +49,30 @@ pub struct ProjectorShared {
     position: AtomicU64,
     shutdown: AtomicBool,
     replay: AtomicBool,
+    /// Set when the thread exits on an error (a poison event, a decode failure, a
+    /// `handle` bug). The read API keeps serving the frozen model, so `/status`
+    /// reports this to distinguish a wedged projector from one merely lagging.
+    failed: AtomicBool,
+    last_error: Mutex<Option<String>>,
 }
 
 impl ProjectorShared {
     /// The last checkpoint position the thread has committed.
     pub fn position(&self) -> u64 {
         self.position.load(Ordering::Relaxed)
+    }
+
+    /// Whether the projector thread has died on an error and stopped advancing.
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    /// The error that stopped the thread, if it failed.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Ask the projector to rebuild-and-swap its read model. Picked up between
@@ -65,6 +83,14 @@ impl ProjectorShared {
 
     fn stop(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self, message: &str) {
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(message.to_owned());
+        self.failed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -138,6 +164,8 @@ fn spawn(
         position: AtomicU64::new(start.get()),
         shutdown: AtomicBool::new(false),
         replay: AtomicBool::new(false),
+        failed: AtomicBool::new(false),
+        last_error: Mutex::new(None),
     });
 
     let task_shared = Arc::clone(&shared);
@@ -155,7 +183,9 @@ fn run(
     model: ReadModel,
 ) {
     if let Err(err) = run_inner(&shared, &unit, &store, model) {
-        tracing::error!("projector `{}` stopped: {err:#}", shared.name);
+        let message = format!("{err:#}");
+        tracing::error!("projector `{}` stopped: {message}", shared.name);
+        shared.record_failure(&message);
     }
 }
 
