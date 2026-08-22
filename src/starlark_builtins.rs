@@ -9,7 +9,7 @@
 //! top-level values; there are no registration calls. Events are declared with
 //! `event(...)` in `events/` and constructed by calling the definition
 //! (`user_registered(...)`), which validates the payload and derives tags; a
-//! command's `handle` returns `emit([...])` or `reject(...)`.
+//! command's `handle` returns an event, a list of events, or `reject(...)`.
 
 use std::fmt;
 use std::hash::Hash;
@@ -456,9 +456,9 @@ impl fmt::Display for EventDef {
 impl<'v> StarlarkValue<'v> for EventDef {
     /// An event definition is callable: `user_registered(user_id = ..., email = ...)`
     /// builds one concrete event, validating the payload against the declared
-    /// fields and deriving tags from the declared tag fields. Handlers pass the
-    /// result to `emit([...])`. Named arguments only, so the call reads like the
-    /// schema it checks against.
+    /// fields and deriving tags from the declared tag fields. A command's `handle`
+    /// returns the result directly, or a list of them. Named arguments only, so the
+    /// call reads like the schema it checks against.
     fn invoke(
         &self,
         _me: Value<'v>,
@@ -519,7 +519,7 @@ impl<'v> StarlarkValue<'v> for EventDef {
 starlark_simple_value!(EventDef);
 
 // ---------------------------------------------------------------------------
-// Constructed event + emit outcome
+// Constructed event
 // ---------------------------------------------------------------------------
 
 /// One concrete event produced by calling an event definition. The payload is
@@ -599,24 +599,6 @@ impl<'v> StarlarkValue<'v> for CipherHandle {
     }
 }
 starlark_simple_value!(CipherHandle);
-
-/// What a command's `handle` returns to append events: the ordered events an
-/// `emit(...)` call collected. A sibling of `reject(...)`, the other terminal
-/// outcome.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
-pub struct EmitOutcome {
-    pub events: Vec<ConstructedEvent>,
-}
-
-impl fmt::Display for EmitOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "emit({} events)", self.events.len())
-    }
-}
-
-#[starlark_value(type = "emit")]
-impl<'v> StarlarkValue<'v> for EmitOutcome {}
-starlark_simple_value!(EmitOutcome);
 
 // ---------------------------------------------------------------------------
 // Query spec (commands): the DCB consistency boundary
@@ -1034,34 +1016,6 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     /// well-formed input the current state forbids. Maps to HTTP 400.
     fn invalid_input(#[starlark(require = pos)] message: String) -> anyhow::Result<InvalidInput> {
         Ok(InvalidInput { message })
-    }
-
-    /// Collect the events a command's `handle` appends. Accepts one constructed
-    /// event or a list of them (`emit(user_registered(...))` or `emit([a, b])`);
-    /// an empty list means "nothing to do", which is valid for idempotent
-    /// commands. Each item must come from calling an event definition, so it is
-    /// already validated and tagged.
-    fn emit<'v>(#[starlark(require = pos)] events: Value<'v>) -> anyhow::Result<EmitOutcome> {
-        let mut collected = Vec::new();
-        if let Some(event) = events.downcast_ref::<ConstructedEvent>() {
-            collected.push(event.clone());
-        } else if let Some(list) = ListRef::from_value(events) {
-            for item in list.iter() {
-                let event = item.downcast_ref::<ConstructedEvent>().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "emit() items must be events from an event definition, got {}",
-                        item.get_type()
-                    )
-                })?;
-                collected.push(event.clone());
-            }
-        } else {
-            anyhow::bail!(
-                "emit() expects an event or a list of events, got {}",
-                events.get_type()
-            );
-        }
-        Ok(EmitOutcome { events: collected })
     }
 
     // --- projector entity ops ----------------------------------------------
@@ -1808,21 +1762,6 @@ pub fn check_fold_result(val: Value<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `handle` must return `emit([...])` (possibly empty) or `reject(...)`. An
-/// empty `emit` means "nothing to do" and is valid for idempotent commands.
-pub fn check_handle_result(val: Value<'_>) -> anyhow::Result<()> {
-    if val.downcast_ref::<Rejection>().is_some()
-        || val.downcast_ref::<InvalidInput>().is_some()
-        || val.downcast_ref::<EmitOutcome>().is_some()
-    {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "handle() must return emit([...]), reject(...) or invalid_input(...), got {}",
-        val.get_type()
-    );
-}
-
 /// Lift a frozen handler value into an evaluation heap so it can be passed to
 /// `call_handler`.
 ///
@@ -1970,8 +1909,34 @@ pub enum HandleOutcome {
     Emit(Vec<EmittedEvent>),
 }
 
+/// Collect the events a command's `handle` (or a test `expect`) yields: one
+/// constructed event, or a list of them (an empty list means "nothing to do",
+/// valid for an idempotent command). Each item must come from calling an event
+/// definition, so it is already validated and tagged. Returns `None` when `value`
+/// is neither an event nor a list, so the caller can report its own error naming
+/// the other valid outcomes.
+pub fn events_from_value(value: Value<'_>) -> anyhow::Result<Option<Vec<ConstructedEvent>>> {
+    if let Some(event) = value.downcast_ref::<ConstructedEvent>() {
+        return Ok(Some(vec![event.clone()]));
+    }
+    let Some(list) = ListRef::from_value(value) else {
+        return Ok(None);
+    };
+    let mut collected = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let event = item.downcast_ref::<ConstructedEvent>().ok_or_else(|| {
+            anyhow::anyhow!(
+                "a returned list must contain only events from an event definition, got {}",
+                item.get_type()
+            )
+        })?;
+        collected.push(event.clone());
+    }
+    Ok(Some(collected))
+}
+
 /// Interpret the value `handle` returned: `reject(...)`, `invalid_input(...)`, or
-/// the events an `emit(...)` collected, lowered to plain data for the store.
+/// the event(s) it returned, lowered to plain data for the store.
 pub fn parse_handle_result(val: Value<'_>) -> anyhow::Result<HandleOutcome> {
     if let Some(rejection) = val.downcast_ref::<Rejection>() {
         return Ok(HandleOutcome::Reject(rejection.clone()));
@@ -1979,9 +1944,8 @@ pub fn parse_handle_result(val: Value<'_>) -> anyhow::Result<HandleOutcome> {
     if let Some(invalid) = val.downcast_ref::<InvalidInput>() {
         return Ok(HandleOutcome::InvalidInput(invalid.clone()));
     }
-    if let Some(emit) = val.downcast_ref::<EmitOutcome>() {
-        let events = emit
-            .events
+    if let Some(events) = events_from_value(val)? {
+        let lowered = events
             .iter()
             .map(|event| EmittedEvent {
                 event_type: event.event_type.clone(),
@@ -1989,10 +1953,10 @@ pub fn parse_handle_result(val: Value<'_>) -> anyhow::Result<HandleOutcome> {
                 tags: event.tags.clone(),
             })
             .collect();
-        return Ok(HandleOutcome::Emit(events));
+        return Ok(HandleOutcome::Emit(lowered));
     }
     anyhow::bail!(
-        "handle() must return emit([...]), reject(...) or invalid_input(...), got {}",
+        "handle() must return an event, a list of events, reject(...) or invalid_input(...), got {}",
         val.get_type()
     );
 }
@@ -2482,6 +2446,53 @@ mod tests {
             let value =
                 call_handler_with_ctx(&module, thaw(&func, &module), &[], 1_000_000, &ctx).unwrap();
             assert_eq!(value.unpack_str(), Some("2026-08-21T00:00:00Z"));
+        });
+    }
+
+    #[test]
+    fn handle_returns_events_directly_or_as_a_list() {
+        use starlark::environment::Module;
+
+        // A command's `handle` returns an event, a list of events, or an empty list
+        // (nothing to append); anything else is a hard error.
+        let src = r#"
+ev = event(type = "t.happened", fields = {"id": uuid()})
+
+def one(input, state):
+    return ev(id = "u1")
+
+def many(input, state):
+    return [ev(id = "u1"), ev(id = "u2")]
+
+def nothing(input, state):
+    return []
+
+def bad(input, state):
+    return 42
+"#;
+        let ast = parse_module("t.star", src.to_owned()).unwrap();
+        let frozen = eval_frozen(ast, &command_globals(), None, false).unwrap();
+        Module::with_temp_heap(|module| {
+            let call = |name: &str| {
+                let func = frozen.get_option(name).unwrap().unwrap();
+                let arg = module.heap().alloc(serde_json::Value::Null);
+                call_handler(&module, thaw(&func, &module), &[arg, arg], 1_000_000)
+            };
+
+            let one = parse_handle_result(call("one").unwrap()).unwrap();
+            assert!(matches!(one, HandleOutcome::Emit(events) if events.len() == 1));
+
+            let many = parse_handle_result(call("many").unwrap()).unwrap();
+            assert!(matches!(many, HandleOutcome::Emit(events) if events.len() == 2));
+
+            let nothing = parse_handle_result(call("nothing").unwrap()).unwrap();
+            assert!(matches!(nothing, HandleOutcome::Emit(events) if events.is_empty()));
+
+            let err = match parse_handle_result(call("bad").unwrap()) {
+                Ok(_) => panic!("expected an error for a non-event return"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("must return an event"), "{err}");
         });
     }
 }

@@ -98,10 +98,11 @@ inconsistently in two places:
   set). It does not validate that a transition between values is legal; transition rules, if ever
   needed, are the author's job in `handle`.
 
-**Emit via the event-def constructor**: `emit(user_registered(user_id = ..., email = ...))`. The
+**Construct an event via its definition**: `user_registered(user_id = ..., email = ...)`. The
 runtime validates the payload against the field schema and derives a tag from every indexed field.
-Missing or extra fields fail fast. The same constructor called in query position (a command's
-`query` or a projector/effect `source`) instead builds a filter clause; see section 5.
+Missing or extra fields fail fast. A command's `handle` returns the constructed event, or a list of
+them, to append. The same constructor called in query position (a command's `query` or a
+projector/effect `source`) instead builds a filter clause; see section 5.
 
 **Envelope**: the tephra payload is a JSON envelope wrapping `data` with `correlation_id`,
 `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The host stamps these
@@ -109,7 +110,7 @@ at append; Starlark never sets them.
 
 **Deploy-time validation** is the reason event definitions are shared. A query that filters an event
 type on a field that type does not declare (or declares `indexed = False`) is a hard error, never a
-silent empty result. Value types are checked against the field's kind, emit constructors against the
+silent empty result. Value types are checked against the field's kind, event constructors against the
 field schema, and projector indexes against declared fields.
 
 ## 5. Commands
@@ -128,7 +129,8 @@ only writer.
 - `initial` is a literal or a function producing the fold's starting state.
 - `fold(state, event)` reduces the boundary's events into decision state.
 - `handle(input, state)` decides and returns one of three terminal outcomes:
-  - `emit([...])` appends events.
+  - an event, or a list of events, appends them (an empty list means "nothing to append", valid for
+    an idempotent command).
   - `reject(code, message)` is a state-dependent refusal: the input was well-formed but the current
     state forbids it (for example, email already taken). Maps to HTTP 422, kept distinct from the 409
     a concurrency conflict returns, so the status alone tells a client whether a retry can help.
@@ -348,7 +350,7 @@ consistent copy is not required for them.
 - `kiln serve <dir>`: run the runtime and HTTP API from a project directory, loading at startup.
 - `kiln check <dir>`: the only static analysis Starlark gets, so it is thorough. It parses, resolves
   the load graph, verifies every query filters on tags the event type actually declares, verifies
-  emit constructors match field schemas, and verifies projector indexes reference declared fields.
+  event constructors match field schemas, and verifies projector indexes reference declared fields.
   For CI and pre-commit.
 - `kiln test <dir>`: events in, assert events out, for commands. Pure functions with declared inputs
   make the harness small, and it is what earns trust in an untyped language.

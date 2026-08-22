@@ -427,7 +427,7 @@ load("events/e.star", "boom")
 input = schema(id = uuid())
 
 def handle(input, state):
-    return emit(boom(id = input.id))
+    return boom(id = input.id)
 "#,
         ),
         (

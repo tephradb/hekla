@@ -27,4 +27,4 @@ def handle(input, state):
         return reject("invalid_name", "name must not be blank")
     if not state["exists"]:
         return reject("unknown_user", "no such user")
-    return emit(user_renamed(user_id = input.user_id, name = input.name))
+    return user_renamed(user_id = input.user_id, name = input.name)

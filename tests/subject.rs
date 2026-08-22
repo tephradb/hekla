@@ -74,11 +74,11 @@ load("events/order.star", "order_placed")
 input = schema(order_id = uuid(), customer_id = u64_(), email = text())
 
 def handle(input, state):
-    return emit(order_placed(
+    return order_placed(
         order_id = input.order_id,
         customer_id = input.customer_id,
         email = input.email,
-    ))
+    )
 "#,
         ),
         (
@@ -233,11 +233,11 @@ load("events/order.star", "order_placed")
 input = schema(order_id = uuid(), customer_id = u64_(), email = text())
 
 def handle(input, state):
-    return emit(order_placed(
+    return order_placed(
         order_id = input.order_id,
         customer_id = input.customer_id,
         email = input.email,
-    ))
+    )
 "#,
         ),
         (
@@ -381,11 +381,11 @@ load("events/order.star", "order_placed")
 input = schema(order_id = uuid(), customer_id = u64_(), email = text())
 
 def handle(input, state):
-    return emit(order_placed(
+    return order_placed(
         order_id = input.order_id,
         customer_id = input.customer_id,
         email = input.email,
-    ))
+    )
 "#,
         ),
         (
@@ -446,11 +446,11 @@ load("events/order.star", "order_placed")
 input = schema(order_id = uuid(), customer_id = u64_(), email = text())
 
 def handle(input, state):
-    return emit(order_placed(
+    return order_placed(
         order_id = input.order_id,
         customer_id = input.customer_id,
         email = input.email,
-    ))
+    )
 "#,
         ),
         (
@@ -473,11 +473,11 @@ def fold(state, event):
     return state
 
 def handle(input, state):
-    return emit(order_placed(
+    return order_placed(
         order_id = input.order_id,
         customer_id = input.customer_id,
         email = state["email"],
-    ))
+    )
 "#,
         ),
     ]);
@@ -587,7 +587,7 @@ def fold(state, event):
 def handle(input, state):
     if state["taken"]:
         return reject("email_taken", "that email is already registered")
-    return emit(account_registered(account_id = input.account_id, email = input.email))
+    return account_registered(account_id = input.account_id, email = input.email)
 "#,
         ),
     ])
@@ -618,11 +618,11 @@ load("events/order.star", "order_placed")
 input = schema(order_id = uuid(), customer_id = u64_(), email = text())
 
 def handle(input, state):
-    return emit(order_placed(
+    return order_placed(
         order_id = input.order_id,
         customer_id = input.customer_id,
         email = input.email,
-    ))
+    )
 "#,
         ),
         (
@@ -701,7 +701,7 @@ def fold(state, event):
 def handle(input, state):
     if state["taken"]:
         return reject("email_taken", "taken")
-    return emit(registered(id = input.id, email = input.email))
+    return registered(id = input.id, email = input.email)
 "#,
         ),
     ]);
@@ -780,11 +780,11 @@ load("events/order.star", "order_placed")
 input = schema(order_id = uuid(), customer_id = u64_(), email = text())
 
 def handle(input, state):
-    return emit(order_placed(
+    return order_placed(
         order_id = input.order_id,
         customer_id = input.customer_id,
         email = input.email,
-    ))
+    )
 "#,
         ),
         (
@@ -795,7 +795,7 @@ load("events/order.star", "touched")
 input = schema(order_id = uuid())
 
 def handle(input, state):
-    return emit(touched(order_id = input.order_id))
+    return touched(order_id = input.order_id)
 "#,
         ),
         (

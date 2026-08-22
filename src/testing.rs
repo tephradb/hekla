@@ -29,7 +29,7 @@ use crate::dispatch::{self, CommandOutcome, EventDefs, build_event};
 use crate::loader::{CommandUnit, LoadedProject};
 use crate::opdb::OpDb;
 use crate::starlark_builtins::{
-    ConstructedEvent, EmitOutcome, EmittedEvent, InvalidInput, Rejection, runtime_builtins,
+    ConstructedEvent, EmittedEvent, InvalidInput, Rejection, events_from_value, runtime_builtins,
 };
 use std::fmt;
 
@@ -88,8 +88,8 @@ starlark_simple_value!(TestCase);
 #[starlark_module]
 pub fn test_builtins(builder: &mut GlobalsBuilder) {
     /// Declare a scenario. `given` are the prior events (constructed from event
-    /// definitions), `input` is the command input dict, and `expect` is an
-    /// `emit([...])`, `reject(...)` or `invalid_input(...)`.
+    /// definitions), `input` is the command input dict, and `expect` is an event,
+    /// a list of events, `reject(...)` or `invalid_input(...)`.
     fn case<'v>(
         #[starlark(require = named)] command: String,
         #[starlark(require = named)] input: Value<'v>,
@@ -130,9 +130,6 @@ pub fn test_builtins(builder: &mut GlobalsBuilder) {
 }
 
 fn parse_expectation(value: Value<'_>) -> anyhow::Result<Expectation> {
-    if let Some(emit) = value.downcast_ref::<EmitOutcome>() {
-        return Ok(Expectation::Emit(emit.events.clone()));
-    }
     if let Some(reject) = value.downcast_ref::<Rejection>() {
         return Ok(Expectation::Reject {
             code: reject.code.clone(),
@@ -141,14 +138,17 @@ fn parse_expectation(value: Value<'_>) -> anyhow::Result<Expectation> {
     if value.downcast_ref::<InvalidInput>().is_some() {
         return Ok(Expectation::InvalidInput);
     }
+    if let Some(events) = events_from_value(value)? {
+        return Ok(Expectation::Emit(events));
+    }
     anyhow::bail!(
-        "expect must be emit([...]), reject(...) or invalid_input(...), got {}",
+        "expect must be an event, a list of events, reject(...) or invalid_input(...), got {}",
         value.get_type()
     )
 }
 
-/// Globals for test files: the base builtins (so `emit`/`reject`/`invalid_input`
-/// and event constructors work) plus `case(...)`.
+/// Globals for test files: the base builtins (so `reject`/`invalid_input` and
+/// event constructors work) plus `case(...)`.
 fn test_globals() -> Globals {
     GlobalsBuilder::standard()
         .with(runtime_builtins)
@@ -387,7 +387,7 @@ fn compare_events(expected: &[ConstructedEvent], actual: &[EmittedEvent]) -> Res
 
 fn describe_expect(expect: &Expectation) -> String {
     match expect {
-        Expectation::Emit(events) => format!("emit of {} event(s)", events.len()),
+        Expectation::Emit(events) => format!("append of {} event(s)", events.len()),
         Expectation::Reject { code } => format!("reject `{code}`"),
         Expectation::InvalidInput => "invalid_input".to_owned(),
     }

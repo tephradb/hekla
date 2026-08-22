@@ -25,8 +25,8 @@ def handle(input, state):
         return reject("invalid_name", "name must not be blank")
     if state["taken"]:
         return reject("email_taken", "that email is already registered")
-    return emit(user_registered(
+    return user_registered(
         user_id = input.user_id,
         email = input.email,
         name = input.name,
-    ))
+    )

@@ -25,4 +25,4 @@ initial = False
 def handle(input, state):
     if state:
         return reject("already_welcomed", "a welcome was already recorded for this user")
-    return emit(user_welcomed(user_id = input.user_id))
+    return user_welcomed(user_id = input.user_id)

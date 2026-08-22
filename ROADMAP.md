@@ -34,7 +34,7 @@ Phase 2, so it is scoped honestly as "toolchain, no server" rather than a runnab
 - `load()` resolver restricted to `events/` and `lib/`, with a load graph (dependency-ordered
   evaluation and cycle detection) and an evaluated-module cache.
 - Event definitions in `events/`; the event-def constructor validates each payload against the field
-  schema, derives tags, and feeds `emit(...)`; structured tag queries.
+  schema and derives tags; structured tag queries.
 - Effects evaluate against effect-scoped globals (`http.*`, `invoke_command`, `now`, `log`, `read`,
   stubbed until Phase 4), so command and projector purity is structural: they never see a clock or
   the network.

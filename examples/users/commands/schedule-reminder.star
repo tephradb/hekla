@@ -10,7 +10,7 @@ input = schema(
 )
 
 def handle(input, state):
-    return emit(reminder_scheduled(
+    return reminder_scheduled(
         user_id = input.user_id,
         due_at = now(),
-    ))
+    )

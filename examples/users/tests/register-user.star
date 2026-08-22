@@ -13,11 +13,11 @@ cases = [
             "email": "alice@example.com",
             "name": "Alice",
         },
-        expect = emit(user_registered(
+        expect = user_registered(
             user_id = "11111111-1111-1111-1111-111111111111",
             email = "alice@example.com",
             name = "Alice",
-        )),
+        ),
     ),
     case(
         name = "rejects a taken email",

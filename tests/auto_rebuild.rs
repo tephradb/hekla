@@ -24,14 +24,14 @@ const EMIT_ONE: &str = r#"
 load("events/e.star", "one")
 input = schema(id = uuid())
 def handle(input, state):
-    return emit(one(id = input.id))
+    return one(id = input.id)
 "#;
 
 const EMIT_TWO: &str = r#"
 load("events/e.star", "two")
 input = schema(id = uuid())
 def handle(input, state):
-    return emit(two(id = input.id))
+    return two(id = input.id)
 "#;
 
 /// The counter projector, parameterised by which event types it sources.

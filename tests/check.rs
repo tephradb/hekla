@@ -99,7 +99,7 @@ def query(input):
     return thing_happened(note = input.note)
 
 def handle(input, state):
-    return emit(thing_happened(thing_id = input.thing_id, note = input.note))
+    return thing_happened(thing_id = input.thing_id, note = input.note)
 "#,
         ),
     ]);
@@ -116,11 +116,11 @@ fn command_cannot_load_another_command() {
     let dir = write_project(&[
         (
             "commands/a.star",
-            "input = schema(x = text())\n\ndef handle(input, state):\n    return emit([])\n",
+            "input = schema(x = text())\n\ndef handle(input, state):\n    return []\n",
         ),
         (
             "commands/b.star",
-            "load(\"commands/a.star\", \"handle\")\n\ninput = schema(x = text())\n\ndef handle(input, state):\n    return emit([])\n",
+            "load(\"commands/a.star\", \"handle\")\n\ninput = schema(x = text())\n\ndef handle(input, state):\n    return []\n",
         ),
     ]);
     let project = LoadedProject::load(dir.path());
@@ -438,7 +438,7 @@ def query(input):
     return thing_happened(nonexistent = input.x)
 
 def handle(input, state):
-    return emit([])
+    return []
 "#,
         ),
     ]);
@@ -586,7 +586,7 @@ def query(input):
     return thing(secret = input.secret)
 
 def handle(input, state):
-    return emit([])
+    return []
 "#,
         ),
     ]);
