@@ -235,6 +235,10 @@ struct ParsedFile {
     source_hash: String,
     /// Normalised library load paths this file imports.
     deps: Vec<String>,
+    /// Local names bound by this file's `load()` statements. A frozen module
+    /// re-exports its loaded symbols, so these mark bindings that are imports, not
+    /// definitions, and must not be registered as events by this module.
+    loaded_names: HashSet<String>,
     /// Load paths that break the `events/`-or-`lib/` restriction. A file with any
     /// is not evaluated; its finding is the actionable one.
     illegal_deps: Vec<String>,
@@ -299,6 +303,7 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
         ast: None,
         source_hash: String::new(),
         deps: Vec::new(),
+        loaded_names: HashSet::new(),
         illegal_deps: Vec::new(),
     };
 
@@ -322,6 +327,8 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
     };
 
     for load in ast.loads() {
+        file.loaded_names
+            .extend(load.symbols.iter().map(|(local, _)| local.to_string()));
         match normalize_load_path(load.module_id) {
             Ok(norm) if is_library_path(&norm) => file.deps.push(norm),
             Ok(norm) => {
@@ -418,7 +425,13 @@ fn evaluate_one_library(
     match eval_frozen(ast, globals, Some(&loader), false) {
         Ok(frozen) => {
             if matches!(file.role, Role::Events) {
-                register_events(&file.rel_path, &frozen, collector, findings);
+                register_events(
+                    &file.rel_path,
+                    &frozen,
+                    &file.loaded_names,
+                    collector,
+                    findings,
+                );
             }
             cache.insert(load_path, frozen);
         }
@@ -426,11 +439,14 @@ fn evaluate_one_library(
     }
 }
 
-/// Pull every `EventDef` bound at module scope into the registry, flagging a
-/// type defined in two places.
+/// Pull every `EventDef` defined at module scope into the registry, flagging a
+/// type defined in two places. A frozen module re-exports the symbols it `load()`s,
+/// so a binding that names an import is skipped: a shared event referenced from a
+/// second module is one definition, not a duplicate.
 fn register_events(
     rel: &str,
     frozen: &FrozenModule,
+    loaded_names: &HashSet<String>,
     collector: &mut EventCollector,
     findings: &mut Vec<Finding>,
 ) {
@@ -439,6 +455,9 @@ fn register_events(
         .filter_map(|name| name.to_value().unpack_str().map(str::to_owned))
         .collect();
     for binding in bindings {
+        if loaded_names.contains(&binding) {
+            continue; // a `load()` re-export, registered by its defining module
+        }
         let Ok(Some(owned)) = frozen.get_option(&binding) else {
             continue;
         };

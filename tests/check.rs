@@ -306,6 +306,29 @@ fn duplicate_event_type_is_an_error() {
 }
 
 #[test]
+fn re_exporting_an_event_is_not_a_duplicate() {
+    // A second events module that `load()`s an event definition re-exports its
+    // symbol, but that is one definition referenced twice, not a type collision.
+    let dir = write_project(&[
+        (
+            "events/a.star",
+            r#"thing = event(type = "thing.happened", fields = {"thing_id": uuid()})"#,
+        ),
+        (
+            "events/b.star",
+            r#"
+load("events/a.star", "thing")
+other = event(type = "other.happened", fields = {"other_id": uuid()})
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let errs = errors(&project);
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    assert_eq!(project.events.by_type.len(), 2);
+}
+
+#[test]
 fn event_field_in_the_reserved_namespace_is_an_error() {
     let dir = write_project(&[(
         "events/reserved.star",
