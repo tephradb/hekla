@@ -28,7 +28,6 @@ use crate::loader::{CommandUnit, LoadedProject};
 use crate::starlark_builtins::{
     ConstructedEvent, EmitOutcome, EmittedEvent, InvalidInput, Rejection, runtime_builtins,
 };
-use crate::validate;
 use std::fmt;
 
 /// Throwaway per-case stores stay small, but the segment must still clear the
@@ -153,8 +152,9 @@ fn test_globals() -> Globals {
 /// Run `kiln test` over the project at `dir`.
 pub fn run(dir: &Path) -> ExitCode {
     let project = LoadedProject::load(dir);
-    let mut findings = project.findings.clone();
-    findings.extend(validate::check(&project));
+    // Reuse the CLI's collection so `kiln test` reports the same findings, in the
+    // same location order, as `kiln check` and `kiln serve`.
+    let findings = crate::cli::collect_findings(&project);
     let load_errors = findings
         .iter()
         .filter(|finding| finding.severity == crate::loader::Severity::Error)
@@ -272,7 +272,7 @@ fn execute_case(command: &CommandUnit, case: &TestCase) -> anyhow::Result<Comman
             data,
             tags: event.tags.clone(),
         };
-        packed.push(build_event(&emitted, &seed_ctx, TEST_NOW)?);
+        packed.push(build_event(&emitted, &seed_ctx, TEST_NOW, None)?);
     }
     if !packed.is_empty() {
         store
@@ -283,7 +283,14 @@ fn execute_case(command: &CommandUnit, case: &TestCase) -> anyhow::Result<Comman
     let input: serde_json::Value =
         serde_json::from_str(&case.input).context("parsing the case input")?;
     let ctx = CommandContext::new(Uuid::new_v4());
-    let outcome = dispatch::run_command(&store, &command.loaded, &input, &ctx, TEST_NOW)?;
+    // Host-side validation is a first-class outcome, and the runtime performs it
+    // once before dispatch; mirror that split here so tests exercise the same path.
+    let outcome = match dispatch::validate_input(&command.loaded, &input) {
+        Ok(()) => dispatch::run_command(&store, &command.loaded, &input, &ctx, TEST_NOW, None)?,
+        Err(err) => CommandOutcome::InvalidInput {
+            message: format!("{err}"),
+        },
+    };
     coordinator.shutdown();
     Ok(outcome)
 }
@@ -359,6 +366,8 @@ fn describe_outcome(outcome: &CommandOutcome) -> String {
         CommandOutcome::Rejected { code, .. } => format!("reject `{code}`"),
         CommandOutcome::InvalidInput { .. } => "invalid_input".to_owned(),
         CommandOutcome::Conflict => "a concurrency conflict".to_owned(),
+        CommandOutcome::AlreadyCommitted(_) => "an idempotent replay".to_owned(),
+        CommandOutcome::Unavailable { .. } => "the store is unavailable".to_owned(),
     }
 }
 

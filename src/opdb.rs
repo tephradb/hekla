@@ -1,11 +1,12 @@
 //! The operational database (`kiln.db`).
 //!
 //! One shared SQLite database holding runtime bookkeeping that is not domain
-//! truth and never belongs in the event log: command idempotency keys, the
-//! effect journal and its per-effect cursor, effect invocations, and
-//! deployed-module metadata. This module owns the schema and its migrations, and
-//! exposes the short, single-statement operations the command and effect runtimes
-//! call under a shared lock.
+//! truth and never belongs in the event log: the effect journal and its per-effect
+//! cursor, effect invocations, and deployed-module metadata. Command idempotency is
+//! not here: it lives in the event log itself, guarded by a per-request tag on the
+//! append (see [`crate::dispatch`]). This module owns the schema and its migrations,
+//! and exposes the short, single-statement operations the effect runtime calls under
+//! a shared lock.
 
 use std::path::Path;
 
@@ -24,16 +25,6 @@ pub const SWEEP_CHUNK: usize = 1000;
 /// The operational database handle.
 pub struct OpDb {
     conn: Connection,
-}
-
-/// The result of trying to reserve an idempotency key.
-pub enum Reserve {
-    /// This request now owns the key: run the command, then `finalize`.
-    Acquired,
-    /// A previous execution already completed; replay its stored outcome.
-    Done { status: u16, outcome: String },
-    /// Another execution holds the key and has not finished yet.
-    Pending,
 }
 
 /// The state of an effect invocation after reserving it, deciding whether the
@@ -65,9 +56,9 @@ impl OpDb {
     fn from_connection(conn: Connection) -> anyhow::Result<OpDb> {
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enabling foreign keys")?;
-        // WAL keeps a finalize write from blocking a concurrent reserve read once
-        // the operational DB grows beyond a single connection. A no-op (stays
-        // `memory`) for the in-memory database used in tests.
+        // WAL keeps a journal write from blocking a concurrent read once the
+        // operational DB grows beyond a single connection. A no-op (stays `memory`)
+        // for the in-memory database used in tests.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_row| Ok(()))
             .context("enabling WAL")?;
         let mut db = OpDb { conn };
@@ -87,86 +78,6 @@ impl OpDb {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .context("reading schema version")?;
         Ok(version)
-    }
-
-    /// Reserve an idempotency key for a command. The caller holds the DB lock only
-    /// for this call; the reserved `pending` row is what excludes a concurrent
-    /// duplicate while the command runs. On `Acquired` the caller must eventually
-    /// `finalize` (success) or `release` (internal error).
-    pub fn reserve(&self, command: &str, key: &str, now: &str) -> anyhow::Result<Reserve> {
-        let inserted = self
-            .conn
-            .execute(
-                "INSERT OR IGNORE INTO idempotency (command, key, state, created_at) \
-                 VALUES (?1, ?2, 'pending', ?3)",
-                params![command, key, now],
-            )
-            .context("reserving idempotency key")?;
-        if inserted == 1 {
-            return Ok(Reserve::Acquired);
-        }
-        let row = self
-            .conn
-            .query_row(
-                "SELECT state, status, outcome FROM idempotency WHERE command = ?1 AND key = ?2",
-                params![command, key],
-                |row| {
-                    let state: String = row.get(0)?;
-                    let status: Option<i64> = row.get(1)?;
-                    let outcome: Option<String> = row.get(2)?;
-                    Ok((state, status, outcome))
-                },
-            )
-            .context("reading idempotency key")?;
-        match row.0.as_str() {
-            "done" => Ok(Reserve::Done {
-                status: row.1.unwrap_or(500) as u16,
-                outcome: row.2.unwrap_or_default(),
-            }),
-            _ => Ok(Reserve::Pending),
-        }
-    }
-
-    /// Record the terminal outcome for a reserved key, so a later replay returns
-    /// exactly this status and body.
-    pub fn finalize(
-        &self,
-        command: &str,
-        key: &str,
-        status: u16,
-        outcome: &str,
-        now: &str,
-    ) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE idempotency SET state = 'done', status = ?3, outcome = ?4, \
-                 completed_at = ?5 WHERE command = ?1 AND key = ?2",
-                params![command, key, status as i64, outcome, now],
-            )
-            .context("finalizing idempotency key")?;
-        Ok(())
-    }
-
-    /// Drop a reservation whose command failed with an internal error, so a retry
-    /// can proceed rather than caching a transient failure.
-    pub fn release(&self, command: &str, key: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "DELETE FROM idempotency WHERE command = ?1 AND key = ?2 AND state = 'pending'",
-                params![command, key],
-            )
-            .context("releasing idempotency key")?;
-        Ok(())
-    }
-
-    /// Clear all `pending` reservations. Run at startup: a pending row can only be
-    /// stale (the process that owned it is gone), and clearing it frees the key.
-    pub fn clear_pending(&self) -> anyhow::Result<usize> {
-        let cleared = self
-            .conn
-            .execute("DELETE FROM idempotency WHERE state = 'pending'", [])
-            .context("clearing pending idempotency keys")?;
-        Ok(cleared)
     }
 
     // --- effect invocations and journal ------------------------------------
@@ -365,20 +276,6 @@ impl OpDb {
         Ok(deleted)
     }
 
-    /// Delete up to `limit` `done` idempotency keys completed before `cutoff`.
-    pub fn sweep_idempotency(&self, cutoff: &str, limit: usize) -> anyhow::Result<usize> {
-        let deleted = self
-            .conn
-            .execute(
-                "DELETE FROM idempotency WHERE rowid IN (\
-                 SELECT rowid FROM idempotency \
-                 WHERE state = 'done' AND completed_at < ?1 LIMIT ?2)",
-                params![cutoff, limit as i64],
-            )
-            .context("sweeping idempotency keys")?;
-        Ok(deleted)
-    }
-
     fn migrate(&mut self) -> anyhow::Result<()> {
         let mut version: i64 = self.schema_version()?;
         while version < SCHEMA_VERSION {
@@ -407,26 +304,10 @@ impl OpDb {
     }
 }
 
-/// The initial schema. Table shapes anticipate the command and effect runtimes
-/// so those phases add behaviour, not columns.
+/// The initial schema. Table shapes anticipate the effect runtime so later phases
+/// add behaviour, not columns. Command idempotency has no table here: it lives in
+/// the event log, guarded by a per-request append tag (see `crate::dispatch`).
 const SCHEMA_V1: &str = "
--- Command idempotency keys. The lookup is global per command, not scoped to a
--- boundary: a retry of a rejected command produced no event, so there would be
--- nothing in the boundary to find. A row is reserved `pending` before the command
--- runs (the mutual-exclusion token for concurrent duplicates) and moved to `done`
--- with the outcome once it finishes; on a hit the runtime returns the original
--- outcome, including rejections.
-CREATE TABLE idempotency (
-    command      TEXT    NOT NULL,
-    key          TEXT    NOT NULL,
-    state        TEXT    NOT NULL CHECK (state IN ('pending', 'done')),
-    status       INTEGER,            -- HTTP status of the original outcome, set on finalize
-    outcome      TEXT,               -- JSON of the original response body, set on finalize
-    created_at   TEXT    NOT NULL,   -- ISO-8601, drives the retention sweeper
-    completed_at TEXT,               -- set on finalize
-    PRIMARY KEY (command, key)
-);
-
 -- One effect invocation: an effect reacting to a single event position. The
 -- recorded script hash lets a restart warn when in-flight code changed under it.
 CREATE TABLE effect_invocation (
@@ -503,12 +384,7 @@ mod tests {
     #[test]
     fn creates_every_table() {
         let db = OpDb::open_in_memory().unwrap();
-        for table in [
-            "idempotency",
-            "effect_invocation",
-            "effect_journal",
-            "module_metadata",
-        ] {
+        for table in ["effect_invocation", "effect_journal", "module_metadata"] {
             let count: i64 = db
                 .connection()
                 .query_row(
@@ -528,61 +404,6 @@ mod tests {
         OpDb::open(&path).unwrap();
         let reopened = OpDb::open(&path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn first_reserve_acquires_second_is_pending() {
-        let db = OpDb::open_in_memory().unwrap();
-        assert!(matches!(
-            db.reserve("c", "k", "t0").unwrap(),
-            Reserve::Acquired
-        ));
-        assert!(matches!(
-            db.reserve("c", "k", "t1").unwrap(),
-            Reserve::Pending
-        ));
-    }
-
-    #[test]
-    fn finalize_makes_replay_return_the_stored_outcome() {
-        let db = OpDb::open_in_memory().unwrap();
-        db.reserve("c", "k", "t0").unwrap();
-        db.finalize("c", "k", 200, r#"{"ok":true}"#, "t1").unwrap();
-        match db.reserve("c", "k", "t2").unwrap() {
-            Reserve::Done { status, outcome } => {
-                assert_eq!(status, 200);
-                assert_eq!(outcome, r#"{"ok":true}"#);
-            }
-            _ => panic!("expected Done"),
-        }
-    }
-
-    #[test]
-    fn release_frees_the_key() {
-        let db = OpDb::open_in_memory().unwrap();
-        db.reserve("c", "k", "t0").unwrap();
-        db.release("c", "k").unwrap();
-        assert!(matches!(
-            db.reserve("c", "k", "t1").unwrap(),
-            Reserve::Acquired
-        ));
-    }
-
-    #[test]
-    fn clear_pending_frees_reservations_but_not_done() {
-        let db = OpDb::open_in_memory().unwrap();
-        db.reserve("c", "pending", "t0").unwrap();
-        db.reserve("c", "done", "t0").unwrap();
-        db.finalize("c", "done", 200, "{}", "t1").unwrap();
-        assert_eq!(db.clear_pending().unwrap(), 1);
-        assert!(matches!(
-            db.reserve("c", "pending", "t2").unwrap(),
-            Reserve::Acquired
-        ));
-        assert!(matches!(
-            db.reserve("c", "done", "t2").unwrap(),
-            Reserve::Done { .. }
-        ));
     }
 
     #[test]
@@ -689,35 +510,6 @@ mod tests {
         assert!(matches!(
             db.begin_invocation("e", 3, "h", "t9").unwrap(),
             InvocationState::Running
-        ));
-    }
-
-    #[test]
-    fn sweep_idempotency_removes_only_old_done() {
-        let db = OpDb::open_in_memory().unwrap();
-        db.reserve("c", "old", "t0").unwrap();
-        db.finalize("c", "old", 200, "{}", "2026-01-01T00:00:00Z")
-            .unwrap();
-        db.reserve("c", "recent", "t0").unwrap();
-        db.finalize("c", "recent", 200, "{}", "2026-12-31T00:00:00Z")
-            .unwrap();
-        db.reserve("c", "pending", "t0").unwrap(); // still pending, no completed_at
-
-        let deleted = db
-            .sweep_idempotency("2026-06-01T00:00:00Z", SWEEP_CHUNK)
-            .unwrap();
-        assert_eq!(deleted, 1);
-        assert!(matches!(
-            db.reserve("c", "old", "t9").unwrap(),
-            Reserve::Acquired
-        ));
-        assert!(matches!(
-            db.reserve("c", "recent", "t9").unwrap(),
-            Reserve::Done { .. }
-        ));
-        assert!(matches!(
-            db.reserve("c", "pending", "t9").unwrap(),
-            Reserve::Pending
         ));
     }
 }

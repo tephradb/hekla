@@ -1,12 +1,11 @@
 //! Project configuration (`kiln.toml`).
 //!
 //! A small, optional file for operational knobs that are not code: the effect
-//! blocking-pool size and the retention windows for effect journals and command
-//! idempotency keys. Defaults are sensible, so a project runs with no config.
-//! The retention windows drive the sweeper; the pool size is validated but
-//! reserved (v1 runs one thread per effect). Validating here means a malformed
-//! `kiln.toml` fails at load, not at the moment the sweeper first reaches for a
-//! setting.
+//! blocking-pool size and the effect-journal retention window. Defaults are
+//! sensible, so a project runs with no config. The retention window drives the
+//! sweeper; the pool size is validated but reserved (v1 runs one thread per
+//! effect). Validating here means a malformed `kiln.toml` fails at load, not at
+//! the moment the sweeper first reaches for a setting.
 
 use std::path::Path;
 use std::{fs, io};
@@ -43,8 +42,6 @@ pub struct Retention {
     /// How long a completed effect invocation's journal is kept before the
     /// sweeper reclaims it. Sweeping is lazy GC, so this only bounds disk use.
     pub effect_journal_days: u32,
-    /// How long a command idempotency key is kept before the sweeper ages it out.
-    pub idempotency_key_days: u32,
 }
 
 impl Default for Effects {
@@ -57,7 +54,6 @@ impl Default for Retention {
     fn default() -> Retention {
         Retention {
             effect_journal_days: 7,
-            idempotency_key_days: 7,
         }
     }
 }
@@ -87,21 +83,12 @@ impl Config {
         if self.effects.pool_size == 0 {
             anyhow::bail!("effects.pool_size must be at least 1");
         }
-        // Retention windows feed date arithmetic, so a typo like a billion days is
-        // caught here rather than turning into a silently-infinite window.
-        for (field, days) in [
-            (
-                "retention.effect_journal_days",
-                self.retention.effect_journal_days,
-            ),
-            (
-                "retention.idempotency_key_days",
-                self.retention.idempotency_key_days,
-            ),
-        ] {
-            if days > MAX_RETENTION_DAYS {
-                anyhow::bail!("{field} must be at most {MAX_RETENTION_DAYS} (100 years)");
-            }
+        // The retention window feeds date arithmetic, so a typo like a billion days
+        // is caught here rather than turning into a silently-infinite window.
+        if self.retention.effect_journal_days > MAX_RETENTION_DAYS {
+            anyhow::bail!(
+                "retention.effect_journal_days must be at most {MAX_RETENTION_DAYS} (100 years)"
+            );
         }
         Ok(())
     }
@@ -116,14 +103,13 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.effects.pool_size, 16);
         assert_eq!(config.retention.effect_journal_days, 7);
-        assert_eq!(config.retention.idempotency_key_days, 7);
     }
 
     #[test]
     fn partial_config_keeps_other_defaults() {
-        let config = Config::parse("[effects]\npool_size = 4\n").unwrap();
-        assert_eq!(config.effects.pool_size, 4);
-        assert_eq!(config.retention.idempotency_key_days, 7);
+        let config = Config::parse("[retention]\neffect_journal_days = 3\n").unwrap();
+        assert_eq!(config.retention.effect_journal_days, 3);
+        assert_eq!(config.effects.pool_size, 16);
     }
 
     #[test]
@@ -134,7 +120,6 @@ mod tests {
     #[test]
     fn absurd_retention_window_is_rejected() {
         assert!(Config::parse("[retention]\neffect_journal_days = 4000000000\n").is_err());
-        assert!(Config::parse("[retention]\nidempotency_key_days = 4000000000\n").is_err());
     }
 
     #[test]

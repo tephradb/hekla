@@ -28,8 +28,8 @@ use crate::context::CommandContext;
 use crate::effect::EffectRuntime;
 use crate::projector::{ProjectorSet, ProjectorShared};
 use crate::read_api;
-use crate::runtime::Runtime;
-use crate::{openapi, starlark_builtins::EntityDef};
+use crate::runtime::{Runtime, error_body};
+use crate::starlark_builtins::EntityDef;
 
 type Shared = Arc<Runtime>;
 
@@ -108,7 +108,12 @@ async fn execute(
     body: Bytes,
 ) -> Response {
     let ctx = CommandContext::new(correlation_id(&headers));
-    let idem_key = header_string(&headers, "idempotency-key");
+    // Normalize the key that gets hashed into the idempotency tag: trim surrounding
+    // whitespace (proxies add it, and `"k"` vs `"k "` must dedupe) and treat a blank
+    // header as no key at all.
+    let idem_key = header_string(&headers, "idempotency-key")
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty());
 
     let value = match parse_body(&body) {
         Ok(value) => value,
@@ -141,8 +146,13 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn openapi_doc(State(runtime): State<Shared>) -> Json<Value> {
-    Json(openapi::build(&runtime.public_commands()))
+async fn openapi_doc(State(runtime): State<Shared>) -> Response {
+    let mut response = runtime.openapi_json().to_owned().into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 async fn docs() -> Html<&'static str> {
@@ -484,14 +494,6 @@ fn parse_body(body: &Bytes) -> Result<Value, String> {
 fn json_response(status: u16, body: Value) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (code, Json(body)).into_response()
-}
-
-fn error_body(ctx: &CommandContext, code: &str, message: &str) -> Value {
-    json!({
-        "correlation_id": ctx.correlation_id.to_string(),
-        "causation_id": ctx.causation_id.to_string(),
-        "error": { "code": code, "message": message },
-    })
 }
 
 async fn shutdown_signal() {

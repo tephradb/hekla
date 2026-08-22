@@ -50,7 +50,7 @@ fn projector_reads_through_the_envelope() {
             ("email".to_owned(), Some("alice@example.com".to_owned())),
         ],
     };
-    let event = build_event(&emitted, &ctx, "1970-01-01T00:00:00Z").unwrap();
+    let event = build_event(&emitted, &ctx, "1970-01-01T00:00:00Z", None).unwrap();
     store.append(vec![event], None).unwrap();
 
     let model_dir = tempfile::tempdir().unwrap();
@@ -136,7 +136,7 @@ def handle(event):
             data: json!({ "id": id }),
             tags: vec![("id".to_owned(), Some(id.clone()))],
         };
-        let event = build_event(&emitted, &ctx, "1970-01-01T00:00:00Z").unwrap();
+        let event = build_event(&emitted, &ctx, "1970-01-01T00:00:00Z", None).unwrap();
         store.append(vec![event], None).unwrap();
     }
 

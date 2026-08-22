@@ -188,8 +188,9 @@ fn run_fmt(dir: &Path, check_only: bool) -> ExitCode {
     }
 }
 
-/// The loader findings plus the semantic checks, sorted by location.
-fn collect_findings(project: &LoadedProject) -> Vec<Finding> {
+/// The loader findings plus the semantic checks, sorted by location. Shared with
+/// `kiln test` so every command reports the same findings in the same order.
+pub(crate) fn collect_findings(project: &LoadedProject) -> Vec<Finding> {
     let mut findings = project.findings.clone();
     findings.extend(validate::check(project));
     findings.sort_by(|left, right| left.location.cmp(&right.location));

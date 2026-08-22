@@ -195,6 +195,52 @@ fn duplicate_event_type_is_an_error() {
 }
 
 #[test]
+fn event_field_in_the_reserved_namespace_is_an_error() {
+    let dir = write_project(&[(
+        "events/reserved.star",
+        r#"
+sneaky = event(
+    type = "sneaky.happened",
+    fields = {"_kiln_idem": text()},
+    tags = ["_kiln_idem"],
+)
+"#,
+    )]);
+    let project = LoadedProject::load(dir.path());
+    let errs = errors(&project);
+    assert!(
+        errs.iter()
+            .any(|err| err.contains("reserved `_kiln_` prefix")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn source_tag_in_the_reserved_namespace_is_an_error() {
+    let dir = write_project(&[
+        ("events/thing.star", EVENTS),
+        (
+            "projectors/things.star",
+            r#"
+things = entity(key = "thing_id", fields = {"thing_id": uuid()})
+
+source = events(tags = {"_kiln_idem": "x"})
+
+def handle(event):
+    return [put(things, {"thing_id": event.data["thing_id"]})]
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let errs = errors(&project);
+    assert!(
+        errs.iter()
+            .any(|err| err.contains("reserved `_kiln_` prefix")),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn parse_error_is_reported_without_crashing() {
     let dir = write_project(&[("commands/broken.star", "def handle(input, state)\n")]);
     let project = LoadedProject::load(dir.path());

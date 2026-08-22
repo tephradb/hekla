@@ -15,7 +15,9 @@ serde_json = "1"
 sha2 = "0.11"
 starlark = "0.14"
 tempfile = "3"
-tephra = { version = "0.3.5", features = ["async", "tracing"] }
+# Pinned to the fail_if_exists existence-clause commit (tephra PR #31), unreleased.
+# Switch to a crates.io version once tephra publishes it.
+tephra = { git = "https://github.com/tephradb/tephra", rev = "56b2af215914ccdd20f154af30e5c782c59c036a", features = ["async", "tracing"] }
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["full"] }
 toml = "1.1"

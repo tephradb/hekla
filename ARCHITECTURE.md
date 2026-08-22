@@ -237,13 +237,12 @@ diverge from the original run. kiln journals `read()` for consistency with the r
 
 **Writing outcomes**: effects do not append events; they `invoke_command`, and that invoke is a
 journaled, idempotent side effect, so durable domain facts (tracking numbers, external ids) land
-exactly once across replays. The idempotency key an effect passes is deterministic, so the common-path
-replay returns the recorded outcome without re-running the command. Across the narrow crash window
-between the command's append and its idempotency finalize, that key is cleared at startup (like every
-pending key), so exactly-once there rests on the command being idempotent under replay: a natural-id
-create, or an explicit DCB boundary that turns the re-append into a no-op reject. This is the same
-requirement, and the same guarantee, as for HTTP commands, so effect-completion commands carry a
-boundary just as any create does. A command rejection is a normal terminal outcome, not a retryable
+exactly once across replays. The idempotency key an effect passes is deterministic, so the target
+command tags every event it emits with that key and guards the append against the tag. A replay (or a
+crash between the command's append and the effect's journal write) finds the prior commit by that tag
+and returns its recovered outcome without re-running the command: exactly-once is enforced by the event
+log itself, not by any op-DB reservation. This is the same mechanism, and the same guarantee, as for
+HTTP commands. A command rejection is a normal terminal outcome, not a retryable
 failure: if a completion command rejects because state moved on (the claim was already cancelled, the
 order already fulfilled), the runtime records the rejection in the journal and completes the
 invocation. Treating rejection as retryable would loop forever on legitimately-stale completions.

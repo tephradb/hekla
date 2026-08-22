@@ -6,9 +6,10 @@
 //! `now()` for the request, built-in per-command idempotency, and optimistic-
 //! concurrency retry.
 //!
-//! [`Runtime::execute`] produces the final `(status, body)` so idempotency can
-//! store the exact response a replay must return. It is synchronous (Starlark and
-//! tephra appends are), so the server calls it on a blocking thread.
+//! Idempotency lives in the event log, not here: a keyed command tags its events and
+//! guards the append against that tag, and [`Runtime::execute`] reconstructs the
+//! original `(status, body)` from those events on a replay. It is synchronous
+//! (Starlark and tephra appends are), so the server calls it on a blocking thread.
 
 use std::collections::HashMap;
 use std::fs;
@@ -31,7 +32,8 @@ use crate::context::CommandContext;
 use crate::dispatch::{self, CommandOutcome};
 use crate::effect::{self, EffectRuntime, EffectShared, HttpClient};
 use crate::loader::{CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
-use crate::opdb::{InvocationState, OpDb, Reserve};
+use crate::opdb::{InvocationState, OpDb};
+use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
 use crate::read_api;
 use crate::starlark_builtins::{EmittedEvent, InputSchema, ModuleDef};
@@ -44,8 +46,7 @@ const SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 /// before the runtime gives up and returns a concurrency conflict.
 const MAX_ATTEMPTS: u32 = 5;
 
-/// The final HTTP outcome of a command execution: the status and the response
-/// body. The body is what idempotency stores, so a replay returns it verbatim.
+/// The final HTTP outcome of a command execution: the status and the response body.
 pub struct ExecResult {
     pub status: u16,
     pub body: Value,
@@ -62,6 +63,9 @@ pub struct Runtime {
     /// after the effect threads spawn (they need `Arc<Runtime>` first).
     effects: OnceLock<Vec<Arc<EffectShared>>>,
     event_count: usize,
+    /// The OpenAPI document serialized once at startup: the public command set is
+    /// fixed for the process lifetime, so `/openapi.json` serves this verbatim.
+    openapi_json: String,
 }
 
 impl Runtime {
@@ -86,12 +90,6 @@ impl Runtime {
             .context("starting the write coordinator")?;
 
         let opdb = OpDb::open(&data_dir.join("kiln.db"))?;
-        // Clear stale reservations before effects start, so a replay of an
-        // `invoke_command` never sees a `pending` row left by a crashed run.
-        let cleared = opdb.clear_pending()?;
-        if cleared > 0 {
-            tracing::warn!("cleared {cleared} stale idempotency reservation(s) from a prior run");
-        }
         let now = now_rfc3339();
 
         let mut commands = HashMap::new();
@@ -138,6 +136,8 @@ impl Runtime {
         }
         let config: Config = project.config;
 
+        let openapi_json = openapi::build(&public_command_schemas(&commands)).to_string();
+
         let runtime = Arc::new(Runtime {
             commands,
             store,
@@ -146,6 +146,7 @@ impl Runtime {
             projectors,
             effects: OnceLock::new(),
             event_count: project.events.by_type.len(),
+            openapi_json,
         });
 
         // Effects need `Arc<Runtime>` (for `invoke_command` and `read`), so they
@@ -198,8 +199,12 @@ impl Runtime {
         self.run_resolved(name, &Arc::clone(command), body, ctx, idem_key)
     }
 
-    /// The shared execution path once a command is resolved: idempotency reserve,
-    /// the retrying decision cycle, then finalize or release.
+    /// The shared execution path once a command is resolved. Idempotency lives
+    /// entirely in the event log: a keyed command tags every event with a per-request
+    /// idempotency tag and guards the append against it, so a crashed or concurrent
+    /// duplicate fails the condition instead of committing twice, and a replay
+    /// reconstructs its original response from those tagged events. There is no
+    /// separate response cache; the log is the single source of truth.
     fn run_resolved(
         &self,
         name: &str,
@@ -209,76 +214,74 @@ impl Runtime {
         idem_key: Option<&str>,
     ) -> anyhow::Result<ExecResult> {
         let now = now_rfc3339();
-
-        // Idempotency: reserve the key, replaying a completed outcome or refusing a
-        // still-running duplicate. The DB lock is held only for the reservation.
-        if let Some(key) = idem_key {
-            match self.lock_opdb().reserve(name, key, &now)? {
-                Reserve::Done { status, outcome } => {
-                    let body = serde_json::from_str(&outcome).unwrap_or(Value::Null);
-                    return Ok(ExecResult { status, body });
-                }
-                Reserve::Pending => {
-                    return Ok(ExecResult {
-                        status: 409,
-                        body: error_body(
-                            ctx,
-                            "in_progress",
-                            "a request with this idempotency key is still being processed",
-                        ),
-                    });
-                }
-                Reserve::Acquired => {}
-            }
-        }
-
-        match self.run_with_retry(command, &body, ctx, &now) {
-            Ok(result) => {
-                if let Some(key) = idem_key {
-                    let outcome = result.body.to_string();
-                    self.lock_opdb()
-                        .finalize(name, key, result.status, &outcome, &now)?;
-                }
-                Ok(result)
-            }
-            Err(err) => {
-                // An internal error caches nothing; free the reservation so a retry
-                // can proceed.
-                if let Some(key) = idem_key {
-                    let _ = self.lock_opdb().release(name, key);
-                }
-                Err(err)
-            }
-        }
+        let idem_tag = idem_key.map(|key| dispatch::idempotency_tag(name, key));
+        self.run_with_retry(command, &body, ctx, &now, idem_tag.as_deref())
     }
 
-    /// Run the decision cycle, retrying the whole cycle on a DCB conflict so a
-    /// re-read rebuilds the decision model. A small exponential backoff keeps a
-    /// hot boundary from hammering the single writer.
+    /// Run the decision cycle, retrying on a DCB conflict so a re-read rebuilds the
+    /// decision model, with a small exponential backoff so a hot boundary does not
+    /// hammer the single writer. When a keyed request already committed (a crash or a
+    /// concurrent duplicate), `run_command` returns `AlreadyCommitted` with the
+    /// outcome recovered from the log rather than re-deciding, so a duplicate never
+    /// re-runs `handle`.
     fn run_with_retry(
         &self,
         command: &CommandUnit,
         body: &Value,
         ctx: &CommandContext,
         now: &str,
+        idem_tag: Option<&str>,
     ) -> anyhow::Result<ExecResult> {
+        // Input is invariant across attempts, so validate once before the loop.
+        if let Err(err) = dispatch::validate_input(&command.loaded, body) {
+            return Ok(ExecResult {
+                status: 400,
+                body: error_body(ctx, "invalid_input", &format!("{err}")),
+            });
+        }
+
         for attempt in 0..MAX_ATTEMPTS {
-            match dispatch::run_command(&self.store, &command.loaded, body, ctx, now)? {
+            match dispatch::run_command(&self.store, &command.loaded, body, ctx, now, idem_tag)? {
                 CommandOutcome::Conflict => {
                     if attempt + 1 < MAX_ATTEMPTS {
                         thread::sleep(Duration::from_millis(1u64 << attempt));
                     }
                 }
-                outcome => return Ok(outcome_to_result(outcome, ctx)),
+                CommandOutcome::Committed { events, positions } => {
+                    return Ok(ExecResult {
+                        status: 200,
+                        body: success_body(ctx, positions, &events),
+                    });
+                }
+                CommandOutcome::AlreadyCommitted(recovered) => {
+                    return Ok(ExecResult {
+                        status: 200,
+                        body: recovered_body(&recovered),
+                    });
+                }
+                CommandOutcome::Rejected { code, message } => {
+                    return Ok(ExecResult {
+                        status: 422,
+                        body: error_body(ctx, &code, &message),
+                    });
+                }
+                CommandOutcome::InvalidInput { message } => {
+                    return Ok(ExecResult {
+                        status: 400,
+                        body: error_body(ctx, "invalid_input", &message),
+                    });
+                }
+                CommandOutcome::Unavailable { message } => {
+                    return Ok(ExecResult {
+                        status: 503,
+                        body: error_body(ctx, "unavailable", &message),
+                    });
+                }
             }
         }
         Ok(ExecResult {
             status: 409,
-            body: error_body(
-                ctx,
-                "concurrency_conflict",
-                "the command's consistency boundary kept changing during the request; retry",
-            ),
+            body: conflict_body(ctx),
         })
     }
 
@@ -436,10 +439,6 @@ impl Runtime {
         self.lock_opdb().sweep_effect_journal(cutoff, limit)
     }
 
-    pub(crate) fn sweep_idempotency(&self, cutoff: &str, limit: usize) -> anyhow::Result<usize> {
-        self.lock_opdb().sweep_idempotency(cutoff, limit)
-    }
-
     /// Read one row from a projector's read model, for the effect `read()` builtin.
     /// Returns `null` when the row is absent.
     pub(crate) fn read_projector(
@@ -503,17 +502,12 @@ impl Runtime {
 
     /// The public commands and their input schemas, for OpenAPI generation.
     pub fn public_commands(&self) -> Vec<(&str, &InputSchema)> {
-        let mut out = Vec::new();
-        for unit in self.commands.values() {
-            if unit.internal {
-                continue;
-            }
-            if let ModuleDef::Command { name, input } = &unit.loaded.def {
-                out.push((name.as_str(), input));
-            }
-        }
-        out.sort_by_key(|(name, _)| *name);
-        out
+        public_command_schemas(&self.commands)
+    }
+
+    /// The OpenAPI document, serialized once at startup.
+    pub fn openapi_json(&self) -> &str {
+        &self.openapi_json
     }
 
     fn lock_opdb(&self) -> MutexGuard<'_, OpDb> {
@@ -541,55 +535,92 @@ pub(crate) fn rfc3339_days_ago(days: u32) -> String {
         .unwrap_or_else(|| "0000-01-01T00:00:00Z".to_owned())
 }
 
-/// Map a command outcome to its HTTP status and response body.
-fn outcome_to_result(outcome: CommandOutcome, ctx: &CommandContext) -> ExecResult {
-    match outcome {
-        CommandOutcome::Committed { events, positions } => ExecResult {
-            status: 200,
-            body: success_body(ctx, positions, &events),
-        },
-        CommandOutcome::Rejected { code, message } => ExecResult {
-            status: 422,
-            body: error_body(ctx, &code, &message),
-        },
-        CommandOutcome::InvalidInput { message } => ExecResult {
-            status: 400,
-            body: error_body(ctx, "invalid_input", &message),
-        },
-        // Handled by the retry loop; reaching here means it exhausted retries.
-        CommandOutcome::Conflict => ExecResult {
-            status: 409,
-            body: error_body(
-                ctx,
-                "concurrency_conflict",
-                "the boundary kept changing; retry",
-            ),
-        },
+/// The public (HTTP-routed) commands and their declared input schemas, sorted by
+/// name, for OpenAPI generation.
+fn public_command_schemas(
+    commands: &HashMap<String, Arc<CommandUnit>>,
+) -> Vec<(&str, &InputSchema)> {
+    let mut out = Vec::new();
+    for unit in commands.values() {
+        if unit.internal {
+            continue;
+        }
+        if let ModuleDef::Command { name, input } = &unit.loaded.def {
+            out.push((name.as_str(), input));
+        }
     }
+    out.sort_by_key(|(name, _)| *name);
+    out
 }
 
+/// The 409 body for a request whose consistency boundary kept changing until the
+/// runtime gave up retrying. One builder so the message never drifts.
+fn conflict_body(ctx: &CommandContext) -> Value {
+    error_body(
+        ctx,
+        "concurrency_conflict",
+        "the command's consistency boundary kept changing during the request; retry",
+    )
+}
+
+/// The 200 body for a freshly committed command.
 fn success_body(
     ctx: &CommandContext,
     positions: Option<PositionRange>,
     events: &[EmittedEvent],
 ) -> Value {
-    let positions = match positions {
-        Some(range) => json!({ "first": range.first.get(), "last": range.last.get() }),
-        None => Value::Null,
-    };
     let events: Vec<Value> = events
         .iter()
         .map(|event| json!({ "type": event.event_type, "tags": tag_strings(&event.tags) }))
         .collect();
+    committed_body(
+        &ctx.correlation_id.to_string(),
+        &ctx.causation_id.to_string(),
+        positions,
+        events,
+    )
+}
+
+/// The 200 body for a command whose prior commit was recovered from the log under its
+/// idempotency tag. Uses the original request's identity (from the stored envelope),
+/// so a log-recovered replay is byte-identical to the op-DB-cached one.
+fn recovered_body(recovered: &dispatch::RecoveredOutcome) -> Value {
+    let events: Vec<Value> = recovered
+        .events
+        .iter()
+        .map(|event| json!({ "type": event.event_type, "tags": event.tags }))
+        .collect();
+    committed_body(
+        &recovered.correlation_id.to_string(),
+        &recovered.causation_id.to_string(),
+        Some(recovered.positions),
+        events,
+    )
+}
+
+/// The shared shape of a committed-command response, so the fresh, log-recovered, and
+/// op-DB-cached paths all return the same body.
+fn committed_body(
+    correlation_id: &str,
+    causation_id: &str,
+    positions: Option<PositionRange>,
+    events: Vec<Value>,
+) -> Value {
+    let positions = match positions {
+        Some(range) => json!({ "first": range.first.get(), "last": range.last.get() }),
+        None => Value::Null,
+    };
     json!({
-        "correlation_id": ctx.correlation_id.to_string(),
-        "causation_id": ctx.causation_id.to_string(),
+        "correlation_id": correlation_id,
+        "causation_id": causation_id,
         "positions": positions,
         "events": events,
     })
 }
 
-fn error_body(ctx: &CommandContext, code: &str, message: &str) -> Value {
+/// The standard error envelope, shared with the HTTP layer so the two error paths
+/// cannot diverge.
+pub(crate) fn error_body(ctx: &CommandContext, code: &str, message: &str) -> Value {
     json!({
         "correlation_id": ctx.correlation_id.to_string(),
         "causation_id": ctx.causation_id.to_string(),
@@ -597,14 +628,18 @@ fn error_body(ctx: &CommandContext, code: &str, message: &str) -> Value {
     })
 }
 
-/// Render derived tags as `"key:value"` / `"key"` for the response.
+/// Render derived tags as `"key:value"` / `"key"` for the response, sorted so a
+/// live outcome matches one recovered from the log (whose tag set is stored sorted).
 fn tag_strings(tags: &[(String, Option<String>)]) -> Vec<String> {
-    tags.iter()
+    let mut out: Vec<String> = tags
+        .iter()
         .map(|(key, value)| match value {
             Some(value) => format!("{key}:{value}"),
             None => key.clone(),
         })
-        .collect()
+        .collect();
+    out.sort();
+    out
 }
 
 /// Resolve the data directory: the flag if given, else `<project>/data`.

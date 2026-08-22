@@ -77,7 +77,15 @@ fn field_schema(kind: &FieldKind) -> Value {
         FieldKind::Money => json!({ "type": "string", "description": "decimal amount" }),
         FieldKind::OneOf(variants) => json!({ "type": "string", "enum": variants }),
         FieldKind::I64 => json!({ "type": "integer", "format": "int64" }),
-        FieldKind::U64 => json!({ "type": "integer", "format": "int64", "minimum": 0 }),
+        // No standard format spans unsigned 64-bit. A numeric `maximum: 2^64-1` would
+        // be silently wrong for the many JSON tools that parse bounds as f64 (it does
+        // not round-trip past 2^53), so state the floor and describe the ceiling in
+        // words rather than declare a bound consumers would corrupt.
+        FieldKind::U64 => json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "unsigned 64-bit integer (0 to 2^64-1)",
+        }),
         FieldKind::Bool => json!({ "type": "boolean" }),
         FieldKind::Json => json!({}),
         FieldKind::Optional(_) => unreachable!("base() strips Optional"),
@@ -88,7 +96,7 @@ fn responses() -> Value {
     json!({
         "200": { "description": "committed; the body carries the appended positions and emitted events" },
         "400": { "description": "the input was malformed" },
-        "409": { "description": "a concurrency conflict, or an idempotency key still in flight; retry" },
+        "409": { "description": "the consistency boundary kept changing; retry" },
         "422": { "description": "the command rejected the request on state grounds" },
         "500": { "description": "internal error" },
     })

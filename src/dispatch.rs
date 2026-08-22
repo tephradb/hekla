@@ -13,13 +13,14 @@
 
 use starlark::environment::Module;
 use tephra::{
-    AppendCondition, AppendError, Event, EventType, Position, PositionRange, Query, QueryItem, Tag,
-    Tags, WriteHandle,
+    AppendCondition, AppendError, ConflictClause, Event, EventType, Position, PositionRange, Query,
+    QueryItem, Tag, Tags, WriteHandle,
 };
 use uuid::Uuid;
 
 use crate::context::{CommandContext, HandleCtx};
 use crate::envelope::{self, Envelope};
+use crate::hash;
 use crate::starlark_builtins::{
     EmittedEvent, EventSpec, HandleOutcome, LoadedModule, ModuleDef, alloc_event, alloc_input,
     call_handler, call_handler_with_ctx, check_fold_result, initial_state, parse_event_specs,
@@ -28,6 +29,52 @@ use crate::starlark_builtins::{
 
 /// Per-handler instruction budget. Bounds a runaway script at dispatch time.
 const MAX_TICKS: u64 = 10_000_000;
+
+/// The reserved tag-key prefix kiln stamps onto events for host bookkeeping. The
+/// loader rejects this namespace on both sides: an event tag field can't emit one
+/// (so a handler can't forge a host tag, or an append condition) and a `query()` /
+/// `events()` tag can't name one (so a handler can't fold over other requests' host
+/// tags).
+pub const RESERVED_TAG_PREFIX: &str = "_kiln_";
+
+/// The reserved tag key carrying a command's per-request idempotency identity. Every
+/// event a keyed command emits gets this tag, and the append is guarded against it,
+/// so exactly-once is enforced by the log itself rather than by op-DB bookkeeping.
+const IDEMPOTENCY_TAG_KEY: &str = "_kiln_idem";
+
+/// The idempotency tag for a `(command, key)` pair: `_kiln_idem:<sha256(command\0key)>`.
+/// Hashing binds the tag to the command (so the same key on two commands cannot
+/// collide) and yields a fixed-length, fixed-charset value regardless of the client's
+/// raw key. Once auto-tagging lands this becomes an ordinary high-cardinality field.
+///
+/// The tag deliberately excludes the request body: the key alone identifies the
+/// request, so reusing a key with a different body replays the first outcome rather
+/// than running the new body. This is standard idempotency-key semantics; a client
+/// that wants a distinct outcome must use a distinct key.
+pub fn idempotency_tag(command: &str, key: &str) -> String {
+    let mut material = Vec::with_capacity(command.len() + 1 + key.len());
+    material.extend_from_slice(command.as_bytes());
+    material.push(0);
+    material.extend_from_slice(key.as_bytes());
+    format!("{IDEMPOTENCY_TAG_KEY}:{}", hash::sha256_hex(&material))
+}
+
+/// A command outcome recovered from the log by its idempotency tag: a prior committed
+/// attempt's events and identity, enough to rebuild the exact success response a
+/// replay must return without re-running `handle`.
+pub struct RecoveredOutcome {
+    pub events: Vec<RecoveredEvent>,
+    pub positions: PositionRange,
+    pub correlation_id: Uuid,
+    pub causation_id: Uuid,
+}
+
+/// One recovered event: its type and its derived tags (reserved host tags stripped),
+/// already rendered as the `"key:value"` strings the response reports.
+pub struct RecoveredEvent {
+    pub event_type: String,
+    pub tags: Vec<String>,
+}
 
 /// The outcome of one command attempt.
 pub enum CommandOutcome {
@@ -45,30 +92,54 @@ pub enum CommandOutcome {
     /// The append hit a concurrent write inside the boundary. The caller should
     /// rebuild state and retry.
     Conflict,
+    /// This request already committed under its idempotency tag (a crashed or
+    /// concurrent duplicate): the outcome was recovered from the log rather than
+    /// re-decided, and the caller returns it verbatim.
+    AlreadyCommitted(RecoveredOutcome),
+    /// The store could not service the append for a transient reason (the write
+    /// coordinator is draining). The caller should surface a retryable status.
+    Unavailable { message: String },
 }
 
-/// Run one command attempt against the store: validate input, read the boundary,
-/// fold, handle, append. `now` is the request's pinned append time, visible to
-/// `handle` through `now()` and stamped into each event's envelope.
+/// Host-side validation of a command's raw input against its declared schema.
+/// A malformed body is the equivalent of `invalid_input(...)` and never reaches a
+/// handler. The runtime validates once before the retry loop, so [`run_command`]
+/// (re-run per attempt) can assume an already-validated body.
+pub fn validate_input(loaded: &LoadedModule, input: &serde_json::Value) -> anyhow::Result<()> {
+    let ModuleDef::Command { input: schema, .. } = &loaded.def else {
+        anyhow::bail!("validate_input called on a non-command module");
+    };
+    validate_command_input(schema, input)
+}
+
+/// Run one command attempt against the store: read the boundary, fold, handle,
+/// append. The caller validates input once via [`validate_input`] before the retry
+/// loop, so this per-attempt cycle assumes a well-formed body. `now` is the
+/// request's pinned append time, visible to `handle` through `now()` and stamped
+/// into each event's envelope.
+///
+/// When `idem_tag` is set, exactly-once is enforced atomically at the append: every
+/// emitted event carries the tag and the append condition's existence clause
+/// ([`AppendCondition::fail_if_exists`]) rejects it if the tag exists anywhere. So a
+/// duplicate (a crash replay or a concurrent request) fails with
+/// [`ConflictClause::Existence`] rather than committing twice, and the runtime then
+/// recovers the original outcome via [`find_committed_outcome`]. There is no
+/// pre-`handle` read: a fresh request pays nothing, and a duplicate re-runs the pure
+/// `handle` but its events never land. The one gap the append can't catch is a
+/// concurrent duplicate whose folded state makes `handle` *reject* before appending;
+/// that reject is checked against the tag too (see the `Reject` arm).
 pub fn run_command(
     store: &WriteHandle,
     loaded: &LoadedModule,
     input: &serde_json::Value,
     ctx: &CommandContext,
     now: &str,
+    idem_tag: Option<&str>,
 ) -> anyhow::Result<CommandOutcome> {
     let ModuleDef::Command { input: schema, .. } = &loaded.def else {
         anyhow::bail!("run_command called on a non-command module");
     };
     let frozen = &loaded.module;
-
-    // 0. Host-side input validation. A malformed body is the equivalent of
-    //    `invalid_input(...)`: it never reaches a handler.
-    if let Err(err) = validate_command_input(schema, input) {
-        return Ok(CommandOutcome::InvalidInput {
-            message: format!("{err}"),
-        });
-    }
 
     Module::with_temp_heap(|module| {
         let input_value = alloc_input(&module, schema, input)?;
@@ -125,10 +196,24 @@ pub fn run_command(
 
         // 4. Append the emitted events, guarded by the same boundary.
         match parse_handle_result(decision)? {
-            HandleOutcome::Reject(rejection) => Ok(CommandOutcome::Rejected {
-                code: rejection.code,
-                message: rejection.message,
-            }),
+            HandleOutcome::Reject(rejection) => {
+                // A state-dependent reject can be spurious under a concurrent same-key
+                // duplicate: this attempt folded the duplicate's just-committed event
+                // and rejected, when the key was already satisfied by that commit. The
+                // append's existence clause can't catch it (a reject never appends), and
+                // only a boundaried command folds state, so re-read by the tag and
+                // recover the committed outcome if it is present.
+                if boundary.is_some()
+                    && let Some(tag) = idem_tag
+                    && let Some(recovered) = find_committed_outcome(store, tag)?
+                {
+                    return Ok(CommandOutcome::AlreadyCommitted(recovered));
+                }
+                Ok(CommandOutcome::Rejected {
+                    code: rejection.code,
+                    message: rejection.message,
+                })
+            }
             HandleOutcome::InvalidInput(invalid) => Ok(CommandOutcome::InvalidInput {
                 message: invalid.message,
             }),
@@ -141,18 +226,53 @@ pub fn run_command(
                 }
                 let packed = events
                     .iter()
-                    .map(|event| build_event(event, ctx, now))
+                    .map(|event| build_event(event, ctx, now, idem_tag))
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                let condition = boundary.map(|query| AppendCondition::new(query).after(after));
+                let condition = build_condition(boundary, after, idem_tag)?;
                 match store.append(packed, condition) {
                     Ok(positions) => Ok(CommandOutcome::Committed {
                         events,
                         positions: Some(positions),
                     }),
-                    // A concurrent write inside the boundary. Both conflict sites
-                    // resolve by rebuilding state on a fresh read, so both are a
-                    // retry signal to the runtime.
-                    Err(AppendError::Conflict { .. }) => Ok(CommandOutcome::Conflict),
+                    // The existence clause fired: this request already committed (a
+                    // crash replay or a concurrent duplicate), caught atomically at the
+                    // append with no TOCTOU. Recover its original outcome.
+                    Err(AppendError::Conflict {
+                        clause: ConflictClause::Existence,
+                        ..
+                    }) => {
+                        let tag = idem_tag.expect("the existence clause is only set when keyed");
+                        match find_committed_outcome(store, tag)? {
+                            Some(recovered) => Ok(CommandOutcome::AlreadyCommitted(recovered)),
+                            None => Err(anyhow::anyhow!(
+                                "idempotency existence guard fired but no committed outcome was found"
+                            )),
+                        }
+                    }
+                    // A concurrent write inside the boundary: rebuild state on a fresh
+                    // read and retry.
+                    Err(AppendError::Conflict {
+                        clause: ConflictClause::Boundary,
+                        ..
+                    }) => Ok(CommandOutcome::Conflict),
+                    // The coordinator is draining: the request never landed, and a
+                    // retry against a fresh process can succeed, so surface it as a
+                    // retryable 503 rather than an opaque 500.
+                    Err(AppendError::Shutdown) => Ok(CommandOutcome::Unavailable {
+                        message: "the write coordinator is shutting down; retry".to_owned(),
+                    }),
+                    // A handler emitted a batch too large to ever store: an author
+                    // bug, distinct from the integrity and I/O failures below.
+                    Err(err @ AppendError::TooLarge { .. }) => Err(anyhow::anyhow!(
+                        "command emitted an oversized event batch: {err}"
+                    )),
+                    // An event already on the log failed to decode during the
+                    // condition scan: an integrity failure, not a normal outcome.
+                    Err(err @ AppendError::Corrupt(_)) => Err(anyhow::anyhow!(
+                        "append aborted on a corrupt event in the boundary: {err}"
+                    )),
+                    // Empty (guarded above) and AfterBeyondTip (a position kiln
+                    // never hands out) are host bugs; Log is a durable write failure.
                     Err(err) => Err(anyhow::anyhow!("append failed: {err}")),
                 }
             }
@@ -177,7 +297,7 @@ pub(crate) fn to_query(specs: &[EventSpec]) -> anyhow::Result<Query> {
                             .map_err(|err| anyhow::anyhow!("invalid event type `{t}`: {err}"))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                items.push(QueryItem::new(types, to_tags(tags)?));
+                items.push(QueryItem::new(types, to_tags(tags, &[])?));
             }
         }
     }
@@ -186,11 +306,19 @@ pub(crate) fn to_query(specs: &[EventSpec]) -> anyhow::Result<Query> {
 
 /// Pack an emitted event for the store: its payload wrapped in a host-stamped
 /// envelope, with the derived tags kept separate as tephra tags so the DCB index
-/// still matches on them. This is the only place enveloping happens.
-pub fn build_event(event: &EmittedEvent, ctx: &CommandContext, now: &str) -> anyhow::Result<Event> {
+/// still matches on them. When `idem_tag` is set it is added as an extra host tag,
+/// so the append condition and a later recovery read can find this request's events.
+/// This is the only place enveloping happens.
+pub fn build_event(
+    event: &EmittedEvent,
+    ctx: &CommandContext,
+    now: &str,
+    idem_tag: Option<&str>,
+) -> anyhow::Result<Event> {
     let ty = EventType::new(event.event_type.as_str())
         .map_err(|err| anyhow::anyhow!("invalid event type `{}`: {err}", event.event_type))?;
-    let tags = to_tags(&event.tags)?;
+    let extra = idem_tag.as_slice();
+    let tags = to_tags(&event.tags, extra)?;
     let envelope = Envelope {
         event_id: Uuid::new_v4(),
         timestamp: now.to_owned(),
@@ -203,10 +331,107 @@ pub fn build_event(event: &EmittedEvent, ctx: &CommandContext, now: &str) -> any
         .map_err(|err| anyhow::anyhow!("encoding event `{}`: {err}", event.event_type))
 }
 
-/// `(key, Some(value))` → `"key:value"`, `(key, None)` → `"key"`. Query and
-/// event go through the same mapping, so a keyed tag matches only a keyed tag.
-fn to_tags(pairs: &[(String, Option<String>)]) -> anyhow::Result<Tags> {
-    let tags = pairs
+/// The append guard for one attempt: the DCB boundary check (fail if a matching event
+/// landed after the fold read) plus, when keyed, tephra's independent existence check
+/// (fail if this request's idempotency tag exists anywhere, at an implicit `after = 0`).
+/// The two clauses have separate positions, so a single append atomically asserts both
+/// the moving decision boundary and the whole-log uniqueness of the request; a
+/// duplicate that committed anywhere is caught even when the boundary's `after` has
+/// advanced past it. A boundaryless keyed command is the pure-existence case.
+fn build_condition(
+    boundary: Option<Query>,
+    after: Position,
+    idem_tag: Option<&str>,
+) -> anyhow::Result<Option<AppendCondition>> {
+    let existence = match idem_tag {
+        Some(tag) => Some(Query::item(idem_item(tag)?)),
+        None => None,
+    };
+    match (boundary, existence) {
+        (None, None) => Ok(None),
+        (None, Some(exists)) => Ok(Some(AppendCondition::exists_only(exists))),
+        (Some(query), None) => Ok(Some(AppendCondition::new(query).after(after))),
+        (Some(query), Some(exists)) => Ok(Some(
+            AppendCondition::new(query)
+                .after(after)
+                .fail_if_exists(exists),
+        )),
+    }
+}
+
+/// A query item matching any event carrying the idempotency tag.
+fn idem_item(tag: &str) -> anyhow::Result<QueryItem> {
+    let tag = Tag::new(tag.to_owned())
+        .map_err(|err| anyhow::anyhow!("invalid idempotency tag `{tag}`: {err}"))?;
+    let tags =
+        Tags::new([tag]).map_err(|err| anyhow::anyhow!("invalid idempotency tag set: {err}"))?;
+    Ok(QueryItem::with_tags(tags))
+}
+
+/// Look for a prior committed attempt of this request in the log, by its idempotency
+/// tag, so a replay returns the original outcome without re-running `handle`. Returns
+/// `None` when the request has not committed yet. The read is an indexed existence
+/// check on a unique, high-cardinality tag at `after = 0`: a term-dictionary probe per
+/// segment, no posting-list decode (the single position inlines into the FST value).
+fn find_committed_outcome(
+    store: &WriteHandle,
+    idem_tag: &str,
+) -> anyhow::Result<Option<RecoveredOutcome>> {
+    let query = Query::item(idem_item(idem_tag)?);
+    let mut reads = store.read(&query, Position::ZERO, None);
+    let mut events = Vec::new();
+    let mut range: Option<(Position, Position)> = None;
+    let mut ids: Option<(Uuid, Uuid)> = None;
+    while let Some(item) = reads.next() {
+        let seq = item.map_err(|err| anyhow::anyhow!("reading idempotent replay: {err}"))?;
+        range = Some(match range {
+            Some((first, _)) => (first, seq.position),
+            None => (seq.position, seq.position),
+        });
+        let (envelope, _data) = envelope::decode(seq.event.data())
+            .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
+        match ids {
+            None => ids = Some((envelope.correlation_id, envelope.causation_id)),
+            // Every event of one command execution shares its causation id. A second
+            // distinct one means two logical requests matched this tag (a double
+            // commit, or an astronomically unlikely hash collision): surface it rather
+            // than splice both commits into one bogus recovered outcome.
+            Some((_, causation)) if envelope.causation_id != causation => {
+                anyhow::bail!("idempotency tag matches events from more than one command execution")
+            }
+            Some(_) => {}
+        }
+        let mut tags: Vec<String> = seq
+            .event
+            .tags()
+            .filter(|tag| !tag.starts_with(RESERVED_TAG_PREFIX))
+            .map(str::to_owned)
+            .collect();
+        // Stored tag sets are sorted; sorting the response tags too keeps recovery
+        // byte-identical to the live outcome, which also sorts (see `tag_strings`).
+        tags.sort();
+        events.push(RecoveredEvent {
+            event_type: seq.event.event_type().to_owned(),
+            tags,
+        });
+    }
+    let Some((first, last)) = range else {
+        return Ok(None);
+    };
+    let (correlation_id, causation_id) = ids.expect("a matched event carries an envelope");
+    Ok(Some(RecoveredOutcome {
+        events,
+        positions: PositionRange { first, last },
+        correlation_id,
+        causation_id,
+    }))
+}
+
+/// `(key, Some(value))` → `"key:value"`, `(key, None)` → `"key"`, plus any `extra`
+/// raw tag strings appended verbatim (the host's reserved tags). Query and event go
+/// through the same pair mapping, so a keyed tag matches only a keyed tag.
+fn to_tags(pairs: &[(String, Option<String>)], extra: &[&str]) -> anyhow::Result<Tags> {
+    let mut tags = pairs
         .iter()
         .map(|(key, value)| {
             let raw = match value {
@@ -216,5 +441,11 @@ fn to_tags(pairs: &[(String, Option<String>)]) -> anyhow::Result<Tags> {
             Tag::new(raw).map_err(|err| anyhow::anyhow!("invalid tag `{key}`: {err}"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    for raw in extra {
+        tags.push(
+            Tag::new((*raw).to_owned())
+                .map_err(|err| anyhow::anyhow!("invalid tag `{raw}`: {err}"))?,
+        );
+    }
     Tags::new(tags).map_err(|err| anyhow::anyhow!("invalid tag set: {err}"))
 }

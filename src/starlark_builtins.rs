@@ -32,6 +32,7 @@ use starlark::values::{
 use starlark::{starlark_module, starlark_simple_value};
 
 use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx};
+use crate::dispatch::RESERVED_TAG_PREFIX;
 
 // ---------------------------------------------------------------------------
 // Field types
@@ -645,6 +646,15 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
             let ft = value.downcast_ref::<FieldType>().ok_or_else(|| {
                 anyhow::anyhow!("event `{}` field `{}` must be a field type", r#type, name)
             })?;
+            // The host stamps its own tags in the `_kiln_` namespace (idempotency
+            // today, auto-tagged fields later). Reserving the prefix here keeps a
+            // handler from forging a host tag, and so an append condition.
+            if name.starts_with(RESERVED_TAG_PREFIX) {
+                anyhow::bail!(
+                    "event `{}`: field `{name}` uses the reserved `{RESERVED_TAG_PREFIX}` prefix",
+                    r#type
+                );
+            }
             field_defs.push((name, ft.0.clone()));
         }
         for tag in &tags.items {
@@ -1460,6 +1470,7 @@ pub fn parse_tags(tags: Value<'_>) -> anyhow::Result<Vec<(String, Option<String>
             let key = k
                 .unpack_str()
                 .ok_or_else(|| anyhow::anyhow!("tag keys must be strings, got {}", k.get_type()))?;
+            reject_reserved_tag(key)?;
             let val = if v.is_none() {
                 None
             } else {
@@ -1478,15 +1489,27 @@ pub fn parse_tags(tags: Value<'_>) -> anyhow::Result<Vec<(String, Option<String>
                 anyhow::anyhow!("tag list items must be strings, got {}", v.get_type())
             })?;
             // split on first ':'; no colon → bare tag
-            match s.find(':') {
-                Some(i) => pairs.push((s[..i].to_owned(), Some(s[i + 1..].to_owned()))),
-                None => pairs.push((s.to_owned(), None)),
-            }
+            let (key, val) = match s.find(':') {
+                Some(i) => (s[..i].to_owned(), Some(s[i + 1..].to_owned())),
+                None => (s.to_owned(), None),
+            };
+            reject_reserved_tag(&key)?;
+            pairs.push((key, val));
         }
         Ok(pairs)
     } else {
         anyhow::bail!("tags must be a dict or list, got {}", tags.get_type());
     }
+}
+
+/// Reject a query/event tag key in the host's reserved `_kiln_` namespace, so a
+/// handler cannot read (or fold over) other requests' host tags such as the
+/// idempotency tag. The write side is already gated by the event-field check.
+fn reject_reserved_tag(key: &str) -> anyhow::Result<()> {
+    if key.starts_with(RESERVED_TAG_PREFIX) {
+        anyhow::bail!("tag `{key}` uses the reserved `{RESERVED_TAG_PREFIX}` prefix");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

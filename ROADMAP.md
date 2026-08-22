@@ -60,11 +60,13 @@ decision cycle behind Axum.
 - Client-supplied ids need no new code (the schema's `uuid()` fields already carry them). Each emitted
   event is wrapped at the append seam in a host-stamped envelope (event id, timestamp, correlation,
   causation, optional triggering event); tags stay outside the envelope as tephra tags, and every
-  store read unwraps the payload. The idempotency key is kept in the operational DB, never on an event.
-- Built-in per-command idempotency: a `pending` reservation is the mutual-exclusion token for
-  concurrent duplicates, moved to `done` with the full response body so a replay returns the original
-  status and body verbatim (including rejections). Startup clears stale reservations; the crash window
-  between append and finalize is documented and bounded by DCB for natural-id creates.
+  store read unwraps the payload.
+- Built-in per-command idempotency lives in the event log, not the operational DB: a keyed command
+  hashes its key into a reserved `_kiln_idem` tag on every event it emits and guards the append against
+  that tag. A replay (or a crash between append and responding) finds the prior commit by that tag and
+  rebuilds the original response from those events, so exactly-once is enforced by the log itself with
+  nothing to reconcile at startup. A rejected or empty-emit command anchors nothing on the log, so a
+  replay re-runs the pure `handle` and reproduces the same terminal outcome.
 - Outcome to status: committed to 200 (with positions and emitted events), `reject` to 422,
   `invalid_input` (and host-side input validation) to 400, a DCB conflict that survives bounded retry
   to 409, unknown or internal command to 404. The runtime re-runs the whole cycle on a conflict so a
@@ -145,12 +147,11 @@ Honest scope for this phase:
 - `effects.pool_size` is validated but not enforced: v1 runs one thread per effect, which already bounds
   concurrency. A real shared blocking pool is reserved for partition-key parallel lanes (a later phase),
   which the watermark-plus-completed-set format already supports.
-- `invoke_command` lands the domain fact exactly-once when the target command is idempotent under replay
-  (a natural-id create or an explicit DCB boundary, like the example's `record-welcome`): the
-  deterministic idempotency key deduplicates in the common path, but across the narrow append-then-
-  finalize crash window the key is cleared on restart (as every pending key is), so the boundary is what
-  dedupes the replay, exactly as for HTTP commands. Raw `http.*` is at-least-once (a crash between a
-  successful request and its journal write re-fires on replay).
+- `invoke_command` lands the domain fact exactly-once: it passes a deterministic idempotency key, so the
+  target command tags every emitted event with that key and guards the append against the tag. A replay
+  (including across the append-then-journal crash window) finds the prior commit by the tag and returns
+  its recovered outcome, so dedupe lives in the event log, exactly as for HTTP commands. Raw `http.*` is
+  at-least-once (a crash between a successful request and its journal write re-fires on replay).
 - `read()`/`scan()` are journaled, so a replayed effect sees point-in-time-stale data by design; at cold
   start an effect can also outrun a projector and journal an empty read that then replays empty forever.
 - One explicit skip endpoint; no automatic dead-lettering, and no per-event retry endpoint beyond

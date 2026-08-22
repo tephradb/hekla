@@ -13,13 +13,14 @@
 //! replay skips them. Because completed calls persist, retrying a failed
 //! invocation replays them and fails at the same point without re-firing.
 //!
-//! Durability boundaries: `invoke_command` lands the domain fact exactly-once when
-//! the target command is idempotent under replay. Its deterministic idempotency
-//! key deduplicates in the common path; across the narrow crash window between the
-//! command's append and its finalize, the key is cleared at startup (like every
-//! pending key), so the command's own DCB boundary is what dedupes the replay,
-//! exactly as for HTTP commands. Raw `http.*` is at-least-once (a crash between a
-//! successful request and its journal write re-fires on replay).
+//! Durability boundaries: `invoke_command` lands the domain fact exactly-once. It
+//! passes a deterministic idempotency key, so the target command tags every event
+//! it emits with that key and guards the append against the tag. A replay after a
+//! crash (or a concurrent duplicate) finds the prior commit by that tag and returns
+//! its recovered outcome instead of committing again, exactly as for HTTP commands;
+//! dedupe lives in the event log, not in any op-DB reservation. Raw `http.*` is
+//! at-least-once (a crash between a successful request and its journal write
+//! re-fires on replay).
 //!
 //! A handler error (a script bug, or a transport error / 5xx the runtime refuses
 //! to surface) wedges the invocation: it retries forever with capped backoff,
@@ -847,24 +848,18 @@ fn read_response(mut response: ureq::http::Response<ureq::Body>) -> anyhow::Resu
 
 fn spawn_sweeper(runtime: Arc<Runtime>, config: &Config) -> anyhow::Result<Sweeper> {
     let effect_days = config.retention.effect_journal_days;
-    let idempotency_days = config.retention.idempotency_key_days;
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let thread_stop = Arc::clone(&stop);
     let join = thread::Builder::new()
         .name("effect-sweeper".to_owned())
-        .spawn(move || sweeper_loop(&runtime, effect_days, idempotency_days, &thread_stop))
+        .spawn(move || sweeper_loop(&runtime, effect_days, &thread_stop))
         .context("spawning the retention sweeper")?;
     Ok(Sweeper { stop, join })
 }
 
-fn sweeper_loop(
-    runtime: &Runtime,
-    effect_days: u32,
-    idempotency_days: u32,
-    stop: &(Mutex<bool>, Condvar),
-) {
+fn sweeper_loop(runtime: &Runtime, effect_days: u32, stop: &(Mutex<bool>, Condvar)) {
     loop {
-        if let Err(err) = run_sweep(runtime, effect_days, idempotency_days) {
+        if let Err(err) = run_sweep(runtime, effect_days) {
             tracing::error!("retention sweep failed: {err:#}");
         }
         let (lock, cvar) = stop;
@@ -886,16 +881,12 @@ fn sweeper_loop(
 /// shared op-DB lock that every effect and command also needs.
 const SWEEP_CHUNK_PAUSE: Duration = Duration::from_millis(10);
 
-/// Sweep completed effect journals and idempotency keys past their retention
-/// window, in bounded chunks so the op-DB lock is never held across a long scan,
-/// yielding briefly between chunks so the effect hot path is not starved.
-fn run_sweep(runtime: &Runtime, effect_days: u32, idempotency_days: u32) -> anyhow::Result<()> {
+/// Sweep completed effect journals past their retention window, in bounded chunks
+/// so the op-DB lock is never held across a long scan, yielding briefly between
+/// chunks so the effect hot path is not starved.
+fn run_sweep(runtime: &Runtime, effect_days: u32) -> anyhow::Result<()> {
     let effect_cutoff = runtime::rfc3339_days_ago(effect_days);
     while runtime.sweep_effect_journal(&effect_cutoff, SWEEP_CHUNK)? == SWEEP_CHUNK {
-        thread::sleep(SWEEP_CHUNK_PAUSE);
-    }
-    let idempotency_cutoff = runtime::rfc3339_days_ago(idempotency_days);
-    while runtime.sweep_idempotency(&idempotency_cutoff, SWEEP_CHUNK)? == SWEEP_CHUNK {
         thread::sleep(SWEEP_CHUNK_PAUSE);
     }
     Ok(())

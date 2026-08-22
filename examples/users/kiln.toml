@@ -6,4 +6,3 @@ pool_size = 8
 
 [retention]
 effect_journal_days = 14
-idempotency_key_days = 30
