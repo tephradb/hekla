@@ -220,3 +220,67 @@ forward. Collected here so they are not lost in the prose of the phase that intr
 Inherent design properties, listed for completeness (not future work): `invoke_command` is exactly-once
 only when the target is idempotent under replay, raw `http.*` is at-least-once, and `read()`/`scan()`
 are journaled (point-in-time-stale on replay).
+
+## Design brainstorm: language and runtime ergonomics (unscheduled)
+
+Raw considerations from design review, captured so they are not lost. None is scheduled, and none is a
+committed shape: each names the tension it addresses and the open question. Several interact with
+features that already shipped (auto-tagging, effect retry, projector auto-rebuild), so they are
+refinements to revisit once real projects exercise them.
+
+- **Per-type folds, and a mutate-or-return decision.** Once a `query` returns multiple event types,
+  `fold(state, event)` becomes a chain of `if event.type == ...` branches in every command. A per-type
+  fold map would dispatch structurally:
+  ```starlark
+  fold = {
+      order_placed: lambda state, event: dict(state, taken = True),
+      shop_suspended: lambda state, event: dict(state, suspended = True),
+  }
+  ```
+  Separately, `fold` today both mutates `state` and returns it; pick one. Mutation is cheaper but hides
+  replay-order bugs, and Starlark's freezing rules will bite anyone who reuses the dict from `initial()`.
+  Decide the contract before folds proliferate.
+- **Meaningful effect outcomes, idempotency keys, and delivery events.** An effect `handle` return value
+  is currently ignored, so `http.post` then a log on failure is at-least-once with silent duplicates and
+  no script-controlled backoff. A meaningful return (`ok()`, `retry(after = 30)`, `dead_letter(reason)`)
+  would move the decision into the script. Pair it with a stable idempotency key derived from the event
+  position (so the receiver can dedupe) and the ability to emit an event back (`email_sent`) so a
+  projector can observe delivery. Connects to the deferred "automatic dead-lettering" gap and the
+  terminal-skip reporting just added.
+- **Event versioning and upcast hooks.** `type = "order.placed"` carries no `version` and no upcast
+  hook, so the first schema change becomes a hand-written migration. A version tag plus an upcast
+  function (old payload in, current shape out, applied on read) would keep the log append-only while
+  letting the schema evolve.
+- **Derive command input from the event schema.** `input = schema(...)` restates the event's field
+  types and will drift from them. Let it derive, e.g. `input = schema(**order_placed.fields)` or a
+  partial selection, so the two cannot disagree.
+- **Unify field access on dot syntax.** Commands read `input.email` but folds and effects read
+  `event.data["email"]`. One access style (dot on both) removes the papercut.
+- **Type-shaped default tagging.** Auto-tagging currently indexes every field unless `indexed=False`. A
+  better default could key off the field type: identity-shaped fields (`uuid()`, integers, short
+  `text()`) are worth tagging, while `money()` almost never is. Refines the shipped auto-tagging default.
+- **Projector rename detection.** Store the projector's source file path in its checkpoint record.
+  Moving `customer-orders.star` then produces an explicit "rename or new projector?" error instead of
+  silently rebuilding from position zero. Refines the shipped definition-change auto-rebuild.
+
+### Suggested sequencing
+
+An opinionated order for the above, by value-to-effort. Not a commitment, a starting point.
+
+1. **First, and cheap: reserve an event `version` slot in the envelope.** The log is empty today, so
+   add the field now even if unused; the upcast hooks can wait, but retrofitting a version onto
+   historical events is the exact migration this item exists to avoid.
+2. **Effect outcomes and the fold contract, together.** The `ok()` / `retry(after)` /
+   `dead_letter(reason)` return is the largest operational win (it also closes the deferred
+   automatic-dead-lettering gap), and pinning `fold` to return-new-state (never mutate) is a cheap
+   correctness win that pairs with per-type folds. Two refinements to the effect item: derive the
+   idempotency key from the event id (envelope, stable across replay and rebuild) rather than the raw
+   log position, and route "emit an event back" through the existing `invoke_command` path so effects
+   stay out of the event-producer role.
+3. **Ergonomics, once the above lands:** per-type fold dispatch, projector rename detection, and
+   unifying field access on dot syntax. Each is small and independent.
+4. **Only if a real project asks:** deriving `input` from the event schema, and type-shaped default
+   tagging. Both are double-edged. Command input legitimately diverges from event fields (plaintext vs
+   subject-encrypted, server-derived ids), so at most make derivation opt-in sugar for the 1:1 case.
+   And prefer "do not auto-tag unbounded `text()` / `json()`" (or warn on it) over an allowlist of
+   taggable types, keeping the explicit `indexed=` opt-out predictable.
