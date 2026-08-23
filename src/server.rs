@@ -1,4 +1,6 @@
-//! The HTTP surface: `POST /commands/{name}`, `GET /status`, `GET /health`, the
+//! The HTTP surface: `POST /commands/{name}`, the generated read API
+//! (`GET /read/{projector}/{entity}[/{key}]`), `POST /projectors/{name}/replay`,
+//! `POST /effects/{name}/skip/{position}`, `GET /status`, `GET /health`, the
 //! generated `GET /openapi.json`, and a Scalar reference UI over it at `GET /docs`.
 //!
 //! Handlers are thin. They pull the correlation id and idempotency key from
@@ -7,6 +9,8 @@
 //! mapping, so the server only turns an [`ExecResult`] into a JSON response.
 
 use std::collections::HashMap;
+use std::future;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +30,7 @@ use uuid::Uuid;
 
 use crate::context::CommandContext;
 use crate::effect::EffectRuntime;
-use crate::projector::{ProjectorSet, ProjectorShared};
+use crate::projector::{ProjectorSet, ProjectorShared, Readiness};
 use crate::read_api;
 use crate::runtime::{Runtime, error_body};
 use crate::starlark_builtins::EntityDef;
@@ -45,12 +49,12 @@ pub async fn serve(
     effects: EffectRuntime,
     addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    let app = router(runtime);
+    let service = app(runtime);
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!("kiln listening on http://{addr}");
-    axum::serve(listener, app)
+    axum::serve(listener, service)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving http")?;
@@ -63,11 +67,7 @@ pub async fn serve(
 
 /// The HTTP application over an already-built runtime, for in-process testing
 /// (drive it with `tower::ServiceExt::oneshot`).
-pub fn app(runtime: Arc<Runtime>) -> Router {
-    router(runtime)
-}
-
-fn router(shared: Shared) -> Router {
+pub fn app(shared: Shared) -> Router {
     Router::new()
         .route("/commands/{name}", post(execute))
         .route("/read/{projector}/{entity}/{key}", get(read_one))
@@ -147,12 +147,14 @@ async fn health() -> Json<Value> {
 }
 
 async fn openapi_doc(State(runtime): State<Shared>) -> Response {
-    let mut response = runtime.openapi_json().to_owned().into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        runtime.openapi_json().to_owned(),
+    )
+        .into_response()
 }
 
 async fn docs() -> Html<&'static str> {
@@ -272,7 +274,6 @@ async fn read_scan(
         None => None,
     };
 
-    // Every cheap param is validated: now honor the read-your-writes wait.
     if let Some(response) = honor_wait(&shared, &projector, wait).await {
         return response;
     }
@@ -342,10 +343,12 @@ async fn skip(
     }
 }
 
-/// Resolve a projector and one of its entities to the projector's shared handle
-/// and the entity definition, or a 404 response (boxed, since it is the rare
-/// variant of a hot path's result). Handlers reuse the handle for both the
-/// read-your-writes wait and the read model's path, avoiding a second lookup.
+/// Resolve a projector and one of its entities to the projector's shared handle and
+/// the entity definition. The error variant (boxed, since it is the rare variant of
+/// a hot path's result) is a 404 for an unknown projector or entity, or a 503 when
+/// the projector's read model cannot be served at the current definition. Handlers
+/// reuse the handle for both the read-your-writes wait and the read model's path,
+/// avoiding a second lookup.
 fn resolve_entity(
     runtime: &Runtime,
     projector: &str,
@@ -357,16 +360,50 @@ fn resolve_entity(
             read_error("not_found", &format!("no projector `{projector}`")),
         )));
     };
-    match read_api::find_entity(&shared.entities, entity) {
-        Some(entity_def) => Ok((Arc::clone(shared), entity_def.clone())),
-        None => Err(Box::new(json_response(
+    let Some(entity_def) = read_api::find_entity(&shared.entities, entity) else {
+        return Err(Box::new(json_response(
             404,
             read_error(
                 "not_found",
                 &format!("no entity `{entity}` in projector `{projector}`"),
             ),
-        ))),
+        )));
+    };
+    // The entity definition above is the current one, but the database may still be
+    // the shape a previous definition built. Querying across that mismatch fails on a
+    // missing column, so say so plainly instead of leaking a SQLite error as a 500.
+    if let Some(response) = not_servable(projector, shared.readiness()) {
+        return Err(Box::new(response));
     }
+    Ok((Arc::clone(shared), entity_def.clone()))
+}
+
+/// A 503 while a projector's read model does not match the definition the read API
+/// would serve it at. `rebuilding` resolves on its own, so it carries a `Retry-After`;
+/// `stale` needs an operator, so it does not.
+fn not_servable(projector: &str, readiness: Readiness) -> Option<Response> {
+    let (code, message, retry) = match readiness {
+        Readiness::Ready => return None,
+        Readiness::Rebuilding => (
+            "rebuilding",
+            format!("projector `{projector}` is rebuilding its read model"),
+            true,
+        ),
+        Readiness::Stale => (
+            "stale",
+            format!(
+                "projector `{projector}` was built from a different definition and auto-rebuild is off; POST /projectors/{projector}/replay to rebuild it"
+            ),
+            false,
+        ),
+    };
+    let mut response = json_response(503, read_error(code, &message));
+    if retry {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    Some(response)
 }
 
 fn read_error(code: &str, message: &str) -> Value {
@@ -509,8 +546,41 @@ fn json_response(status: u16, body: Value) -> Response {
 }
 
 async fn shutdown_signal() {
-    if signal::ctrl_c().await.is_err() {
-        tracing::error!("failed to install the ctrl-c handler");
+    on_ctrl_c(signal::ctrl_c().await).await;
+}
+
+/// Report the ctrl-c handler's outcome to `with_graceful_shutdown`. A handler
+/// that could not be installed never resolves: returning would drain a
+/// freshly started server as if a signal had arrived, so the process has to be
+/// killed externally instead.
+async fn on_ctrl_c(installed: io::Result<()>) {
+    if installed.is_err() {
+        tracing::error!("failed to install the ctrl-c handler; shutdown must be forced");
+        future::pending::<()>().await;
     }
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_ctrl_c_handler_never_reports_a_shutdown() {
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            on_ctrl_c(Err(io::Error::other("handler not installed"))),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a server whose signal handler failed must keep serving, not drain at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_installed_handler_reports_the_signal() {
+        let outcome = tokio::time::timeout(Duration::from_millis(50), on_ctrl_c(Ok(()))).await;
+        assert!(outcome.is_ok(), "a real ctrl-c must resolve the wait");
+    }
 }

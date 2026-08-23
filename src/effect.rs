@@ -329,7 +329,7 @@ fn run(
                     shared.name,
                     attempt + 1
                 );
-                if sleep_watching_shutdown(&shared, backoff(attempt)) {
+                if sleep_watching(&shared, None, backoff(attempt)) {
                     break;
                 }
                 attempt = attempt.saturating_add(1);
@@ -440,9 +440,9 @@ fn run_invocation(
         // has failed at least once). Checking before the first attempt would let a
         // skip requested for a not-yet-reached position drop a healthy event.
         if attempt > 0 && shared.skip_position.load(Ordering::Relaxed) == position {
-            shared.skip_position.store(0, Ordering::Relaxed);
-            runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
-            shared.clear_failures();
+            honor_skip(shared, || {
+                runtime.complete_invocation(effect, position, &runtime::now_rfc3339())
+            })?;
             tracing::warn!(
                 "effect `{effect}` skipped wedged position {position} by operator request"
             );
@@ -465,16 +465,19 @@ fn run_invocation(
             }
             // A terminal failure (an erased subject a `reveal()` needed) cannot be
             // recovered by retrying, so complete the invocation and move on rather
-            // than wedge forever. Recorded as a terminal skip (not a wedge) and cleared
-            // of any earlier wedge state, so `consecutive_failures` stays unambiguous.
+            // than wedge forever.
             Err(failure) if failure.terminal => {
                 tracing::error!(
                     "effect `{effect}` invocation at position {position} failed terminally: {}",
                     failure.message
                 );
+                // Record durably before touching the shared counters, as the success
+                // arm does. A failing op-DB write here propagates and the position is
+                // retried, so mutating first would count the skip twice and clear the
+                // wedge state for an invocation that never actually completed.
+                runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
                 shared.record_terminal_skip(&failure.message);
                 shared.clear_failures();
-                runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
                 return Ok(Progress::Advanced);
             }
             Err(failure) => {
@@ -484,7 +487,7 @@ fn run_invocation(
                     attempt + 1,
                     failure.message
                 );
-                if wedge_wait(shared, position, backoff(attempt)) {
+                if sleep_watching(shared, Some(position), backoff(attempt)) {
                     return Ok(Progress::Interrupted);
                 }
                 attempt = attempt.saturating_add(1);
@@ -555,34 +558,32 @@ fn backoff(attempt: u32) -> Duration {
         .min(BACKOFF_CAP)
 }
 
-/// Sleep up to `total`, returning early. Returns `true` if shutdown fired (the
-/// caller stops mid-wedge); a pending skip for `position` also returns early
-/// (`false`), so the retry loop re-checks it at the top.
-fn wedge_wait(shared: &EffectShared, position: u64, total: Duration) -> bool {
-    let tick = Duration::from_millis(100);
-    let mut waited = Duration::ZERO;
-    while waited < total {
-        if shared.shutdown.load(Ordering::Relaxed) {
-            return true;
-        }
-        if shared.skip_position.load(Ordering::Relaxed) == position {
-            return false;
-        }
-        thread::sleep(tick.min(total - waited));
-        waited += tick;
-    }
-    shared.shutdown.load(Ordering::Relaxed)
+/// Honor a pending operator skip by completing the wedged invocation. The request
+/// is cleared only once the completion is durable, so a failed op-DB write leaves
+/// the skip pending for the driver's next pass rather than losing it.
+fn honor_skip(
+    shared: &EffectShared,
+    complete: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    complete()?;
+    shared.skip_position.store(0, Ordering::Relaxed);
+    shared.clear_failures();
+    Ok(())
 }
 
-/// Sleep up to `total`, returning `true` early if shutdown fired. Used by the
-/// driver supervisor, which retries on infrastructure errors but has no per-event
-/// skip to honor.
-fn sleep_watching_shutdown(shared: &EffectShared, total: Duration) -> bool {
+/// Sleep up to `total`, returning `true` if shutdown fired (the caller stops
+/// mid-wedge). A pending skip for `skip` also returns early (`false`), so the retry
+/// loop re-checks it at the top; the driver supervisor passes `None`, having no
+/// per-event skip to honor.
+fn sleep_watching(shared: &EffectShared, skip: Option<u64>, total: Duration) -> bool {
     let tick = Duration::from_millis(100);
     let mut waited = Duration::ZERO;
     while waited < total {
         if shared.shutdown.load(Ordering::Relaxed) {
             return true;
+        }
+        if skip.is_some_and(|position| shared.skip_position.load(Ordering::Relaxed) == position) {
+            return false;
         }
         thread::sleep(tick.min(total - waited));
         waited += tick;
@@ -654,6 +655,17 @@ fn call_hash(kind: &str, call: &Value) -> String {
     crate::hash::sha256_hex(canonical.to_string().as_bytes())
 }
 
+/// Collapse an anyhow cause chain into a single flat message.
+///
+/// A host error leaves this module through a starlark builtin, where it becomes
+/// `starlark::ErrorKind::Native` and is rendered with plain `Display`: every cause
+/// under the outermost context is dropped long before the wedge records
+/// `last_error`. Rendering the chain here keeps the reason attached to the call
+/// that names it.
+fn flatten_chain(err: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("{err:#}")
+}
+
 impl EffectHost for EffectHostImpl<'_> {
     fn http(
         &self,
@@ -670,9 +682,7 @@ impl EffectHost for EffectHostImpl<'_> {
             "http",
             &json!({ "method": method, "url": url, "headers": headers_sorted, "body": body }),
         );
-        let method = method.to_owned();
-        let url = url.to_owned();
-        self.journaled(&hash, move |_| {
+        self.journaled(&hash, |_| {
             let body_bytes = match &body {
                 Some(value) => Some(serde_json::to_vec(value).context("serialising an http body")?),
                 None => None,
@@ -686,8 +696,8 @@ impl EffectHost for EffectHostImpl<'_> {
                 request_headers.push(("content-type".to_owned(), "application/json".to_owned()));
             }
             let request = HttpRequest {
-                method: method.clone(),
-                url: url.clone(),
+                method: method.to_owned(),
+                url: url.to_owned(),
                 headers: request_headers,
                 body: body_bytes,
             };
@@ -702,26 +712,24 @@ impl EffectHost for EffectHostImpl<'_> {
             }
             Ok(http_response_to_json(response))
         })
+        .map_err(flatten_chain)
     }
 
     fn invoke_command(&self, name: &str, input: Value) -> anyhow::Result<Value> {
         let hash = call_hash(
             "invoke_command",
-            &json!({ "command": name, "input": input.clone() }),
+            &json!({ "command": name, "input": input }),
         );
-        let key_hash = hash.clone();
-        let name = name.to_owned();
-        self.journaled(&hash, move |disambiguator| {
-            let idempotency_key = format!(
-                "{}:{}:{}:{}",
-                self.effect, self.position, key_hash, disambiguator
-            );
+        self.journaled(&hash, |disambiguator| {
+            let idempotency_key =
+                format!("{}:{}:{hash}:{disambiguator}", self.effect, self.position);
             let ctx = CommandContext::from_effect(self.env.correlation_id, self.env.event_id);
             let result =
                 self.runtime
-                    .execute_from_effect(&name, input, &ctx, Some(&idempotency_key))?;
+                    .execute_from_effect(name, input, &ctx, Some(&idempotency_key))?;
             Ok(json!({ "status": result.status, "body": result.body }))
         })
+        .map_err(flatten_chain)
     }
 
     fn read(&self, projector: &str, entity: &str, key: &str) -> anyhow::Result<Value> {
@@ -729,10 +737,10 @@ impl EffectHost for EffectHostImpl<'_> {
             "read",
             &json!({ "projector": projector, "entity": entity, "key": key }),
         );
-        let (projector, entity, key) = (projector.to_owned(), entity.to_owned(), key.to_owned());
-        self.journaled(&hash, move |_| {
-            self.runtime.read_projector(&projector, &entity, &key)
+        self.journaled(&hash, |_| {
+            self.runtime.read_projector(projector, entity, key)
         })
+        .map_err(flatten_chain)
     }
 
     fn scan(
@@ -756,16 +764,18 @@ impl EffectHost for EffectHostImpl<'_> {
                 "limit": limit,
             }),
         );
-        let (projector, entity) = (projector.to_owned(), entity.to_owned());
-        self.journaled(&hash, move |_| {
+        self.journaled(&hash, |_| {
             self.runtime
-                .scan_projector(&projector, &entity, filter, cursor, limit)
+                .scan_projector(projector, entity, filter, cursor, limit)
         })
+        .map_err(flatten_chain)
     }
 
     fn now(&self) -> anyhow::Result<String> {
         let hash = call_hash("now", &json!({}));
-        let value = self.journaled(&hash, |_| Ok(Value::String(runtime::now_rfc3339())))?;
+        let value = self
+            .journaled(&hash, |_| Ok(Value::String(runtime::now_rfc3339())))
+            .map_err(flatten_chain)?;
         value
             .as_str()
             .map(str::to_owned)
@@ -792,7 +802,10 @@ impl EffectHost for EffectHostImpl<'_> {
         let keystore = self.runtime.keystore().ok_or_else(|| {
             anyhow::anyhow!("reveal() needs a master key, but none is configured")
         })?;
-        match keystore.decrypt_subject(subject_field, subject_value, field, ciphertext)? {
+        match keystore
+            .decrypt_subject(subject_field, subject_value, field, ciphertext)
+            .map_err(flatten_chain)?
+        {
             Some(plaintext) => Ok(plaintext),
             None => {
                 // The subject was erased. No retry can recover the data, so mark this
@@ -807,10 +820,8 @@ impl EffectHost for EffectHostImpl<'_> {
 }
 
 fn http_response_to_json(response: HttpResponse) -> Value {
-    let body = match serde_json::from_slice::<Value>(&response.body) {
-        Ok(json) => json,
-        Err(_) => Value::String(String::from_utf8_lossy(&response.body).into_owned()),
-    };
+    let body = serde_json::from_slice::<Value>(&response.body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&response.body).into_owned()));
     // Headers are a multimap: each name maps to a list of values, so repeated
     // headers (for example several `set-cookie`) all survive rather than the last
     // silently winning.
@@ -871,28 +882,7 @@ impl UreqClient {
             agent: Agent::new_with_config(config),
         }
     }
-}
 
-impl Default for UreqClient {
-    fn default() -> UreqClient {
-        UreqClient::new()
-    }
-}
-
-impl HttpClient for UreqClient {
-    fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
-        match request.method.as_str() {
-            "GET" => self.without_body(self.agent.get(&request.url), request),
-            "DELETE" => self.without_body(self.agent.delete(&request.url), request),
-            "POST" => self.with_body(self.agent.post(&request.url), request),
-            "PUT" => self.with_body(self.agent.put(&request.url), request),
-            "PATCH" => self.with_body(self.agent.patch(&request.url), request),
-            other => anyhow::bail!("unsupported http method `{other}`"),
-        }
-    }
-}
-
-impl UreqClient {
     fn without_body(
         &self,
         mut builder: ureq::RequestBuilder<WithoutBody>,
@@ -920,6 +910,25 @@ impl UreqClient {
             .send(&body[..])
             .map_err(|err| anyhow::anyhow!("http transport error: {err}"))?;
         read_response(response)
+    }
+}
+
+impl Default for UreqClient {
+    fn default() -> UreqClient {
+        UreqClient::new()
+    }
+}
+
+impl HttpClient for UreqClient {
+    fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+        match request.method.as_str() {
+            "GET" => self.without_body(self.agent.get(&request.url), request),
+            "DELETE" => self.without_body(self.agent.delete(&request.url), request),
+            "POST" => self.with_body(self.agent.post(&request.url), request),
+            "PUT" => self.with_body(self.agent.put(&request.url), request),
+            "PATCH" => self.with_body(self.agent.patch(&request.url), request),
+            other => anyhow::bail!("unsupported http method `{other}`"),
+        }
     }
 }
 
@@ -1063,7 +1072,100 @@ impl HttpClient for StubHttpClient {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
+
+    fn test_shared() -> EffectShared {
+        EffectShared {
+            name: "test".to_owned(),
+            position: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+            consecutive_failures: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+            terminal_skips: AtomicU64::new(0),
+            last_terminal_error: Mutex::new(None),
+            skip_position: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn a_failed_completion_leaves_the_skip_request_pending() {
+        let shared = test_shared();
+        shared.request_skip(7);
+        shared.record_failure("boom");
+
+        let err = honor_skip(&shared, || anyhow::bail!("op-db is locked")).unwrap_err();
+        assert!(err.to_string().contains("op-db is locked"));
+        assert_eq!(
+            shared.skip_position.load(Ordering::Relaxed),
+            7,
+            "a skip must survive a failed completion so the driver honors it on the next pass"
+        );
+        assert_eq!(
+            shared.consecutive_failures(),
+            1,
+            "the position is still wedged"
+        );
+
+        honor_skip(&shared, || Ok(())).unwrap();
+        assert_eq!(shared.skip_position.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.consecutive_failures(), 0);
+        assert_eq!(shared.last_error(), None);
+    }
+
+    /// Both the skip and the shutdown paths return before the full backoff elapses,
+    /// so each case is timed. Asserting only the returned bool would pass even with
+    /// the early return deleted: the call would simply take the whole 30 seconds and
+    /// still report `false`.
+    #[test]
+    fn sleep_watching_returns_early_only_for_the_wedged_position() {
+        let long = Duration::from_secs(30);
+        let shared = test_shared();
+        shared.request_skip(7);
+
+        let started = Instant::now();
+        assert!(
+            !sleep_watching(&shared, Some(7), long),
+            "a skip is not a shutdown"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a skip for this position must cut the backoff short, waited {:?}",
+            started.elapsed()
+        );
+
+        shared.stop();
+        let started = Instant::now();
+        assert!(
+            sleep_watching(&shared, None, long),
+            "a shutdown is reported as such"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown must cut the backoff short, waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The skip only applies to the position it names: a skip for a different
+    /// position must let the backoff run its course.
+    #[test]
+    fn sleep_watching_ignores_a_skip_for_another_position() {
+        let shared = test_shared();
+        shared.request_skip(7);
+        let started = Instant::now();
+        assert!(!sleep_watching(
+            &shared,
+            Some(9),
+            Duration::from_millis(300)
+        ));
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "waited only {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn backoff_grows_then_caps() {
@@ -1133,5 +1235,24 @@ mod tests {
         assert_eq!(stub.send(&request).unwrap().status, 503);
         assert_eq!(stub.send(&request).unwrap().status, 200);
         assert_eq!(stub.call_count(), 2);
+    }
+
+    #[test]
+    fn flatten_chain_folds_every_cause_into_the_display() {
+        let err =
+            anyhow::anyhow!("connection refused").context("http POST https://example.test/welcome");
+        assert_eq!(
+            format!("{err}"),
+            "http POST https://example.test/welcome",
+            "plain Display drops the cause, which is what the starlark boundary sees"
+        );
+
+        let flat = flatten_chain(err);
+        assert_eq!(
+            format!("{flat}"),
+            "http POST https://example.test/welcome: connection refused"
+        );
+        // No cause left to render twice once the chain is folded in.
+        assert_eq!(format!("{flat:#}"), format!("{flat}"));
     }
 }

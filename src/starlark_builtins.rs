@@ -1,7 +1,6 @@
 //! Starlark builtins for the runtime.
 //!
-//! Verified against starlark 0.14.2. The `pagable` feature gate note: `NoSerialize`
-//! is behind `pagable`; drop it if you disable that feature.
+//! Verified against starlark 0.14.2.
 //!
 //! Module layout: each `.star` file is one command, projector or effect,
 //! identified by its filename (slug-validated). Handlers (`query`, `initial`,
@@ -19,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use allocative::Allocative;
 use anyhow::Context;
 use serde::Serializer;
-use starlark::any::ProvidesStaticType;
+use starlark::any::{AnyLifetime, ProvidesStaticType};
 use starlark::collections::{SmallMap, StarlarkHasher};
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator, FileLoader};
@@ -28,6 +27,7 @@ use starlark::values::dict::{AllocDict, DictRef};
 use starlark::values::list::{ListRef, UnpackList};
 use starlark::values::none::NoneType;
 use starlark::values::structs::AllocStruct;
+use starlark::values::tuple::TupleRef;
 use starlark::values::{
     Heap, NoSerialize, OwnedFrozenValue, StarlarkValue, Value, ValueLike, starlark_value,
 };
@@ -36,6 +36,7 @@ use starlark::{starlark_module, starlark_simple_value};
 use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx, QueryCtx};
 use crate::dispatch::RESERVED_TAG_PREFIX;
 use crate::read_api::RESERVED_QUERY_PARAMS;
+use crate::read_model::quote_ident;
 
 // ---------------------------------------------------------------------------
 // Field types
@@ -144,7 +145,7 @@ impl<'v> StarlarkValue<'v> for FieldType {}
 starlark_simple_value!(FieldType);
 
 /// Assemble a [`FieldType`] from a base kind and the shared `indexed`/`subject`/
-/// `unique` policy arguments, applying the kind-independent rules: `unique` implies
+/// `unique` policy arguments, applying the kind-independent rules: `unique` requires
 /// `subject` and indexing, and neither `subject` nor `unique` is meaningful on an
 /// opaque `json` blob or an unbounded `text` (whose ciphertext tag must stay
 /// bounded). Sibling-reference rules (the subject naming a real, non-encrypted
@@ -213,6 +214,68 @@ fn validate_subject_refs(context: &str, fields: &[(String, FieldMeta)]) -> anyho
         }
     }
     Ok(())
+}
+
+/// Whether `name` is a plain SQL identifier: ascii letters, digits and underscores,
+/// starting with a letter or underscore.
+fn is_sql_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// How deep [`contains_cipher_handle`] descends before giving up. Real payloads
+/// nest a handful of levels; the cap exists so a self-referential value cannot
+/// recurse forever.
+const MAX_HANDLE_SCAN_DEPTH: u32 = 64;
+
+/// Whether `value` is, or transitively contains, a [`CipherHandle`]. The re-emit
+/// guard has to see through lists, tuples and dicts: `to_json_value` flattens a
+/// nested handle to its bare ciphertext, which would then be stored (or
+/// re-encrypted) as if it were plaintext.
+///
+/// Past [`MAX_HANDLE_SCAN_DEPTH`] this reports `false` rather than descending
+/// further. Starlark values can be cyclic (`x = []; x.append(x)`), and recursing
+/// into one would overflow the stack and abort the process. Returning `false` hands
+/// the value to `to_json_value`, which detects the cycle and fails the command with
+/// a normal error. A handle buried deeper than the cap is therefore not caught here,
+/// which is the same position the guard was in before it looked inside containers at
+/// all.
+fn contains_cipher_handle(value: Value<'_>) -> bool {
+    fn scan(value: Value<'_>, depth: u32) -> bool {
+        if value.downcast_ref::<CipherHandle>().is_some() {
+            return true;
+        }
+        if depth == MAX_HANDLE_SCAN_DEPTH {
+            return false;
+        }
+        if let Some(list) = ListRef::from_value(value) {
+            return list.iter().any(|item| scan(item, depth + 1));
+        }
+        if let Some(tuple) = TupleRef::from_value(value) {
+            return tuple.iter().any(|item| scan(item, depth + 1));
+        }
+        if let Some(dict) = DictRef::from_value(value) {
+            return dict
+                .iter()
+                .any(|(key, val)| scan(key, depth + 1) || scan(val, depth + 1));
+        }
+        false
+    }
+    scan(value, 0)
+}
+
+/// Downcast an entity builtin's first argument to its [`EntityDef`], naming the
+/// builtin in the error.
+fn entity_arg<'v>(builtin: &str, entity: Value<'v>) -> anyhow::Result<&'v EntityDef> {
+    entity.downcast_ref::<EntityDef>().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{builtin}() first argument must be an entity(...), got {}",
+            entity.get_type()
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -305,12 +368,12 @@ impl EntityDef {
                 } else {
                     ""
                 };
-                format!("  {} {}{}{}", name, meta.sql_type(), pk, null)
+                format!("  {} {}{pk}{null}", quote_ident(name), meta.sql_type())
             })
             .collect();
         format!(
             "CREATE TABLE IF NOT EXISTS {} (\n{}\n)",
-            self.name,
+            quote_ident(&self.name),
             cols.join(",\n")
         )
     }
@@ -319,18 +382,37 @@ impl EntityDef {
         self.indexes
             .iter()
             .map(|ix| {
+                let columns: Vec<String> = ix.columns.iter().map(|col| quote_ident(col)).collect();
                 format!(
-                    "CREATE INDEX IF NOT EXISTS {}_{} ON {} ({})",
-                    self.name,
-                    ix.name,
-                    self.name,
-                    ix.columns.join(", ")
+                    "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+                    quote_ident(&format!("{}_{}", self.name, ix.name)),
+                    quote_ident(&self.name),
+                    columns.join(", ")
                 )
             })
             .collect()
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Generated SQL quotes every identifier, so this is not what keeps the SQL
+        // well-formed; it keeps a `name =` override (or an `index("...")` name) to
+        // something that reads as a table name in a schema dump, a log line or an
+        // ad-hoc query, which a name carrying quotes or spaces would not.
+        if !is_sql_identifier(&self.name) {
+            anyhow::bail!(
+                "entity `{}`: table name must be ascii letters, digits and underscores, starting with a letter or underscore",
+                self.name
+            );
+        }
+        for ix in &self.indexes {
+            if !is_sql_identifier(&ix.name) {
+                anyhow::bail!(
+                    "entity `{}`: index name `{}` must be ascii letters, digits and underscores, starting with a letter or underscore",
+                    self.name,
+                    ix.name
+                );
+            }
+        }
         let Some((_, key_meta)) = self.fields.iter().find(|(n, _)| *n == self.key) else {
             anyhow::bail!(
                 "entity `{}`: key `{}` is not a declared field",
@@ -481,7 +563,7 @@ impl<'v> StarlarkValue<'v> for EventDef {
             // fed back into a constructor: it would serialise to its ciphertext and be
             // re-encrypted, storing ciphertext-of-ciphertext. A derivation must be
             // built from the plaintext the command already holds.
-            if value.downcast_ref::<CipherHandle>().is_some() {
+            if contains_cipher_handle(*value) {
                 return Err(anyhow::anyhow!(
                     "event `{}` field `{}`: a subject-encrypted value from an event cannot be re-emitted; supply the plaintext",
                     self.event_type,
@@ -708,8 +790,8 @@ impl fmt::Display for EntityOp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.kind {
             EntityOpKind::Put(_) => write!(f, "put(#{})", self.entity_id),
-            EntityOpKind::Patch { key, .. } => write!(f, "patch(#{}, {})", self.entity_id, key),
-            EntityOpKind::Delete(key) => write!(f, "delete(#{}, {})", self.entity_id, key),
+            EntityOpKind::Patch { key, .. } => write!(f, "patch(#{}, {key})", self.entity_id),
+            EntityOpKind::Delete(key) => write!(f, "delete(#{}, {key})", self.entity_id),
         }
     }
 }
@@ -731,15 +813,6 @@ pub enum ModuleKind {
 }
 
 impl ModuleKind {
-    /// The directory (relative to the project root) this kind is authored under.
-    pub fn dir(self) -> &'static str {
-        match self {
-            ModuleKind::Command => "commands",
-            ModuleKind::Projector => "projectors",
-            ModuleKind::Effect => "effects",
-        }
-    }
-
     /// The word used in diagnostics.
     pub fn label(self) -> &'static str {
         match self {
@@ -890,8 +963,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         for (name, value) in fields {
             let ft = value.downcast_ref::<FieldType>().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "schema field `{}` must be a field type, got {}",
-                    name,
+                    "schema field `{name}` must be a field type, got {}",
                     value.get_type()
                 )
             })?;
@@ -914,7 +986,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] columns: UnpackList<String>,
     ) -> anyhow::Result<IndexDef> {
         if columns.items.is_empty() {
-            anyhow::bail!("index `{}` needs at least one column", name);
+            anyhow::bail!("index `{name}` needs at least one column");
         }
         Ok(IndexDef {
             name,
@@ -970,7 +1042,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         let mut field_defs = Vec::with_capacity(fields.len());
         for (name, value) in fields {
             let ft = value.downcast_ref::<FieldType>().ok_or_else(|| {
-                anyhow::anyhow!("event `{}` field `{}` must be a field type", r#type, name)
+                anyhow::anyhow!("event `{}` field `{name}` must be a field type", r#type)
             })?;
             // The host stamps its own tags in the `_kiln_` namespace (the
             // idempotency tag, and the global uniqueness tag). Reserving the prefix
@@ -1028,16 +1100,12 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] entity: Value<'v>,
         #[starlark(require = pos)] row: Value<'v>,
     ) -> anyhow::Result<EntityOp> {
-        let def = entity.downcast_ref::<EntityDef>().ok_or_else(|| {
-            anyhow::anyhow!(
-                "put() first argument must be an entity(...), got {}",
-                entity.get_type()
-            )
-        })?;
-        if let Some(dict) = DictRef::from_value(row) {
-            enforce_subject_columns(def, &dict, None)
-                .map_err(|err| anyhow::anyhow!("put(): {err}"))?;
-        }
+        let def = entity_arg("put", entity)?;
+        // Handle provenance only survives on the Starlark value, so the row has to be
+        // checked before `to_json_value` flattens it.
+        let dict = DictRef::from_value(row)
+            .ok_or_else(|| anyhow::anyhow!("put() row must be a dict, got {}", row.get_type()))?;
+        enforce_subject_columns(def, &dict, None).map_err(|err| anyhow::anyhow!("put(): {err}"))?;
         let json = row
             .to_json_value()
             .map_err(|err| anyhow::anyhow!("put() row must be JSON-serialisable: {err}"))?;
@@ -1059,16 +1127,12 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] key: String,
         #[starlark(require = pos)] changes: Value<'v>,
     ) -> anyhow::Result<EntityOp> {
-        let def = entity.downcast_ref::<EntityDef>().ok_or_else(|| {
-            anyhow::anyhow!(
-                "patch() first argument must be an entity(...), got {}",
-                entity.get_type()
-            )
+        let def = entity_arg("patch", entity)?;
+        let dict = DictRef::from_value(changes).ok_or_else(|| {
+            anyhow::anyhow!("patch() changes must be a dict, got {}", changes.get_type())
         })?;
-        if let Some(dict) = DictRef::from_value(changes) {
-            enforce_subject_columns(def, &dict, Some(&key))
-                .map_err(|err| anyhow::anyhow!("patch(): {err}"))?;
-        }
+        enforce_subject_columns(def, &dict, Some(&key))
+            .map_err(|err| anyhow::anyhow!("patch(): {err}"))?;
         let json = changes
             .to_json_value()
             .map_err(|err| anyhow::anyhow!("patch() changes must be JSON-serialisable: {err}"))?;
@@ -1097,12 +1161,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] entity: Value<'v>,
         #[starlark(require = pos)] key: String,
     ) -> anyhow::Result<EntityOp> {
-        let def = entity.downcast_ref::<EntityDef>().ok_or_else(|| {
-            anyhow::anyhow!(
-                "delete() first argument must be an entity(...), got {}",
-                entity.get_type()
-            )
-        })?;
+        let def = entity_arg("delete", entity)?;
         Ok(EntityOp {
             entity_id: def.id,
             kind: EntityOpKind::Delete(key),
@@ -1129,8 +1188,8 @@ pub fn module_name_from_path(filename: &str) -> anyhow::Result<String> {
     let stem = Path::new(filename)
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("{}: cannot derive a name from the filename", filename))?;
-    validate_slug(stem).map_err(|err| anyhow::anyhow!("{}: {}", filename, err))?;
+        .ok_or_else(|| anyhow::anyhow!("{filename}: cannot derive a name from the filename"))?;
+    validate_slug(stem).map_err(|err| anyhow::anyhow!("{filename}: {err}"))?;
     Ok(stem.to_owned())
 }
 
@@ -1138,12 +1197,11 @@ fn validate_slug(s: &str) -> anyhow::Result<()> {
     if s.is_empty() {
         anyhow::bail!("name is empty");
     }
-    let bytes = s.as_bytes();
-    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+    if s.starts_with('-') || s.ends_with('-') {
         anyhow::bail!("name `{s}` must not start or end with a hyphen");
     }
     let mut prev_hyphen = false;
-    for &b in bytes {
+    for &b in s.as_bytes() {
         if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
             anyhow::bail!("name `{s}` must be lowercase letters, digits and single hyphens");
         }
@@ -1215,7 +1273,7 @@ pub fn module_def_from_frozen(
     // omits them and the host calls `handle(input, None)` directly), but
     // `handle` is always required.
     if module.get_option("handle")?.is_none() {
-        anyhow::bail!("{}: missing required `handle` function", filename);
+        anyhow::bail!("{filename}: missing required `handle` function");
     }
     Ok(match kind {
         ModuleKind::Command => ModuleDef::Command {
@@ -1237,40 +1295,15 @@ pub fn module_def_from_frozen(
     })
 }
 
-/// Parse, evaluate and read a single standalone file (no `load()` resolution).
-/// The project loader wires imports itself; this is for one-off use and tests.
-/// Whether the file is a command, projector or effect is decided by the caller
-/// (directory convention) and passed in as `kind`.
-pub fn load_script(
-    filename: &str,
-    src: String,
-    kind: ModuleKind,
-) -> starlark::Result<LoadedModule> {
-    let name = module_name_from_path(filename)?;
-    let source_hash = crate::hash::sha256_hex(src.as_bytes());
-    let ast = parse_module(filename, src)?;
-    // A projector's or effect's `source` is evaluated in query mode; a command's
-    // body only defines functions.
-    let query_mode = matches!(kind, ModuleKind::Projector | ModuleKind::Effect);
-    let module = eval_frozen(ast, &globals_for(kind), None, query_mode)?;
-    let def = module_def_from_frozen(kind, name, filename, &module)?;
-    Ok(LoadedModule {
-        def,
-        module,
-        source_hash,
-    })
-}
-
 /// Read the required `input = schema(...)` global off a command module.
 fn read_schema(module: &FrozenModule, filename: &str) -> anyhow::Result<InputSchema> {
     let Some(owned) = module.get_option("input")? else {
-        anyhow::bail!("{}: command must define `input = schema(...)`", filename);
+        anyhow::bail!("{filename}: command must define `input = schema(...)`");
     };
     let val = owned.value();
     let schema = val.downcast_ref::<InputSchema>().ok_or_else(|| {
         anyhow::anyhow!(
-            "{}: `input` must be a schema(...), got {}",
-            filename,
+            "{filename}: `input` must be a schema(...), got {}",
             val.get_type()
         )
     })?;
@@ -1304,47 +1337,63 @@ fn read_projector(
         }
         resolved
             .validate()
-            .map_err(|err| anyhow::anyhow!("{}: {}", filename, err))?;
+            .map_err(|err| anyhow::anyhow!("{filename}: {err}"))?;
         entities.push(resolved);
     }
     // Deterministic DDL/output order regardless of how `names()` iterates.
     entities.sort_by(|a, b| a.name.cmp(&b.name));
     if entities.is_empty() {
         anyhow::bail!(
-            "{}: projector defines no entities; assign one with `name = entity(...)`",
-            filename
+            "{filename}: projector defines no entities; assign one with `name = entity(...)`"
         );
     }
 
-    let Some(owned) = module.get_option("source")? else {
-        anyhow::bail!(
-            "{}: projector must define `source = ...` (events(...), all_events(), or a list)",
-            filename
-        );
-    };
-    let sources = parse_event_specs(owned.value())
-        .map_err(|err| anyhow::anyhow!("{}: `source` {}", filename, err))?;
+    let sources = read_sources(module, filename, "projector")?;
     Ok((entities, sources))
 }
 
 /// Read an effect's `source` subscription. An effect has no entities: it reacts
-/// to events and performs side effects (the durable-execution runtime lands in a
-/// later phase). Its shape is a `source` plus `handle`; validating `source` here
-/// means a broken subscription fails at load rather than at first dispatch.
+/// to events and performs durable side effects. Its shape is a `source` plus
+/// `handle`; validating `source` here means a broken subscription fails at load
+/// rather than at first dispatch.
 fn read_effect(module: &FrozenModule, filename: &str) -> anyhow::Result<Vec<EventSpec>> {
+    read_sources(module, filename, "effect")
+}
+
+/// Read the required `source` subscription off a projector or effect module.
+/// `kind` names the module kind in the error.
+fn read_sources(
+    module: &FrozenModule,
+    filename: &str,
+    kind: &str,
+) -> anyhow::Result<Vec<EventSpec>> {
     let Some(owned) = module.get_option("source")? else {
         anyhow::bail!(
-            "{}: effect must define `source = ...` (events(...), all_events(), or a list)",
-            filename
+            "{filename}: {kind} must define `source = ...` (an event definition call like `order_placed(...)`, `all_events()`, or a list of them)"
         );
     };
-    parse_event_specs(owned.value())
-        .map_err(|err| anyhow::anyhow!("{}: `source` {}", filename, err))
+    parse_event_specs(owned.value()).map_err(|err| anyhow::anyhow!("{filename}: `source` {err}"))
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch sketch
+// Handler invocation
 // ---------------------------------------------------------------------------
+
+/// The shared body of every `call_handler*`: the only thing that varies between
+/// them is the context put on the evaluator, which is what decides which
+/// context-gated builtins resolve.
+fn eval_with_extra<'v, 'a, 'e>(
+    module: &Module<'v>,
+    func: Value<'v>,
+    args: &[Value<'v>],
+    max_instructions: u64,
+    extra: Option<&'a dyn AnyLifetime<'e>>,
+) -> starlark::Result<Value<'v>> {
+    let mut eval = Evaluator::new(module);
+    eval.set_max_tick_count(max_instructions)?;
+    eval.extra = extra;
+    eval.eval_function(func, args, &[])
+}
 
 /// Call a handler. Synchronous and non-yielding, so this belongs on
 /// `spawn_blocking`, never on a Tokio worker.
@@ -1354,9 +1403,7 @@ pub fn call_handler<'v>(
     args: &[Value<'v>],
     max_instructions: u64,
 ) -> starlark::Result<Value<'v>> {
-    let mut eval = Evaluator::new(module);
-    eval.set_max_tick_count(max_instructions)?;
-    eval.eval_function(func, args, &[])
+    eval_with_extra(module, func, args, max_instructions, None)
 }
 
 /// Call a handler with a [`HandleCtx`] in scope, so `now()` resolves. Used only
@@ -1369,10 +1416,7 @@ pub fn call_handler_with_ctx<'v>(
     max_instructions: u64,
     ctx: &HandleCtx,
 ) -> starlark::Result<Value<'v>> {
-    let mut eval = Evaluator::new(module);
-    eval.set_max_tick_count(max_instructions)?;
-    eval.extra = Some(ctx);
-    eval.eval_function(func, args, &[])
+    eval_with_extra(module, func, args, max_instructions, Some(ctx))
 }
 
 /// Call a command's `query` with a [`QueryCtx`] in scope, so an event-definition
@@ -1385,10 +1429,7 @@ pub fn call_handler_with_query_ctx<'v>(
     max_instructions: u64,
 ) -> starlark::Result<Value<'v>> {
     let query_ctx = QueryCtx;
-    let mut eval = Evaluator::new(module);
-    eval.set_max_tick_count(max_instructions)?;
-    eval.extra = Some(&query_ctx);
-    eval.eval_function(func, args, &[])
+    eval_with_extra(module, func, args, max_instructions, Some(&query_ctx))
 }
 
 /// Call a projector's `handle` with a [`ProjectorCtx`] in scope, so `get()` can
@@ -1400,10 +1441,7 @@ pub fn call_handler_with_projector_ctx<'v>(
     max_instructions: u64,
     ctx: &ProjectorCtx,
 ) -> starlark::Result<Value<'v>> {
-    let mut eval = Evaluator::new(module);
-    eval.set_max_tick_count(max_instructions)?;
-    eval.extra = Some(ctx);
-    eval.eval_function(func, args, &[])
+    eval_with_extra(module, func, args, max_instructions, Some(ctx))
 }
 
 /// Call an effect's `handle` with an [`EffectCtx`] in scope, so the impure
@@ -1416,10 +1454,7 @@ pub fn call_handler_with_effect_ctx<'v>(
     max_instructions: u64,
     ctx: &EffectCtx,
 ) -> starlark::Result<Value<'v>> {
-    let mut eval = Evaluator::new(module);
-    eval.set_max_tick_count(max_instructions)?;
-    eval.extra = Some(ctx);
-    eval.eval_function(func, args, &[])
+    eval_with_extra(module, func, args, max_instructions, Some(ctx))
 }
 
 /// The globals for pure modules (projectors, and the `events/` and `lib/` files
@@ -1434,15 +1469,12 @@ pub fn globals() -> Globals {
 /// at load; the `handle`-only guard is enforced at call time by the presence of
 /// the context, so `query` and `fold` (evaluated without one) cannot read a clock.
 #[starlark_module]
-pub fn command_builtins(builder: &mut GlobalsBuilder) {
+pub(crate) fn command_builtins(builder: &mut GlobalsBuilder) {
     fn now(eval: &mut Evaluator) -> anyhow::Result<String> {
-        match eval
-            .extra
+        eval.extra
             .and_then(|extra| extra.downcast_ref::<HandleCtx>())
-        {
-            Some(ctx) => Ok(ctx.now.clone()),
-            None => anyhow::bail!("now() is only available in handle()"),
-        }
+            .map(|ctx| ctx.now.clone())
+            .ok_or_else(|| anyhow::anyhow!("now() is only available in handle()"))
     }
 }
 
@@ -1460,37 +1492,29 @@ pub fn command_globals() -> Globals {
 /// It exists as a global so a `handle` naming it resolves at load; the guard is
 /// the presence of the context, so it errors anywhere but a projector `handle`.
 #[starlark_module]
-pub fn projector_builtins(builder: &mut GlobalsBuilder) {
+pub(crate) fn projector_builtins(builder: &mut GlobalsBuilder) {
     fn get<'v>(
         #[starlark(require = pos)] entity: Value<'v>,
         #[starlark(require = pos)] key: String,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
-        let def = entity.downcast_ref::<EntityDef>().ok_or_else(|| {
-            anyhow::anyhow!(
-                "get() first argument must be an entity(...), got {}",
-                entity.get_type()
-            )
-        })?;
+        let def = entity_arg("get", entity)?;
         let ctx = eval
             .extra
             .and_then(|extra| extra.downcast_ref::<ProjectorCtx>())
             .ok_or_else(|| anyhow::anyhow!("get() is only available in a projector's handle()"))?;
-        match ctx.reader.get(def.id, &key)? {
-            // Wrap subject columns as handles, exactly as an event is materialised, so
-            // a read-modify-write (`get()` then `put()`) round-trips: the ciphertext
-            // stays opaque and re-storing it is a valid handle, not a raw string.
-            Some(row) => {
-                let value = match row.as_object() {
-                    Some(obj) if def.fields.iter().any(|(_, m)| m.subject.is_some()) => {
-                        alloc_row_with_handles(eval.heap(), &def.fields, obj)
-                    }
-                    _ => eval.heap().alloc(row),
-                };
-                Ok(value)
+        let Some(row) = ctx.reader.get(def.id, &key)? else {
+            return Ok(Value::new_none());
+        };
+        // Wrap subject columns as handles, exactly as an event is materialised, so a
+        // read-modify-write (`get()` then `put()`) round-trips: the ciphertext stays
+        // opaque and re-storing it is a valid handle, not a raw string.
+        Ok(match row.as_object() {
+            Some(obj) if def.fields.iter().any(|(_, m)| m.subject.is_some()) => {
+                alloc_row_with_handles(eval.heap(), &def.fields, obj)
             }
-            None => Ok(Value::new_none()),
-        }
+            _ => eval.heap().alloc(row),
+        })
     }
 }
 
@@ -1589,7 +1613,7 @@ fn http_dispatch<'v>(
 /// an [`EffectCtx`], so they error anywhere but an effect's `handle`. Commands and
 /// projectors never see these globals, so purity stays structural.
 #[starlark_module]
-pub fn effect_builtins(builder: &mut GlobalsBuilder) {
+pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
     fn now(eval: &mut Evaluator) -> anyhow::Result<String> {
         effect_host(eval, "now()")?.now()
     }
@@ -1661,7 +1685,11 @@ pub fn effect_builtins(builder: &mut GlobalsBuilder) {
             (None, None) => None,
             _ => anyhow::bail!("scan() `field` and `value` must be given together"),
         };
-        let limit = limit.map(|n| n.max(0) as usize);
+        // A negative limit would clamp to a one-row page, silently truncating the scan.
+        let limit = match limit {
+            Some(n) if n < 0 => anyhow::bail!("scan() limit must not be negative"),
+            other => other.map(|n| n as usize),
+        };
         let host = effect_host(eval, "scan()")?;
         let result = host.scan(&projector, &entity, filter, cursor, limit)?;
         Ok(eval.heap().alloc(result))
@@ -1674,7 +1702,7 @@ pub fn effect_builtins(builder: &mut GlobalsBuilder) {
 /// reach here (the runtime retries them); a `status >= 400` is a real result the
 /// handler decides on.
 #[starlark_module]
-pub fn http_builtins(builder: &mut GlobalsBuilder) {
+pub(crate) fn http_builtins(builder: &mut GlobalsBuilder) {
     fn get<'v>(
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -1711,24 +1739,14 @@ pub fn http_builtins(builder: &mut GlobalsBuilder) {
     }
 }
 
-/// Globals for effects: the base builtins plus the (currently stubbed) impure
-/// capabilities and the `http` namespace.
+/// Globals for effects: the base builtins plus the journaled impure capabilities
+/// and the `http` namespace.
 pub fn effect_globals() -> Globals {
     GlobalsBuilder::standard()
         .with(runtime_builtins)
         .with(effect_builtins)
         .with_namespace("http", http_builtins)
         .build()
-}
-
-/// The globals a module of `kind` is evaluated against. Commands get `now()`,
-/// effects get the impure capabilities, projectors stay pure.
-pub fn globals_for(kind: ModuleKind) -> Globals {
-    match kind {
-        ModuleKind::Command => command_globals(),
-        ModuleKind::Effect => effect_globals(),
-        ModuleKind::Projector => projector_globals(),
-    }
 }
 
 /// Allocate the initial state for a command on the given heap.
@@ -1773,10 +1791,6 @@ pub fn thaw<'v>(func: &OwnedFrozenValue, module: &Module<'v>) -> Value<'v> {
     // returned Value<'v> is a valid view of permanently-allocated frozen data.
     unsafe { func.owned_frozen_value(module.frozen_heap()).to_value() }
 }
-
-// ---------------------------------------------------------------------------
-// Tag parsing: shared by the `events` builtin and emitted events
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Materialising inputs and events for the handlers
@@ -1838,7 +1852,7 @@ pub fn alloc_event<'v>(
 /// so it survives a read-modify-write, never silently dropped. A null (unset optional)
 /// subject field stays absent. Shared by `alloc_event` and the projector `get()`
 /// builtin, so both read paths wrap identically.
-pub fn alloc_row_with_handles<'v>(
+pub(crate) fn alloc_row_with_handles<'v>(
     heap: Heap<'v>,
     fields: &[(String, FieldMeta)],
     obj: &serde_json::Map<String, serde_json::Value>,
@@ -1867,7 +1881,6 @@ pub fn alloc_row_with_handles<'v>(
                         subject_value,
                     })
                 }
-                // A null (unset optional) subject field stays absent/None.
                 None => heap.alloc(value.clone()),
             },
             None => heap.alloc(value.clone()),
@@ -1947,12 +1960,15 @@ pub fn parse_handle_result(val: Value<'_>) -> anyhow::Result<HandleOutcome> {
     if let Some(events) = events_from_value(val)? {
         let lowered = events
             .iter()
-            .map(|event| EmittedEvent {
-                event_type: event.event_type.clone(),
-                data: serde_json::from_str(&event.data_json).unwrap_or(serde_json::Value::Null),
-                tags: event.tags.clone(),
+            .map(|event| {
+                Ok(EmittedEvent {
+                    event_type: event.event_type.clone(),
+                    data: serde_json::from_str(&event.data_json)
+                        .with_context(|| format!("event `{}` payload", event.event_type))?,
+                    tags: event.tags.clone(),
+                })
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         return Ok(HandleOutcome::Emit(lowered));
     }
     anyhow::bail!(
@@ -1962,11 +1978,11 @@ pub fn parse_handle_result(val: Value<'_>) -> anyhow::Result<HandleOutcome> {
 }
 
 /// Interpret the value a projector's `handle` returned: a list of `put(...)` /
-/// `delete(...)` ops (possibly empty).
+/// `patch(...)` / `delete(...)` ops (possibly empty).
 pub fn parse_entity_ops(val: Value<'_>) -> anyhow::Result<Vec<EntityOp>> {
     let list = ListRef::from_value(val).ok_or_else(|| {
         anyhow::anyhow!(
-            "projector handle() must return a list of put(...)/delete(...) ops, got {}",
+            "projector handle() must return a list of put(...)/patch(...)/delete(...) ops, got {}",
             val.get_type()
         )
     })?;
@@ -2104,14 +2120,17 @@ fn enforce_subject_columns<'v>(
 /// Validate a JSON object against a set of declared fields: no unknown fields,
 /// every non-`optional` field present and non-null, and each value well-typed for
 /// its `FieldKind`. `what` names the subject in error messages (e.g. an event
-/// type, or "input"). Shared by event-payload and command-input validation.
-pub fn check_fields(
+/// type, or "input").
+fn check_declared<'a, I>(
     what: &str,
-    fields: &[(String, FieldKind)],
+    fields: I,
     obj: &serde_json::Map<String, serde_json::Value>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    I: Iterator<Item = (&'a str, &'a FieldKind)> + Clone,
+{
     for key in obj.keys() {
-        if !fields.iter().any(|(name, _)| name == key) {
+        if !fields.clone().any(|(name, _)| name == key) {
             anyhow::bail!("{what}: unknown field `{key}`");
         }
     }
@@ -2126,29 +2145,28 @@ pub fn check_fields(
     Ok(())
 }
 
+/// Validate a command's input against its declared schema fields.
+pub(crate) fn check_fields(
+    what: &str,
+    fields: &[(String, FieldKind)],
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    check_declared(what, fields.iter().map(|(n, k)| (n.as_str(), k)), obj)
+}
+
 /// Validate a constructed event's payload against its declared fields. This is the
 /// check the event constructor runs at emit time, so a malformed event fails where
 /// it is built.
-pub fn validate_event_payload(
+pub(crate) fn validate_event_payload(
     event_type: &str,
     fields: &[(String, FieldMeta)],
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let what = format!("event `{event_type}`");
-    for key in obj.keys() {
-        if !fields.iter().any(|(name, _)| name == key) {
-            anyhow::bail!("{what}: unknown field `{key}`");
-        }
-    }
-    for (name, meta) in fields {
-        match obj.get(name) {
-            Some(value) => check_value(&meta.kind, value)
-                .map_err(|err| anyhow::anyhow!("{what} field `{name}`: {err}"))?,
-            None if meta.is_nullable() => {}
-            None => anyhow::bail!("{what}: missing required field `{name}`"),
-        }
-    }
-    Ok(())
+    check_declared(
+        &format!("event `{event_type}`"),
+        fields.iter().map(|(n, m)| (n.as_str(), &m.kind)),
+        obj,
+    )
 }
 
 /// Validate a command's request body against its input schema before the decision
@@ -2198,14 +2216,25 @@ fn check_value(kind: &FieldKind, value: &serde_json::Value) -> anyhow::Result<()
                 anyhow::bail!("`{text}` is not one of {variants:?}");
             }
         }
+        // Both integer kinds are stored in a SQLite INTEGER column, which is signed
+        // 64-bit, so a value above `i64::MAX` is refused here rather than at the
+        // projector. Reinterpreting the bits would round-trip but sort below zero,
+        // silently breaking `ORDER BY` and the `key > ?` cursor for those rows; the
+        // same reason `money` cannot key an ordered scan.
         FieldKind::I64 => {
-            if !value.is_i64() && !value.is_u64() {
-                anyhow::bail!("expected an integer");
+            if !value.is_i64() {
+                anyhow::bail!("expected an integer between {} and {}", i64::MIN, i64::MAX);
             }
         }
         FieldKind::U64 => {
             if !value.is_u64() {
                 anyhow::bail!("expected a non-negative integer");
+            }
+            if !value.is_i64() {
+                anyhow::bail!(
+                    "{value} exceeds the largest storable integer ({})",
+                    i64::MAX
+                );
             }
         }
         FieldKind::Bool => {
@@ -2225,7 +2254,7 @@ fn is_decimal_string(text: &str) -> bool {
     let mut parts = unsigned.splitn(2, '.');
     let whole = parts.next().unwrap_or("");
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-    digits(whole) && parts.next().map(digits).unwrap_or(true)
+    digits(whole) && parts.next().is_none_or(digits)
 }
 
 /// Build the tags for a constructed event under automatic tagging: every `indexed`
@@ -2249,13 +2278,12 @@ fn derive_tags(
         }
         let text = match obj.get(name) {
             None | Some(serde_json::Value::Null) => continue,
-            Some(serde_json::Value::String(value)) => value.clone(),
-            Some(serde_json::Value::Number(value)) => value.to_string(),
-            Some(serde_json::Value::Bool(value)) => value.to_string(),
-            Some(other) => anyhow::bail!(
-                "event `{event_type}`: indexed field `{name}` must be a scalar, got a {}",
-                json_kind(other)
-            ),
+            Some(other) => scalar_to_string(other).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "event `{event_type}`: indexed field `{name}` must be a scalar, got a {}",
+                    json_kind(other)
+                )
+            })?,
         };
         tags.push((name.clone(), Some(text)));
     }
@@ -2293,16 +2321,16 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Interpret a `query` result or a projector `source`: a single `events(...)` /
-/// `all_events()`, or a list of them OR'd together. The specs lower to a tephra
-/// `Query` (OR across items, AND within an item's tags).
+/// Interpret a `query` result or a projector `source`: a single event-definition
+/// call or `all_events()`, or a list of them OR'd together. The specs lower to a
+/// tephra `Query` (OR across items, AND within an item's tags).
 pub fn parse_event_specs(val: Value<'_>) -> anyhow::Result<Vec<EventSpec>> {
     if let Some(spec) = val.downcast_ref::<EventSpec>() {
         return Ok(vec![spec.clone()]);
     }
     let list = ListRef::from_value(val).ok_or_else(|| {
         anyhow::anyhow!(
-            "must be events(...)/all_events() or a list of them, got {}",
+            "must be an event definition call (e.g. `order_placed(...)`), all_events(), or a list of them, got {}",
             val.get_type()
         )
     })?;
@@ -2312,7 +2340,10 @@ pub fn parse_event_specs(val: Value<'_>) -> anyhow::Result<Vec<EventSpec>> {
     let mut specs = Vec::with_capacity(list.len());
     for item in list.iter() {
         let spec = item.downcast_ref::<EventSpec>().ok_or_else(|| {
-            anyhow::anyhow!("list items must be events(...), got {}", item.get_type())
+            anyhow::anyhow!(
+                "list items must be event definition calls or all_events(), got {}",
+                item.get_type()
+            )
         })?;
         specs.push(spec.clone());
     }
@@ -2349,6 +2380,53 @@ mod tests {
         value.as_object().unwrap().clone()
     }
 
+    /// The largest `i64`, plus one, as a JSON number. `serde_json` keeps it as a
+    /// `u64`, which is exactly the shape that used to reach the read model.
+    fn above_i64_max() -> serde_json::Value {
+        serde_json::json!(i64::MAX as u64 + 1)
+    }
+
+    #[test]
+    fn a_u64_within_the_storable_range_is_accepted() {
+        assert!(check_value(&FieldKind::U64, &serde_json::json!(0u64)).is_ok());
+        assert!(check_value(&FieldKind::U64, &serde_json::json!(i64::MAX as u64)).is_ok());
+    }
+
+    #[test]
+    fn a_u64_above_i64_max_is_rejected_rather_than_wedging_the_projector() {
+        let err = check_value(&FieldKind::U64, &above_i64_max()).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds the largest storable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_negative_value_is_still_rejected_for_u64() {
+        let err = check_value(&FieldKind::U64, &serde_json::json!(-1)).unwrap_err();
+        assert!(err.to_string().contains("non-negative"), "{err}");
+    }
+
+    #[test]
+    fn an_i64_field_rejects_a_positive_value_that_does_not_fit() {
+        // The old check accepted anything `is_u64()`, so this value passed input
+        // validation and then failed at the read model's `as_i64()`.
+        let err = check_value(&FieldKind::I64, &above_i64_max()).unwrap_err();
+        assert!(err.to_string().contains("expected an integer"), "{err}");
+        assert!(check_value(&FieldKind::I64, &serde_json::json!(i64::MIN)).is_ok());
+        assert!(check_value(&FieldKind::I64, &serde_json::json!(i64::MAX)).is_ok());
+    }
+
+    #[test]
+    fn an_out_of_range_integer_is_rejected_through_command_input_validation() {
+        let schema = InputSchema {
+            fields: vec![("count".to_owned(), FieldKind::U64)],
+        };
+        let err = validate_command_input(&schema, &serde_json::json!({"count": above_i64_max()}))
+            .unwrap_err();
+        assert!(err.to_string().contains("count"), "{err}");
+    }
+
     #[test]
     fn accepts_a_well_typed_payload() {
         let obj = object(serde_json::json!({"id": "u1", "amount": "10.50", "kind": "a"}));
@@ -2383,8 +2461,6 @@ mod tests {
 
     #[test]
     fn auto_tags_indexed_fields_and_skips_null_optionals() {
-        // Auto-tagging: every present, indexed field becomes a tag; the absent
-        // optional `note` contributes none.
         let obj = object(serde_json::json!({"id": "u1", "amount": "1", "kind": "a"}));
         let tags = derive_tags("t", &fields(), &obj).unwrap();
         assert_eq!(
@@ -2416,6 +2492,134 @@ mod tests {
         assert_eq!(tags, vec![("id".to_owned(), Some("u1".to_owned()))]);
     }
 
+    fn entity(name: &str, indexes: Vec<IndexDef>) -> EntityDef {
+        EntityDef {
+            id: 1,
+            name: name.to_owned(),
+            key: "id".to_owned(),
+            fields: vec![
+                ("id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+                (
+                    "email".to_owned(),
+                    FieldMeta::plain(FieldKind::Text {
+                        max_length: Some(200),
+                    }),
+                ),
+            ],
+            indexes,
+        }
+    }
+
+    #[test]
+    fn accepts_an_identifier_table_and_index_name() {
+        let indexes = vec![IndexDef {
+            name: "by_email".to_owned(),
+            columns: vec!["email".to_owned()],
+        }];
+        entity("user_accounts2", indexes).validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_a_table_name_that_is_not_an_identifier() {
+        for name in ["user accounts", "users; drop table users", "2users", ""] {
+            let err = entity(name, Vec::new()).validate().unwrap_err();
+            assert!(err.to_string().contains("table name"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_an_index_name_that_is_not_an_identifier() {
+        let indexes = vec![IndexDef {
+            name: "by email) ; drop table users --".to_owned(),
+            columns: vec!["email".to_owned()],
+        }];
+        let err = entity("users", indexes).validate().unwrap_err();
+        assert!(err.to_string().contains("index name"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_cipher_handle_nested_in_an_emitted_payload() {
+        // A handle serialises to its bare ciphertext, so one smuggled through a list
+        // or dict would be stored as if it were plaintext, outside the key's reach.
+        let src = r#"
+ev = event(type = "t.derived", fields = {"blob": json(indexed = False)})
+
+def in_list(handle):
+    return ev(blob = [handle])
+
+def in_dict(handle):
+    return ev(blob = {"inner": handle})
+"#;
+        let ast = parse_module("t.star", src.to_owned()).unwrap();
+        let frozen = eval_frozen(ast, &command_globals(), None, false).unwrap();
+        Module::with_temp_heap(|module| {
+            let handle = module.heap().alloc(CipherHandle {
+                ciphertext: "Y2lwaGVydGV4dA".to_owned(),
+                field: "email".to_owned(),
+                subject_field: "user_id".to_owned(),
+                subject_value: "u1".to_owned(),
+            });
+            for name in ["in_list", "in_dict"] {
+                let func = frozen.get_option(name).unwrap().unwrap();
+                let err = call_handler(&module, thaw(&func, &module), &[handle], 1_000_000)
+                    .expect_err("a nested handle must not be re-emitted");
+                assert!(err.to_string().contains("re-emitted"), "{name}: {err}");
+            }
+        });
+    }
+
+    #[test]
+    fn put_and_patch_require_a_dict_before_flattening() {
+        let src = r#"
+users = entity(key = "id", fields = {"id": uuid()})
+
+def bad_put():
+    return put(users, bad_put)
+
+def bad_patch():
+    return patch(users, "u1", bad_patch)
+"#;
+        let ast = parse_module("t.star", src.to_owned()).unwrap();
+        let frozen = eval_frozen(ast, &projector_globals(), None, false).unwrap();
+        Module::with_temp_heap(|module| {
+            for name in ["bad_put", "bad_patch"] {
+                let func = frozen.get_option(name).unwrap().unwrap();
+                let err = call_handler(&module, thaw(&func, &module), &[], 1_000_000)
+                    .expect_err("a non-dict row must not reach the subject-column check");
+                assert!(err.to_string().contains("must be a dict"), "{name}: {err}");
+            }
+        });
+    }
+
+    #[test]
+    fn scan_rejects_a_negative_limit() {
+        let src = "def f():\n    return scan(\"p\", \"e\", limit = -1)\n";
+        let ast = parse_module("t.star", src.to_owned()).unwrap();
+        let frozen = eval_frozen(ast, &effect_globals(), None, false).unwrap();
+        Module::with_temp_heap(|module| {
+            let func = frozen.get_option("f").unwrap().unwrap();
+            let err = call_handler(&module, thaw(&func, &module), &[], 1_000_000)
+                .expect_err("a negative limit must not be coerced to a one-row page");
+            assert!(err.to_string().contains("negative"), "{err}");
+        });
+    }
+
+    #[test]
+    fn a_malformed_event_payload_is_an_error_not_a_null() {
+        Module::with_temp_heap(|module| {
+            let value = module.heap().alloc(ConstructedEvent {
+                event_type: "t.broken".to_owned(),
+                data_json: "{not json".to_owned(),
+                tags: Vec::new(),
+            });
+            let err = match parse_handle_result(value) {
+                Ok(_) => panic!("a malformed payload must not be lowered to a null"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("t.broken"), "{err}");
+        });
+    }
+
     #[test]
     fn money_decimal_forms() {
         assert!(is_decimal_string("0"));
@@ -2429,10 +2633,6 @@ mod tests {
 
     #[test]
     fn now_needs_a_handle_context() {
-        use starlark::environment::Module;
-
-        use crate::context::HandleCtx;
-
         let ast = parse_module("t.star", "def f():\n    return now()\n".to_owned()).unwrap();
         let frozen = eval_frozen(ast, &command_globals(), None, false).unwrap();
         Module::with_temp_heap(|module| {
@@ -2451,10 +2651,6 @@ mod tests {
 
     #[test]
     fn handle_returns_events_directly_or_as_a_list() {
-        use starlark::environment::Module;
-
-        // A command's `handle` returns an event, a list of events, or an empty list
-        // (nothing to append); anything else is a hard error.
         let src = r#"
 ev = event(type = "t.happened", fields = {"id": uuid()})
 

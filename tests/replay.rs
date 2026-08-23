@@ -4,42 +4,21 @@
 //! head position. If the rename or WAL handling were wrong, these reads would fail
 //! or come back empty.
 
-use std::path::Path;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
-use kiln::context::CommandContext;
-use kiln::effect::{HttpClient, StubHttpClient};
-use kiln::loader::LoadedProject;
 use kiln::read_api;
+use kiln::read_model::ReadModel;
 use kiln::runtime::Runtime;
-use serde_json::json;
-use uuid::Uuid;
+use tephra::Position;
 
-const A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-const B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-const C: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+mod support;
+
+use support::{
+    UUID_A, UUID_B, UUID_C, boot_example, boot_example_at, register_user, wait_position,
+};
 
 fn register(rt: &Runtime, user_id: &str) {
-    let ctx = CommandContext::new(Uuid::new_v4());
-    let body = json!({ "user_id": user_id, "email": format!("{user_id}@x"), "name": "U" });
-    assert_eq!(
-        rt.execute("register-user", body, &ctx, None)
-            .unwrap()
-            .status,
-        200
-    );
-}
-
-fn wait_position(rt: &Runtime, projector: &str, target: u64) {
-    for _ in 0..300 {
-        if rt.projector(projector).unwrap().position() >= target {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("projector `{projector}` did not reach position {target}");
+    register_user(rt, user_id, &format!("{user_id}@x"), "U");
 }
 
 /// The `users` row for `user_id`, read through the read API against the live file.
@@ -53,34 +32,30 @@ fn read_user(rt: &Runtime, user_id: &str) -> Option<serde_json::Value> {
 
 #[test]
 fn replay_rebuilds_and_keeps_serving() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/users");
-    let project = LoadedProject::load(&root);
-    assert!(!project.has_errors(), "{:?}", project.findings);
-    let data = tempfile::tempdir().unwrap();
-    let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http, None).unwrap();
+    let harness = boot_example();
+    let rt = &harness.rt;
 
-    register(&rt, A);
-    register(&rt, B);
-    wait_position(&rt, "users", 2);
-    assert!(read_user(&rt, A).is_some());
-    assert!(read_user(&rt, B).is_some());
+    register(rt, UUID_A);
+    register(rt, UUID_B);
+    wait_position(rt, "users", 2);
+    assert!(read_user(rt, UUID_A).is_some());
+    assert!(read_user(rt, UUID_B).is_some());
 
     // Rebuild-and-swap both projectors from scratch, then append one more event
     // around the replay so the rebuild's catch-up must include it too.
     rt.projector("users").unwrap().request_replay();
     rt.projector("user-stats").unwrap().request_replay();
-    register(&rt, C);
+    register(rt, UUID_C);
 
     // The rebuild projects to the current head (3), so the position returns to it.
-    wait_position(&rt, "users", 3);
-    wait_position(&rt, "user-stats", 3);
+    wait_position(rt, "users", 3);
+    wait_position(rt, "user-stats", 3);
 
     // Every row survived the swap, and the new one is present.
-    let alice = read_user(&rt, A).expect("A survived the rebuild");
-    assert_eq!(alice["user_id"], A);
-    assert!(read_user(&rt, B).is_some());
-    assert!(read_user(&rt, C).is_some());
+    let alice = read_user(rt, UUID_A).expect("A survived the rebuild");
+    assert_eq!(alice["user_id"], UUID_A);
+    assert!(read_user(rt, UUID_B).is_some());
+    assert!(read_user(rt, UUID_C).is_some());
 
     // The running-total projector rebuilt to the right count, and the read reports
     // the rebuilt checkpoint position.
@@ -90,7 +65,53 @@ fn replay_rebuilds_and_keeps_serving() {
     assert_eq!(row.unwrap()["count"].as_i64(), Some(3));
     assert_eq!(position, 3);
 
-    effects.shutdown_and_join();
-    projectors.shutdown_and_join();
-    coord.shutdown();
+    harness.shutdown();
+}
+
+#[test]
+fn a_replay_discards_a_stale_rebuild_file() {
+    // A caller-owned data directory, so the read model outlives the harness and can
+    // be inspected once the projector thread has joined.
+    let data = tempfile::tempdir().unwrap();
+    let harness = boot_example_at(data.path());
+    let rt = &harness.rt;
+
+    register(rt, UUID_A);
+    register(rt, UUID_B);
+    wait_position(rt, "users", 2);
+
+    // A crash mid-rebuild leaves a partial sibling behind. Plant one that is a valid,
+    // openable read model whose checkpoint already claims head but which holds no
+    // rows: reusing it rather than deleting it would swap an empty model into place
+    // and never notice, because there is nothing left for it to project.
+    let shared = rt.projector("users").unwrap();
+    let db_path = shared.db_path.clone();
+    let entities = Arc::clone(&shared.entities);
+    let rebuild_path = db_path.with_extension("rebuild.db");
+    let planted = ReadModel::open(&rebuild_path, &entities).unwrap();
+    planted.advance_checkpoint(Position::new(3)).unwrap();
+    drop(planted);
+
+    register(rt, UUID_C);
+    shared.request_replay();
+    wait_position(rt, "users", 3);
+
+    // Shut down before inspecting: the loop takes a pending replay before it takes a
+    // pending shutdown, so joining the thread means the rebuild has finished.
+    harness.shutdown();
+
+    let model = ReadModel::open_readonly(&db_path).unwrap();
+    let entity = entities.iter().find(|e| e.name == "users").unwrap();
+    for user_id in [UUID_A, UUID_B, UUID_C] {
+        assert!(
+            model.get(entity, user_id).unwrap().is_some(),
+            "{user_id} is missing, so the replay reused the planted file"
+        );
+    }
+    assert_eq!(model.read_checkpoint().unwrap().get(), 3);
+    drop(model);
+    assert!(
+        !rebuild_path.exists(),
+        "the rebuild sibling is renamed into place, never left behind"
+    );
 }

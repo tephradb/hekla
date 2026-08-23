@@ -47,23 +47,24 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
     for command in &project.commands {
         check_command_query(command, &project.events, &mut findings);
     }
-    for projector in &project.projectors {
-        if let ModuleDef::Projector { sources, .. } = &projector.loaded.def {
+    // Projectors and effects subscribe the same way, so they are checked together:
+    // all projectors first, then all effects.
+    let subscribers = project
+        .projectors
+        .iter()
+        .map(|unit| (&unit.loaded.def, unit.rel_path.as_str()))
+        .chain(
+            project
+                .effects
+                .iter()
+                .map(|unit| (&unit.loaded.def, unit.rel_path.as_str())),
+        );
+    for (def, rel) in subscribers {
+        if let ModuleDef::Projector { sources, .. } | ModuleDef::Effect { sources, .. } = def {
             validate_specs(
                 sources,
                 &project.events,
-                &projector.rel_path,
-                Context::Source,
-                &mut findings,
-            );
-        }
-    }
-    for effect in &project.effects {
-        if let ModuleDef::Effect { sources, .. } = &effect.loaded.def {
-            validate_specs(
-                sources,
-                &project.events,
-                &effect.rel_path,
+                rel,
                 Context::Source,
                 &mut findings,
             );

@@ -71,7 +71,7 @@ const IDEMPOTENCY_TAG_KEY: &str = "_kiln_idem";
 /// The idempotency tag for a `(command, key)` pair: `_kiln_idem:<sha256(command\0key)>`.
 /// Hashing binds the tag to the command (so the same key on two commands cannot
 /// collide) and yields a fixed-length, fixed-charset value regardless of the client's
-/// raw key. Once auto-tagging lands this becomes an ordinary high-cardinality field.
+/// raw key.
 ///
 /// The tag deliberately excludes the request body: the key alone identifies the
 /// request, so reusing a key with a different body replays the first outcome rather
@@ -151,9 +151,9 @@ pub fn validate_input(loaded: &LoadedModule, input: &serde_json::Value) -> anyho
 /// [`ConflictClause::Existence`] rather than committing twice, and the runtime then
 /// recovers the original outcome via [`find_committed_outcome`]. There is no
 /// pre-`handle` read: a fresh request pays nothing, and a duplicate re-runs the pure
-/// `handle` but its events never land. The one gap the append can't catch is a
-/// concurrent duplicate whose folded state makes `handle` *reject* before appending;
-/// that reject is checked against the tag too (see the `Reject` arm).
+/// `handle` but its events never land. The gaps the append can't catch are the
+/// decisions that never append at all: a `handle` that rejects, and one that emits
+/// nothing. Both are checked against the tag directly (see [`recover_if_committed`]).
 #[allow(clippy::too_many_arguments)]
 pub fn run_command(
     store: &WriteHandle,
@@ -173,8 +173,8 @@ pub fn run_command(
     Module::with_temp_heap(|module| {
         let input_value = alloc_input(&module, schema, input)?;
 
-        // 1. Consistency boundary from `query` (optional). May return one spec or
-        //    a list of them, OR'd into the boundary.
+        // Consistency boundary from `query` (optional). May return one spec or a
+        // list of them, OR'd into the boundary.
         let boundary = match frozen.get_option("query")? {
             Some(func) => {
                 let result = call_handler_with_query_ctx(
@@ -191,7 +191,6 @@ pub fn run_command(
             None => None,
         };
 
-        // 2. Initial state, then fold the events inside the boundary.
         let mut state = initial_state(frozen, &module)
             .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?;
         let mut after = Position::ZERO;
@@ -213,7 +212,7 @@ pub fn run_command(
             }
         }
 
-        // 3. Decide. `handle` alone sees the pinned clock.
+        // `handle` alone sees the pinned clock.
         let handle_fn = frozen
             .get_option("handle")?
             .ok_or_else(|| anyhow::anyhow!("command has no handle() function"))?;
@@ -229,18 +228,10 @@ pub fn run_command(
         )
         .map_err(|err| anyhow::anyhow!("handle() failed: {err}"))?;
 
-        // 4. Append the emitted events, guarded by the same boundary.
         match parse_handle_result(decision)? {
             HandleOutcome::Reject(rejection) => {
-                // A state-dependent reject can be spurious under a concurrent same-key
-                // duplicate: this attempt folded the duplicate's just-committed event
-                // and rejected, when the key was already satisfied by that commit. The
-                // append's existence clause can't catch it (a reject never appends), and
-                // only a boundaried command folds state, so re-read by the tag and
-                // recover the committed outcome if it is present.
-                if boundary.is_some()
-                    && let Some(tag) = idem_tag
-                    && let Some(recovered) = find_committed_outcome(store, events, tag)?
+                if let Some(recovered) =
+                    recover_if_committed(store, events, boundary.as_ref(), idem_tag)?
                 {
                     return Ok(CommandOutcome::AlreadyCommitted(recovered));
                 }
@@ -254,6 +245,11 @@ pub fn run_command(
             }),
             HandleOutcome::Emit(emitted) => {
                 if emitted.is_empty() {
+                    if let Some(recovered) =
+                        recover_if_committed(store, events, boundary.as_ref(), idem_tag)?
+                    {
+                        return Ok(CommandOutcome::AlreadyCommitted(recovered));
+                    }
                     return Ok(CommandOutcome::Committed {
                         events: emitted,
                         positions: None,
@@ -382,7 +378,7 @@ pub(crate) fn to_query(
                             let subject_value = constraints
                                 .iter()
                                 .find(|(f, _)| f == subject_field)
-                                .map(|(_, v)| v.clone());
+                                .map(|(_, v)| v);
                             let resolved = match subject_value {
                                 // Scoped: encrypt with an existing per-subject key only,
                                 // so a query never mints or resurrects one. An absent key
@@ -390,7 +386,7 @@ pub(crate) fn to_query(
                                 Some(subject_value) => ks
                                     .encrypt_subject_existing(
                                         subject_field,
-                                        &subject_value,
+                                        subject_value,
                                         field,
                                         value,
                                     )?
@@ -419,8 +415,6 @@ pub(crate) fn to_query(
                     }
                 }
                 if unmatchable {
-                    // No key for a constrained subject: require a reserved tag no event
-                    // carries, so this clause matches nothing without minting a key.
                     tags.push((NOMATCH_TAG.to_owned(), None));
                 }
                 items.push(QueryItem::new(vec![ty], to_tags(&tags, &[])?));
@@ -463,14 +457,24 @@ pub fn build_event(
 /// Lower an emitted event to its stored form: encrypt every subject-scoped field
 /// (in the payload and in its tag), add the global-key tag for a `unique` field, and
 /// derive the plaintext tags of the remaining indexed fields. Returns the payload to
-/// envelope and the tag pairs. Without a schema (an event type not in the registry)
-/// the plaintext data and the constructor-derived tags pass through unchanged.
+/// envelope and the tag pairs.
+///
+/// Fails closed on an event type the registry does not know. The loader rejects an
+/// `event(...)` bound outside `events/`, but a definition built inside a function
+/// body reaches here unregistered, and passing it through would store a `subject`
+/// field as plaintext in both the payload and its tag: unerasable, and silent.
 fn lower_event(
     event: &EmittedEvent,
     event_def: Option<&EventDef>,
     keystore: Option<&KeyStore>,
 ) -> anyhow::Result<(serde_json::Value, TagPairs)> {
-    let (Some(def), Some(obj)) = (event_def, event.data.as_object()) else {
+    let def = event_def.ok_or_else(|| {
+        anyhow::anyhow!(
+            "event type `{}` is not declared in events/; define it there and load() it, so its schema (and any `subject` encryption) is applied",
+            event.event_type
+        )
+    })?;
+    let Some(obj) = event.data.as_object() else {
         return Ok((event.data.clone(), event.tags.clone()));
     };
     if !def.fields.iter().any(|(_, meta)| meta.subject.is_some()) {
@@ -567,6 +571,25 @@ fn idem_item(tag: &str) -> anyhow::Result<QueryItem> {
     let tags =
         Tags::new([tag]).map_err(|err| anyhow::anyhow!("invalid idempotency tag set: {err}"))?;
     Ok(QueryItem::with_tags(tags))
+}
+
+/// A keyed request's own prior commit, checked when this attempt is about to return
+/// without appending anything. Both such decisions (a `handle` that rejects, and one
+/// that emits nothing) can be spurious under a crashed or concurrent same-key
+/// duplicate: this attempt folded the duplicate's just-committed events and concluded
+/// the work was already done. Neither appends, so the append's existence clause can't
+/// catch it, and only a boundaried command folds state at all, which is why the tag
+/// re-read is confined to that case.
+fn recover_if_committed(
+    store: &WriteHandle,
+    event_defs: &EventDefs,
+    boundary: Option<&Query>,
+    idem_tag: Option<&str>,
+) -> anyhow::Result<Option<RecoveredOutcome>> {
+    match (boundary, idem_tag) {
+        (Some(_), Some(tag)) => find_committed_outcome(store, event_defs, tag),
+        _ => Ok(None),
+    }
 }
 
 /// Look for a prior committed attempt of this request in the log, by its idempotency

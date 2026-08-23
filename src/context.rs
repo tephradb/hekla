@@ -1,11 +1,19 @@
-//! Per-request command context and the host handle context.
+//! The host contexts a module body sees through `eval.extra`, and the traits
+//! behind them.
 //!
 //! [`CommandContext`] carries the causation metadata a command stamps onto the
 //! events it emits: the correlation id (the flow this request belongs to), a
 //! fresh causation id (this command execution), and an optional triggering event.
-//! [`HandleCtx`] is the host context a command's `handle` reads through
-//! `eval.extra`, holding the request's pinned `now()` so repeated calls agree and
-//! so `query` and `fold`, which run without it, cannot reach a clock.
+//!
+//! The rest are per-phase evaluator contexts, each present only while the call it
+//! names runs, so a builtin that needs one errors everywhere else: [`HandleCtx`]
+//! for a command's `handle`, holding the request's pinned `now()` so repeated
+//! calls agree and so `query` and `fold` cannot reach a clock; [`QueryCtx`] while
+//! a `query` or a `source` is evaluated; [`ProjectorCtx`] for a projector's
+//! `handle`, behind `get()`; and [`EffectCtx`] for an effect's `handle`, behind
+//! the impure builtins. [`EntityReader`] and [`EffectHost`] are the host seams the
+//! last two carry, declared here so the builtins layer stays independent of the
+//! runtime that backs them.
 
 use starlark::any::ProvidesStaticType;
 use uuid::Uuid;

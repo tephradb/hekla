@@ -13,6 +13,7 @@
 //! semantic checks that need the event registry (query tags, source types) live
 //! in [`crate::validate`], which runs on the [`LoadedProject`] this produces.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -69,7 +70,7 @@ pub struct EventRegistry {
     /// Event type string to its definition.
     pub by_type: HashMap<String, EventDef>,
     /// Evaluated `events/` and `lib/` modules, keyed by their load path.
-    pub library: HashMap<String, FrozenModule>,
+    library: HashMap<String, FrozenModule>,
 }
 
 /// A loaded command, plus where it came from and whether it is internal.
@@ -140,6 +141,7 @@ impl LoadedProject {
             &projector,
             &effect,
             &cache,
+            &collector.by_type,
             &mut findings,
         );
 
@@ -239,9 +241,9 @@ struct ParsedFile {
     /// re-exports its loaded symbols, so these mark bindings that are imports, not
     /// definitions, and must not be registered as events by this module.
     loaded_names: HashSet<String>,
-    /// Load paths that break the `events/`-or-`lib/` restriction. A file with any
-    /// is not evaluated; its finding is the actionable one.
-    illegal_deps: Vec<String>,
+    /// Set when a load path breaks the `events/`-or-`lib/` restriction. Such a file
+    /// is not evaluated; the finding recorded at parse time is the actionable one.
+    has_illegal_deps: bool,
 }
 
 /// Accumulates event definitions across `events/` modules, tracking where each
@@ -259,7 +261,7 @@ fn discover_and_parse(root: &Path, findings: &mut Vec<Finding>) -> Vec<ParsedFil
         if !dir.is_dir() {
             continue;
         }
-        for path in star_files(&dir) {
+        for path in star_files(&dir, findings) {
             let rel = rel_to_string(root, &path);
             let role = match subdir {
                 "events" => Role::Events,
@@ -304,7 +306,7 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
         source_hash: String::new(),
         deps: Vec::new(),
         loaded_names: HashSet::new(),
-        illegal_deps: Vec::new(),
+        has_illegal_deps: false,
     };
 
     let src = match fs::read_to_string(path) {
@@ -331,7 +333,7 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
             .extend(load.symbols.iter().map(|(local, _)| local.to_string()));
         match normalize_load_path(load.module_id) {
             Ok(norm) if is_library_path(&norm) => file.deps.push(norm),
-            Ok(norm) => {
+            Ok(_) => {
                 findings.push(Finding::error(
                     &file.rel_path,
                     format!(
@@ -340,11 +342,11 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
                         role.label()
                     ),
                 ));
-                file.illegal_deps.push(norm);
+                file.has_illegal_deps = true;
             }
             Err(msg) => {
                 findings.push(Finding::error(&file.rel_path, msg));
-                file.illegal_deps.push(load.module_id.to_owned());
+                file.has_illegal_deps = true;
             }
         }
     }
@@ -373,7 +375,7 @@ fn evaluate_libraries(
         .filter(|(_, file)| {
             matches!(file.role, Role::Events | Role::Lib)
                 && file.ast.is_some()
-                && file.illegal_deps.is_empty()
+                && !file.has_illegal_deps
         })
         .map(|(idx, _)| idx)
         .collect();
@@ -432,6 +434,15 @@ fn evaluate_one_library(
                     collector,
                     findings,
                 );
+            } else {
+                reject_event_definition(
+                    &file.rel_path,
+                    file.role,
+                    &frozen,
+                    &file.loaded_names,
+                    &collector.by_type,
+                    findings,
+                );
             }
             cache.insert(load_path, frozen);
         }
@@ -439,10 +450,31 @@ fn evaluate_one_library(
     }
 }
 
+/// Every `EventDef` bound at this module's scope. A frozen module re-exports the
+/// symbols it `load()`s, so a binding that names an import is skipped: a shared
+/// event referenced from a second module is one definition, not a second one.
+fn module_event_defs(frozen: &FrozenModule, loaded_names: &HashSet<String>) -> Vec<EventDef> {
+    let bindings: Vec<&str> = frozen
+        .names()
+        .filter_map(|name| name.to_value().unpack_str())
+        .collect();
+    let mut defs = Vec::new();
+    for binding in bindings {
+        if loaded_names.contains(binding) {
+            continue;
+        }
+        let Ok(Some(owned)) = frozen.get_option(binding) else {
+            continue;
+        };
+        if let Some(def) = owned.value().downcast_ref::<EventDef>() {
+            defs.push(def.clone());
+        }
+    }
+    defs
+}
+
 /// Pull every `EventDef` defined at module scope into the registry, flagging a
-/// type defined in two places. A frozen module re-exports the symbols it `load()`s,
-/// so a binding that names an import is skipped: a shared event referenced from a
-/// second module is one definition, not a duplicate.
+/// type defined in two places.
 fn register_events(
     rel: &str,
     frozen: &FrozenModule,
@@ -450,26 +482,13 @@ fn register_events(
     collector: &mut EventCollector,
     findings: &mut Vec<Finding>,
 ) {
-    let bindings: Vec<String> = frozen
-        .names()
-        .filter_map(|name| name.to_value().unpack_str().map(str::to_owned))
-        .collect();
-    for binding in bindings {
-        if loaded_names.contains(&binding) {
-            continue; // a `load()` re-export, registered by its defining module
-        }
-        let Ok(Some(owned)) = frozen.get_option(&binding) else {
-            continue;
-        };
-        let Some(def) = owned.value().downcast_ref::<EventDef>() else {
-            continue;
-        };
+    for def in module_event_defs(frozen, loaded_names) {
         if let Some(other) = collector.defined_in.get(&def.event_type) {
             findings.push(Finding::error(
                 rel,
                 format!(
-                    "event type `{}` is already defined in {}",
-                    def.event_type, other
+                    "event type `{}` is already defined in {other}",
+                    def.event_type
                 ),
             ));
             continue;
@@ -477,9 +496,39 @@ fn register_events(
         collector
             .defined_in
             .insert(def.event_type.clone(), rel.to_owned());
-        collector
-            .by_type
-            .insert(def.event_type.clone(), def.clone());
+        collector.by_type.insert(def.event_type.clone(), def);
+    }
+}
+
+/// Reject an event defined outside `events/`. Only `events/` modules feed the
+/// registry, so such a definition is invisible to the runtime: dispatch falls back
+/// to its no-schema path and writes a `subject` field to the immutable log as
+/// plaintext, in the payload and in its tag, where it can never be erased.
+///
+/// A type the registry already holds is not invisible, so it is left alone. That
+/// covers re-binding a loaded definition under a second name (`Alias = thing_done`),
+/// which [`module_event_defs`] cannot tell from a fresh definition: it skips only
+/// the exact `load()` local name.
+fn reject_event_definition(
+    rel: &str,
+    role: Role,
+    frozen: &FrozenModule,
+    loaded_names: &HashSet<String>,
+    registered: &HashMap<String, EventDef>,
+    findings: &mut Vec<Finding>,
+) {
+    for def in module_event_defs(frozen, loaded_names) {
+        if registered.contains_key(&def.event_type) {
+            continue;
+        }
+        findings.push(Finding::error(
+            rel,
+            format!(
+                "event type `{}` is defined in a {}; move the definition to events/ and load() it here, since only events/ definitions are registered",
+                def.event_type,
+                role.label()
+            ),
+        ));
     }
 }
 
@@ -490,6 +539,7 @@ fn evaluate_units(
     projector_globals: &Globals,
     effect_globals: &Globals,
     cache: &HashMap<String, FrozenModule>,
+    registered: &HashMap<String, EventDef>,
     findings: &mut Vec<Finding>,
 ) -> (Vec<CommandUnit>, Vec<ProjectorUnit>, Vec<EffectUnit>) {
     let loader = LibraryLoader { cache };
@@ -501,7 +551,7 @@ fn evaluate_units(
         let Some(kind) = file.role.module_kind() else {
             continue;
         };
-        if !file.illegal_deps.is_empty() {
+        if file.has_illegal_deps {
             continue;
         }
         let (Some(name), Some(ast)) = (file.name.clone(), file.ast.take()) else {
@@ -526,6 +576,14 @@ fn evaluate_units(
                 continue;
             }
         };
+        reject_event_definition(
+            &rel,
+            file.role,
+            &frozen,
+            &file.loaded_names,
+            registered,
+            findings,
+        );
         let def = match module_def_from_frozen(kind, name, &rel, &frozen) {
             Ok(def) => def,
             Err(err) => {
@@ -594,13 +652,13 @@ fn report_duplicates<'a>(
 ) {
     let mut seen: HashMap<&str, &str> = HashMap::new();
     for (name, rel) in items {
-        match seen.get(name) {
-            Some(first) => findings.push(Finding::error(
+        match seen.entry(name) {
+            Entry::Occupied(first) => findings.push(Finding::error(
                 rel,
-                format!("{kind} name `{name}` is already used by {first}"),
+                format!("{kind} name `{name}` is already used by {}", first.get()),
             )),
-            None => {
-                seen.insert(name, rel);
+            Entry::Vacant(slot) => {
+                slot.insert(rel);
             }
         }
     }
@@ -654,18 +712,34 @@ fn normalize_load_path(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_owned())
 }
 
-fn star_files(dir: &Path) -> Vec<PathBuf> {
-    WalkDir::new(dir)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(walkdir::DirEntry::into_path)
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("star"))
-        .collect()
+/// The `.star` files under `dir`, in a stable order. A subtree that cannot be
+/// walked is reported rather than dropped: a silently missing command would let
+/// `kiln check` pass on a project the runtime cannot fully load.
+pub(crate) fn star_files(dir: &Path, findings: &mut Vec<Finding>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in WalkDir::new(dir).sort_by_file_name() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                findings.push(Finding::error(
+                    dir.display().to_string(),
+                    format!("walking the project tree: {err}"),
+                ));
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.into_path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("star") {
+            files.push(path);
+        }
+    }
+    files
 }
 
-fn rel_to_string(root: &Path, path: &Path) -> String {
+pub(crate) fn rel_to_string(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.components()
         .map(|component| component.as_os_str().to_string_lossy())

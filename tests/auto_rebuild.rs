@@ -3,17 +3,20 @@
 //! now built from rather than stalling at its old checkpoint.
 
 use std::fs;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use kiln::context::CommandContext;
-use kiln::effect::{HttpClient, StubHttpClient};
-use kiln::loader::LoadedProject;
+use kiln::projector::Readiness;
+use kiln::read_model::ReadModel;
 use kiln::runtime::Runtime;
-use serde_json::json;
+use rusqlite::Connection;
+use serde_json::{Value, json};
 use uuid::Uuid;
+
+mod support;
+
+use support::{Boot, Harness, ctx};
 
 const EVENTS: &str = r#"
 one = event(type = "e.one", fields = {"id": uuid()})
@@ -34,6 +37,9 @@ def handle(input, state):
     return two(id = input.id)
 "#;
 
+/// `kiln.toml` turning the automatic rebuild off.
+const AUTO_REBUILD_OFF: &str = "[projectors]\nauto_rebuild = false\n";
+
 /// The counter projector, parameterised by which event types it sources.
 fn counter(source: &str) -> String {
     format!(
@@ -52,67 +58,83 @@ def handle(event):
     )
 }
 
+/// The same projector with an extra `label` column, so a redeploy changes the entity
+/// schema rather than the source set. `ReadModel::open` creates tables with
+/// `IF NOT EXISTS`, so the column only appears if a rebuild ran first.
+fn labelled_counter(source: &str) -> String {
+    format!(
+        r#"
+load("events/e.star", "one", "two")
+
+totals = entity(key = "id", fields = {{"id": text(), "n": i64_(), "label": text()}})
+
+source = {source}
+
+def handle(event):
+    row = get(totals, "all")
+    n = (row["n"] if row else 0) + 1
+    return [put(totals, {{"id": "all", "n": n, "label": "x"}})]
+"#
+    )
+}
+
+/// Rewrite the project in place, so the next boot sees the redeployed definition.
 fn write_project(dir: &Path, counter_source: &str) {
+    write_project_with(dir, counter(counter_source), None);
+}
+
+/// The same, with an explicit projector module and an optional `kiln.toml`. Passing
+/// `None` removes any config a previous deploy left, so a redeploy cannot inherit it.
+fn write_project_with(dir: &Path, projector: String, config: Option<&str>) {
     for (rel, content) in [
         ("events/e.star", EVENTS.to_owned()),
         ("commands/emit-one.star", EMIT_ONE.to_owned()),
         ("commands/emit-two.star", EMIT_TWO.to_owned()),
-        ("projectors/counter.star", counter(counter_source)),
+        ("projectors/counter.star", projector),
     ] {
         let path = dir.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
     }
-}
-
-fn boot(project_dir: &Path, data_dir: &Path) -> Runtime2 {
-    let project = LoadedProject::load(project_dir);
-    assert!(!project.has_errors(), "{:?}", project.findings);
-    let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(200));
-    let (rt, coord, projectors, effects) = Runtime::open(project, data_dir, http, None).unwrap();
-    Runtime2 {
-        rt,
-        coord,
-        projectors,
-        effects,
+    let config_path = dir.join("kiln.toml");
+    match config {
+        Some(text) => fs::write(config_path, text).unwrap(),
+        None => drop(fs::remove_file(config_path)),
     }
 }
 
-struct Runtime2 {
-    rt: Arc<Runtime>,
-    coord: tephra::WriteCoordinator,
-    projectors: kiln::projector::ProjectorSet,
-    effects: kiln::effect::EffectRuntime,
-}
-
-impl Runtime2 {
-    fn shutdown(self) {
-        self.effects.shutdown_and_join();
-        self.projectors.shutdown_and_join();
-        self.coord.shutdown();
-    }
+fn boot(project_dir: &Path, data_dir: &Path) -> Harness {
+    Boot::new(project_dir)
+        .data_dir(data_dir)
+        .http_status(200)
+        .start()
 }
 
 fn emit(rt: &Runtime, command: &str) {
-    let ctx = CommandContext::new(Uuid::new_v4());
     let result = rt
         .execute(
             command,
             json!({ "id": Uuid::new_v4().to_string() }),
-            &ctx,
+            &ctx(),
             None,
         )
         .unwrap();
     assert_eq!(result.status, 200, "{command}: {:?}", result.body);
 }
 
-fn wait_count(rt: &Runtime, expected: i64) -> bool {
+/// Poll the `totals` row until `want` accepts it, giving up after three seconds.
+fn wait_row(rt: &Runtime, want: impl Fn(&Value) -> bool) -> bool {
     for _ in 0..300 {
         let shared = rt.projector("counter").unwrap();
-        let model = kiln::read_model::ReadModel::open_readonly(&shared.db_path).unwrap();
+        // The rebuild swaps a freshly built database in under the reader, so an open
+        // can transiently fail; retry rather than panic on the race this test drives.
+        let Ok(model) = ReadModel::open_readonly(&shared.db_path) else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
         let entity = shared.entities.iter().find(|e| e.name == "totals").unwrap();
         if let Ok(Some(row)) = model.get(entity, "all")
-            && row["n"].as_i64() == Some(expected)
+            && want(&row)
         {
             return true;
         }
@@ -120,6 +142,34 @@ fn wait_count(rt: &Runtime, expected: i64) -> bool {
         thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+fn wait_count(rt: &Runtime, expected: i64) -> bool {
+    wait_row(rt, |row| row["n"].as_i64() == Some(expected))
+}
+
+/// Whatever the projector left on disk, named so a test can inspect it between boots.
+fn db_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("projectors").join("counter.db")
+}
+
+/// The definition hash recorded on the read model, read straight off the closed file.
+fn recorded_definition(data_dir: &Path) -> Option<String> {
+    ReadModel::open_readonly(&db_path(data_dir))
+        .unwrap()
+        .read_definition()
+        .unwrap()
+}
+
+/// Why the projector is not advancing, for an assertion message.
+fn diagnosis(rt: &Runtime) -> String {
+    let shared = rt.projector("counter").unwrap();
+    format!(
+        "readiness={} failed={} last_error={:?}",
+        shared.readiness().label(),
+        shared.failed(),
+        shared.last_error()
+    )
 }
 
 #[test]
@@ -168,6 +218,187 @@ fn an_unchanged_definition_does_not_rebuild() {
     assert!(
         wait_count(&b.rt, 2),
         "should resume and count the new event"
+    );
+    b.shutdown();
+}
+
+#[test]
+fn an_added_entity_field_rebuilds_with_the_new_column() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    write_project(project.path(), "[one()]");
+    let a = boot(project.path(), data.path());
+    emit(&a.rt, "emit-one");
+    emit(&a.rt, "emit-one");
+    assert!(wait_count(&a.rt, 2));
+    a.shutdown();
+
+    // Deploy B keeps the same source set but grows the entity by one column. The
+    // rebuild has to run before the first batch: an `INSERT` naming `label` against
+    // the old table would fail on the missing column and wedge the thread for good.
+    write_project_with(project.path(), labelled_counter("[one()]"), None);
+    let b = boot(project.path(), data.path());
+    assert!(
+        wait_row(&b.rt, |row| row["n"].as_i64() == Some(2)
+            && row["label"] == "x"),
+        "the rebuilt table should carry the new column: {}",
+        diagnosis(&b.rt)
+    );
+    assert!(
+        !b.rt.projector("counter").unwrap().failed(),
+        "the projector should not have died applying the new shape"
+    );
+    b.shutdown();
+}
+
+#[test]
+fn auto_rebuild_off_idles_stale_and_leaves_the_definition_unstamped() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    write_project_with(project.path(), counter("[one()]"), Some(AUTO_REBUILD_OFF));
+    let a = boot(project.path(), data.path());
+    for _ in 0..2 {
+        emit(&a.rt, "emit-one");
+        emit(&a.rt, "emit-two");
+    }
+    assert!(wait_count(&a.rt, 2));
+    a.shutdown();
+    let stamped_by_a = recorded_definition(data.path()).expect("deploy A recorded its definition");
+
+    // Deploy B changes the source set with auto-rebuild off. The model on disk was
+    // built from a different event set, so the projector reports `stale` and idles
+    // rather than applying batches on top of it.
+    write_project_with(
+        project.path(),
+        counter("[one(), two()]"),
+        Some(AUTO_REBUILD_OFF),
+    );
+    let b = boot(project.path(), data.path());
+    assert_eq!(
+        b.rt.projector("counter").unwrap().readiness(),
+        Readiness::Stale
+    );
+    emit(&b.rt, "emit-two");
+    assert!(
+        !wait_count(&b.rt, 3),
+        "a stale projector must not apply batches onto the old model: {}",
+        diagnosis(&b.rt)
+    );
+    assert!(
+        wait_count(&b.rt, 2),
+        "the old model is left exactly as it was"
+    );
+    b.shutdown();
+
+    // The crux: deploy B must not stamp its own definition onto a model it did not
+    // rebuild. If it had, the mismatch would be invisible forever after.
+    assert_eq!(
+        recorded_definition(data.path()),
+        Some(stamped_by_a),
+        "an unrebuilt model keeps the definition it was actually built under"
+    );
+
+    // Deploy C is deploy B with auto-rebuild back on. The mismatch is still there to
+    // be found, so it rebuilds and counts all five events (2x e.one, 3x e.two).
+    write_project_with(project.path(), counter("[one(), two()]"), None);
+    let c = boot(project.path(), data.path());
+    assert!(
+        wait_count(&c.rt, 5),
+        "the still-visible mismatch should rebuild from position 0: {}",
+        diagnosis(&c.rt)
+    );
+    c.shutdown();
+}
+
+#[test]
+fn a_legacy_read_model_without_a_definition_hash_is_rebuilt_not_blessed() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    write_project(project.path(), "[one()]");
+    let a = boot(project.path(), data.path());
+    emit(&a.rt, "emit-one");
+    emit(&a.rt, "emit-one");
+    assert!(wait_count(&a.rt, 2));
+    a.shutdown();
+
+    // Age the model into one written before the definition hash existed, and put a
+    // wrong count in it so "rebuilt" and "resumed" are distinguishable: a rebuild
+    // from position 0 recomputes n=2, while blessing the file leaves n=99.
+    let conn = Connection::open(db_path(data.path())).unwrap();
+    conn.execute("UPDATE _kiln_definition SET definition_hash = NULL", [])
+        .unwrap();
+    conn.execute("UPDATE totals SET n = 99", []).unwrap();
+    drop(conn);
+
+    // With auto-rebuild off, an unverifiable shape is `stale`, not `ready`: the model
+    // is left untouched and its hash stays NULL so the next boot can still act on it.
+    write_project_with(project.path(), counter("[one()]"), Some(AUTO_REBUILD_OFF));
+    let b = boot(project.path(), data.path());
+    assert_eq!(
+        b.rt.projector("counter").unwrap().readiness(),
+        Readiness::Stale
+    );
+    assert!(wait_count(&b.rt, 99), "the legacy model is not touched");
+    b.shutdown();
+    assert_eq!(
+        recorded_definition(data.path()),
+        None,
+        "stamping a model that was never verified would silence this forever"
+    );
+
+    // With auto-rebuild on, the same unverifiable model is rebuilt from position 0
+    // and only then records the definition it was built under.
+    write_project(project.path(), "[one()]");
+    let c = boot(project.path(), data.path());
+    assert!(
+        wait_count(&c.rt, 2),
+        "the rebuild should discard the planted count: {}",
+        diagnosis(&c.rt)
+    );
+    c.shutdown();
+    assert!(
+        recorded_definition(data.path()).is_some(),
+        "a rebuilt model records its definition as the new baseline"
+    );
+}
+
+#[test]
+fn shutdown_drains_pending_events_to_head() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    write_project(project.path(), "[one()]");
+    let a = boot(project.path(), data.path());
+    // Deliberately no wait: the shutdown lands while the projector is still behind,
+    // and the loop must drain to head before it exits rather than dropping the tail.
+    for _ in 0..20 {
+        emit(&a.rt, "emit-one");
+    }
+    a.shutdown();
+
+    let model = ReadModel::open_readonly(&db_path(data.path())).unwrap();
+    assert_eq!(
+        model.read_checkpoint().unwrap().get(),
+        20,
+        "the checkpoint should reach head, not stop where the flag was seen"
+    );
+    drop(model);
+
+    // Resuming from that checkpoint counts every event exactly once: a lagging
+    // checkpoint would replay the tail and push the running total past 21.
+    let b = boot(project.path(), data.path());
+    assert!(
+        wait_count(&b.rt, 20),
+        "the drained total survives the restart"
+    );
+    emit(&b.rt, "emit-one");
+    assert!(
+        wait_count(&b.rt, 21),
+        "each event is counted once across the restart: {}",
+        diagnosis(&b.rt)
     );
     b.shutdown();
 }

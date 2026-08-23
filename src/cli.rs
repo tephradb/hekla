@@ -2,7 +2,9 @@
 //!
 //! `check` (thorough static analysis) and `fmt` (whitespace normalisation) are
 //! toolchain commands; `serve` runs the command runtime and HTTP API, and `test`
-//! runs the command scenarios under `tests/`.
+//! runs the command scenarios under `tests/`. `rotate` and `erase` are the
+//! operational key commands: rewrapping subject keys under a new master, and
+//! irreversibly deleting one subject's key.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -132,8 +134,11 @@ fn rotate(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let data = runtime::resolve_data_dir(dir, data_dir);
-    let opdb = match OpDb::open(&data.join("kiln.db")) {
+    let db_path = match operational_db(dir, data_dir) {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    let opdb = match OpDb::open(&db_path) {
         Ok(opdb) => Arc::new(Mutex::new(opdb)),
         Err(err) => {
             eprintln!("error: opening the operational database: {err:#}");
@@ -161,8 +166,11 @@ fn erase(
     dir: &Path,
     data_dir: Option<&Path>,
 ) -> ExitCode {
-    let data = runtime::resolve_data_dir(dir, data_dir);
-    let opdb = match OpDb::open(&data.join("kiln.db")) {
+    let db_path = match operational_db(dir, data_dir) {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    let opdb = match OpDb::open(&db_path) {
         Ok(opdb) => opdb,
         Err(err) => {
             eprintln!("error: opening the operational database: {err:#}");
@@ -187,15 +195,22 @@ fn erase(
     }
 }
 
+/// The operational database inside the resolved data directory. `OpDb::open`
+/// creates the file when it is missing, so a mistyped `--data-dir` would otherwise
+/// let `rotate` and `erase` report success against a fresh empty database.
+fn operational_db(dir: &Path, data_dir: Option<&Path>) -> Result<PathBuf, ExitCode> {
+    let path = runtime::resolve_data_dir(dir, data_dir).join("kiln.db");
+    if path.exists() {
+        Ok(path)
+    } else {
+        eprintln!("error: no operational database at {}", path.display());
+        Err(ExitCode::FAILURE)
+    }
+}
+
 fn check(dir: &Path) -> ExitCode {
     let project = LoadedProject::load(dir);
-    let findings = collect_findings(&project);
-    print_findings(&findings);
-    let errors = findings
-        .iter()
-        .filter(|finding| finding.severity == Severity::Error)
-        .count();
-    let warnings = findings.len() - errors;
+    let (errors, warnings) = report_findings(&project);
 
     let modules = project.commands.len() + project.projectors.len() + project.effects.len();
     println!(
@@ -218,7 +233,7 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>) -> ExitCode {
     init_tracing();
 
     let project = LoadedProject::load(dir);
-    let errors = report_findings(&project);
+    let (errors, _) = report_findings(&project);
     if errors > 0 {
         eprintln!("refusing to serve: the project has {errors} error(s)");
         return ExitCode::FAILURE;
@@ -308,14 +323,15 @@ pub(crate) fn collect_findings(project: &LoadedProject) -> Vec<Finding> {
     findings
 }
 
-/// Print every finding and return the error count.
-fn report_findings(project: &LoadedProject) -> usize {
+/// Print every finding and return the (error, warning) counts.
+fn report_findings(project: &LoadedProject) -> (usize, usize) {
     let findings = collect_findings(project);
     print_findings(&findings);
-    findings
+    let errors = findings
         .iter()
         .filter(|finding| finding.severity == Severity::Error)
-        .count()
+        .count();
+    (errors, findings.len() - errors)
 }
 
 fn init_tracing() {
@@ -330,5 +346,26 @@ fn print_findings(findings: &[Finding]) {
             Severity::Warning => "warning",
         };
         println!("{severity}: {}: {}", finding.location, finding.message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    /// `OpDb::open` would create the database, so without this guard `kiln erase`
+    /// against a mistyped `--data-dir` reports a successful no-op erasure.
+    #[test]
+    fn a_data_dir_with_no_database_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(operational_db(dir.path(), None).is_err());
+
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let db_path = data.join("kiln.db");
+        fs::write(&db_path, b"").unwrap();
+        assert_eq!(operational_db(dir.path(), None).unwrap(), db_path);
     }
 }

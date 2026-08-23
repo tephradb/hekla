@@ -3,80 +3,77 @@
 //! command, which appends `user.welcomed`. These tests pin the durable properties:
 //! the invocation runs once, restarting the runtime replays the journal without
 //! re-firing a completed invocation, and a 5xx wedges the effect (visible in the
-//! health signals) until an explicit operator skip advances it.
+//! health signals) until an explicit operator skip advances it. They also pin the
+//! runtime's split between what reaches the script (a 4xx) and what it absorbs as
+//! a wedge (a transport error), and that draining a wedged effect leaves its
+//! invocation to replay rather than losing it.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kiln::context::CommandContext;
-use kiln::effect::{EffectRuntime, HttpClient, StubHttpClient};
-use kiln::loader::LoadedProject;
-use kiln::projector::ProjectorSet;
+use kiln::effect::{HttpClient, StubHttpClient};
 use kiln::runtime::Runtime;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
-use tephra::WriteCoordinator;
 use uuid::Uuid;
 
-const ALICE: &str = "11111111-1111-1111-1111-111111111111";
+mod support;
+
+use support::{ALICE, Boot, Harness, log_head, register_user, wait_until};
+
 const EFFECT: &str = "send-welcome";
 
-struct Booted {
-    rt: Arc<Runtime>,
-    coord: WriteCoordinator,
-    projectors: ProjectorSet,
-    effects: EffectRuntime,
-}
-
-impl Booted {
-    fn shutdown(self) {
-        self.effects.shutdown_and_join();
-        self.projectors.shutdown_and_join();
-        self.coord.shutdown();
-    }
-}
-
-fn boot(data: &Path, http: Arc<dyn HttpClient>) -> Booted {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/users");
-    let project = LoadedProject::load(&root);
-    assert!(!project.has_errors(), "{:?}", project.findings);
-    let (rt, coord, projectors, effects) = Runtime::open(project, data, http, None).unwrap();
-    Booted {
-        rt,
-        coord,
-        projectors,
-        effects,
-    }
+fn boot(data: &Path, http: Arc<dyn HttpClient>) -> Harness {
+    Boot::example().data_dir(data).http(http).start()
 }
 
 fn register(rt: &Runtime, id: &str) {
-    let ctx = CommandContext::new(Uuid::new_v4());
-    let body = json!({ "user_id": id, "email": format!("{id}@example.com"), "name": "U" });
-    assert_eq!(
-        rt.execute("register-user", body, &ctx, None)
-            .unwrap()
-            .status,
-        200
-    );
-}
-
-fn wait_until<F: Fn() -> bool>(label: &str, cond: F) {
-    for _ in 0..500 {
-        if cond() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {label}");
-}
-
-fn log_head(rt: &Runtime) -> u64 {
-    rt.status()["log_head"].as_u64().unwrap()
+    register_user(rt, id, &format!("{id}@example.com"), "U");
 }
 
 fn effect_position(rt: &Runtime) -> u64 {
     rt.effect(EFFECT).unwrap().position()
+}
+
+/// The operational DB, read directly: the durable side of the effect state that
+/// the in-memory health signals only summarise.
+fn open_op_db(data: &Path) -> Connection {
+    Connection::open(data.join("kiln.db")).unwrap()
+}
+
+fn invocation_status(db: &Connection, position: i64) -> Option<String> {
+    db.query_row(
+        "SELECT status FROM effect_invocation WHERE effect = ?1 AND position = ?2",
+        params![EFFECT, position],
+        |row| row.get(0),
+    )
+    .optional()
+    .unwrap()
+}
+
+fn watermark(db: &Connection) -> i64 {
+    db.query_row(
+        "SELECT watermark FROM effect_cursor WHERE effect = ?1",
+        params![EFFECT],
+        |row| row.get(0),
+    )
+    .optional()
+    .unwrap()
+    // No row at all means the effect never advanced.
+    .unwrap_or(0)
+}
+
+fn journal_results(db: &Connection, position: i64) -> Vec<String> {
+    let mut stmt = db
+        .prepare("SELECT result FROM effect_journal WHERE effect = ?1 AND position = ?2")
+        .unwrap();
+    let rows = stmt
+        .query_map(params![EFFECT, position], |row| row.get::<_, String>(0))
+        .unwrap();
+    rows.map(Result::unwrap).collect()
 }
 
 #[test]
@@ -198,4 +195,140 @@ fn a_5xx_wedges_the_effect_and_an_operator_skip_advances_it() {
     assert_eq!(log_head(&booted.rt), 1, "skipping does not append");
 
     booted.shutdown();
+}
+
+#[test]
+fn a_skip_armed_before_the_event_arrives_does_not_drop_it() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::ok());
+    let booted = boot(data.path(), stub.clone());
+
+    // Armed for a position the driver has not reached yet. The skip is honored only
+    // once the position has genuinely failed, so a healthy event must still run.
+    booted.rt.effect(EFFECT).unwrap().request_skip(1);
+
+    register(&booted.rt, ALICE); // user.registered at position 1
+    wait_until("effect to complete", || log_head(&booted.rt) >= 2);
+
+    assert_eq!(stub.call_count(), 1, "the welcome post really fired");
+    assert_eq!(
+        log_head(&booted.rt),
+        2,
+        "record-welcome landed, so the event was processed rather than skipped"
+    );
+    let effect = booted.rt.effect(EFFECT).unwrap();
+    assert_eq!(effect.consecutive_failures(), 0);
+    assert_eq!(effect.terminal_skips(), 0);
+
+    booted.shutdown();
+}
+
+#[test]
+fn shutting_down_a_wedged_effect_drains_promptly_and_leaves_it_running() {
+    let data = tempfile::tempdir().unwrap();
+    let booted = boot(data.path(), Arc::new(StubHttpClient::status(500)));
+
+    register(&booted.rt, ALICE); // user.registered at position 1
+
+    // Five failures in, the driver is part-way through a multi-second backoff: a
+    // backoff wait that slept it out instead of polling the shutdown flag would push
+    // the drain past the assertion below.
+    wait_until("the backoff to grow", || {
+        booted.rt.effect(EFFECT).unwrap().consecutive_failures() >= 5
+    });
+
+    let start = Instant::now();
+    booted.shutdown();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "draining a wedged effect took {elapsed:?}"
+    );
+
+    // The abandoned invocation stays `running` and the watermark stays behind it,
+    // so the next boot replays the event rather than losing its side effect.
+    let db = open_op_db(data.path());
+    assert_eq!(
+        invocation_status(&db, 1).as_deref(),
+        Some("running"),
+        "an interrupted invocation must not be marked terminal"
+    );
+    assert_eq!(watermark(&db), 0, "the watermark did not advance past it");
+}
+
+#[test]
+fn a_transport_error_wedges_the_effect_and_never_reaches_the_handler() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::new(|_, _| {
+        anyhow::bail!("connection refused")
+    }));
+    let booted = boot(data.path(), stub.clone());
+
+    register(&booted.rt, ALICE); // user.registered at position 1
+    wait_until("the wedge to surface", || {
+        booted.rt.effect(EFFECT).unwrap().consecutive_failures() > 0
+    });
+
+    assert!(stub.call_count() >= 1, "the transport was really attempted");
+    let effect = booted.rt.effect(EFFECT).unwrap();
+    let last_error = effect.last_error().expect("a wedge records its last error");
+    assert!(
+        last_error.contains("http POST https://example.test/welcome"),
+        "the wedge names the failed call: {last_error}"
+    );
+    // The cause chain has to survive the starlark boundary: naming the call
+    // without the transport reason tells an operator which call failed but not why.
+    assert!(
+        last_error.contains("connection refused"),
+        "the wedge keeps the transport reason: {last_error}"
+    );
+    assert_eq!(
+        effect.terminal_skips(),
+        0,
+        "a transport error is a wedge, not a terminal skip"
+    );
+    assert_eq!(
+        log_head(&booted.rt),
+        1,
+        "the handler never ran past http.post, so no user.welcomed"
+    );
+
+    booted.shutdown();
+
+    let db = open_op_db(data.path());
+    assert_eq!(invocation_status(&db, 1).as_deref(), Some("running"));
+    assert!(
+        journal_results(&db, 1).is_empty(),
+        "a failed call is never journaled"
+    );
+}
+
+#[test]
+fn a_4xx_reaches_the_handler_and_completes_the_invocation() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::status(404));
+    let booted = boot(data.path(), stub.clone());
+
+    register(&booted.rt, ALICE); // user.registered at position 1
+    wait_until("the effect to advance", || effect_position(&booted.rt) >= 1);
+    thread::sleep(Duration::from_millis(100)); // any retry would show up here
+
+    assert_eq!(stub.call_count(), 1, "a 4xx is a result, not a retry");
+    let effect = booted.rt.effect(EFFECT).unwrap();
+    assert_eq!(effect.consecutive_failures(), 0, "a 4xx does not wedge");
+    assert_eq!(effect.terminal_skips(), 0);
+    assert_eq!(
+        log_head(&booted.rt),
+        1,
+        "the handler logged the rejection instead of invoking record-welcome"
+    );
+
+    booted.shutdown();
+
+    let db = open_op_db(data.path());
+    assert_eq!(invocation_status(&db, 1).as_deref(), Some("terminal"));
+    let journal = journal_results(&db, 1);
+    assert_eq!(journal.len(), 1, "one journaled call: the http.post");
+    let recorded: serde_json::Value = serde_json::from_str(&journal[0]).unwrap();
+    assert_eq!(recorded["status"], 404, "the 4xx response is journaled");
 }

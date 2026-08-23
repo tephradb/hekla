@@ -99,8 +99,6 @@ impl Config {
         if self.effects.pool_size == 0 {
             anyhow::bail!("effects.pool_size must be at least 1");
         }
-        // The retention window feeds date arithmetic, so a typo like a billion days
-        // is caught here rather than turning into a silently-infinite window.
         if self.retention.effect_journal_days > MAX_RETENTION_DAYS {
             anyhow::bail!(
                 "retention.effect_journal_days must be at most {MAX_RETENTION_DAYS} (100 years)"

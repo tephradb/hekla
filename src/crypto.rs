@@ -28,7 +28,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use zeroize::Zeroizing;
 
-use crate::opdb::OpDb;
+use crate::opdb::{OpDb, RewrapUpdate};
 
 /// The AES-256-SIV key length: two 256-bit keys (S2V + CTR), so 64 bytes.
 const SIV_KEY_LEN: usize = 64;
@@ -124,7 +124,7 @@ pub fn master_keys_from_env() -> anyhow::Result<Option<MasterKeys>> {
 }
 
 /// Decode a base64 (standard or url-safe) 32-byte master key.
-pub fn decode_master_key(encoded: &str) -> anyhow::Result<[u8; MASTER_KEY_LEN]> {
+fn decode_master_key(encoded: &str) -> anyhow::Result<[u8; MASTER_KEY_LEN]> {
     let trimmed = encoded.trim();
     let bytes = URL_SAFE_NO_PAD
         .decode(trimmed)
@@ -180,10 +180,9 @@ impl KeyStore {
         field: &str,
         plaintext: &str,
     ) -> anyhow::Result<Option<String>> {
-        match self.load_secret(subject_field, subject_value)? {
-            Some(secret) => Ok(Some(encrypt_with(&secret, field, plaintext.as_bytes())?)),
-            None => Ok(None),
-        }
+        self.load_secret(subject_field, subject_value)?
+            .map(|secret| encrypt_with(&secret, field, plaintext.as_bytes()))
+            .transpose()
     }
 
     /// Decrypt a subject-scoped ciphertext. Returns `Ok(None)` when the value is
@@ -219,7 +218,7 @@ impl KeyStore {
         let rows = self.lock().all_subject_keys()?;
         // Unwrap and rewrap off-lock, then commit every change in one transaction, so
         // the pass is atomic (no half-rotated store on a crash) and pays one fsync.
-        let mut updates: Vec<crate::opdb::RewrapUpdate> = Vec::new();
+        let mut updates: Vec<RewrapUpdate> = Vec::new();
         for (field, value, wrapped, master_id) in rows {
             if master_id == primary_id {
                 continue;
@@ -260,9 +259,9 @@ impl KeyStore {
             .filter(|id| self.masters.get(id).is_none())
             .collect();
         if !missing.is_empty() {
+            let missing = missing.join(", ");
             anyhow::bail!(
-                "stored subject data was wrapped under master key(s) not configured now: {}. Set KILN_MASTER_KEY (and KILN_MASTER_KEY_PREVIOUS, comma-separated, for masters mid-rotation) to the master(s) that wrapped this data. Losing a master is permanent, unrecoverable loss of every subject it wrapped",
-                missing.join(", ")
+                "stored subject data was wrapped under master key(s) not configured now: {missing}. Set KILN_MASTER_KEY (and KILN_MASTER_KEY_PREVIOUS, comma-separated, for masters mid-rotation) to the master(s) that wrapped this data. Losing a master is permanent, unrecoverable loss of every subject it wrapped"
             );
         }
         Ok(())
@@ -279,12 +278,22 @@ impl KeyStore {
         else {
             return Ok(None);
         };
-        let master = self.masters.get(&master_id).ok_or_else(|| {
+        let master = self.master_for(&master_id, subject_field)?;
+        Ok(Some(unwrap_key(master, &wrapped)?))
+    }
+
+    /// The configured master that wrapped a stored subject key, or an error naming
+    /// the master that is missing: without it the subject cannot be read at all.
+    fn master_for(
+        &self,
+        master_id: &str,
+        subject_field: &str,
+    ) -> anyhow::Result<&[u8; MASTER_KEY_LEN]> {
+        self.masters.get(master_id).ok_or_else(|| {
             anyhow!(
                 "cannot unwrap subject `{subject_field}`: master key `{master_id}` is not configured (was KILN_MASTER_KEY rotated away without keeping the previous key?)"
             )
-        })?;
-        Ok(Some(unwrap_key(master, &wrapped)?))
+        })
     }
 
     /// Get the subject's secret, creating it on first use. Concurrency-safe: a

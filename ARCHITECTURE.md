@@ -40,7 +40,7 @@ One word per concept, no synonyms.
   replay the effect deterministically after a crash. Lives in the operational DB, never the log.
 - **Envelope**: host-stamped per-event metadata: `correlation_id`, `causation_id`, an optional
   `triggering_event_id`, and an append `timestamp`. The `id` and `position` are tephra's. The
-  idempotency key is not on the event; it is request plumbing, stored operationally.
+  client's idempotency key is not on the event; a reserved tag derived from it is (section 5).
 
 ## 3. Module layout and deployment
 
@@ -70,8 +70,8 @@ project/
   under a file watcher is how the mechanism everything depends on gets subtly wrong. Restart is
   instant and correct. Graceful shutdown drains effects first (section 7).
 - **Configuration (`kiln.toml`)**: a small project-level file for operational knobs that are not
-  code: the effect blocking-pool size, and the retention windows for effect journals and command
-  idempotency keys. Defaults are sensible, so a project runs with no config.
+  code: the effect blocking-pool size and the retention window for effect journals. Defaults are
+  sensible, so a project runs with no config.
 
 ## 4. Events and schema
 
@@ -89,7 +89,7 @@ forgotten from the tag list was unqueryable forever (and adding it later missed 
 
 **Field type system** (shared across event schemas, command input `schema()`, and entity schemas):
 `text`, `i64`, `u64`, `bool`, `uuid`, `timestamp`, `money`, `json`, `one_of`, `optional`. This is
-kiln's existing `FieldKind` set. Two representations are pinned so they are not decided
+kiln's existing `FieldKind` set. Three representations are pinned so they are not decided
 inconsistently in two places:
 
 - **`money`**: a decimal string on the wire (JSON event payloads and read-API responses), an integer
@@ -97,6 +97,13 @@ inconsistently in two places:
 - **`one_of`**: the runtime validates value membership only (a written value must be in the declared
   set). It does not validate that a transition between values is legal; transition rules, if ever
   needed, are the author's job in `handle`.
+- **`i64` and `u64`**: both land in a SQLite `INTEGER` column, which is signed 64-bit, so the
+  storable range for either is `i64::MIN..=i64::MAX`. A `u64` above `i64::MAX` is rejected at the
+  write boundary (command input and event construction), not silently stored. Reinterpreting the
+  bits would round-trip the value but sort it below zero, which would quietly break `ORDER BY` and
+  the `key > ?` cursor for those rows: the same failure that keeps `money` from keying an ordered
+  scan. So `u64` means "non-negative, up to `i64::MAX`"; widening it would need a storage form that
+  still orders correctly.
 
 **Construct an event via its definition**: `user_registered(user_id = ..., email = ...)`. The
 runtime validates the payload against the field schema and derives a tag from every indexed field.
@@ -156,13 +163,20 @@ concurrent write inside the boundary fails the append, and the caller retries.
 **Built-in idempotency key** is distinct from id-based dedupe. It exists for commands where nothing
 in the input distinguishes intent (approving a claim twice with identical input could be one retry
 or two deliberate approvals, and no domain check can resolve that). `execute` accepts an idempotency
-key; the runtime looks it up in a per-command idempotency table in the operational DB. The lookup is
-global per command, not scoped to the boundary, because a retry of a rejected command produced no
-event and there would be nothing in the boundary to find. On a hit it returns the original outcome,
-including rejections (a retried `email_taken` comes back as `email_taken`, not success). Keys are
-scoped per command so the same key on two commands does not collide, and they are swept on a
-retention window. The key never goes on an event as a tag; tags are domain identity, this is request
-plumbing.
+key; the runtime hashes it together with the command name into a reserved `_kiln_idem` tag, stamps
+every emitted event with that tag, and guards the append against the tag existing anywhere in the
+log. The guard is whole-log rather than scoped to the boundary, so a duplicate that committed
+anywhere is caught even once the boundary's `after` has moved past it, and it is asserted by the
+append itself, so there is no read-then-write window. When it fires, the runtime re-reads by the tag
+and returns the original commit's events and identity verbatim instead of re-running `handle`. A
+first attempt that rejected appended nothing and so left no tag, so a retry re-decides and returns
+the same rejection unless state moved; a reject that folded state is still checked against the tag,
+so a duplicate racing an in-flight commit recovers that commit rather than reporting a spurious
+refusal. Hashing the command name in keeps the same key on two commands from colliding, and keeps
+the tag fixed-length whatever the client sent. Nothing is stored outside the log, so nothing has to
+be swept: exactly-once is a property of the append. The client's raw key never reaches an event; the
+derived tag lives in the reserved `_kiln_` namespace, which no event definition can emit and no
+`query()` can name, so request plumbing never becomes domain vocabulary.
 
 **Commands never invoke commands.** Sharing a boundary would make the callee's query a lie, and
 separate appends give partial failure with no rollback. Chaining goes through the log: a command
@@ -201,6 +215,25 @@ concurrently. Replay is rebuild-and-swap: build a fresh database from position 0
 WAL back into the file and drop to rollback mode so it is self-contained), then rename it in, so state
 and position move together atomically and a reader that opens the file mid-swap never sees a torn one.
 
+**Definition reconcile and readiness**: a projector records the hash of its *definition* (its source
+set and entity schema, not its handler body) inside its read model. At startup the recorded hash is
+compared with the current one before the projector's handle is published, because the read API builds
+its `SELECT` from the current entity definitions while the database on disk still has the previous
+shape, and `CREATE TABLE IF NOT EXISTS` will not add a column to an existing table. Comparing is one
+small read; only the replay it may imply is slow, and that stays on the projector thread, so boot
+never blocks on log length. Each projector therefore carries a readiness:
+
+- `ready`: the on-disk model matches the current definition, and reads are served normally.
+- `rebuilding`: the definition changed and a rebuild is in flight. Reads of that projector answer
+  `503` with a `Retry-After`; every other projector keeps serving.
+- `stale`: the same mismatch with `[projectors] auto_rebuild = false`, so only an operator resolves
+  it. Reads answer `503` naming `POST /projectors/{name}/replay`, and the thread idles rather than
+  applying batches, since a batch built from the current entities would fail on a missing column.
+  The definition hash is deliberately left unrecorded, so the mismatch stays visible until a replay
+  actually rebuilds the model.
+
+Readiness is reported per projector in `/status` alongside `position`, `lag` and `failed`.
+
 **Read model access** is only ever through the generated read API (section 10), never by opening the
 SQLite file directly. Each read opens its own read-only connection and reads the projector position in
 the same snapshot as the rows. The table layout stays private.
@@ -237,10 +270,22 @@ field the pinning implementation needs later, so writing it now avoids a journal
 **Journal storage** is the shared operational DB, never the event log. HTTP responses are
 operational scratch (tokens, PII), not domain facts; putting them in an immutable log would make
 them permanent and would couple the log to the effect implementation. A background sweeper deletes
-completed invocations older than a configurable retention window (`kiln.toml`), and the same sweeper
-ages out command idempotency keys. Sweeping is lazy GC, not transactionally required: because the
-terminal record step is journaled, a crash between the append and the delete replays the terminal
-step rather than double-applying, so the sweeper only reclaims space and never affects correctness.
+completed invocations older than a configurable retention window (`kiln.toml`), in bounded chunks so
+one sweep never holds the connection across a long scan.
+
+Sweeping is lazy GC, but it is not unconditionally safe, so the delete is bounded by the effect's own
+cursor: it reclaims only positions at or below the persisted watermark. The driver completes
+invocations one position at a time and advances the watermark only once the whole batch is terminal
+(and an interrupted pass does not advance it at all), so a crash or shutdown mid-batch leaves terminal
+positions *above* the watermark. Those are exactly the positions the next boot replays; reclaiming
+them would drop the journal that makes the replay a no-op, and every side effect in them would fire a
+second time. Within the bound the original reasoning holds: because the terminal record step is
+journaled, a crash between the append and the delete replays the terminal step rather than
+double-applying, so the sweeper only reclaims space. An effect that has never persisted a cursor is
+never swept, matching the resume path, which treats a missing cursor as position 0 and replays from
+the start of the log. The cost of the bound is retention: rows above the watermark, and everything
+belonging to a permanently wedged or removed effect, are kept past the window until the cursor moves
+over them.
 
 **Builtins (v1)**: journaled `http.{get,post,...}`; `invoke_command(name, input)` targeting a public
 or internal command; `now()`; `log()`; and a journaled `read(projector, entity, key)` plus
@@ -254,14 +299,15 @@ diverge from the original run. kiln journals `read()` for consistency with the r
 **Writing outcomes**: effects do not append events; they `invoke_command`, and that invoke is a
 journaled, idempotent side effect, so durable domain facts (tracking numbers, external ids) land
 exactly once across replays. The idempotency key an effect passes is deterministic, so the target
-command tags every event it emits with that key and guards the append against the tag. A replay (or a
-crash between the command's append and the effect's journal write) finds the prior commit by that tag
-and returns its recovered outcome without re-running the command: exactly-once is enforced by the event
-log itself, not by any op-DB reservation. This is the same mechanism, and the same guarantee, as for
-HTTP commands. A command rejection is a normal terminal outcome, not a retryable
-failure: if a completion command rejects because state moved on (the claim was already cancelled, the
-order already fulfilled), the runtime records the rejection in the journal and completes the
-invocation. Treating rejection as retryable would loop forever on legitimately-stale completions.
+command tags every event it emits with the tag derived from it and guards the append against that
+tag. A replay (or a crash between the command's append and the effect's journal write) finds the
+prior commit by that tag and returns its recovered outcome without re-running the command:
+exactly-once is enforced by the event log itself, not by any op-DB reservation. This is the same
+mechanism, and the same guarantee, as for HTTP commands. A command rejection is a normal terminal
+outcome, not a retryable failure: if a completion command rejects because state moved on (the claim
+was already cancelled, the order already fulfilled), the runtime records the rejection in the
+journal and completes the invocation. Treating rejection as retryable would loop forever on
+legitimately-stale completions.
 
 **Retry split**: the runtime absorbs transport errors and 5xx with backoff, and those never reach
 the script. A result that reaches Starlark is therefore always terminal, so `status >= 400` in a
@@ -317,7 +363,7 @@ silent.
 data/
   events/                # tephra segments (immutable source of truth)
   projectors/{name}.db   # read-model tables + checkpoint (one transaction)
-  kiln.db                # shared operational DB: effect journals, idempotency keys, module metadata
+  kiln.db                # shared operational DB: effect journals, subject keys, module metadata
 ```
 
 Backup is "copy the directory". Projector databases are rebuildable from the log regardless, so a
@@ -328,8 +374,9 @@ consistent copy is not required for them.
 - `POST /commands/{name}` executes a command (public commands only), accepting idempotency-key and
   correlation-id headers, and echoes correlation and causation. The outcome maps to status: committed
   to 200 (with the appended positions), `reject` to 422, `invalid_input` to 400, and a DCB
-  concurrency conflict that survives retries to 409. A replayed idempotency key returns the original
-  outcome and status.
+  concurrency conflict that survives retries to 409. An idempotency key whose first attempt
+  committed replays that commit's response, positions and original correlation and causation
+  included; a key whose first attempt rejected has nothing in the log to replay, so it re-decides.
 - **Read API generated from entity schemas**: `GET /read/{projector}/{entity}/{key}` and an indexed
   filter/scan endpoint. Only declared indexes are filterable; an unindexed filter is a 400 telling
   the author to declare the index, never a table scan. Pagination is cursor-based, not offset. Every

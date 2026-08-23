@@ -216,6 +216,10 @@ forward. Collected here so they are not lost in the prose of the phase that intr
   escape hatch; a wedged effect is never advanced automatically.
 - **Cold-start empty read** (Phase 4): an effect can outrun a projector and journal an empty
   `read()`/`scan()` that then replays empty forever; accepted, not yet guarded.
+- **Integers above `i64::MAX`** (Phase 3): both `i64` and `u64` land in a signed SQLite `INTEGER`, so
+  a `u64` past `i64::MAX` is rejected at the write boundary rather than stored. Widening it needs a
+  storage form that still orders correctly, since the read API's `ORDER BY` and `key > ?` cursor
+  depend on numeric order; a bit-reinterpretation would round-trip but sort those rows below zero.
 
 Inherent design properties, listed for completeness (not future work): `invoke_command` is exactly-once
 only when the target is idempotent under replay, raw `http.*` is at-least-once, and `read()`/`scan()`

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
+use crate::loader::rel_to_string;
+
 /// Directories that never hold project source and are skipped when walking.
 const SKIP_DIRS: [&str; 4] = [".git", "target", "kiln-data", "data"];
 
@@ -43,6 +45,7 @@ pub fn run(root: &Path, check_only: bool) -> Outcome {
         }
         outcome.changed.push(rel.clone());
         if !check_only && let Err(err) = fs::write(&path, normalised) {
+            outcome.changed.pop();
             outcome.errors.push((rel, format!("writing file: {err}")));
         }
     }
@@ -51,24 +54,19 @@ pub fn run(root: &Path, check_only: bool) -> Outcome {
 
 /// Line endings to `\n`, trailing whitespace stripped, exactly one trailing
 /// newline. Indentation is untouched.
-pub fn normalize(src: &str) -> String {
+fn normalize(src: &str) -> String {
     let unified = src.replace("\r\n", "\n").replace('\r', "\n");
-    let lines: Vec<&str> = unified.split('\n').collect();
-    let mut out = String::with_capacity(unified.len());
-    for (idx, line) in lines.iter().enumerate() {
-        out.push_str(line.trim_end_matches([' ', '\t']));
-        if idx + 1 < lines.len() {
-            out.push('\n');
-        }
+    let body = unified
+        .lines()
+        .map(|line| line.trim_end_matches([' ', '\t']))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim_end_matches('\n');
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("{body}\n")
     }
-    let trimmed = out.trim_end_matches('\n');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let mut result = String::with_capacity(trimmed.len() + 1);
-    result.push_str(trimmed);
-    result.push('\n');
-    result
 }
 
 fn star_files(root: &Path) -> Vec<PathBuf> {
@@ -76,29 +74,17 @@ fn star_files(root: &Path) -> Vec<PathBuf> {
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
-            if entry.file_type().is_dir() {
-                entry
+            !entry.file_type().is_dir()
+                || entry
                     .file_name()
                     .to_str()
-                    .map(|name| !SKIP_DIRS.contains(&name))
-                    .unwrap_or(true)
-            } else {
-                true
-            }
+                    .is_none_or(|name| !SKIP_DIRS.contains(&name))
         })
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(walkdir::DirEntry::into_path)
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("star"))
         .collect()
-}
-
-fn rel_to_string(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 #[cfg(test)]
@@ -130,5 +116,26 @@ mod tests {
     fn empty_input_stays_empty() {
         assert_eq!(normalize(""), "");
         assert_eq!(normalize("\n\n"), "");
+    }
+
+    /// A file whose write fails was not formatted, so it must not be counted as
+    /// one: reporting both `error:` and `formatted:` for the same path is a lie.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_written_is_not_counted_as_formatted() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.star");
+        fs::write(&path, "x = 1  \n").unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o444)).unwrap();
+        if fs::write(&path, "x = 1  \n").is_ok() {
+            return; // running as root, where the read-only bit denies nothing
+        }
+
+        let outcome = run(dir.path(), false);
+        assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+        assert!(outcome.changed.is_empty(), "{:?}", outcome.changed);
     }
 }

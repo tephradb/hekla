@@ -13,17 +13,19 @@ use std::path::Path;
 use std::str;
 
 use anyhow::Context;
+use rusqlite::config::DbConfig;
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, Row, Transaction, params_from_iter};
 use tephra::Position;
 
 use crate::starlark_builtins::{EntityDef, EntityOpKind, FieldKind, FieldMeta};
 
-/// The projector checkpoint, co-located with the read-model tables so it commits
-/// in the same transaction as the state it describes. `completed_above` records
-/// positions processed above `position`; it is always empty under the sequential
-/// model, reserved so parallel lanes need no schema migration.
-const CHECKPOINT_DDL: &str = "\
+/// The projector's internal tables: the checkpoint, co-located with the read-model
+/// tables so it commits in the same transaction as the state it describes, and the
+/// definition hash the model was built under. `completed_above` records positions
+/// processed above `position`; it is always empty under the sequential model,
+/// reserved so parallel lanes need no schema migration.
+const INTERNAL_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _kiln_checkpoint (
     id              INTEGER PRIMARY KEY CHECK (id = 0),
     position        INTEGER NOT NULL,
@@ -43,15 +45,16 @@ pub struct ReadModel {
 
 impl ReadModel {
     /// Open (or create) the database at `path` and create each entity's table
-    /// and indexes, plus the checkpoint. Pass a filesystem path; the tables use
+    /// and indexes, plus the internal tables. Pass a filesystem path; the tables use
     /// `IF NOT EXISTS`, so reopening an existing read model is fine.
     pub fn open(path: &Path, entities: &[EntityDef]) -> anyhow::Result<ReadModel> {
         let conn = Connection::open(path).context("opening read-model database")?;
+        reject_double_quoted_strings(&conn)?;
         // WAL lets the read API read concurrently with this single writer.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_row| Ok(()))
             .context("enabling WAL")?;
-        conn.execute_batch(CHECKPOINT_DDL)
-            .context("creating the checkpoint table")?;
+        conn.execute_batch(INTERNAL_DDL)
+            .context("creating the projector's internal tables")?;
         for entity in entities {
             conn.execute_batch(&entity.create_table_sql())
                 .with_context(|| format!("creating table `{}`", entity.name))?;
@@ -72,6 +75,7 @@ impl ReadModel {
             | OpenFlags::SQLITE_OPEN_URI;
         let conn = Connection::open_with_flags(path, flags)
             .context("opening read-model database read-only")?;
+        reject_double_quoted_strings(&conn)?;
         conn.pragma_update(None, "query_only", "ON")
             .context("enabling query_only")?;
         Ok(ReadModel { conn })
@@ -171,10 +175,9 @@ impl ReadModel {
                 let obj = row.as_object().context("put row is not a JSON object")?;
                 let placeholders = vec!["?"; entity.fields.len()].join(", ");
                 let sql = format!(
-                    "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
-                    entity.name,
+                    "INSERT OR REPLACE INTO {} ({}) VALUES ({placeholders})",
+                    quote_ident(&entity.name),
                     column_list(entity),
-                    placeholders
                 );
                 let mut values = Vec::with_capacity(entity.fields.len());
                 for (name, meta) in &entity.fields {
@@ -192,7 +195,7 @@ impl ReadModel {
                 let mut values = Vec::new();
                 for (name, meta) in &entity.fields {
                     if let Some(value) = obj.get(name) {
-                        assignments.push(format!("{name} = ?"));
+                        assignments.push(format!("{} = ?", quote_ident(name)));
                         values
                             .push(to_sql(meta, value).with_context(|| format!("column `{name}`"))?);
                     }
@@ -200,19 +203,25 @@ impl ReadModel {
                 if assignments.is_empty() {
                     return Ok(());
                 }
-                values.push(key_to_sql(key_kind(entity), &key));
+                values.push(bind_or_text(key_kind(entity), &key));
                 let sql = format!(
                     "UPDATE {} SET {} WHERE {} = ?",
-                    entity.name,
+                    quote_ident(&entity.name),
                     assignments.join(", "),
-                    entity.key
+                    quote_ident(&entity.key)
                 );
                 self.conn.execute(&sql, params_from_iter(values))?;
             }
             EntityOpKind::Delete(key) => {
-                let sql = format!("DELETE FROM {} WHERE {} = ?", entity.name, entity.key);
-                self.conn
-                    .execute(&sql, params_from_iter([key_to_sql(key_kind(entity), &key)]))?;
+                let sql = format!(
+                    "DELETE FROM {} WHERE {} = ?",
+                    quote_ident(&entity.name),
+                    quote_ident(&entity.key)
+                );
+                self.conn.execute(
+                    &sql,
+                    params_from_iter([bind_or_text(key_kind(entity), &key)]),
+                )?;
             }
         }
         Ok(())
@@ -229,14 +238,12 @@ impl ReadModel {
         let columns = column_list(entity);
         let sql = format!(
             "SELECT {columns} FROM {} WHERE {} = ?",
-            entity.name, entity.key
+            quote_ident(&entity.name),
+            quote_ident(&entity.key)
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter([key_to_sql(key_kind(entity), key)]))?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row_to_json(entity, row)?)),
-            None => Ok(None),
-        }
+        let mut rows = stmt.query(params_from_iter([bind_or_text(key_kind(entity), key)]))?;
+        rows.next()?.map(|row| row_to_json(entity, row)).transpose()
     }
 
     /// Scan an entity ordered by key, optionally filtered by one column and
@@ -254,29 +261,30 @@ impl ReadModel {
         let mut clauses = Vec::new();
         let mut binds: Vec<SqlValue> = Vec::new();
         if let Some((column, value)) = filter {
-            clauses.push(format!("{column} = ?"));
+            clauses.push(format!("{} = ?", quote_ident(column)));
             let kind = entity
                 .fields
                 .iter()
                 .find(|(name, _)| name == column)
                 .map(|(_, meta)| &meta.kind);
             binds.push(match kind {
-                Some(kind) => coerce_value(kind, value).unwrap_or_else(|_| text(value)),
+                Some(kind) => bind_or_text(kind, value),
                 None => text(value),
             });
         }
         if let Some(after) = after_key {
-            clauses.push(format!("{} > ?", entity.key));
-            binds.push(key_to_sql(key_kind(entity), after));
+            clauses.push(format!("{} > ?", quote_ident(&entity.key)));
+            binds.push(bind_or_text(key_kind(entity), after));
         }
         let where_clause = if clauses.is_empty() {
             String::new()
         } else {
             format!(" WHERE {}", clauses.join(" AND "))
         };
+        let key = quote_ident(&entity.key);
         let sql = format!(
-            "SELECT {columns} FROM {}{where_clause} ORDER BY {} LIMIT ?",
-            entity.name, entity.key
+            "SELECT {columns} FROM {}{where_clause} ORDER BY {key} LIMIT ?",
+            quote_ident(&entity.name)
         );
         binds.push(SqlValue::Integer(limit as i64));
         let mut stmt = self.conn.prepare(&sql)?;
@@ -295,9 +303,39 @@ fn column_list(entity: &EntityDef) -> String {
     entity
         .fields
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| quote_ident(name))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Wrap a generated table, column or index name in SQLite's double-quote syntax,
+/// doubling any embedded quote. Every identifier this crate interpolates into SQL
+/// goes through this: a field named after a SQLite keyword (`group`, `order`,
+/// `select`, ...) is a valid column name that unquoted is a syntax error, and a
+/// table whose CREATE fails takes the whole runtime down at boot.
+///
+/// SQLite resolves `"group"` and `group` to the same name, so quoting changes only
+/// how a statement parses, never the stored schema: a read model written before
+/// this still opens, reads and writes with no rebuild.
+pub(crate) fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Turn off SQLite's double-quoted-string misfeature on `conn`, in both DML and DDL.
+///
+/// This is the other half of [`quote_ident`] and is not optional. By default SQLite
+/// accepts a double-quoted token that resolves to no identifier as a *string
+/// literal*, so `SELECT "email" FROM rows` against a table lacking that column
+/// returns the text `email` for every row instead of failing. That would turn a read
+/// model whose shape predates a field addition from a loud error into silently wrong
+/// data, and would hide exactly the mismatch [`crate::projector::Readiness`] exists
+/// to detect. With DQS off, an unknown quoted identifier is `no such column` again.
+fn reject_double_quoted_strings(conn: &Connection) -> anyhow::Result<()> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)
+        .context("disabling double-quoted string literals in DML")?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)
+        .context("disabling double-quoted string literals in DDL")?;
+    Ok(())
 }
 
 /// Reconstruct one selected row as a JSON object, NULL columns omitted, typed per
@@ -384,12 +422,12 @@ pub(crate) fn coerce_value(kind: &FieldKind, raw: &str) -> anyhow::Result<SqlVal
     })
 }
 
-/// Bind an op's key string as the key column's type, falling back to text when it
+/// Bind a key or filter string as its column's type, falling back to text when it
 /// does not parse. Internal ops supply well-typed keys; the external filter path
 /// validates the value first (via [`coerce_value`]) so a mismatch 400s rather than
 /// reaching here.
-fn key_to_sql(kind: &FieldKind, key: &str) -> SqlValue {
-    coerce_value(kind, key).unwrap_or_else(|_| text(key))
+fn bind_or_text(kind: &FieldKind, raw: &str) -> SqlValue {
+    coerce_value(kind, raw).unwrap_or_else(|_| text(raw))
 }
 
 fn text(value: &str) -> SqlValue {
@@ -424,7 +462,12 @@ fn from_sql(meta: &FieldMeta, value: ValueRef) -> anyhow::Result<serde_json::Val
         ValueRef::Text(bytes) => {
             let text = str::from_utf8(bytes).context("non-UTF-8 text column")?;
             match meta.kind.base() {
-                FieldKind::Json => serde_json::from_str(text).unwrap_or(J::Null),
+                // Text that does not parse comes back as the raw string rather than
+                // null, so a column that changed kind between deploys reads as bad
+                // data instead of silently vanishing from the row.
+                FieldKind::Json => {
+                    serde_json::from_str(text).unwrap_or_else(|_| J::String(text.to_owned()))
+                }
                 _ => J::String(text.to_owned()),
             }
         }
@@ -440,6 +483,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::starlark_builtins::IndexDef;
 
     fn users_entity() -> EntityDef {
         EntityDef {
@@ -566,6 +610,177 @@ mod tests {
     }
 
     #[test]
+    fn keyword_named_identifiers_survive_every_generated_statement() {
+        // Table, key, filter column and plain column are all SQLite keywords. Each op
+        // below builds a different statement (CREATE, CREATE INDEX, INSERT, SELECT,
+        // UPDATE, DELETE), so a single unquoted identifier anywhere is a syntax error.
+        let entity = EntityDef {
+            id: 1,
+            name: "order".to_owned(),
+            key: "group".to_owned(),
+            fields: vec![
+                ("group".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+                (
+                    "select".to_owned(),
+                    FieldMeta::plain(FieldKind::Text { max_length: None }),
+                ),
+            ],
+            indexes: vec![IndexDef {
+                name: "by_select".to_owned(),
+                columns: vec!["select".to_owned()],
+            }],
+        };
+        let (model, _dir) = open_temp(slice::from_ref(&entity));
+
+        for (key, value) in [("g1", "a"), ("g2", "b")] {
+            model
+                .apply_one(
+                    &entity,
+                    EntityOpKind::Put(json!({ "group": key, "select": value }).to_string()),
+                )
+                .unwrap();
+        }
+        assert_eq!(model.get(&entity, "g1").unwrap().unwrap()["select"], "a");
+        let filtered = model
+            .scan(&entity, Some(("select", "b")), None, 50)
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["group"], "g2");
+        // The cursor branch adds `key > ?` and the ORDER BY on the keyword key.
+        let after = model.scan(&entity, None, Some("g1"), 50).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["group"], "g2");
+
+        model
+            .apply_one(
+                &entity,
+                EntityOpKind::Patch {
+                    key: "g1".to_owned(),
+                    changes: json!({ "select": "patched" }).to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            model.get(&entity, "g1").unwrap().unwrap()["select"],
+            "patched"
+        );
+
+        model
+            .apply_one(&entity, EntityOpKind::Delete("g1".to_owned()))
+            .unwrap();
+        assert!(model.get(&entity, "g1").unwrap().is_none());
+        assert_eq!(model.rows(&entity).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_read_model_created_with_unquoted_ddl_still_reads_and_writes() {
+        // Quoting is a parsing change, not a schema change: SQLite resolves `"group"`
+        // and `group` to the same column. A model built by the pre-quoting generator
+        // must keep working with no rebuild, so build one by hand and drive it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let mut entity = users_entity();
+        entity.indexes.push(IndexDef {
+            name: "by_email".to_owned(),
+            columns: vec!["email".to_owned()],
+        });
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (user_id TEXT PRIMARY KEY NOT NULL, email TEXT NOT NULL);
+                 CREATE INDEX users_by_email ON users (email);
+                 INSERT INTO users (user_id, email) VALUES ('u0', 'old@x');",
+            )
+            .unwrap();
+        }
+
+        // `IF NOT EXISTS` leaves the hand-built table and index alone; the quoted DDL
+        // must resolve to the same names, not conflict with them or duplicate them.
+        let model = ReadModel::open(&path, slice::from_ref(&entity)).unwrap();
+        assert_eq!(model.get(&entity, "u0").unwrap().unwrap()["email"], "old@x");
+        put(&model, &entity, "u1", "new@x");
+        assert_eq!(model.rows(&entity).unwrap().len(), 2);
+        assert_eq!(
+            model
+                .scan(&entity, Some(("email", "old@x")), None, 50)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The stored names carry no quotes: unquoted SQL still resolves them.
+        let names: Vec<String> = model
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('users')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, vec!["user_id", "email"]);
+        // `sql IS NOT NULL` skips the implicit index behind the TEXT primary key.
+        let indexes: Vec<String> = model
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND tbl_name = 'users' AND sql IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            indexes,
+            vec!["users_by_email"],
+            "the quoted CREATE INDEX names the existing index rather than adding one"
+        );
+    }
+
+    #[test]
+    fn quote_ident_doubles_an_embedded_quote() {
+        assert_eq!(quote_ident("group"), "\"group\"");
+        assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
+    }
+
+    /// Quoting identifiers is only safe with SQLite's double-quoted-string fallback
+    /// off. With it on (the default), `SELECT "nope" FROM t` yields the text `nope`
+    /// for every row instead of failing, so a read model whose shape predates a field
+    /// addition would serve the column's own name as data.
+    #[test]
+    fn an_unknown_quoted_column_errors_instead_of_becoming_a_string_literal() {
+        let (model, _dir) = open_temp(slice::from_ref(&users_entity()));
+        let err = model
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM users", quote_ident("nope")),
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no such column"),
+            "expected a missing column to fail loudly, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_connection_also_rejects_double_quoted_strings() {
+        let (model, dir) = open_temp(slice::from_ref(&users_entity()));
+        drop(model);
+        let reopened = ReadModel::open_readonly(&dir.path().join("m.db")).unwrap();
+        let err = reopened
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM users", quote_ident("nope")),
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column"), "{err}");
+    }
+
+    #[test]
     fn coerce_value_rejects_type_mismatches() {
         assert!(coerce_value(&FieldKind::I64, "42").is_ok());
         assert!(coerce_value(&FieldKind::I64, "abc").is_err());
@@ -575,5 +790,38 @@ mod tests {
         let opt_int = FieldKind::Optional(Box::new(FieldKind::I64));
         assert!(coerce_value(&opt_int, "7").is_ok());
         assert!(coerce_value(&opt_int, "seven").is_err());
+    }
+
+    #[test]
+    fn a_json_column_that_does_not_parse_reads_back_as_its_raw_text() {
+        // A column declared text() in one deploy and json() in the next, with no
+        // rebuild: the surviving plaintext rows must read back as the raw string.
+        // Decoding them as null would drop the key from the row entirely, reporting
+        // bad data as absent data.
+        let as_text = EntityDef {
+            id: 1,
+            name: "docs".to_owned(),
+            key: "doc_id".to_owned(),
+            fields: vec![
+                ("doc_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+                (
+                    "body".to_owned(),
+                    FieldMeta::plain(FieldKind::Text { max_length: None }),
+                ),
+            ],
+            indexes: vec![],
+        };
+        let (model, _dir) = open_temp(slice::from_ref(&as_text));
+        model
+            .apply_one(
+                &as_text,
+                EntityOpKind::Put(json!({ "doc_id": "d1", "body": "not json" }).to_string()),
+            )
+            .unwrap();
+
+        let mut as_json = as_text.clone();
+        as_json.fields[1].1 = FieldMeta::plain(FieldKind::Json);
+        let row = model.get(&as_json, "d1").unwrap().unwrap();
+        assert_eq!(row["body"], "not json");
     }
 }

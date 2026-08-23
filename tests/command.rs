@@ -2,90 +2,26 @@
 //! echoed correlation/causation, idempotent replay, and the pinned clock. Each
 //! test runs the real decision cycle against a fresh temp store and op DB.
 
-use std::fs;
-use std::path::Path;
-use std::sync::Arc;
 use std::thread;
 
-use kiln::context::CommandContext;
-use kiln::effect::{EffectRuntime, HttpClient, StubHttpClient};
-use kiln::loader::LoadedProject;
-use kiln::projector::ProjectorSet;
-use kiln::runtime::Runtime;
-use serde_json::json;
-use tempfile::TempDir;
-use tephra::WriteCoordinator;
-use uuid::Uuid;
+use serde_json::{Value, json};
 
-type Parts = (Arc<Runtime>, WriteCoordinator, ProjectorSet, EffectRuntime);
+mod support;
 
-/// Open the example project against a throwaway data directory. Effects run with a
-/// stub HTTP client, so registering a user fires the welcome effect without
-/// touching the network.
-fn open() -> (
-    Arc<Runtime>,
-    WriteCoordinator,
-    ProjectorSet,
-    EffectRuntime,
-    TempDir,
-) {
-    let data = tempfile::tempdir().unwrap();
-    let parts = open_at(data.path());
-    (parts.0, parts.1, parts.2, parts.3, data)
-}
-
-/// Open the example project against an explicit data directory, so a test can reopen
-/// the same event log under a fresh operational DB.
-fn open_at(data_dir: &Path) -> Parts {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/users");
-    let project = LoadedProject::load(&root);
-    assert!(
-        !project.has_errors(),
-        "example project has errors: {:?}",
-        project.findings
-    );
-    let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    Runtime::open(project, data_dir, http, None).unwrap()
-}
-
-/// Delete `kiln.db` (and its WAL sidecars) while the event log survives, then reopen.
-/// Command idempotency lives entirely in the log, so this proves a replay recovers
-/// across a restart even with the operational DB gone (it holds only effect state).
-fn drop_op_db(data_dir: &Path) {
-    for name in ["kiln.db", "kiln.db-wal", "kiln.db-shm"] {
-        let path = data_dir.join(name);
-        if path.exists() {
-            fs::remove_file(path).unwrap();
-        }
-    }
-}
-
-/// Drain effects, then projectors, then the writer.
-fn shutdown(effects: EffectRuntime, projectors: ProjectorSet, coord: WriteCoordinator) {
-    effects.shutdown_and_join();
-    projectors.shutdown_and_join();
-    coord.shutdown();
-}
-
-fn ctx() -> CommandContext {
-    CommandContext::new(Uuid::new_v4())
-}
-
-fn register(user_id: &str, email: &str, name: &str) -> serde_json::Value {
-    json!({ "user_id": user_id, "email": email, "name": name })
-}
-
-const ALICE: &str = "11111111-1111-1111-1111-111111111111";
-const BOB: &str = "22222222-2222-2222-2222-222222222222";
+use support::{
+    ALICE, BOB, Boot, Harness, boot_example, boot_example_at, ctx, drop_op_db, log_head,
+    register_body, write_project,
+};
 
 #[test]
 fn commits_a_new_registration() {
-    let (rt, coord, projectors, effects, _data) = open();
+    let harness = boot_example();
     let ctx = ctx();
-    let result = rt
+    let result = harness
+        .rt
         .execute(
             "register-user",
-            register(ALICE, "alice@example.com", "Alice"),
+            register_body(ALICE, "alice@example.com", "Alice"),
             &ctx,
             None,
         )
@@ -98,36 +34,40 @@ fn commits_a_new_registration() {
     );
     assert_eq!(result.body["causation_id"], ctx.causation_id.to_string());
     assert!(result.body["positions"]["first"].is_number());
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
 fn rejects_a_taken_email_with_422() {
-    let (rt, coord, projectors, effects, _data) = open();
-    rt.execute(
-        "register-user",
-        register(ALICE, "dup@example.com", "Alice"),
-        &ctx(),
-        None,
-    )
-    .unwrap();
-    let result = rt
+    let harness = boot_example();
+    harness
+        .rt
         .execute(
             "register-user",
-            register(BOB, "dup@example.com", "Bob"),
+            register_body(ALICE, "dup@example.com", "Alice"),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    let result = harness
+        .rt
+        .execute(
+            "register-user",
+            register_body(BOB, "dup@example.com", "Bob"),
             &ctx(),
             None,
         )
         .unwrap();
     assert_eq!(result.status, 422);
     assert_eq!(result.body["error"]["code"], "email_taken");
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
 fn missing_required_field_is_400() {
-    let (rt, coord, projectors, effects, _data) = open();
-    let result = rt
+    let harness = boot_example();
+    let result = harness
+        .rt
         .execute(
             "register-user",
             json!({ "user_id": ALICE, "email": "alice@example.com" }),
@@ -137,13 +77,14 @@ fn missing_required_field_is_400() {
         .unwrap();
     assert_eq!(result.status, 400);
     assert_eq!(result.body["error"]["code"], "invalid_input");
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
 fn wrong_typed_field_is_400() {
-    let (rt, coord, projectors, effects, _data) = open();
-    let result = rt
+    let harness = boot_example();
+    let result = harness
+        .rt
         .execute(
             "register-user",
             json!({ "user_id": ALICE, "email": 42, "name": "Alice" }),
@@ -152,35 +93,38 @@ fn wrong_typed_field_is_400() {
         )
         .unwrap();
     assert_eq!(result.status, 400);
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
 fn unknown_command_is_404() {
-    let (rt, coord, projectors, effects, _data) = open();
-    let result = rt
+    let harness = boot_example();
+    let result = harness
+        .rt
         .execute("does-not-exist", json!({}), &ctx(), None)
         .unwrap();
     assert_eq!(result.status, 404);
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
 fn internal_command_is_not_routed() {
-    let (rt, coord, projectors, effects, _data) = open();
-    let result = rt
+    let harness = boot_example();
+    let result = harness
+        .rt
         .execute("record-welcome", json!({ "user_id": ALICE }), &ctx(), None)
         .unwrap();
     assert_eq!(result.status, 404);
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
 fn idempotent_replay_returns_the_original_outcome() {
-    let (rt, coord, projectors, effects, _data) = open();
+    let harness = boot_example();
     let ctx1 = ctx();
-    let body = register(ALICE, "alice@example.com", "Alice");
-    let first = rt
+    let body = register_body(ALICE, "alice@example.com", "Alice");
+    let first = harness
+        .rt
         .execute("register-user", body.clone(), &ctx1, Some("k1"))
         .unwrap();
     assert_eq!(first.status, 200);
@@ -188,9 +132,9 @@ fn idempotent_replay_returns_the_original_outcome() {
     // A fresh run of the same request would now reject the duplicate email, but a
     // replay under the same key recovers the original 200 from the log, including the
     // original correlation id.
-    let ctx2 = ctx();
-    let replay = rt
-        .execute("register-user", body, &ctx2, Some("k1"))
+    let replay = harness
+        .rt
+        .execute("register-user", body, &ctx(), Some("k1"))
         .unwrap();
     assert_eq!(replay.status, 200);
     assert_eq!(replay.body, first.body);
@@ -198,13 +142,14 @@ fn idempotent_replay_returns_the_original_outcome() {
         replay.body["correlation_id"],
         ctx1.correlation_id.to_string()
     );
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
 fn now_is_available_in_handle() {
-    let (rt, coord, projectors, effects, _data) = open();
-    let result = rt
+    let harness = boot_example();
+    let result = harness
+        .rt
         .execute(
             "schedule-reminder",
             json!({ "user_id": ALICE }),
@@ -216,7 +161,7 @@ fn now_is_available_in_handle() {
     // event committed; had now() errored, the command would have failed.
     assert_eq!(result.status, 200);
     assert_eq!(result.body["events"][0]["type"], "reminder.scheduled");
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
@@ -224,9 +169,10 @@ fn boundaryless_command_recovers_from_the_log_across_a_restart() {
     let data = tempfile::tempdir().unwrap();
 
     // First run: a boundaryless keyed command commits.
-    let (rt, coord, projectors, effects) = open_at(data.path());
+    let harness = boot_example_at(data.path());
     let ctx1 = ctx();
-    let first = rt
+    let first = harness
+        .rt
         .execute(
             "schedule-reminder",
             json!({ "user_id": ALICE }),
@@ -235,7 +181,7 @@ fn boundaryless_command_recovers_from_the_log_across_a_restart() {
         )
         .unwrap();
     assert_eq!(first.status, 200);
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 
     // Restart with the operational DB gone: only the event log survives.
     drop_op_db(data.path());
@@ -244,8 +190,9 @@ fn boundaryless_command_recovers_from_the_log_across_a_restart() {
     // the log, byte-identical (original ids, positions, and the original
     // `now()`-derived event); the re-run's own emitted event never lands because the
     // append's existence clause rejects it.
-    let (rt, coord, projectors, effects) = open_at(data.path());
-    let replay = rt
+    let harness = boot_example_at(data.path());
+    let replay = harness
+        .rt
         .execute(
             "schedule-reminder",
             json!({ "user_id": ALICE }),
@@ -267,7 +214,8 @@ fn boundaryless_command_recovers_from_the_log_across_a_restart() {
     // And no duplicate was appended: a fresh key lands right after the single
     // original event, proving the replay wrote nothing.
     let last = first.body["positions"]["last"].as_u64().unwrap();
-    let fresh = rt
+    let fresh = harness
+        .rt
         .execute(
             "schedule-reminder",
             json!({ "user_id": BOB }),
@@ -276,7 +224,7 @@ fn boundaryless_command_recovers_from_the_log_across_a_restart() {
         )
         .unwrap();
     assert_eq!(fresh.body["positions"]["first"].as_u64(), Some(last + 1));
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
@@ -284,30 +232,32 @@ fn boundaried_command_recovers_instead_of_re_rejecting_across_a_restart() {
     let data = tempfile::tempdir().unwrap();
 
     // First run: a command with a real uniqueness boundary commits under a key.
-    let (rt, coord, projectors, effects) = open_at(data.path());
-    let first = rt
+    let harness = boot_example_at(data.path());
+    let first = harness
+        .rt
         .execute(
             "register-user",
-            register(ALICE, "alice@example.com", "Alice"),
+            register_body(ALICE, "alice@example.com", "Alice"),
             &ctx(),
             Some("k1"),
         )
         .unwrap();
     assert_eq!(first.status, 200);
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 
     // Restart with the operational DB gone, then reopen over the same log.
     drop_op_db(data.path());
-    let (rt, coord, projectors, effects) = open_at(data.path());
+    let harness = boot_example_at(data.path());
 
     // Replaying the key must recover the original 200 from the log. The replay
     // re-folds, sees the email already taken, and `handle` rejects; the reject arm's
     // tag re-read finds the prior commit and recovers its 200 instead of returning a
     // spurious 422 for a request that had succeeded.
-    let replay = rt
+    let replay = harness
+        .rt
         .execute(
             "register-user",
-            register(ALICE, "alice@example.com", "Alice"),
+            register_body(ALICE, "alice@example.com", "Alice"),
             &ctx(),
             Some("k1"),
         )
@@ -318,13 +268,13 @@ fn boundaried_command_recovers_instead_of_re_rejecting_across_a_restart() {
         replay.body
     );
     assert_eq!(replay.body["positions"], first.body["positions"]);
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
 }
 
 #[test]
 fn concurrent_same_key_requests_commit_once_and_all_recover() {
-    let (rt, coord, projectors, effects, _data) = open();
-    let body = register(ALICE, "concurrent@example.com", "Alice");
+    let harness = boot_example();
+    let body = register_body(ALICE, "concurrent@example.com", "Alice");
 
     // Fire many same-key requests at a boundaried command at once. The append's
     // existence clause serializes them atomically: exactly one commits, and every
@@ -333,7 +283,7 @@ fn concurrent_same_key_requests_commit_once_and_all_recover() {
     let outcomes: Vec<(u16, serde_json::Value)> = thread::scope(|scope| {
         let handles: Vec<_> = (0..8)
             .map(|_| {
-                let rt = &rt;
+                let rt = &harness.rt;
                 let body = body.clone();
                 scope.spawn(move || {
                     let result = rt
@@ -346,7 +296,7 @@ fn concurrent_same_key_requests_commit_once_and_all_recover() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let (_, ref winner) = outcomes[0];
+    let winner = &outcomes[0].1;
     for (status, body) in &outcomes {
         assert_eq!(
             *status, 200,
@@ -356,5 +306,298 @@ fn concurrent_same_key_requests_commit_once_and_all_recover() {
         // second commit would have carried a distinct position range.
         assert_eq!(body["positions"], winner["positions"]);
     }
-    shutdown(effects, projectors, coord);
+    harness.shutdown();
+}
+
+/// A minimal project whose only command is idempotent by construction: once the
+/// account is closed, `handle` returns no events rather than rejecting.
+const CLOSE_ACCOUNT_EVENTS: &str = r#"
+account_closed = event(
+    type = "account.closed",
+    fields = {"account_id": uuid()},
+)
+"#;
+
+const CLOSE_ACCOUNT: &str = r#"
+load("events/e.star", "account_closed")
+
+input = schema(account_id = uuid())
+
+def query(input):
+    return account_closed(account_id = input.account_id)
+
+initial = False
+
+def fold(state, event):
+    return True
+
+def handle(input, state):
+    if state:
+        return []
+    return account_closed(account_id = input.account_id)
+"#;
+
+#[test]
+fn empty_emit_replay_recovers_the_original_outcome() {
+    let project = write_project(&[
+        ("events/e.star", CLOSE_ACCOUNT_EVENTS),
+        ("commands/close-account.star", CLOSE_ACCOUNT),
+    ]);
+    let harness = Boot::new(project.path()).http_status(200).start();
+
+    let body = json!({ "account_id": ALICE });
+    let ctx1 = ctx();
+    let first = harness
+        .rt
+        .execute("close-account", body.clone(), &ctx1, Some("k1"))
+        .unwrap();
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body["events"][0]["type"], "account.closed");
+
+    // The replay folds the committed event and `handle` emits nothing, so no append
+    // happens and the existence clause never fires. Recovery has to come from the tag
+    // re-read; without it the client gets an empty 200 where the original returned the
+    // committed events and positions.
+    let replay = harness
+        .rt
+        .execute("close-account", body, &ctx(), Some("k1"))
+        .unwrap();
+    assert_eq!(replay.status, 200);
+    assert_eq!(
+        replay.body, first.body,
+        "an empty emit must replay the original outcome"
+    );
+    assert_eq!(
+        replay.body["correlation_id"],
+        ctx1.correlation_id.to_string(),
+        "recovery uses the original request's identity, not the replay's"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn concurrent_renames_of_the_same_user_all_commit_after_retrying() {
+    let harness = boot_example();
+    let registered = harness
+        .rt
+        .execute(
+            "register-user",
+            register_body(ALICE, "alice@example.com", "Alice"),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(registered.status, 200, "{:?}", registered.body);
+
+    // `rename-user`'s boundary is this user's whole history, so four unkeyed renames
+    // of the same user all collide on it. Each loser must re-read and retry: unlike
+    // the same-key case there is no idempotency tag to recover from, so a boundary
+    // conflict that stopped being retried would surface as a 409.
+    let outcomes: Vec<(u16, Value)> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let rt = &harness.rt;
+                scope.spawn(move || {
+                    let result = rt
+                        .execute(
+                            "rename-user",
+                            json!({ "user_id": ALICE, "name": format!("n{i}") }),
+                            &ctx(),
+                            None,
+                        )
+                        .unwrap();
+                    (result.status, result.body)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut firsts: Vec<u64> = Vec::new();
+    for (status, body) in &outcomes {
+        assert_eq!(
+            *status, 200,
+            "a boundary conflict is retried, not surfaced: {body:?}"
+        );
+        firsts.push(body["positions"]["first"].as_u64().unwrap());
+    }
+    // Distinct start positions mean four separate physical commits: a retry that
+    // reused stale folded state, or an attempt appended twice, would repeat one.
+    firsts.sort_unstable();
+    firsts.dedup();
+    assert_eq!(
+        firsts.len(),
+        4,
+        "each rename commits exactly once: {firsts:?}"
+    );
+
+    // One registration plus four renames, and nothing else: the welcome effect's
+    // stubbed POST answers 400, so no `user.welcomed` lands.
+    assert_eq!(log_head(&harness.rt), 5);
+    harness.shutdown();
+}
+
+#[test]
+fn a_drained_write_coordinator_returns_503_unavailable() {
+    let data = tempfile::tempdir().unwrap();
+    // Drain by hand rather than through `Harness::shutdown`, which consumes the
+    // runtime along with the coordinator. Once `WriteCoordinator::shutdown` has
+    // joined the writer thread, any later append sends on a disconnected channel.
+    let Harness {
+        rt,
+        coord,
+        projectors,
+        effects,
+        ..
+    } = boot_example_at(data.path());
+    effects.shutdown_and_join();
+    projectors.shutdown_and_join();
+    coord.shutdown();
+
+    // A boundaryless command reads nothing, so the only thing that can fail is the
+    // append itself.
+    let result = rt
+        .execute(
+            "schedule-reminder",
+            json!({ "user_id": ALICE }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.status, 503, "{:?}", result.body);
+    assert_eq!(result.body["error"]["code"], "unavailable");
+    let message = result.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("retry"),
+        "a write that never landed must read as retryable: {message}"
+    );
+}
+
+#[test]
+fn the_same_idempotency_key_on_two_commands_does_not_collide() {
+    let harness = boot_example();
+
+    // A client reusing one key across a workflow's two calls is normal. The tag
+    // hashes the command name alongside the key, so the second call must decide for
+    // itself rather than replay the first call's outcome.
+    let first = harness
+        .rt
+        .execute(
+            "register-user",
+            register_body(ALICE, "alice@example.com", "Alice"),
+            &ctx(),
+            Some("shared-key"),
+        )
+        .unwrap();
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert_eq!(first.body["events"][0]["type"], "user.registered");
+
+    let second = harness
+        .rt
+        .execute(
+            "schedule-reminder",
+            json!({ "user_id": ALICE }),
+            &ctx(),
+            Some("shared-key"),
+        )
+        .unwrap();
+    assert_eq!(second.status, 200, "{:?}", second.body);
+    assert_eq!(
+        second.body["events"][0]["type"], "reminder.scheduled",
+        "the second command must not replay the first's event"
+    );
+    assert_ne!(
+        second.body["positions"]["first"], first.body["positions"]["first"],
+        "a recovered outcome would carry the first command's positions"
+    );
+    assert_eq!(log_head(&harness.rt), 2, "both commands actually appended");
+    harness.shutdown();
+}
+
+#[test]
+fn a_keyed_request_that_rejects_returns_422_and_does_not_burn_the_key() {
+    let harness = boot_example();
+    let committed = harness
+        .rt
+        .execute(
+            "register-user",
+            register_body(ALICE, "dup@example.com", "Alice"),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(committed.status, 200, "{:?}", committed.body);
+
+    // A keyed request that genuinely should be rejected: the reject arm re-reads the
+    // tag, finds no prior commit under this key, and surfaces the rejection.
+    let rejected = harness
+        .rt
+        .execute(
+            "register-user",
+            register_body(BOB, "dup@example.com", "Bob"),
+            &ctx(),
+            Some("k9"),
+        )
+        .unwrap();
+    assert_eq!(rejected.status, 422, "{:?}", rejected.body);
+    assert_eq!(rejected.body["error"]["code"], "email_taken");
+    assert_eq!(
+        log_head(&harness.rt),
+        1,
+        "a rejection appends nothing, so it writes no tag either"
+    );
+
+    // The key was therefore never burned: the same key on a body that can succeed
+    // commits for real instead of replaying the rejection or a phantom 200.
+    let retried = harness
+        .rt
+        .execute(
+            "register-user",
+            register_body(BOB, "bob@example.com", "Bob"),
+            &ctx(),
+            Some("k9"),
+        )
+        .unwrap();
+    assert_eq!(retried.status, 200, "{:?}", retried.body);
+    assert_eq!(retried.body["events"][0]["type"], "user.registered");
+    assert_eq!(
+        retried.body["positions"]["first"].as_u64(),
+        Some(committed.body["positions"]["last"].as_u64().unwrap() + 1),
+        "the retry lands as a fresh append"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn an_unknown_field_in_the_body_is_rejected_with_400() {
+    let harness = boot_example();
+    let result = harness
+        .rt
+        .execute(
+            "register-user",
+            json!({
+                "user_id": ALICE,
+                "email": "alice@example.com",
+                "name": "Alice",
+                "nickname": "Al",
+            }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    // The input schema is strict: a typo'd or stale field is a client error, not a
+    // silently dropped one that lets the command run against a body it never got.
+    assert_eq!(result.status, 400, "{:?}", result.body);
+    assert_eq!(result.body["error"]["code"], "invalid_input");
+    let message = result.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("unknown field `nickname`"),
+        "the error names the offending field: {message}"
+    );
+    assert_eq!(
+        log_head(&harness.rt),
+        0,
+        "input validation happens before any append"
+    );
+    harness.shutdown();
 }

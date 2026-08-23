@@ -1,84 +1,20 @@
 //! The HTTP command surface: header handling around the idempotency key and the
 //! generated OpenAPI document. Drives the in-process router with `oneshot`.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use kiln::effect::{EffectRuntime, HttpClient, StubHttpClient};
-use kiln::loader::LoadedProject;
-use kiln::projector::ProjectorSet;
-use kiln::runtime::Runtime;
-use kiln::server;
 use serde_json::{Value, json};
-use tempfile::TempDir;
-use tephra::WriteCoordinator;
 use tower::ServiceExt;
 
-const ALICE: &str = "11111111-1111-1111-1111-111111111111";
-const BOB: &str = "22222222-2222-2222-2222-222222222222";
+mod support;
 
-struct Harness {
-    rt: Arc<Runtime>,
-    coord: WriteCoordinator,
-    projectors: ProjectorSet,
-    effects: EffectRuntime,
-    _data: TempDir,
-}
-
-impl Harness {
-    fn shutdown(self) {
-        self.effects.shutdown_and_join();
-        self.projectors.shutdown_and_join();
-        self.coord.shutdown();
-    }
-}
-
-fn boot() -> Harness {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/users");
-    let project = LoadedProject::load(&root);
-    assert!(!project.has_errors(), "{:?}", project.findings);
-    let data = tempfile::tempdir().unwrap();
-    let http: Arc<dyn HttpClient> = Arc::new(StubHttpClient::status(400));
-    let (rt, coord, projectors, effects) = Runtime::open(project, data.path(), http, None).unwrap();
-    Harness {
-        rt,
-        coord,
-        projectors,
-        effects,
-        _data: data,
-    }
-}
-
-/// POST a command with an optional `Idempotency-Key` header.
-async fn post_command(
-    app: &Router,
-    name: &str,
-    body: Value,
-    idem_key: Option<&str>,
-) -> (StatusCode, Value) {
-    let mut builder = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/commands/{name}"))
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(key) = idem_key {
-        builder = builder.header("idempotency-key", key);
-    }
-    let request = builder.body(Body::from(body.to_string())).unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
-}
+use support::{ALICE, BOB, boot_example, post_command};
 
 #[tokio::test]
 async fn blank_idempotency_key_is_not_a_shared_key() {
-    let harness = boot();
-    let app = server::app(Arc::clone(&harness.rt));
+    let harness = boot_example();
+    let app = harness.app();
 
     // A present-but-empty header must not be treated as a real key. Two unrelated
     // requests carrying an empty key must not collide: the first commits, the second
@@ -108,8 +44,8 @@ async fn blank_idempotency_key_is_not_a_shared_key() {
 
 #[tokio::test]
 async fn whitespace_only_differs_in_the_key_still_dedupes() {
-    let harness = boot();
-    let app = server::app(Arc::clone(&harness.rt));
+    let harness = boot_example();
+    let app = harness.app();
 
     // A retry whose Idempotency-Key picked up surrounding whitespace (proxies do
     // this) must hash to the same tag, so the second request recovers the first's
@@ -132,12 +68,14 @@ async fn whitespace_only_differs_in_the_key_still_dedupes() {
     .await;
     assert_eq!(second, StatusCode::OK, "{second_body:?}");
     assert_eq!(second_body["positions"], first_body["positions"]);
+
+    harness.shutdown();
 }
 
 #[tokio::test]
 async fn openapi_is_served_as_json() {
-    let harness = boot();
-    let app = server::app(Arc::clone(&harness.rt));
+    let harness = boot_example();
+    let app = harness.app();
 
     let request = Request::builder()
         .method(Method::GET)
@@ -161,6 +99,60 @@ async fn openapi_is_served_as_json() {
     assert!(
         doc["paths"]["/commands/register-user"].is_object(),
         "the public command is documented: {doc}"
+    );
+
+    harness.shutdown();
+}
+
+/// POST a raw (possibly non-JSON) body to a command, bypassing the serialization
+/// `post_command` does, so the body contract itself can be exercised.
+async fn post_raw(app: &Router, name: &str, body: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/commands/{name}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn a_non_object_or_malformed_body_is_a_400() {
+    let harness = boot_example();
+    let app = harness.app();
+
+    // A JSON array is well-formed JSON but not a request body. It has to be refused
+    // before dispatch: reaching input allocation would surface as an opaque 500.
+    let (status, body) = post_raw(&app, "register-user", "[1, 2]").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(body["error"]["message"], "body must be a JSON object");
+
+    // Malformed JSON is likewise a client error, with the parse failure explained.
+    let (status, body) = post_raw(&app, "register-user", "{not json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["error"]["code"], "invalid_input");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("body is not valid JSON"),
+        "the 400 explains the parse failure: {message}"
+    );
+
+    // An empty body becomes `{}` (so a command with no fields needs no payload) and
+    // reaches schema validation, which is what reports the missing fields. A 500
+    // here would mean the empty body was handed to dispatch as a non-object.
+    let (status, body) = post_raw(&app, "register-user", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["error"]["code"], "invalid_input");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("missing required field"),
+        "an empty body reaches the input schema: {message}"
     );
 
     harness.shutdown();

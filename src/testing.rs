@@ -7,8 +7,9 @@
 //! `expect`. Seeding goes through the same `build_event` path as a live append, so
 //! a seeded event is byte-identical to one the runtime would write.
 
+use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -21,17 +22,15 @@ use starlark::values::{NoSerialize, StarlarkValue, Value, ValueLike, starlark_va
 use starlark::{starlark_module, starlark_simple_value};
 use tephra::{SegmentConfig, SegmentSet, WriteCoordinator, WriterConfig};
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 use crate::context::CommandContext;
 use crate::crypto::{KeyStore, MasterKeys};
 use crate::dispatch::{self, CommandOutcome, EventDefs, build_event};
-use crate::loader::{CommandUnit, LoadedProject};
+use crate::loader::{CommandUnit, LoadedProject, Severity, rel_to_string, star_files};
 use crate::opdb::OpDb;
 use crate::starlark_builtins::{
     ConstructedEvent, EmittedEvent, InvalidInput, Rejection, events_from_value, runtime_builtins,
 };
-use std::fmt;
 
 /// Throwaway per-case stores stay small, but the segment must still clear the
 /// writer's default max batch size.
@@ -56,7 +55,7 @@ enum Expectation {
 
 /// One `case(...)` scenario.
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
-pub struct TestCase {
+pub(crate) struct TestCase {
     name: Option<String>,
     command: String,
     given: Vec<ConstructedEvent>,
@@ -86,7 +85,7 @@ starlark_simple_value!(TestCase);
 
 /// The `case(...)` builtin exposed to test files.
 #[starlark_module]
-pub fn test_builtins(builder: &mut GlobalsBuilder) {
+pub(crate) fn test_builtins(builder: &mut GlobalsBuilder) {
     /// Declare a scenario. `given` are the prior events (constructed from event
     /// definitions), `input` is the command input dict, and `expect` is an event,
     /// a list of events, `reject(...)` or `invalid_input(...)`.
@@ -162,17 +161,18 @@ pub fn run(dir: &Path) -> ExitCode {
     // Reuse the CLI's collection so `kiln test` reports the same findings, in the
     // same location order, as `kiln check` and `kiln serve`.
     let findings = crate::cli::collect_findings(&project);
-    let load_errors = findings
+    let errors: Vec<_> = findings
         .iter()
-        .filter(|finding| finding.severity == crate::loader::Severity::Error)
-        .count();
-    if load_errors > 0 {
-        for finding in &findings {
-            if finding.severity == crate::loader::Severity::Error {
-                eprintln!("error: {}: {}", finding.location, finding.message);
-            }
+        .filter(|finding| finding.severity == Severity::Error)
+        .collect();
+    if !errors.is_empty() {
+        for finding in &errors {
+            eprintln!("error: {}: {}", finding.location, finding.message);
         }
-        eprintln!("cannot run tests: the project has {load_errors} error(s)");
+        eprintln!(
+            "cannot run tests: the project has {} error(s)",
+            errors.len()
+        );
         return ExitCode::FAILURE;
     }
 
@@ -180,7 +180,19 @@ pub fn run(dir: &Path) -> ExitCode {
     let mut passed = 0usize;
     let mut failed = 0usize;
 
-    for path in test_files(&dir.join("tests")) {
+    let tests_dir = dir.join("tests");
+    let mut walk_findings = Vec::new();
+    let test_paths = if tests_dir.is_dir() {
+        star_files(&tests_dir, &mut walk_findings)
+    } else {
+        Vec::new()
+    };
+    for finding in &walk_findings {
+        eprintln!("error: {}: {}", finding.location, finding.message);
+        failed += 1;
+    }
+
+    for path in test_paths {
         let rel = rel_to_string(dir, &path);
         let src = match fs::read_to_string(&path) {
             Ok(src) => src,
@@ -402,23 +414,4 @@ fn describe_outcome(outcome: &CommandOutcome) -> String {
         CommandOutcome::AlreadyCommitted(_) => "an idempotent replay".to_owned(),
         CommandOutcome::Unavailable { .. } => "the store is unavailable".to_owned(),
     }
-}
-
-fn test_files(dir: &Path) -> Vec<PathBuf> {
-    WalkDir::new(dir)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(walkdir::DirEntry::into_path)
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("star"))
-        .collect()
-}
-
-fn rel_to_string(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
 }

@@ -2,11 +2,12 @@
 //!
 //! One shared SQLite database holding runtime bookkeeping that is not domain
 //! truth and never belongs in the event log: the effect journal and its per-effect
-//! cursor, effect invocations, and deployed-module metadata. Command idempotency is
-//! not here: it lives in the event log itself, guarded by a per-request tag on the
-//! append (see [`crate::dispatch`]). This module owns the schema and its migrations,
-//! and exposes the short, single-statement operations the effect runtime calls under
-//! a shared lock.
+//! cursor, effect invocations, deployed-module metadata, and the per-subject
+//! encryption keys behind field-level erasure. Command idempotency is not here: it
+//! lives in the event log itself, guarded by a per-request tag on the append (see
+//! [`crate::dispatch`]). This module owns the schema and its migrations, and exposes
+//! the short, single-statement operations the effect runtime calls under a shared
+//! lock.
 
 use std::path::Path;
 use std::time::Duration;
@@ -80,8 +81,9 @@ impl OpDb {
         Ok(db)
     }
 
-    /// The connection, for the runtimes that read and write these tables.
-    pub fn connection(&self) -> &Connection {
+    /// The raw connection, for tests that assert directly on the schema.
+    #[cfg(test)]
+    fn connection(&self) -> &Connection {
         &self.conn
     }
 
@@ -247,11 +249,8 @@ impl OpDb {
                 Ok(position as u64)
             })
             .context("querying running invocations")?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.context("reading running invocation position")?);
-        }
-        Ok(out)
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting running invocation positions")
     }
 
     /// Record what is deployed: one row per loaded module, keyed by name and kind.
@@ -277,13 +276,26 @@ impl OpDb {
     /// Delete up to `limit` `terminal` effect invocations completed before
     /// `cutoff`, cascading to their journal rows. Returns the count deleted, so
     /// the sweeper loops until a call clears fewer than `limit`.
+    ///
+    /// A position is only reclaimable once the effect's cursor has passed it. The
+    /// driver completes invocations one position at a time but persists the
+    /// watermark per batch (and not at all when a shutdown interrupts a batch), so
+    /// `terminal` rows routinely sit above the watermark. Those are exactly the rows
+    /// the next boot replays: dropping them makes `begin_invocation` report `Running`
+    /// against an empty journal and every recorded side effect fires a second time.
     pub fn sweep_effect_journal(&self, cutoff: &str, limit: usize) -> anyhow::Result<usize> {
+        // No cursor row means the effect has never persisted a watermark, so
+        // `effect_resume_after` resumes it from 0 and every position replays. The
+        // subquery is NULL there, the comparison is NULL, and nothing is swept for
+        // that effect: intended, and it starts sweeping once a cursor exists.
         let deleted = self
             .conn
             .execute(
                 "DELETE FROM effect_invocation WHERE rowid IN (\
                  SELECT rowid FROM effect_invocation \
-                 WHERE status = 'terminal' AND completed_at < ?1 LIMIT ?2)",
+                 WHERE status = 'terminal' AND completed_at < ?1 \
+                 AND position <= (SELECT watermark FROM effect_cursor \
+                 WHERE effect = effect_invocation.effect) LIMIT ?2)",
                 params![cutoff, limit as i64],
             )
             .context("sweeping effect journal")?;
@@ -434,33 +446,32 @@ impl OpDb {
         Ok(rewrapped)
     }
 
+    /// Bring the schema up to [`SCHEMA_VERSION`], one version per transaction. The
+    /// DDL and the `user_version` bump commit together, so a crash or a failure
+    /// mid-migration leaves the database exactly at the version it was at rather
+    /// than half-migrated and unopenable forever after.
     fn migrate(&mut self) -> anyhow::Result<()> {
         let mut version: i64 = self.schema_version()?;
-        while version < SCHEMA_VERSION {
-            match version {
-                0 => self
-                    .conn
-                    .execute_batch(SCHEMA_V1)
-                    .context("applying schema v1")?,
-                1 => self
-                    .conn
-                    .execute_batch(SCHEMA_V2)
-                    .context("applying schema v2")?,
-                2 => self
-                    .conn
-                    .execute_batch(SCHEMA_V3)
-                    .context("applying schema v3")?,
-                other => anyhow::bail!("no migration from schema version {other}"),
-            }
-            version += 1;
-            self.conn
-                .pragma_update(None, "user_version", version)
-                .context("recording schema version")?;
-        }
         if version > SCHEMA_VERSION {
             anyhow::bail!(
                 "operational database is at schema version {version}, newer than this build ({SCHEMA_VERSION})"
             );
+        }
+        while version < SCHEMA_VERSION {
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .context("beginning a migration transaction")?;
+            match version {
+                0 => tx.execute_batch(SCHEMA_V1).context("applying schema v1")?,
+                1 => tx.execute_batch(SCHEMA_V2).context("applying schema v2")?,
+                2 => tx.execute_batch(SCHEMA_V3).context("applying schema v3")?,
+                other => anyhow::bail!("no migration from schema version {other}"),
+            }
+            version += 1;
+            tx.pragma_update(None, "user_version", version)
+                .context("recording schema version")?;
+            tx.commit().context("committing a migration")?;
         }
         Ok(())
     }
@@ -728,6 +739,9 @@ mod tests {
     #[test]
     fn sweep_removes_only_old_terminal_and_cascades_the_journal() {
         let db = OpDb::open_in_memory().unwrap();
+        // The cursor is past both completed positions, so age and status are the only
+        // things under test here.
+        db.set_effect_watermark("e", 2).unwrap();
         // Old terminal: swept, journal cascades.
         db.begin_invocation("e", 1, "h", "t0").unwrap();
         db.journal_put("e", 1, "abc", 0, "{}", "t0").unwrap();
@@ -754,5 +768,127 @@ mod tests {
             db.begin_invocation("e", 3, "h", "t9").unwrap(),
             InvocationState::Running
         ));
+    }
+
+    /// A mid-batch shutdown (`Progress::Interrupted`) leaves positions that are
+    /// already `terminal` sitting above the effect's persisted watermark: the driver
+    /// only advances the cursor once the whole batch is through. If those rows age
+    /// past the retention window while the process is down, the sweep must leave them
+    /// alone, or the next boot resumes from the watermark, finds no invocation row,
+    /// and re-fires every side effect it already performed.
+    #[test]
+    fn sweep_keeps_terminal_invocations_above_the_effect_watermark() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.set_effect_watermark("e", 0).unwrap();
+        db.begin_invocation("e", 5, "h", "t0").unwrap();
+        db.journal_put("e", 5, "abc", 0, "{}", "t0").unwrap();
+        db.complete_invocation("e", 5, "2020-01-01T00:00:00Z")
+            .unwrap();
+
+        let deleted = db
+            .sweep_effect_journal("2026-06-01T00:00:00Z", SWEEP_CHUNK)
+            .unwrap();
+        assert_eq!(
+            deleted, 0,
+            "a terminal invocation the cursor has not passed is still needed"
+        );
+        assert!(
+            db.journal_get("e", 5, "abc", 0).unwrap().is_some(),
+            "the journal cascaded away under a watermark that never reached it"
+        );
+        assert!(
+            matches!(
+                db.begin_invocation("e", 5, "h", "t9").unwrap(),
+                InvocationState::AlreadyTerminal
+            ),
+            "the position re-runs after the sweep, so its side effects fire twice"
+        );
+    }
+
+    /// One effect's cursor must not license sweeping another's positions, and an
+    /// effect with no cursor row at all resumes from 0, so nothing of its is
+    /// reclaimable until it persists a watermark.
+    #[test]
+    fn sweep_bounds_each_effect_by_its_own_cursor() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.set_effect_watermark("swept", 1).unwrap();
+        for effect in ["swept", "no-cursor"] {
+            db.begin_invocation(effect, 1, "h", "t0").unwrap();
+            db.journal_put(effect, 1, "abc", 0, "{}", "t0").unwrap();
+            db.complete_invocation(effect, 1, "2020-01-01T00:00:00Z")
+                .unwrap();
+        }
+
+        let deleted = db
+            .sweep_effect_journal("2026-06-01T00:00:00Z", SWEEP_CHUNK)
+            .unwrap();
+        assert_eq!(deleted, 1, "only the effect with a cursor past 1 is swept");
+        assert_eq!(db.journal_get("swept", 1, "abc", 0).unwrap(), None);
+        assert!(
+            db.journal_get("no-cursor", 1, "abc", 0).unwrap().is_some(),
+            "an effect that has never persisted a cursor still replays position 1"
+        );
+    }
+
+    #[test]
+    fn sweep_returns_exactly_the_limit_when_more_rows_remain() {
+        let db = OpDb::open_in_memory().unwrap();
+        // The cursor is past every position here, so the chunk boundary is the only
+        // thing under test.
+        db.set_effect_watermark("e", 3).unwrap();
+        for position in 1..=3 {
+            db.begin_invocation("e", position, "h", "t0").unwrap();
+            db.journal_put("e", position, "abc", 0, "{}", "t0").unwrap();
+            db.complete_invocation("e", position, "2020-01-01T00:00:00Z")
+                .unwrap();
+        }
+
+        let first = db.sweep_effect_journal("2026-06-01T00:00:00Z", 2).unwrap();
+        assert_eq!(first, 2, "a full chunk keeps `run_sweep` looping");
+        let second = db.sweep_effect_journal("2026-06-01T00:00:00Z", 2).unwrap();
+        assert_eq!(second, 1, "a short chunk ends `run_sweep`'s loop");
+        let third = db.sweep_effect_journal("2026-06-01T00:00:00Z", 2).unwrap();
+        assert_eq!(third, 0, "nothing is left to reclaim");
+        assert_eq!(
+            db.journal_get("e", 3, "abc", 0).unwrap(),
+            None,
+            "the last chunk cascaded its journal rows too"
+        );
+    }
+
+    /// Drives the real `OpDb::open` (and so `migrate`) rather than SQLite's
+    /// transaction semantics: it fails a migration mid-batch and asserts the DDL and
+    /// the `user_version` bump roll back together. Without the transaction the DDL
+    /// survives and the next open dies on `table already exists`, forever.
+    #[test]
+    fn a_migration_that_fails_partway_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kiln.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+            // Collides with the index v3 creates after its CREATE TABLE, so the batch
+            // fails with one statement already applied.
+            conn.execute_batch("CREATE INDEX subject_key_by_master ON module_metadata (kind);")
+                .unwrap();
+        }
+
+        assert!(OpDb::open(&path).is_err(), "the v3 batch cannot succeed");
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2, "a failed migration does not bump the version");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'subject_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "a failed migration rolls back its applied DDL");
     }
 }

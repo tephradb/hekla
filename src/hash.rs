@@ -1,8 +1,9 @@
 //! Content hashing.
 //!
-//! One helper, used in two places that must agree on a stable digest: a module's
-//! source hash (recorded in `module_metadata` and used as an effect's script
-//! hash) and the content-hash key of an effect's journaled calls.
+//! One helper, shared by every place that needs a stable digest: a module's source
+//! hash (recorded in `module_metadata` and used as an effect's script hash), the
+//! content-hash key of an effect's journaled calls, the material behind an
+//! idempotency tag, a read model's schema hash, and a master key's fingerprint.
 
 use std::fmt::Write as _;
 
@@ -24,7 +25,6 @@ mod tests {
 
     #[test]
     fn matches_a_known_vector() {
-        // The SHA-256 of the empty input.
         assert_eq!(
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

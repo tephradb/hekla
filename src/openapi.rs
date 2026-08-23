@@ -34,7 +34,7 @@ fn command_path(name: &str, schema: &InputSchema) -> Value {
             "operationId": format!("execute_{}", name.replace('-', "_")),
             "summary": format!("execute the `{name}` command"),
             "requestBody": {
-                "required": true,
+                "required": schema.fields.iter().any(|(_, kind)| !kind.is_nullable()),
                 "content": {
                     "application/json": { "schema": input_schema(schema) },
                 },
@@ -99,6 +99,7 @@ fn responses() -> Value {
         "409": { "description": "the consistency boundary kept changing; retry" },
         "422": { "description": "the command rejected the request on state grounds" },
         "500": { "description": "internal error" },
+        "503": { "description": "the store was unavailable; retry" },
     })
 }
 
@@ -150,5 +151,41 @@ mod tests {
             !required.contains(&json!("note")),
             "optional is not required"
         );
+    }
+
+    #[test]
+    fn a_body_is_required_only_when_a_field_is() {
+        let binding = schema();
+        let doc = build(&[("do-thing", &binding)]);
+        assert_eq!(
+            doc["paths"]["/commands/do-thing"]["post"]["requestBody"]["required"],
+            json!(true)
+        );
+
+        let all_optional = InputSchema {
+            fields: vec![(
+                "note".to_owned(),
+                FieldKind::Optional(Box::new(FieldKind::Text { max_length: None })),
+            )],
+        };
+        let doc = build(&[("ping", &all_optional)]);
+        assert_eq!(
+            doc["paths"]["/commands/ping"]["post"]["requestBody"]["required"],
+            json!(false),
+            "an empty body parses as an empty object, so an all-optional command needs none"
+        );
+    }
+
+    #[test]
+    fn documents_every_status_the_command_route_returns() {
+        let binding = schema();
+        let doc = build(&[("do-thing", &binding)]);
+        let responses = &doc["paths"]["/commands/do-thing"]["post"]["responses"];
+        for status in ["200", "400", "409", "422", "500", "503"] {
+            assert!(
+                responses.get(status).is_some(),
+                "the spec omits the {status} response"
+            );
+        }
     }
 }

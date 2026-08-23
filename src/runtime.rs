@@ -27,7 +27,6 @@ use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::config::Config;
 use crate::context::CommandContext;
 use crate::crypto::{KeyStore, MasterKeys};
 use crate::dispatch::{self, CommandOutcome, EventDefs};
@@ -69,7 +68,6 @@ pub struct Runtime {
     /// The effect handles, for `/status` and the skip endpoint. Set once, right
     /// after the effect threads spawn (they need `Arc<Runtime>` first).
     effects: OnceLock<Vec<Arc<EffectShared>>>,
-    event_count: usize,
     /// The OpenAPI document serialized once at startup: the public command set is
     /// fixed for the process lifetime, so `/openapi.json` serves this verbatim.
     openapi_json: String,
@@ -164,7 +162,6 @@ impl Runtime {
                 &now,
             )?;
         }
-        let config: Config = project.config;
 
         let openapi_json = openapi::build(&public_command_schemas(&commands)).to_string();
 
@@ -176,7 +173,6 @@ impl Runtime {
         if let Some(keystore) = &keystore {
             keystore.verify_masters_present()?;
         }
-        let event_count = events.len();
 
         let runtime = Arc::new(Runtime {
             commands,
@@ -187,14 +183,13 @@ impl Runtime {
             started: Instant::now(),
             projectors,
             effects: OnceLock::new(),
-            event_count,
             openapi_json,
         });
 
         // Effects need `Arc<Runtime>` (for `invoke_command` and `read`), so they
         // spawn after the runtime is built; the runtime learns their handles for
         // `/status` here, once.
-        let effect_runtime = effect::start_all(effect_units, &runtime, http, &config)?;
+        let effect_runtime = effect::start_all(effect_units, &runtime, http, &project.config)?;
         let _ = runtime.effects.set(effect_runtime.shared_handles());
 
         Ok((runtime, coordinator, projector_set, effect_runtime))
@@ -217,7 +212,7 @@ impl Runtime {
                 body: error_body(ctx, "not_found", &format!("no public command `{name}`")),
             });
         };
-        self.run_resolved(name, &Arc::clone(command), body, ctx, idem_key)
+        self.run_resolved(name, command, body, ctx, idem_key)
     }
 
     /// Execute a command invoked by an effect. Unlike [`execute`](Runtime::execute)
@@ -238,7 +233,7 @@ impl Runtime {
                 body: error_body(ctx, "not_found", &format!("no command `{name}`")),
             });
         };
-        self.run_resolved(name, &Arc::clone(command), body, ctx, idem_key)
+        self.run_resolved(name, command, body, ctx, idem_key)
     }
 
     /// The shared execution path once a command is resolved. Idempotency lives
@@ -344,20 +339,15 @@ impl Runtime {
     /// position) and, separately, `terminal_skips`/`last_terminal_error` for positions
     /// abandoned to unrecoverable failures (an erased subject a `reveal()` needed).
     pub fn status(&self) -> Value {
-        let (public, internal): (Vec<&str>, Vec<&str>) = self
-            .commands
-            .values()
-            .map(|unit| (unit.loaded.def.name(), unit.internal))
-            .fold((Vec::new(), Vec::new()), |mut acc, (name, internal)| {
-                if internal {
-                    acc.1.push(name);
-                } else {
-                    acc.0.push(name);
-                }
-                acc
-            });
-        let mut public = public;
-        let mut internal = internal;
+        let mut public: Vec<&str> = Vec::new();
+        let mut internal: Vec<&str> = Vec::new();
+        for unit in self.commands.values() {
+            if unit.internal {
+                internal.push(unit.loaded.def.name());
+            } else {
+                public.push(unit.loaded.def.name());
+            }
+        }
         public.sort();
         internal.sort();
 
@@ -372,6 +362,7 @@ impl Runtime {
                     "name": handle.name,
                     "position": position,
                     "lag": head.saturating_sub(position),
+                    "readiness": handle.readiness().label(),
                     "failed": handle.failed(),
                     "last_error": handle.last_error(),
                 })
@@ -406,7 +397,7 @@ impl Runtime {
             "commands": { "public": public, "internal": internal },
             "projectors": projectors,
             "effects": effects,
-            "events": self.event_count,
+            "events": self.events.len(),
         })
     }
 
@@ -560,11 +551,6 @@ impl Runtime {
         Ok(json!({ "items": page.items, "next_cursor": page.next_cursor }))
     }
 
-    /// The public commands and their input schemas, for OpenAPI generation.
-    pub fn public_commands(&self) -> Vec<(&str, &InputSchema)> {
-        public_command_schemas(&self.commands)
-    }
-
     /// The OpenAPI document, serialized once at startup.
     pub fn openapi_json(&self) -> &str {
         &self.openapi_json
@@ -673,7 +659,7 @@ fn success_body(
 
 /// The 200 body for a command whose prior commit was recovered from the log under its
 /// idempotency tag. Uses the original request's identity (from the stored envelope),
-/// so a log-recovered replay is byte-identical to the op-DB-cached one.
+/// so a log-recovered replay is byte-identical to the original response.
 fn recovered_body(recovered: &dispatch::RecoveredOutcome) -> Value {
     let events: Vec<Value> = recovered
         .events
@@ -688,8 +674,8 @@ fn recovered_body(recovered: &dispatch::RecoveredOutcome) -> Value {
     )
 }
 
-/// The shared shape of a committed-command response, so the fresh, log-recovered, and
-/// op-DB-cached paths all return the same body.
+/// The shared shape of a committed-command response, so the fresh and log-recovered
+/// paths return the same body.
 fn committed_body(
     correlation_id: &str,
     causation_id: &str,

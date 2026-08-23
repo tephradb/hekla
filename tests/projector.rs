@@ -2,26 +2,22 @@
 //! must unwrap `.data` in `project_to_head` (not only in the command fold), or a
 //! projector would see the metadata wrapper instead of the payload.
 
-use std::fs;
-use std::path::Path;
-
-use kiln::context::CommandContext;
-use kiln::dispatch::build_event;
-use kiln::loader::LoadedProject;
 use kiln::projector::project_to_head;
 use kiln::read_model::ReadModel;
-use kiln::starlark_builtins::{EmittedEvent, ModuleDef};
+use kiln::starlark_builtins::{EmittedEvent, EntityOpKind, ModuleDef};
 use serde_json::json;
-use tephra::{SegmentConfig, SegmentSet, WriteCoordinator, WriterConfig};
 use uuid::Uuid;
 
-const ALICE: &str = "11111111-1111-1111-1111-111111111111";
+mod support;
+
+use support::{
+    ALICE, Boot, MISSING, UUID_A, UUID_B, UUID_C, ctx, example_dir, load_ok, log_head, open_store,
+    seed_event, write_project,
+};
 
 #[test]
 fn projector_reads_through_the_envelope() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/users");
-    let project = LoadedProject::load(&root);
-    assert!(!project.has_errors(), "{:?}", project.findings);
+    let project = load_ok(&example_dir("users"));
 
     let projector = project
         .projectors
@@ -33,39 +29,28 @@ fn projector_reads_through_the_envelope() {
     };
 
     let store_dir = tempfile::tempdir().unwrap();
-    let set = SegmentSet::open(
-        store_dir.path().join("events"),
-        SegmentConfig::new(16 * 1024 * 1024),
-    )
-    .unwrap();
-    let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default()).unwrap();
+    let (coordinator, store) = open_store(store_dir.path());
 
     // Append a real, envelope-wrapped event through the same seam a command uses.
-    let ctx = CommandContext::new(Uuid::new_v4());
-    let emitted = EmittedEvent {
-        event_type: "user.registered".to_owned(),
-        data: json!({ "user_id": ALICE, "email": "alice@example.com", "name": "Alice" }),
-        tags: vec![
-            ("user_id".to_owned(), Some(ALICE.to_owned())),
-            ("email".to_owned(), Some("alice@example.com".to_owned())),
-        ],
-    };
-    let event = build_event(
-        &emitted,
-        project.events.by_type.get(&emitted.event_type),
-        None,
+    let ctx = ctx();
+    seed_event(
+        &store,
+        &project,
         &ctx,
-        "1970-01-01T00:00:00Z",
-        None,
-    )
-    .unwrap();
-    store.append(vec![event], None).unwrap();
+        EmittedEvent {
+            event_type: "user.registered".to_owned(),
+            data: json!({ "user_id": ALICE, "email": "alice@example.com", "name": "Alice" }),
+            tags: vec![
+                ("user_id".to_owned(), Some(ALICE.to_owned())),
+                ("email".to_owned(), Some("alice@example.com".to_owned())),
+            ],
+        },
+    );
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("users.db"), entities).unwrap();
     let seen = project_to_head(&store, &projector.loaded, &model, &project.events.by_type).unwrap();
     assert_eq!(seen, 1);
-    // The checkpoint advanced to the appended event.
     assert_eq!(model.read_checkpoint().unwrap().get(), 1);
 
     let entity = entities
@@ -81,32 +66,23 @@ fn projector_reads_through_the_envelope() {
     coordinator.shutdown();
 }
 
-fn write_file(root: &Path, rel: &str, contents: &str) {
-    let path = root.join(rel);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, contents).unwrap();
-}
+const THING_EVENTS: &str = r#"
+happened = event(
+    type = "thing.happened",
+    fields = {"id": uuid()},
+)
+"#;
 
 #[test]
 fn get_reads_through_uncommitted_writes_in_a_batch() {
     // A projector that keeps a running count with get()+put(): the second event in
     // a batch must observe the first event's still-uncommitted write, or the total
     // would land at 1 instead of 2.
-    let dir = tempfile::tempdir().unwrap();
-    write_file(
-        dir.path(),
-        "events/thing.star",
-        r#"
-happened = event(
-    type = "thing.happened",
-    fields = {"id": uuid()},
-)
-"#,
-    );
-    write_file(
-        dir.path(),
-        "projectors/counter.star",
-        r#"
+    let dir = write_project(&[
+        ("events/thing.star", THING_EVENTS),
+        (
+            "projectors/counter.star",
+            r#"
 load("events/thing.star", "happened")
 
 totals = entity(key = "id", fields = {"id": text(), "count": i64_()})
@@ -118,41 +94,31 @@ def handle(event):
     count = (row["count"] if row else 0) + 1
     return [put(totals, {"id": "all", "count": count})]
 "#,
-    );
+        ),
+    ]);
 
-    let project = LoadedProject::load(dir.path());
-    assert!(!project.has_errors(), "{:?}", project.findings);
+    let project = load_ok(dir.path());
     let projector = &project.projectors[0];
     let ModuleDef::Projector { entities, .. } = &projector.loaded.def else {
         panic!("expected a projector");
     };
 
     let store_dir = tempfile::tempdir().unwrap();
-    let set = SegmentSet::open(
-        store_dir.path().join("events"),
-        SegmentConfig::new(16 * 1024 * 1024),
-    )
-    .unwrap();
-    let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default()).unwrap();
+    let (coordinator, store) = open_store(store_dir.path());
 
-    let ctx = CommandContext::new(Uuid::new_v4());
+    let ctx = ctx();
     for _ in 0..2 {
         let id = Uuid::new_v4().to_string();
-        let emitted = EmittedEvent {
-            event_type: "thing.happened".to_owned(),
-            data: json!({ "id": id }),
-            tags: vec![("id".to_owned(), Some(id.clone()))],
-        };
-        let event = build_event(
-            &emitted,
-            project.events.by_type.get(&emitted.event_type),
-            None,
+        seed_event(
+            &store,
+            &project,
             &ctx,
-            "1970-01-01T00:00:00Z",
-            None,
-        )
-        .unwrap();
-        store.append(vec![event], None).unwrap();
+            EmittedEvent {
+                event_type: "thing.happened".to_owned(),
+                data: json!({ "id": id }),
+                tags: vec![("id".to_owned(), Some(id.clone()))],
+            },
+        );
     }
 
     let model_dir = tempfile::tempdir().unwrap();
@@ -164,4 +130,352 @@ def handle(event):
     let row = model.get(entity, "all").unwrap().unwrap();
     assert_eq!(row["count"].as_i64(), Some(2));
     coordinator.shutdown();
+}
+
+#[test]
+fn a_failed_op_names_the_entity_it_was_applying() {
+    // A read model whose table predates a new entity field: the INSERT names a column
+    // the table does not have. The failure reaches /status verbatim, so it has to say
+    // which entity was being written, not just the bare SQLite message.
+    let dir = write_project(&[
+        ("events/thing.star", THING_EVENTS),
+        (
+            "projectors/things.star",
+            r#"
+load("events/thing.star", "happened")
+
+rows = entity(key = "id", fields = {"id": text(), "label": text()})
+
+source = [happened()]
+
+def handle(event):
+    return [put(rows, {"id": event.data["id"], "label": "x"})]
+"#,
+        ),
+    ]);
+
+    let project = load_ok(dir.path());
+    let projector = &project.projectors[0];
+    let ModuleDef::Projector { entities, .. } = &projector.loaded.def else {
+        panic!("expected a projector");
+    };
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let (coordinator, store) = open_store(store_dir.path());
+
+    let ctx = ctx();
+    let id = Uuid::new_v4().to_string();
+    seed_event(
+        &store,
+        &project,
+        &ctx,
+        EmittedEvent {
+            event_type: "thing.happened".to_owned(),
+            data: json!({ "id": id }),
+            tags: vec![("id".to_owned(), Some(id.clone()))],
+        },
+    );
+
+    // Open the read model at the old shape, before `label` was declared.
+    let mut stale = entities[0].clone();
+    stale.fields.retain(|(name, _)| name != "label");
+    let model_dir = tempfile::tempdir().unwrap();
+    let model = ReadModel::open(&model_dir.path().join("things.db"), &[stale]).unwrap();
+
+    let err = project_to_head(&store, &projector.loaded, &model, &project.events.by_type)
+        .expect_err("the insert names a column the stale table does not have");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("applying an op to entity `rows`"),
+        "{rendered}"
+    );
+    coordinator.shutdown();
+}
+
+const BIG_EVENTS: &str = r#"
+counted = event(
+    type = "big.counted",
+    fields = {"id": uuid(), "n": u64_()},
+)
+"#;
+
+const BIG_PROJECTOR: &str = r#"
+load("events/big.star", "counted")
+
+nums = entity(key = "id", fields = {"id": uuid(), "n": u64_()})
+
+source = [counted()]
+
+def handle(event):
+    return [put(nums, {"id": event.data["id"], "n": event.data["n"]})]
+"#;
+
+/// Project one `big.counted` carrying `n` and read the stored value back.
+fn project_one_u64(n: u64) -> serde_json::Value {
+    let dir = write_project(&[
+        ("events/big.star", BIG_EVENTS),
+        ("projectors/big.star", BIG_PROJECTOR),
+    ]);
+    let project = load_ok(dir.path());
+    let projector = &project.projectors[0];
+    let ModuleDef::Projector { entities, .. } = &projector.loaded.def else {
+        panic!("expected a projector");
+    };
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let (coordinator, store) = open_store(store_dir.path());
+    let ctx = ctx();
+    seed_event(
+        &store,
+        &project,
+        &ctx,
+        EmittedEvent {
+            event_type: "big.counted".to_owned(),
+            data: json!({ "id": UUID_A, "n": n }),
+            tags: vec![("id".to_owned(), Some(UUID_A.to_owned()))],
+        },
+    );
+
+    let model_dir = tempfile::tempdir().unwrap();
+    let model = ReadModel::open(&model_dir.path().join("big.db"), entities).unwrap();
+    let seen = project_to_head(&store, &projector.loaded, &model, &project.events.by_type).unwrap();
+    assert_eq!(seen, 1);
+    let entity = entities.iter().find(|e| e.name == "nums").unwrap();
+    let read_back = model.get(entity, UUID_A).unwrap().expect("the row landed");
+    coordinator.shutdown();
+    read_back
+}
+
+#[test]
+fn a_u64_field_at_exactly_i64_max_round_trips_through_the_read_model() {
+    // `i64::MAX` is the top of the storable range for either integer kind, since both
+    // land in a signed SQLite INTEGER. Nothing above it ever reaches a projector: the
+    // write boundary refuses it, which the command test below pins.
+    let row = project_one_u64(i64::MAX as u64);
+    assert_eq!(row["n"].as_u64(), Some(i64::MAX as u64));
+}
+
+const BIG_COMMAND: &str = r#"
+load("events/big.star", "counted")
+
+input = schema(id = uuid(), n = u64_())
+
+def handle(input, state):
+    return counted(id = input.id, n = input.n)
+"#;
+
+#[test]
+fn a_u64_above_i64_max_is_refused_at_the_command_boundary() {
+    // The other end of that range, end to end: a u64 a signed INTEGER cannot hold is
+    // invalid input, refused before any append, rather than a value that reaches
+    // `to_sql` and wedges the projector thread on every replay.
+    let dir = write_project(&[
+        ("events/big.star", BIG_EVENTS),
+        ("commands/count.star", BIG_COMMAND),
+        ("projectors/big.star", BIG_PROJECTOR),
+    ]);
+    let harness = Boot::new(dir.path()).start();
+
+    let result = harness
+        .rt
+        .execute(
+            "count",
+            json!({ "id": UUID_A, "n": u64::MAX }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(result.status, 400, "{:?}", result.body);
+    assert_eq!(result.body["error"]["code"], "invalid_input");
+    let message = result.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("`n`"),
+        "the error names the field: {message}"
+    );
+    assert!(
+        message.contains(&i64::MAX.to_string()),
+        "the error names the storable ceiling: {message}"
+    );
+    assert_eq!(
+        log_head(&harness.rt),
+        0,
+        "invalid input must not reach the log"
+    );
+
+    harness.shutdown();
+}
+
+const LIFECYCLE_EVENTS: &str = r#"
+added = event(type = "thing.added", fields = {"id": uuid()})
+removed = event(type = "thing.removed", fields = {"id": uuid()})
+"#;
+
+const LIFECYCLE_PROJECTOR: &str = r#"
+load("events/thing.star", "added", "removed")
+
+things = entity(key = "id", fields = {"id": uuid()})
+
+source = [added(), removed()]
+
+def handle(event):
+    if event.type == "thing.added":
+        return [put(things, {"id": event.data["id"]})]
+    return [delete(things, event.data["id"])]
+"#;
+
+#[test]
+fn a_delete_op_removes_the_row_and_is_a_no_op_for_a_missing_key() {
+    let dir = write_project(&[
+        ("events/thing.star", LIFECYCLE_EVENTS),
+        ("projectors/things.star", LIFECYCLE_PROJECTOR),
+    ]);
+    let project = load_ok(dir.path());
+    let projector = &project.projectors[0];
+    let ModuleDef::Projector { entities, .. } = &projector.loaded.def else {
+        panic!("expected a projector");
+    };
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let (coordinator, store) = open_store(store_dir.path());
+    let ctx = ctx();
+    // C is removed without ever having been added: the delete must find no row and
+    // stay silent rather than erroring and wedging the batch.
+    for (event_type, id) in [
+        ("thing.added", UUID_A),
+        ("thing.added", UUID_B),
+        ("thing.removed", UUID_A),
+        ("thing.removed", UUID_C),
+    ] {
+        seed_event(
+            &store,
+            &project,
+            &ctx,
+            EmittedEvent {
+                event_type: event_type.to_owned(),
+                data: json!({ "id": id }),
+                tags: vec![("id".to_owned(), Some(id.to_owned()))],
+            },
+        );
+    }
+
+    let model_dir = tempfile::tempdir().unwrap();
+    let model = ReadModel::open(&model_dir.path().join("things.db"), entities).unwrap();
+    let seen = project_to_head(&store, &projector.loaded, &model, &project.events.by_type).unwrap();
+    assert_eq!(seen, 4);
+
+    let entity = entities.iter().find(|e| e.name == "things").unwrap();
+    assert!(
+        model.get(entity, UUID_A).unwrap().is_none(),
+        "the deleted row is gone"
+    );
+    assert!(
+        model.get(entity, UUID_B).unwrap().is_some(),
+        "an untouched row survives its sibling's delete"
+    );
+    assert_eq!(model.rows(entity).unwrap().len(), 1);
+    coordinator.shutdown();
+}
+
+const RENAME_EVENTS: &str = r#"
+registered = event(type = "u.registered", fields = {"id": uuid(), "name": text()})
+renamed = event(type = "u.renamed", fields = {"id": uuid(), "name": text()})
+"#;
+
+const RENAME_PROJECTOR: &str = r#"
+load("events/u.star", "registered", "renamed")
+
+people = entity(key = "id", fields = {"id": uuid(), "name": text()})
+
+source = [registered(), renamed()]
+
+def handle(event):
+    if event.type == "u.registered":
+        return [put(people, {"id": event.data["id"], "name": event.data["name"]})]
+    return [patch(people, event.data["id"], {"name": event.data["name"]})]
+"#;
+
+#[test]
+fn a_patch_for_a_missing_row_is_a_silent_no_op() {
+    let dir = write_project(&[
+        ("events/u.star", RENAME_EVENTS),
+        ("projectors/people.star", RENAME_PROJECTOR),
+    ]);
+    let project = load_ok(dir.path());
+    let projector = &project.projectors[0];
+    let ModuleDef::Projector { entities, .. } = &projector.loaded.def else {
+        panic!("expected a projector");
+    };
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let (coordinator, store) = open_store(store_dir.path());
+    let ctx = ctx();
+    // The rename for MISSING arrives with no row behind it, exactly as it would for
+    // a projector whose source set grew to include renames it never saw registers for.
+    for (event_type, id, name) in [
+        ("u.renamed", MISSING, "Ghost"),
+        ("u.registered", ALICE, "Alice"),
+        ("u.renamed", ALICE, "Alicia"),
+    ] {
+        seed_event(
+            &store,
+            &project,
+            &ctx,
+            EmittedEvent {
+                event_type: event_type.to_owned(),
+                data: json!({ "id": id, "name": name }),
+                tags: vec![("id".to_owned(), Some(id.to_owned()))],
+            },
+        );
+    }
+
+    let model_dir = tempfile::tempdir().unwrap();
+    let model = ReadModel::open(&model_dir.path().join("people.db"), entities).unwrap();
+    let seen = project_to_head(&store, &projector.loaded, &model, &project.events.by_type).unwrap();
+    assert_eq!(seen, 3);
+
+    let entity = entities.iter().find(|e| e.name == "people").unwrap();
+    assert!(
+        model.get(entity, MISSING).unwrap().is_none(),
+        "a patch must never fabricate the row it missed"
+    );
+    assert_eq!(model.rows(entity).unwrap().len(), 1);
+    assert_eq!(model.get(entity, ALICE).unwrap().unwrap()["name"], "Alicia");
+    coordinator.shutdown();
+}
+
+#[test]
+fn a_patch_with_no_declared_columns_leaves_the_row_untouched() {
+    // The `assignments.is_empty()` early return in `apply_one`: a patch whose changes
+    // name nothing the entity declares must be a no-op, not an `UPDATE ... SET`
+    // with an empty assignment list (a SQL syntax error that would wedge the batch).
+    let dir = write_project(&[
+        ("events/u.star", RENAME_EVENTS),
+        ("projectors/people.star", RENAME_PROJECTOR),
+    ]);
+    let project = load_ok(dir.path());
+    let ModuleDef::Projector { entities, .. } = &project.projectors[0].loaded.def else {
+        panic!("expected a projector");
+    };
+    let entity = entities.iter().find(|e| e.name == "people").unwrap();
+
+    let model_dir = tempfile::tempdir().unwrap();
+    let model = ReadModel::open(&model_dir.path().join("people.db"), entities).unwrap();
+    model
+        .apply_one(
+            entity,
+            EntityOpKind::Put(json!({ "id": ALICE, "name": "Alice" }).to_string()),
+        )
+        .unwrap();
+    model
+        .apply_one(
+            entity,
+            EntityOpKind::Patch {
+                key: ALICE.to_owned(),
+                changes: "{}".to_owned(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(model.get(entity, ALICE).unwrap().unwrap()["name"], "Alice");
 }

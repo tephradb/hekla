@@ -16,7 +16,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
 
 use crate::crypto::{KeyStore, RowDecryptor};
-use crate::read_model::ReadModel;
+use crate::read_model::{ReadModel, coerce_value};
 use crate::starlark_builtins::{EntityDef, FieldKind, scalar_to_string};
 
 /// Default page size for a scan when the request does not set `limit`.
@@ -63,13 +63,13 @@ pub fn is_filterable(entity: &EntityDef, field: &str) -> bool {
 /// so it is a declared field; an unknown field is left for that check to reject.
 pub fn check_filter(entity: &EntityDef, field: &str, value: &str) -> anyhow::Result<()> {
     match entity.fields.iter().find(|(name, _)| name == field) {
-        Some((_, meta)) => crate::read_model::coerce_value(&meta.kind, value).map(|_| ()),
+        Some((_, meta)) => coerce_value(&meta.kind, value).map(|_| ()),
         None => Ok(()),
     }
 }
 
 /// Encode a row key as an opaque forward cursor.
-pub fn encode_cursor(key: &str) -> String {
+fn encode_cursor(key: &str) -> String {
     URL_SAFE_NO_PAD.encode(key.as_bytes())
 }
 
@@ -124,12 +124,6 @@ fn decrypt_row(
             continue; // absent / null column
         };
         let plaintext = match obj.get(subject_field).and_then(scalar_to_string) {
-            // `decrypt` returns `Ok(None)` when the value is unreadable under the current
-            // key (the key is gone, or the ciphertext will not decrypt under it: a stale
-            // row under a superseded key, or a tampered ciphertext, which are
-            // indistinguishable); that column reads as absent, the erasure guarantee.
-            // Only a key that cannot be obtained at all (a wrong or rotated-away master)
-            // returns `Err` and must surface, not silently blank every column.
             Some(subject_value) => decryptor
                 .decrypt(subject_field, &subject_value, name, &ciphertext)
                 .with_context(|| format!("decrypting column `{name}`"))?,
