@@ -614,6 +614,57 @@ def handle(input, state):
 }
 
 #[test]
+fn a_command_may_not_redeclare_a_type_events_already_declares() {
+    // Not an alias: a second `event(...)` under a name the registry already holds.
+    // Only the `events/` definition is registered, so this one's fields are never
+    // checked and never encrypted, yet the type name makes it look declared. It is
+    // refused here rather than at the first append.
+    assert_error(
+        &[
+            (
+                "events/thing.star",
+                r#"thing_done = event(type = "thing.done", fields = {"thing_id": uuid()})"#,
+            ),
+            (
+                "commands/do-thing.star",
+                r#"
+thing_done = event(type = "thing.done", fields = {"thing_id": uuid(), "note": text()})
+
+input = schema(thing_id = uuid())
+
+def handle(input, state):
+    return thing_done(thing_id = input.thing_id, note = "x")
+"#,
+            ),
+        ],
+        "redeclared in a command",
+    );
+}
+
+/// Two `events/` modules that both re-export one definition describe one event, so
+/// the second must not be reported as a collision with the first.
+#[test]
+fn one_definition_re_exported_by_two_event_modules_is_not_a_duplicate() {
+    let dir = write_project(&[
+        (
+            "events/thing.star",
+            r#"thing_done = event(type = "thing.done", fields = {"thing_id": uuid()})"#,
+        ),
+        (
+            "events/reexport.star",
+            r#"
+load("events/thing.star", "thing_done")
+
+ThingDone = thing_done
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    assert!(errors(&project).is_empty(), "{:?}", project.findings);
+    assert!(project.events.by_type.contains_key("thing.done"));
+}
+
+#[test]
 fn a_lib_module_may_re_export_an_event_it_loads() {
     // A `lib/` file that `load()`s an event re-exports the symbol. That is a
     // reference to the one definition in `events/`, not a second definition.

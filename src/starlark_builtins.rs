@@ -34,7 +34,7 @@ use starlark::values::{
 use starlark::{starlark_module, starlark_simple_value};
 
 use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx, QueryCtx};
-use crate::dispatch::RESERVED_TAG_PREFIX;
+use crate::dispatch::{EventDefs, RESERVED_TAG_PREFIX};
 use crate::read_api::RESERVED_QUERY_PARAMS;
 use crate::read_model::quote_ident;
 
@@ -328,6 +328,17 @@ fn next_entity_id() -> u64 {
     ENTITY_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Process-unique handles for event definitions. Every `event(...)` call mints a
+/// fresh one and the registry keeps the id of the definition it registered, so the
+/// host can tell a declared definition from one a handler built at runtime under the
+/// same type name. Cloning preserves it, so loading a definition, re-binding it under
+/// a second name, and registering it all yield the same id.
+static EVENT_DEF_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_event_def_id() -> u64 {
+    EVENT_DEF_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct EntityDef {
     pub id: u64,
@@ -508,6 +519,9 @@ impl EntityDef {
 
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct EventDef {
+    /// This definition's identity, from [`next_event_def_id`]. Tells the registered
+    /// definition apart from a same-named one built inside a function body.
+    pub id: u64,
     pub event_type: String,
     /// Every field, with its per-field tagging and encryption policy. Under
     /// automatic tagging each `indexed` field becomes a store tag; there is no
@@ -592,6 +606,7 @@ impl<'v> StarlarkValue<'v> for EventDef {
         validate_event_payload(&self.event_type, &self.fields, &payload)?;
         let tags = derive_tags(&self.event_type, &self.fields, &payload)?;
         Ok(heap.alloc(ConstructedEvent {
+            def_id: self.id,
             event_type: self.event_type.clone(),
             data_json: serde_json::Value::Object(payload).to_string(),
             tags,
@@ -609,6 +624,9 @@ starlark_simple_value!(EventDef);
 /// already derived, so the dispatch layer appends it without re-validating.
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct ConstructedEvent {
+    /// The [`EventDef::id`] of the definition that built this event, checked against
+    /// the registry before it is emitted.
+    pub def_id: u64,
     pub event_type: String,
     pub data_json: String,
     pub tags: Vec<(String, Option<String>)>,
@@ -1057,6 +1075,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         }
         validate_subject_refs(&format!("event `{}`", r#type), &field_defs)?;
         Ok(EventDef {
+            id: next_event_def_id(),
             event_type: r#type,
             fields: field_defs,
         })
@@ -1948,19 +1967,46 @@ pub fn events_from_value(value: Value<'_>) -> anyhow::Result<Option<Vec<Construc
     Ok(Some(collected))
 }
 
+/// Check that `event` came from the definition the project registered for its type,
+/// and not from a second `event(...)` built under the same name.
+///
+/// A definition constructed inside a function body never reaches the loader, so it
+/// carries whatever schema the handler chose: fields the declared event does not
+/// have (stored verbatim, and so never encrypted or erasable), a different set of
+/// indexed fields, or forged store tags. The registry's definition is the one the
+/// deploy-time checks ran against, so only events built from it may be emitted.
+pub fn check_registered_definition(
+    event: &ConstructedEvent,
+    events: &EventDefs,
+) -> anyhow::Result<()> {
+    match events.get(&event.event_type) {
+        Some(def) if def.id == event.def_id => Ok(()),
+        Some(_) => anyhow::bail!(
+            "event `{}` was built from a definition declared outside events/; load() the declared definition instead of calling event(type = \"{}\", ...) again",
+            event.event_type,
+            event.event_type
+        ),
+        None => anyhow::bail!(
+            "event type `{}` is not declared in events/; define it there and load() it, so its schema (and any `subject` encryption) is applied",
+            event.event_type
+        ),
+    }
+}
+
 /// Interpret the value `handle` returned: `reject(...)`, `invalid_input(...)`, or
 /// the event(s) it returned, lowered to plain data for the store.
-pub fn parse_handle_result(val: Value<'_>) -> anyhow::Result<HandleOutcome> {
+pub fn parse_handle_result(val: Value<'_>, events: &EventDefs) -> anyhow::Result<HandleOutcome> {
     if let Some(rejection) = val.downcast_ref::<Rejection>() {
         return Ok(HandleOutcome::Reject(rejection.clone()));
     }
     if let Some(invalid) = val.downcast_ref::<InvalidInput>() {
         return Ok(HandleOutcome::InvalidInput(invalid.clone()));
     }
-    if let Some(events) = events_from_value(val)? {
-        let lowered = events
+    if let Some(constructed) = events_from_value(val)? {
+        let lowered = constructed
             .iter()
             .map(|event| {
+                check_registered_definition(event, events)?;
                 Ok(EmittedEvent {
                     event_type: event.event_type.clone(),
                     data: serde_json::from_str(&event.data_json)
@@ -2604,19 +2650,113 @@ def bad_patch():
         });
     }
 
+    /// The registry a project would hold for the event definitions a module declares
+    /// at top level, mirroring what `events/` modules feed the loader.
+    fn registry(frozen: &FrozenModule) -> EventDefs {
+        let names: Vec<String> = frozen
+            .names()
+            .filter_map(|name| name.to_value().unpack_str().map(str::to_owned))
+            .collect();
+        let mut defs = EventDefs::new();
+        for name in names {
+            let Ok(Some(owned)) = frozen.get_option(&name) else {
+                continue;
+            };
+            if let Some(def) = owned.value().downcast_ref::<EventDef>() {
+                defs.insert(def.event_type.clone(), def.clone());
+            }
+        }
+        defs
+    }
+
     #[test]
     fn a_malformed_event_payload_is_an_error_not_a_null() {
+        let def = EventDef {
+            id: next_event_def_id(),
+            event_type: "t.broken".to_owned(),
+            fields: Vec::new(),
+        };
+        let events = EventDefs::from([(def.event_type.clone(), def.clone())]);
         Module::with_temp_heap(|module| {
             let value = module.heap().alloc(ConstructedEvent {
+                def_id: def.id,
                 event_type: "t.broken".to_owned(),
                 data_json: "{not json".to_owned(),
                 tags: Vec::new(),
             });
-            let err = match parse_handle_result(value) {
+            let err = match parse_handle_result(value, &events) {
                 Ok(_) => panic!("a malformed payload must not be lowered to a null"),
                 Err(err) => err,
             };
             assert!(err.to_string().contains("t.broken"), "{err}");
+        });
+    }
+
+    /// A handler that builds its own `event(...)` under a declared type name would
+    /// otherwise be lowered against the registry's schema, so any field the real
+    /// definition does not declare rides into the log verbatim: never validated,
+    /// never encrypted, never erasable.
+    #[test]
+    fn a_definition_built_inside_a_handler_cannot_be_emitted() {
+        let src = r#"
+ev = event(type = "t.happened", fields = {"id": uuid()})
+
+def shadow(input, state):
+    forged = event(type = "t.happened", fields = {"id": uuid(), "secret": text()})
+    return forged(id = "u1", secret = "alice@example.com")
+
+def unknown(input, state):
+    forged = event(type = "t.undeclared", fields = {"id": uuid()})
+    return forged(id = "u1")
+"#;
+        let ast = parse_module("t.star", src.to_owned()).unwrap();
+        let frozen = eval_frozen(ast, &command_globals(), None, false).unwrap();
+        let events = registry(&frozen);
+        Module::with_temp_heap(|module| {
+            let emit = |name: &str| {
+                let func = frozen.get_option(name).unwrap().unwrap();
+                let arg = module.heap().alloc(serde_json::Value::Null);
+                let value =
+                    call_handler(&module, thaw(&func, &module), &[arg, arg], 1_000_000).unwrap();
+                parse_handle_result(value, &events)
+            };
+
+            let Err(err) = emit("shadow") else {
+                panic!("a redeclared definition must not be emitted");
+            };
+            assert!(
+                err.to_string().contains("declared outside events/"),
+                "{err}"
+            );
+
+            let Err(err) = emit("unknown") else {
+                panic!("an undeclared type must not be emitted");
+            };
+            assert!(err.to_string().contains("not declared in events/"), "{err}");
+        });
+    }
+
+    /// The identity check must not catch a definition merely referred to by a second
+    /// name: that is the same definition, and rejecting it would be a false positive.
+    #[test]
+    fn a_definition_referred_to_by_a_second_name_still_emits() {
+        let src = r#"
+ev = event(type = "t.happened", fields = {"id": uuid()})
+alias = ev
+
+def handle(input, state):
+    return alias(id = "u1")
+"#;
+        let ast = parse_module("t.star", src.to_owned()).unwrap();
+        let frozen = eval_frozen(ast, &command_globals(), None, false).unwrap();
+        let events = registry(&frozen);
+        Module::with_temp_heap(|module| {
+            let func = frozen.get_option("handle").unwrap().unwrap();
+            let arg = module.heap().alloc(serde_json::Value::Null);
+            let value =
+                call_handler(&module, thaw(&func, &module), &[arg, arg], 1_000_000).unwrap();
+            let outcome = parse_handle_result(value, &events).unwrap();
+            assert!(matches!(outcome, HandleOutcome::Emit(events) if events.len() == 1));
         });
     }
 
@@ -2668,6 +2808,7 @@ def bad(input, state):
 "#;
         let ast = parse_module("t.star", src.to_owned()).unwrap();
         let frozen = eval_frozen(ast, &command_globals(), None, false).unwrap();
+        let defs = registry(&frozen);
         Module::with_temp_heap(|module| {
             let call = |name: &str| {
                 let func = frozen.get_option(name).unwrap().unwrap();
@@ -2675,16 +2816,16 @@ def bad(input, state):
                 call_handler(&module, thaw(&func, &module), &[arg, arg], 1_000_000)
             };
 
-            let one = parse_handle_result(call("one").unwrap()).unwrap();
+            let one = parse_handle_result(call("one").unwrap(), &defs).unwrap();
             assert!(matches!(one, HandleOutcome::Emit(events) if events.len() == 1));
 
-            let many = parse_handle_result(call("many").unwrap()).unwrap();
+            let many = parse_handle_result(call("many").unwrap(), &defs).unwrap();
             assert!(matches!(many, HandleOutcome::Emit(events) if events.len() == 2));
 
-            let nothing = parse_handle_result(call("nothing").unwrap()).unwrap();
+            let nothing = parse_handle_result(call("nothing").unwrap(), &defs).unwrap();
             assert!(matches!(nothing, HandleOutcome::Emit(events) if events.is_empty()));
 
-            let err = match parse_handle_result(call("bad").unwrap()) {
+            let err = match parse_handle_result(call("bad").unwrap(), &defs) {
                 Ok(_) => panic!("expected an error for a non-event return"),
                 Err(err) => err,
             };

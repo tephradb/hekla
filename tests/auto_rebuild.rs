@@ -4,9 +4,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use axum::http::{Method, StatusCode};
 use kiln::projector::Readiness;
 use kiln::read_model::ReadModel;
 use kiln::runtime::Runtime;
@@ -16,7 +18,7 @@ use uuid::Uuid;
 
 mod support;
 
-use support::{Boot, Harness, ctx};
+use support::{Boot, Harness, ctx, get, send, wait_until};
 
 const EVENTS: &str = r#"
 one = event(type = "e.one", fields = {"id": uuid()})
@@ -159,6 +161,15 @@ fn recorded_definition(data_dir: &Path) -> Option<String> {
         .unwrap()
         .read_definition()
         .unwrap()
+}
+
+/// Put a directory where the rebuild's scratch database must go. `rebuild` clears any
+/// leftover `*.rebuild.db` first, and removing a file fails on a directory, so the
+/// rebuild stops at its first step with the live model untouched.
+fn block_rebuild(data_dir: &Path) -> PathBuf {
+    let blocker = db_path(data_dir).with_extension("rebuild.db");
+    fs::create_dir_all(&blocker).unwrap();
+    blocker
 }
 
 /// Why the projector is not advancing, for an assertion message.
@@ -400,5 +411,78 @@ fn shutdown_drains_pending_events_to_head() {
         "each event is counted once across the restart: {}",
         diagnosis(&b.rt)
     );
+    b.shutdown();
+}
+
+/// A rebuild that fails leaves the read model at the shape it had, so it cannot be
+/// served or advanced. What it must not do is take the projector's thread down with
+/// it: that made `POST /replay` a promise nothing would keep, and left the read API
+/// answering `rebuilding` (retry, this resolves itself) forever. It idles instead,
+/// says why, and a replay recovers it in place.
+#[tokio::test]
+async fn a_failed_rebuild_idles_and_a_replay_recovers_it() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    write_project(project.path(), "[one()]");
+    let a = boot(project.path(), data.path());
+    for _ in 0..2 {
+        emit(&a.rt, "emit-one");
+        emit(&a.rt, "emit-two");
+    }
+    assert!(wait_count(&a.rt, 2));
+    a.shutdown();
+
+    // Deploy B changes the source set, so boot plans a rebuild; the blocker fails it.
+    let blocker = block_rebuild(data.path());
+    write_project(project.path(), "[one(), two()]");
+    let b = boot(project.path(), data.path());
+    let shared = Arc::clone(b.rt.projector("counter").unwrap());
+    wait_until("the rebuild to fail", || {
+        shared.readiness() == Readiness::Failed
+    });
+
+    assert!(
+        shared.running(),
+        "a failed rebuild must not stop the thread"
+    );
+    assert!(shared.failed());
+    assert!(shared.last_error().is_some(), "the failure names its cause");
+
+    // The model is still the old shape, so it must not take batches built at the new
+    // one, and it must not be served as though it could.
+    emit(&b.rt, "emit-two");
+    assert!(
+        !wait_count(&b.rt, 3),
+        "a projector that failed to rebuild must not apply batches: {}",
+        diagnosis(&b.rt)
+    );
+    assert!(wait_count(&b.rt, 2), "the old model is left as it was");
+
+    let app = b.app();
+    let (status, body) = get(&app, "/read/counter/totals/all").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "rebuild_failed");
+
+    // Clear the cause and retry: no restart, and the failure clears with it.
+    fs::remove_dir_all(&blocker).unwrap();
+    let (status, _) = send(&app, Method::POST, "/projectors/counter/replay").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    wait_until("the replay to rebuild the model", || {
+        shared.readiness() == Readiness::Ready
+    });
+    assert!(!shared.failed(), "recovering clears the recorded failure");
+    assert!(shared.last_error().is_none());
+
+    // Five events match the new source set: four from deploy A and the one above.
+    assert!(
+        wait_count(&b.rt, 5),
+        "the rebuild reprocesses every matching event: {}",
+        diagnosis(&b.rt)
+    );
+    let (status, body) = get(&app, "/read/counter/totals/all").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["item"]["n"].as_i64(), Some(5));
+
     b.shutdown();
 }

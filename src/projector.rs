@@ -58,6 +58,10 @@ pub enum Readiness {
     /// The definition changed and auto-rebuild is off, so nothing will resolve it
     /// but an operator-triggered replay.
     Stale,
+    /// A rebuild was attempted and failed, leaving the model at the shape it had.
+    /// Like [`Readiness::Stale`] it needs an operator, but the cause is an error
+    /// rather than a setting, so [`ProjectorShared::last_error`] names it.
+    Failed,
 }
 
 impl Readiness {
@@ -65,6 +69,7 @@ impl Readiness {
         match raw {
             1 => Readiness::Rebuilding,
             2 => Readiness::Stale,
+            3 => Readiness::Failed,
             _ => Readiness::Ready,
         }
     }
@@ -74,6 +79,7 @@ impl Readiness {
             Readiness::Ready => 0,
             Readiness::Rebuilding => 1,
             Readiness::Stale => 2,
+            Readiness::Failed => 3,
         }
     }
 
@@ -83,7 +89,15 @@ impl Readiness {
             Readiness::Ready => "ready",
             Readiness::Rebuilding => "rebuilding",
             Readiness::Stale => "stale",
+            Readiness::Failed => "rebuild_failed",
         }
+    }
+
+    /// Whether a batch built from the current entity definitions can be applied to
+    /// the model on disk. Only the shape matters, so a lagging or failed projector
+    /// whose model is current still applies.
+    fn applies_batches(self) -> bool {
+        matches!(self, Readiness::Ready | Readiness::Rebuilding)
     }
 }
 
@@ -102,9 +116,13 @@ pub struct ProjectorShared {
     position: AtomicU64,
     shutdown: AtomicBool,
     replay: AtomicBool,
-    /// Set when the thread exits on an error (a poison event, a decode failure, a
-    /// `handle` bug). The read API keeps serving the frozen model, so `/status`
-    /// reports this to distinguish a wedged projector from one merely lagging.
+    /// Cleared when the thread exits, so a replay request can say plainly that
+    /// nothing is left to pick it up rather than accept it and drop it.
+    running: AtomicBool,
+    /// Set when an operation failed: the thread exited on an error (a poison event,
+    /// a decode failure, a `handle` bug), or a rebuild failed but the thread lives on
+    /// to retry. The read API keeps serving the frozen model, so `/status` reports
+    /// this to distinguish a wedged projector from one merely lagging.
     failed: AtomicBool,
     /// A [`Readiness`] discriminant. Decided synchronously in [`spawn`], before the
     /// handle is published, so the read API never observes a shape it cannot serve.
@@ -118,9 +136,17 @@ impl ProjectorShared {
         self.position.load(Ordering::Acquire)
     }
 
-    /// Whether the projector thread has died on an error and stopped advancing.
+    /// Whether the projector's last operation failed. Read alongside
+    /// [`ProjectorShared::running`] and [`ProjectorShared::readiness`], which say
+    /// whether it can recover on its own.
     pub fn failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
+    }
+
+    /// Whether the projector's thread is still alive. A stopped projector serves its
+    /// frozen model but will never advance or act on a replay again.
+    pub fn running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
     }
 
     /// Whether the on-disk read model can be served at the current definition.
@@ -156,6 +182,16 @@ impl ProjectorShared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(message.to_owned());
         self.failed.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear a recorded failure once the projector has recovered from it, so
+    /// `/status` reports the current state rather than the worst one it ever saw.
+    fn clear_failure(&self) {
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.failed.store(false, Ordering::Relaxed);
     }
 }
 
@@ -250,6 +286,7 @@ fn spawn(
         position: AtomicU64::new(start.get()),
         shutdown: AtomicBool::new(false),
         replay: AtomicBool::new(false),
+        running: AtomicBool::new(true),
         failed: AtomicBool::new(false),
         readiness: AtomicU8::new(plan.readiness().as_u8()),
         last_error: Mutex::new(None),
@@ -261,6 +298,16 @@ fn spawn(
         .spawn(move || run(task_shared, unit, store, model, events, definition, plan))
         .with_context(|| format!("spawning projector `{name}`"))?;
     Ok((shared, join))
+}
+
+/// Clears [`ProjectorShared::running`] when the projector thread leaves, so a replay
+/// is never accepted by a projector that is no longer there to act on it.
+struct RunningFlag<'a>(&'a ProjectorShared);
+
+impl Drop for RunningFlag<'_> {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Relaxed);
+    }
 }
 
 /// What reconciling the read model against the current definition requires.
@@ -320,6 +367,9 @@ fn run(
     definition: String,
     plan: Reconcile,
 ) {
+    // Declared first so it drops last: `running` is cleared however the thread leaves,
+    // a panic included, and only once the failure below has been recorded.
+    let _running = RunningFlag(&shared);
     if let Err(err) = run_inner(&shared, &unit, &store, model, &events, &definition, plan) {
         let message = format!("{err:#}");
         tracing::error!("projector `{}` stopped: {message}", shared.name);
@@ -356,8 +406,7 @@ fn run_inner(
                 "projector `{}` definition changed; rebuilding its read model",
                 shared.name
             );
-            model = rebuild(shared, unit, store, model, events, definition)?;
-            shared.set_readiness(Readiness::Ready);
+            model = rebuild_or_degrade(shared, unit, store, model, events, definition)?;
         }
         // Do not stamp the current definition onto a model we did not rebuild: that
         // would bless possibly-stale data at a possibly-old shape as current and
@@ -373,17 +422,18 @@ fn run_inner(
     let mut sub = store.subscribe(query.clone(), model.read_checkpoint()?);
     loop {
         if shared.replay.swap(false, Ordering::Relaxed) {
-            model = rebuild(shared, unit, store, model, events, definition)?;
-            // A replay is the only way out of `Stale`, and it is harmless otherwise.
-            shared.set_readiness(Readiness::Ready);
+            // A replay is the only way out of `Stale` or `Failed`, and it is harmless
+            // otherwise.
+            model = rebuild_or_degrade(shared, unit, store, model, events, definition)?;
             sub = store.subscribe(query.clone(), model.read_checkpoint()?);
             continue;
         }
 
-        // A stale model has the previous definition's shape, so applying a batch built
-        // from the current entities would fail on a missing column and kill the thread.
-        // Idle instead, leaving the checkpoint where it is, until a replay rebuilds it.
-        if shared.readiness() == Readiness::Stale {
+        // A model at a previous definition's shape cannot take a batch built from the
+        // current entities: the apply would fail on a missing column and stop the
+        // thread. Idle instead, leaving the checkpoint where it is, until a replay
+        // rebuilds it.
+        if !shared.readiness().applies_batches() {
             if shared.shutdown.load(Ordering::Relaxed) {
                 break;
             }
@@ -422,6 +472,55 @@ fn run_inner(
         }
     }
     Ok(())
+}
+
+/// Rebuild and swap, keeping the thread alive when it fails.
+///
+/// A rebuild that stopped the thread left the read API serving a self-resolving
+/// `rebuilding` 503 that nothing would ever resolve, and a replay request with no
+/// thread to pick it up: the only recovery was a restart. Recording the failure and
+/// idling instead keeps the replay endpoint meaningful, so an operator can fix the
+/// cause and retry in place.
+fn rebuild_or_degrade(
+    shared: &ProjectorShared,
+    unit: &ProjectorUnit,
+    store: &WriteHandle,
+    model: ReadModel,
+    events: &EventDefs,
+    definition: &str,
+) -> anyhow::Result<ReadModel> {
+    let err = match rebuild(shared, unit, store, model, events, definition) {
+        Ok(fresh) => {
+            shared.clear_failure();
+            shared.set_readiness(Readiness::Ready);
+            return Ok(fresh);
+        }
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    tracing::error!(
+        "projector `{}` could not rebuild its read model: {message}",
+        shared.name
+    );
+    shared.record_failure(&message);
+    shared.set_readiness(Readiness::Failed);
+
+    // `rebuild` closes the live model before swapping, so reopen whatever survived on
+    // disk. The swap is its last step and may well have landed, in which case the
+    // model is current after all and the projector goes on serving and tailing.
+    let reopened = ReadModel::open(&shared.db_path, &shared.entities).with_context(|| {
+        format!(
+            "reopening the read model for projector `{}` after a failed rebuild",
+            shared.name
+        )
+    })?;
+    if reconcile_plan(&reopened, definition, false)? != Reconcile::Stale {
+        shared.set_readiness(Readiness::Ready);
+    }
+    shared
+        .position
+        .store(reopened.read_checkpoint()?.get(), Ordering::Release);
+    Ok(reopened)
 }
 
 /// Project every event up to the current head into `model`, committing in batches
@@ -748,8 +847,38 @@ mod tests {
 
     #[test]
     fn readiness_round_trips_through_its_atomic_form() {
-        for readiness in [Readiness::Ready, Readiness::Rebuilding, Readiness::Stale] {
+        for readiness in [
+            Readiness::Ready,
+            Readiness::Rebuilding,
+            Readiness::Stale,
+            Readiness::Failed,
+        ] {
             assert_eq!(Readiness::from_u8(readiness.as_u8()), readiness);
+        }
+    }
+
+    /// A model the read API refuses to serve is one a batch cannot be applied to
+    /// either: both turn on whether the shape on disk is the current one. `Rebuilding`
+    /// is the exception, since the rebuild itself is what applies those batches.
+    #[test]
+    fn only_a_current_shape_takes_batches() {
+        assert!(Readiness::Ready.applies_batches());
+        assert!(Readiness::Rebuilding.applies_batches());
+        assert!(!Readiness::Stale.applies_batches());
+        assert!(!Readiness::Failed.applies_batches());
+    }
+
+    /// Reconciling never yields `Failed`: it is decided by a rebuild that ran, not by
+    /// comparing definitions, so nothing here may produce it.
+    #[test]
+    fn a_reconcile_plan_never_starts_out_failed() {
+        for plan in [
+            Reconcile::UpToDate,
+            Reconcile::Stamp,
+            Reconcile::Rebuild,
+            Reconcile::Stale,
+        ] {
+            assert_ne!(plan.readiness(), Readiness::Failed);
         }
     }
 }

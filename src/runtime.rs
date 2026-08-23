@@ -363,6 +363,7 @@ impl Runtime {
                     "position": position,
                     "lag": head.saturating_sub(position),
                     "readiness": handle.readiness().label(),
+                    "running": handle.running(),
                     "failed": handle.failed(),
                     "last_error": handle.last_error(),
                 })

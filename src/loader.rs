@@ -483,6 +483,15 @@ fn register_events(
     findings: &mut Vec<Finding>,
 ) {
     for def in module_event_defs(frozen, loaded_names) {
+        // The same definition re-exported under a second name is one event, not a
+        // collision; only a genuinely different definition of the type is.
+        if collector
+            .by_type
+            .get(&def.event_type)
+            .is_some_and(|known| known.id == def.id)
+        {
+            continue;
+        }
         if let Some(other) = collector.defined_in.get(&def.event_type) {
             findings.push(Finding::error(
                 rel,
@@ -505,10 +514,11 @@ fn register_events(
 /// to its no-schema path and writes a `subject` field to the immutable log as
 /// plaintext, in the payload and in its tag, where it can never be erased.
 ///
-/// A type the registry already holds is not invisible, so it is left alone. That
-/// covers re-binding a loaded definition under a second name (`Alias = thing_done`),
-/// which [`module_event_defs`] cannot tell from a fresh definition: it skips only
-/// the exact `load()` local name.
+/// Re-binding a loaded definition under a second name (`Alias = thing_done`) is not
+/// a definition, and [`module_event_defs`] cannot tell the two apart: it skips only
+/// the exact `load()` local name. Comparing [`EventDef::id`] can, so an alias passes
+/// while a fresh `event(...)` reusing a declared type name is still caught here
+/// rather than at the first append.
 fn reject_event_definition(
     rel: &str,
     role: Role,
@@ -518,17 +528,20 @@ fn reject_event_definition(
     findings: &mut Vec<Finding>,
 ) {
     for def in module_event_defs(frozen, loaded_names) {
-        if registered.contains_key(&def.event_type) {
-            continue;
-        }
-        findings.push(Finding::error(
-            rel,
-            format!(
+        let message = match registered.get(&def.event_type) {
+            Some(known) if known.id == def.id => continue,
+            Some(_) => format!(
+                "event type `{}` is redeclared in a {}; load() the events/ definition instead, since only that one is registered",
+                def.event_type,
+                role.label()
+            ),
+            None => format!(
                 "event type `{}` is defined in a {}; move the definition to events/ and load() it here, since only events/ definitions are registered",
                 def.event_type,
                 role.label()
             ),
-        ));
+        };
+        findings.push(Finding::error(rel, message));
     }
 }
 
@@ -791,7 +804,7 @@ mod behaviour_tests {
             let handle = frozen.get_option("handle").unwrap().unwrap();
             let result =
                 call_handler(&module, thaw(&handle, &module), &[input, state], 10_000_000).unwrap();
-            parse_handle_result(result).unwrap()
+            parse_handle_result(result, &project.events.by_type).unwrap()
         })
     }
 

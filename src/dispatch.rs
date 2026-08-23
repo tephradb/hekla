@@ -228,7 +228,7 @@ pub fn run_command(
         )
         .map_err(|err| anyhow::anyhow!("handle() failed: {err}"))?;
 
-        match parse_handle_result(decision)? {
+        match parse_handle_result(decision, events)? {
             HandleOutcome::Reject(rejection) => {
                 if let Some(recovered) =
                     recover_if_committed(store, events, boundary.as_ref(), idem_tag)?
@@ -459,10 +459,11 @@ pub fn build_event(
 /// derive the plaintext tags of the remaining indexed fields. Returns the payload to
 /// envelope and the tag pairs.
 ///
-/// Fails closed on an event type the registry does not know. The loader rejects an
-/// `event(...)` bound outside `events/`, but a definition built inside a function
-/// body reaches here unregistered, and passing it through would store a `subject`
-/// field as plaintext in both the payload and its tag: unerasable, and silent.
+/// Fails closed on an event type the registry does not know: passing one through
+/// would store a `subject` field as plaintext in both the payload and its tag,
+/// unerasable and silent. Events from a handler are already checked against the
+/// registry by identity when they are collected, so this is the last line of defence,
+/// covering the host-built events a test harness seeds a log with.
 fn lower_event(
     event: &EmittedEvent,
     event_def: Option<&EventDef>,

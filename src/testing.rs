@@ -29,7 +29,8 @@ use crate::dispatch::{self, CommandOutcome, EventDefs, build_event};
 use crate::loader::{CommandUnit, LoadedProject, Severity, rel_to_string, star_files};
 use crate::opdb::OpDb;
 use crate::starlark_builtins::{
-    ConstructedEvent, EmittedEvent, InvalidInput, Rejection, events_from_value, runtime_builtins,
+    ConstructedEvent, EmittedEvent, InvalidInput, Rejection, check_registered_definition,
+    events_from_value, runtime_builtins,
 };
 
 /// Throwaway per-case stores stay small, but the segment must still clear the
@@ -277,6 +278,7 @@ fn execute_case(
     events: &EventDefs,
     case: &TestCase,
 ) -> anyhow::Result<CommandOutcome> {
+    check_case_definitions(case, events)?;
     let dir = tempfile::tempdir().context("creating a temp store")?;
     let set = SegmentSet::open(
         dir.path().join("events"),
@@ -338,6 +340,20 @@ fn execute_case(
     };
     coordinator.shutdown();
     Ok(outcome)
+}
+
+/// Refuse a scenario that names an event type through a definition the project did
+/// not register. `given` would seed the log at a schema the runtime never checked,
+/// and `expect` would fail the comparison for a reason the diff could not name.
+fn check_case_definitions(case: &TestCase, events: &EventDefs) -> anyhow::Result<()> {
+    let expected: &[ConstructedEvent] = match &case.expect {
+        Expectation::Emit(list) => list,
+        Expectation::Reject { .. } | Expectation::InvalidInput => &[],
+    };
+    for event in case.given.iter().chain(expected) {
+        check_registered_definition(event, events)?;
+    }
+    Ok(())
 }
 
 fn compare(expect: &Expectation, outcome: &CommandOutcome) -> Result<(), String> {

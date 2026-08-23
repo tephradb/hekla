@@ -307,21 +307,32 @@ async fn read_scan(
 }
 
 /// `POST /projectors/{name}/replay`: schedule a rebuild-and-swap. Returns 202; the
-/// projector picks it up between batches and callers watch `/status` for lag.
+/// projector picks it up between batches and callers watch `/status` for lag. A
+/// projector whose thread has stopped gets a 503 instead: the request is only a flag,
+/// and nothing is left to act on it.
 async fn replay(State(runtime): State<Shared>, Path(name): Path<String>) -> Response {
-    match runtime.projector(&name) {
-        Some(shared) => {
-            shared.request_replay();
-            json_response(
-                202,
-                json!({ "status": "replay_scheduled", "projector": name }),
-            )
-        }
-        None => json_response(
+    let Some(shared) = runtime.projector(&name) else {
+        return json_response(
             404,
             read_error("not_found", &format!("no projector `{name}`")),
-        ),
+        );
+    };
+    if !shared.running() {
+        return json_response(
+            503,
+            read_error(
+                "not_running",
+                &format!(
+                    "projector `{name}` has stopped; see its `last_error` in /status, then restart the server"
+                ),
+            ),
+        );
     }
+    shared.request_replay();
+    json_response(
+        202,
+        json!({ "status": "replay_scheduled", "projector": name }),
+    )
 }
 
 /// `POST /effects/{name}/skip/{position}`: an explicit, manual operator action to
@@ -393,6 +404,13 @@ fn not_servable(projector: &str, readiness: Readiness) -> Option<Response> {
             "stale",
             format!(
                 "projector `{projector}` was built from a different definition and auto-rebuild is off; POST /projectors/{projector}/replay to rebuild it"
+            ),
+            false,
+        ),
+        Readiness::Failed => (
+            "rebuild_failed",
+            format!(
+                "projector `{projector}` could not rebuild its read model; see its `last_error` in /status, then POST /projectors/{projector}/replay to retry"
             ),
             false,
         ),

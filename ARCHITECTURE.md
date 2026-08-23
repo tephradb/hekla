@@ -111,6 +111,16 @@ Missing or extra fields fail fast. A command's `handle` returns the constructed 
 them, to append. The same constructor called in query position (a command's `query` or a
 projector/effect `source`) instead builds a filter clause; see section 5.
 
+**Only the registered definition may be emitted.** Each `event(...)` call mints a process-unique id,
+and a constructed event carries the id of the definition that built it, so the append seam can check
+identity rather than the type name. That closes the case where a handler builds its own
+`event(type = "user.registered", ...)` inside a function body: the name matches a declared type, so
+the event would be lowered against the registry's schema, and any field the real definition does not
+declare would ride into the immutable log verbatim, never validated and never encrypted. Referring
+to a loaded definition by a second name is the same definition and keeps working. The same identity
+check runs at load time, so a module-scope redeclaration outside `events/` is a `kiln check` error
+rather than a runtime one.
+
 **Envelope**: the tephra payload is a JSON envelope wrapping `data` with `correlation_id`,
 `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The host stamps these
 at append; Starlark never sets them.
@@ -231,8 +241,18 @@ never blocks on log length. Each projector therefore carries a readiness:
   applying batches, since a batch built from the current entities would fail on a missing column.
   The definition hash is deliberately left unrecorded, so the mismatch stays visible until a replay
   actually rebuilds the model.
+- `rebuild_failed`: a rebuild ran and failed. Like `stale` it needs an operator, but the cause is an
+  error rather than a setting, so `last_error` names it and reads answer `503` pointing there. The
+  thread survives the failure and idles, so `POST /projectors/{name}/replay` retries in place once
+  the cause is fixed; a rebuild that took the thread down instead left the read API promising a
+  `rebuilding` retry that nothing would ever satisfy, recoverable only by restarting. A replay is
+  attempted against whatever survived on disk, since the atomic swap is the rebuild's last step and
+  may well have landed.
 
-Readiness is reported per projector in `/status` alongside `position`, `lag` and `failed`.
+Readiness is reported per projector in `/status` alongside `position`, `lag`, `running` and
+`failed`. `running` is what separates a projector that idles awaiting an operator from one whose
+thread is gone: a replay posted to the latter is refused with `503` rather than accepted and
+dropped.
 
 **Read model access** is only ever through the generated read API (section 10), never by opening the
 SQLite file directly. Each read opens its own read-only connection and reads the projector position in
