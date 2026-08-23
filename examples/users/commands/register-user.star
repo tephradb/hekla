@@ -13,12 +13,12 @@ input = schema(
 def query(input):
     return user_registered(email = input.email)
 
-def initial():
-    return {"taken": False}
+initial = {"taken": False}
 
+# One event type in the boundary, so a single function is the simpler shape. The
+# fold returns the new state; it never mutates the one it is handed.
 def fold(state, event):
-    state["taken"] = True
-    return state
+    return dict(state, taken = True)
 
 def handle(input, state):
     if is_blank(input.name):

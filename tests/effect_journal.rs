@@ -727,3 +727,81 @@ fn a_runaway_handler_is_cut_off_by_the_tick_budget_and_wedges() {
         "shutdown must not wait out the join timeout"
     );
 }
+
+// --- per-type handle dispatch ---------------------------------------------
+
+/// The keys are the subscription. `user_activated` is deliberately absent, so the
+/// effect never reads those events at all, which is the point: there is no second list
+/// that could disagree with this one. The second arm is constrained, so it fires only
+/// for the registration that matches it.
+const PER_TYPE_EFFECT: &str = r#"
+load("events/user.star", "user_registered")
+
+handle = {
+    user_registered(): lambda event: http.post(
+        url = "https://a.test/welcome/" + event.data["user_id"],
+        body = {"email": event.data["email"]},
+    ),
+    user_registered(name = "VIP"): lambda event: http.post(
+        url = "https://a.test/vip/" + event.data["user_id"],
+        body = {},
+    ),
+}
+"#;
+
+#[test]
+fn a_per_type_effect_handle_subscribes_to_exactly_its_arms() {
+    let dir = project_with_read_model(PER_TYPE_EFFECT);
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::new(|_, _| {
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+    }));
+    let harness = boot(dir.path(), data.path(), stub.clone());
+
+    // A plain registration matches only the unconstrained arm.
+    register(&harness.rt, ALICE);
+    // A VIP registration matches both, so both fire for the one event.
+    let vip = json!({ "user_id": BOB, "email": "bob@x", "name": "VIP" });
+    let result = harness
+        .rt
+        .execute("register-user", vip, &ctx(), None)
+        .unwrap();
+    assert_eq!(result.status, 200, "{:?}", result.body);
+    activate(&harness.rt, ALICE);
+
+    wait_until("both registrations to be handled", || {
+        harness.rt.effect(EFFECT).unwrap().position() >= 2
+    });
+    thread::sleep(Duration::from_millis(100));
+
+    assert_eq!(calls_ending(&stub, ALICE), 1, "one arm matches ALICE");
+    let urls: Vec<String> = stub.calls().iter().map(|call| call.url.clone()).collect();
+    assert!(
+        urls.contains(&format!("https://a.test/welcome/{BOB}"))
+            && urls.contains(&format!("https://a.test/vip/{BOB}")),
+        "both matching arms fire for one event, got {urls:?}"
+    );
+    // Declaration order, so a replay journals and replays the same call sequence.
+    let welcome = urls
+        .iter()
+        .position(|u| u.ends_with(&format!("welcome/{BOB}")));
+    let vip_call = urls.iter().position(|u| u.ends_with(&format!("vip/{BOB}")));
+    assert!(
+        welcome < vip_call,
+        "arms run in declaration order: {urls:?}"
+    );
+
+    // `user.activated` is not in any key, so the effect never subscribed to it and
+    // there is no invocation to account for.
+    assert_eq!(
+        invocation_status(data.path(), 3),
+        None,
+        "an unsubscribed type is never read"
+    );
+    assert_eq!(harness.rt.effect(EFFECT).unwrap().consecutive_failures(), 0);
+    harness.shutdown();
+}

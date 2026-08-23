@@ -232,12 +232,10 @@ input = schema(order_id = uuid(), customer_id = uint())
 def query(input):
     return order_placed(customer_id = input.customer_id)
 
-def initial():
-    return {"email": None}
+initial = {"email": None}
 
 def fold(state, event):
-    state["email"] = event.data["email"]
-    return state
+    return dict(state, email = event.data["email"])
 
 def handle(input, state):
     return order_placed(
@@ -409,12 +407,10 @@ input = schema(id = uuid(), email = str())
 def query(input):
     return registered(email = input.email)
 
-def initial():
-    return {"taken": False}
+initial = {"taken": False}
 
 def fold(state, event):
-    state["taken"] = True
-    return state
+    return dict(state, taken = True)
 
 def handle(input, state):
     if state["taken"]:
@@ -828,12 +824,10 @@ input = schema(order_id = uuid(), customer_id = uint(), email = str())
 def query(input):
     return order_placed(customer_id = input.customer_id, email = input.email)
 
-def initial():
-    return {"seen": False}
+initial = {"seen": False}
 
 def fold(state, event):
-    state["seen"] = True
-    return state
+    return dict(state, seen = True)
 
 def handle(input, state):
     if state["seen"]:
@@ -931,12 +925,10 @@ input = schema(customer_id = uint(), email = str())
 def query(input):
     return order_placed(customer_id = input.customer_id, email = input.email)
 
-def initial():
-    return {"found": False}
+initial = {"found": False}
 
 def fold(state, event):
-    state["found"] = True
-    return state
+    return dict(state, found = True)
 
 def handle(input, state):
     return []

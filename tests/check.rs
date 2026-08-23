@@ -1107,3 +1107,352 @@ cases = [
         "a mismatched expectation must fail the suite"
     );
 }
+
+// --- per-type dispatch maps -----------------------------------------------
+
+/// Two event types over one entity, so a boundary and a fold map can disagree.
+const PAIR_EVENTS: &str = r#"
+opened = event(type = "t.opened", fields = {"thing_id": uuid()})
+closed = event(type = "t.closed", fields = {"thing_id": uuid()})
+"#;
+
+/// A command whose boundary spans both types, with `{FOLD}` substituted in.
+fn pair_command(fold: &str) -> String {
+    format!(
+        r#"
+load("events/t.star", "opened", "closed")
+
+input = schema(thing_id = uuid())
+
+def query(input):
+    return [opened(thing_id = input.thing_id), closed(thing_id = input.thing_id)]
+
+initial = {{"open": False}}
+
+{fold}
+
+def handle(input, state):
+    return []
+"#
+    )
+}
+
+/// Both arms present: the shape every other case in this section deviates from.
+fn both_arms() -> String {
+    pair_command(
+        "fold = {\n    opened: lambda state, event: dict(state, open = True),\n    closed: lambda state, event: dict(state, open = False),\n}",
+    )
+}
+
+#[test]
+fn a_well_formed_fold_map_checks_clean() {
+    assert_clean(&[
+        ("events/t.star", PAIR_EVENTS),
+        ("commands/thing.star", &both_arms()),
+    ]);
+}
+
+#[test]
+fn a_fold_map_key_that_is_not_an_event_definition_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            (
+                "commands/thing.star",
+                &pair_command("fold = {\"t.opened\": lambda state, event: state}"),
+            ),
+        ],
+        "keys must be event definitions loaded from events/",
+    );
+}
+
+#[test]
+fn a_fold_map_value_that_is_not_a_function_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            ("commands/thing.star", &pair_command("fold = {opened: 7}")),
+        ],
+        "entry for `t.opened()` must be a function",
+    );
+}
+
+#[test]
+fn an_empty_fold_map_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            ("commands/thing.star", &pair_command("fold = {}")),
+        ],
+        "maps no event definitions",
+    );
+}
+
+#[test]
+fn a_fold_that_is_neither_a_function_nor_a_map_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            ("commands/thing.star", &pair_command("fold = 7")),
+        ],
+        "must be a function, or a dict mapping event definitions to functions",
+    );
+}
+
+/// The hole the loader's module-scope scan cannot see: a definition built inside the
+/// map literal is never bound to a name, so nothing else rejects it, and dispatch
+/// keys on the type string, so it would quietly work.
+#[test]
+fn a_fold_map_key_built_inline_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            (
+                "commands/thing.star",
+                &pair_command(
+                    "fold = {event(type = \"t.opened\", fields = {\"thing_id\": uuid()}): lambda state, event: state}",
+                ),
+            ),
+        ],
+        "declared outside events/",
+    );
+}
+
+#[test]
+fn an_initial_that_is_a_function_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            (
+                "commands/thing.star",
+                &both_arms().replace(
+                    "initial = {\"open\": False}",
+                    "def initial():\n    return {\"open\": False}",
+                ),
+            ),
+        ],
+        "`initial` must be a value, not a function",
+    );
+}
+
+#[test]
+fn an_initial_that_is_not_data_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            (
+                "commands/thing.star",
+                &both_arms().replace("initial = {\"open\": False}", "initial = opened"),
+            ),
+        ],
+        "`initial` must be a plain value",
+    );
+}
+
+/// A command's `query` is evaluated with a placeholder input, so a branch it did not
+/// take could legitimately name the type. Warning, never an error.
+#[test]
+fn a_fold_entry_outside_the_boundary_is_a_warning() {
+    let source = pair_command(
+        "fold = {\n    opened: lambda state, event: dict(state, open = True),\n    closed: lambda state, event: state,\n}",
+    )
+    .replace(
+        "return [opened(thing_id = input.thing_id), closed(thing_id = input.thing_id)]",
+        "return opened(thing_id = input.thing_id)",
+    );
+    let dir = write_project(&[
+        ("events/t.star", PAIR_EVENTS),
+        ("commands/thing.star", &source),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let warns = warnings(&project);
+    assert!(
+        warns.iter().any(|warn| warn.contains(
+            "`fold` has an entry for `t.closed`, which query does not include, so it never runs"
+        )),
+        "got {warns:?}"
+    );
+    assert!(errors(&project).is_empty(), "must not fail the check");
+}
+
+/// A command's boundary is also its append condition, so a type can belong there to
+/// make a concurrent write conflict without telling the decision anything new.
+/// `examples/users/commands/rename-user.star` is the live case: renames are in the
+/// boundary, and the fold has no arm for them because `exists` is settled by the
+/// registration. Warning on that would fire on correct code, and would penalise the
+/// map form for being explicit where a `def fold` ignoring a type says nothing.
+#[test]
+fn a_boundary_type_with_no_fold_entry_is_not_reported() {
+    let source = pair_command("fold = {opened: lambda state, event: dict(state, open = True)}");
+    let dir = write_project(&[
+        ("events/t.star", PAIR_EVENTS),
+        ("commands/thing.star", &source),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let warns = warnings(&project);
+    assert!(
+        !warns
+            .iter()
+            .any(|warn| warn.contains("`fold` has no entry")),
+        "a boundary type may be guarded without being folded, got {warns:?}"
+    );
+    assert!(errors(&project).is_empty(), "must not fail the check");
+}
+
+#[test]
+fn a_fold_with_no_query_is_a_warning() {
+    let source = r#"
+load("events/t.star", "opened")
+
+input = schema(thing_id = uuid())
+
+initial = {"open": False}
+
+fold = {opened: lambda state, event: dict(state, open = True)}
+
+def handle(input, state):
+    return []
+"#;
+    let dir = write_project(&[
+        ("events/t.star", PAIR_EVENTS),
+        ("commands/thing.star", source),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let warns = warnings(&project);
+    assert!(
+        warns
+            .iter()
+            .any(|warn| warn.contains("defines `fold` but no `query`")),
+        "got {warns:?}"
+    );
+    assert!(errors(&project).is_empty(), "must not fail the check");
+}
+
+/// `all_events()` names no types, so neither direction has anything to compare.
+#[test]
+fn a_fold_map_against_an_all_events_boundary_is_not_cross_checked() {
+    let source = pair_command("fold = {opened: lambda state, event: dict(state, open = True)}")
+        .replace(
+            "return [opened(thing_id = input.thing_id), closed(thing_id = input.thing_id)]",
+            "return all_events()",
+        );
+    let dir = write_project(&[
+        ("events/t.star", PAIR_EVENTS),
+        ("commands/thing.star", &source),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let warns = warnings(&project);
+    assert!(
+        !warns.iter().any(|warn| warn.contains("`fold`")),
+        "an all_events() boundary has nothing to cross-check, got {warns:?}"
+    );
+    assert!(errors(&project).is_empty());
+}
+
+/// A `query` that cannot be evaluated leaves the boundary unknown, so the map is
+/// checked for shape and registration but not against clauses that were never seen.
+#[test]
+fn a_fold_map_against_an_unevaluable_query_is_not_cross_checked() {
+    let source = r#"
+load("events/t.star", "opened", "closed")
+
+input = schema(thing_id = uuid())
+
+def query(input):
+    fail("boom")
+
+initial = {"open": False}
+
+fold = {opened: lambda state, event: dict(state, open = True)}
+
+def handle(input, state):
+    return []
+"#;
+    let dir = write_project(&[
+        ("events/t.star", PAIR_EVENTS),
+        ("commands/thing.star", source),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let warns = warnings(&project);
+    assert!(
+        !warns
+            .iter()
+            .any(|warn| warn.contains("`fold` has an entry")),
+        "got {warns:?}"
+    );
+    assert!(errors(&project).is_empty());
+}
+
+/// A map's keys are the subscription, so a `source` beside them is a second list to
+/// keep in step: exactly the shape this design removes.
+#[test]
+fn a_projector_with_both_source_and_a_handle_map_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            (
+                "projectors/things.star",
+                r#"
+load("events/t.star", "opened", "closed")
+
+things = entity(key = "thing_id", fields = {"thing_id": uuid()})
+
+source = [opened(), closed()]
+
+handle = {
+    opened(): lambda event: [put(things, {"thing_id": event.data["thing_id"]})],
+    closed(): lambda event: [delete(things, event.data["thing_id"])],
+}
+"#,
+            ),
+        ],
+        "`handle`'s keys are the subscription",
+    );
+}
+
+/// The single-function form says nothing about which events it wants, so it still
+/// needs `source`.
+#[test]
+fn a_projector_with_a_function_handle_and_no_source_is_an_error() {
+    assert_error(
+        &[
+            ("events/t.star", PAIR_EVENTS),
+            (
+                "projectors/things.star",
+                r#"
+load("events/t.star", "opened")
+
+things = entity(key = "thing_id", fields = {"thing_id": uuid()})
+
+def handle(event):
+    return [put(things, {"thing_id": event.data["thing_id"]})]
+"#,
+            ),
+        ],
+        "or key `handle` by the events it wants",
+    );
+}
+
+/// A clause key is validated as a subscription clause, so an unindexed filter is
+/// caught by the check that already covers `source`.
+#[test]
+fn a_handle_clause_on_a_non_indexed_field_is_an_error() {
+    assert_error(
+        &[
+            ("events/thing.star", EVENTS),
+            (
+                "projectors/things.star",
+                r#"
+load("events/thing.star", "thing_happened")
+
+things = entity(key = "thing_id", fields = {"thing_id": uuid()})
+
+handle = {
+    thing_happened(note = "x"): lambda event: [put(things, {"thing_id": event.data["thing_id"]})],
+}
+"#,
+            ),
+        ],
+        "is not indexed",
+    );
+}

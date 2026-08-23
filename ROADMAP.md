@@ -183,7 +183,69 @@ Honest scope for this phase:
 - The read endpoints are still absent from the generated OpenAPI (which documents only commands), so
   `after`/`timeout_ms` are undocumented there for now.
 
-## Phase 6 and beyond (deferred, with triggers)
+## Phase 6: subscription-keyed dispatch and the fold contract (done)
+
+Language ergonomics over the machinery every earlier phase built. Once a boundary spans more than one
+event type, `fold(state, event)` becomes a chain of `if event.type == ...` branches, and the same
+chain appears in every projector and effect. This phase gives all three one structural dispatch,
+folds a projector's and effect's `source` into it, and settles the contract `fold` had left open.
+
+- **Clause-keyed dispatch** for a projector's or effect's `handle`: a dict mapping query clauses to
+  functions, alongside the single-function form which stays valid (and is the only option over an
+  `all_events()` subscription). **The keys are the subscription**, so `source` is derived from them
+  and declaring it beside a map is an error: the two-lists-to-keep-in-step shape this codebase avoids
+  for entities and for tags is now avoided here too.
+- **Every arm whose clause matches runs, in declaration order.** Several clauses may name one event
+  type, so an arm can select a subset (`order_placed(shop_id = 1)`) without the general arm losing
+  it. No arm can be shadowed by an earlier one, so order fixes only the sequence of ops or journaled
+  calls, which determinism needs, and never which arms run.
+- **The match is tephra's own predicate.** Each arm is lowered to the `QueryItem` the subscription
+  already builds and matched with `tephra::Matches`, the single definition of "does this event
+  match" that tephra's index is itself differential-tested against. kiln writes no matcher, so an
+  arm's filter and the subscription's filter cannot drift apart, and a subject-scoped constraint
+  works because the same lowering encrypted both the tag and the filter.
+- **A command's `fold` keeps bare-definition keys.** Its boundary is `query(input)`, computed per
+  request, so a constraint on a key would be a filter the boundary never applied; a clause key there
+  is a load error saying so. The dispatch rule is the same for all three, `fold` simply cannot
+  express overlapping keys.
+- **An event no arm selects is skipped before its envelope is decoded**, so a map over a wide
+  boundary pays nothing per irrelevant event. For a projector or effect it is not even read, since
+  the keys are the subscription.
+- **`fold` returns the new state and never mutates the one it was handed.** `initial` is now a
+  literal value and never a function (a zero-arg, clock-free function can only produce a constant),
+  so it stays the frozen module global it already was: the per-request JSON round-trip that existed
+  solely to hand `fold` something mutable is gone, and a fold that assigns into `state` fails on the
+  first event it sees, with a message that names the contract rather than starlark's bare `Immutable`.
+- **`kiln check` reports the one thing neither the loader nor the subscription check catches**: a key
+  built by calling `event(...)` inline. The loader's module-scope scan only sees definitions bound to
+  a name, so an inline one inside a dict literal would reach dispatch unregistered and quietly work.
+  A command's `fold` is additionally checked for entries its boundary never returns, which is dead
+  code.
+
+Honest scope for this phase:
+
+- **The no-mutation rule is enforced at the first folded event, not at every one.** starlark-rust
+  0.14 makes `Freezer::new` crate-private, so an arbitrary value cannot be frozen mid-evaluation:
+  once an arm returns a dict it built, mutating that one is undetectable. And `AstModule`'s
+  statements are crate-private too, so there is no static lint of handler bodies to fall back on.
+- **A dead `fold` entry is a warning, not an error.** A command's `query` is evaluated with a
+  placeholder input, so a branch the placeholder did not take could legitimately name a type the map
+  covers. A projector's and effect's keys need no such check at all, being the subscription itself.
+- **A boundary type with no fold entry is not reported.** It was, briefly, on the reasoning that
+  ignoring a boundary event narrows what a command observes. That reasoning was wrong: the boundary
+  and the fold answer different questions, so the check fired on correct code (the shipped
+  `rename-user` example, which had to carry a no-op arm to satisfy it), and it penalised the map form
+  for being explicit where a `def fold` that ignores a type says nothing at all.
+- **Two `handle` forms remain.** Folding `source` into the map removed one list, not one form. The
+  single-function form stays because any multi-statement handler needs a `def` anyway, and forcing
+  the map form on a single-type projector reintroduces a named-function indirection that reads as a
+  naming convention. Four of the five example subscriptions are single-type, so that is the common
+  case rather than an edge.
+- **State is still read by subscript** (`state["taken"]`), matching `event.data["email"]`. Unifying
+  field access on dot syntax is its own item below, and flipping only the state half early would have
+  left a fold writing `state.exists` while reading `event.data["email"]`.
+
+## Phase 7 and beyond (deferred, with triggers)
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
 warranted.
@@ -230,20 +292,10 @@ are journaled (point-in-time-stale on replay).
 Raw considerations from design review, captured so they are not lost. None is scheduled, and none is a
 committed shape: each names the tension it addresses and the open question. Several interact with
 features that already shipped (auto-tagging, effect retry, projector auto-rebuild), so they are
-refinements to revisit once real projects exercise them.
+refinements to revisit once real projects exercise them. One item, per-type folds and the
+mutate-or-return decision, shipped as Phase 6, which also folded a projector's and effect's `source`
+into the dispatch map; the rest stand as written.
 
-- **Per-type folds, and a mutate-or-return decision.** Once a `query` returns multiple event types,
-  `fold(state, event)` becomes a chain of `if event.type == ...` branches in every command. A per-type
-  fold map would dispatch structurally:
-  ```starlark
-  fold = {
-      order_placed: lambda state, event: dict(state, taken = True),
-      shop_suspended: lambda state, event: dict(state, suspended = True),
-  }
-  ```
-  Separately, `fold` today both mutates `state` and returns it; pick one. Mutation is cheaper but hides
-  replay-order bugs, and Starlark's freezing rules will bite anyone who reuses the dict from `initial()`.
-  Decide the contract before folds proliferate.
 - **Meaningful effect outcomes, idempotency keys, and delivery events.** An effect `handle` return value
   is currently ignored, so `http.post` then a log on failure is at-least-once with silent duplicates and
   no script-controlled backoff. A meaningful return (`ok()`, `retry(after = 30)`, `dead_letter(reason)`)
@@ -259,7 +311,9 @@ refinements to revisit once real projects exercise them.
   types and will drift from them. Let it derive, e.g. `input = schema(**order_placed.fields)` or a
   partial selection, so the two cannot disagree.
 - **Unify field access on dot syntax.** Commands read `input.email` but folds and effects read
-  `event.data["email"]`. One access style (dot on both) removes the papercut.
+  `event.data["email"]`, and a command's folded state reads `state["taken"]`. One access style (dot on
+  all three) removes the papercut. Phase 6 left state on subscript deliberately, so the three flip
+  together rather than leaving a fold writing `state.exists` while reading `event.data["email"]`.
 - **Type-shaped default tagging.** Auto-tagging currently indexes every field unless `indexed=False`. A
   better default could key off the field type: identity-shaped fields (`uuid()`, integers, short
   `str()`) are worth tagging, while `money()` almost never is. Refines the shipped auto-tagging default.
@@ -269,20 +323,21 @@ refinements to revisit once real projects exercise them.
 
 ### Suggested sequencing
 
-An opinionated order for the above, by value-to-effort. Not a commitment, a starting point.
+An opinionated order for the above, by value-to-effort. Not a commitment, a starting point. Per-type
+dispatch and the fold contract, which used to head this list, shipped as Phase 6.
 
 1. **First, and cheap: reserve an event `version` slot in the envelope.** The log is empty today, so
    add the field now even if unused; the upcast hooks can wait, but retrofitting a version onto
    historical events is the exact migration this item exists to avoid.
-2. **Effect outcomes and the fold contract, together.** The `ok()` / `retry(after)` /
-   `dead_letter(reason)` return is the largest operational win (it also closes the deferred
-   automatic-dead-lettering gap), and pinning `fold` to return-new-state (never mutate) is a cheap
-   correctness win that pairs with per-type folds. Two refinements to the effect item: derive the
-   idempotency key from the event id (envelope, stable across replay and rebuild) rather than the raw
-   log position, and route "emit an event back" through the existing `invoke_command` path so effects
-   stay out of the event-producer role.
-3. **Ergonomics, once the above lands:** per-type fold dispatch, projector rename detection, and
-   unifying field access on dot syntax. Each is small and independent.
+2. **Effect outcomes.** The `ok()` / `retry(after)` / `dead_letter(reason)` return is the largest
+   remaining operational win, and it closes the deferred automatic-dead-lettering gap. Two
+   refinements to the item as written: derive the idempotency key from the event id (envelope, stable
+   across replay and rebuild) rather than the raw log position, and route "emit an event back"
+   through the existing `invoke_command` path so effects stay out of the event-producer role.
+3. **Ergonomics:** unifying field access on dot syntax, and projector rename detection. Each is small
+   and independent. Dot syntax now covers three surfaces at once (`input`, `event.data`, and a
+   command's folded `state`), which is why Phase 6 deliberately left state on subscript rather than
+   flipping half of it early.
 4. **Only if a real project asks:** deriving `input` from the event schema, and type-shaped default
    tagging. Both are double-edged. Command input legitimately diverges from event fields (plaintext vs
    subject-encrypted, server-derived ids), so at most make derivation opt-in sugar for the 1:1 case.

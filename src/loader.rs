@@ -597,7 +597,7 @@ fn evaluate_units(
             registered,
             findings,
         );
-        let def = match module_def_from_frozen(kind, name, &rel, &frozen) {
+        let def = match module_def_from_frozen(kind, name, &frozen) {
             Ok(def) => def,
             Err(err) => {
                 findings.push(Finding::error(&rel, format!("{err:#}")));

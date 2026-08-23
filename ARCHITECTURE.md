@@ -162,9 +162,43 @@ only writer.
   matches everything. Constraining a field is a subset match, so over-constraining silently matches
   nothing (which `kiln check` warns about). A subject-encrypted field can only be filtered when its
   subject is also constrained (scoped) or it is `unique` (global); see section 15.
-- `initial` is a literal or a function producing the fold's starting state.
-- `fold(state, event)` reduces the boundary's events into decision state.
-- `handle(input, state)` decides and returns one of three terminal outcomes:
+- `initial` is a literal value producing the fold's starting state, never a function: it sees no
+  input, no clock and no randomness, so it can only be a constant, and a module-level expression
+  already covers everything a function could compute.
+- `fold` reduces the boundary's events into decision state, and **returns the new state rather than
+  mutating the one it was handed**. It is either a single `fold(state, event)` function, or a dict
+  mapping event definitions to functions, which dispatches per type instead of branching on
+  `event.type`:
+  ```starlark
+  fold = {
+      order_placed: lambda state, event: dict(state, taken = True),
+      shop_suspended: lambda state, event: dict(state, suspended = True),
+  }
+  ```
+  Keys are the loaded definitions, not type strings, so a typo fails at `load()` and the
+  only-the-registered-definition rule reaches dispatch too. Unlike a projector's or effect's `handle`,
+  they are bare definitions and never constrained clauses: a command's boundary is `query(input)`,
+  computed per request, so a constraint here would be a filter the boundary never applied. An event type with no entry leaves state
+  unchanged, but is still read into the boundary and still counts toward the append condition. That
+  is a normal shape rather than an oversight: **the boundary and the fold answer different
+  questions.** The boundary is the append condition, so a type belongs there whenever a concurrent
+  write of it should make this command fail; the fold is the decision state, so a type belongs there
+  only when `handle` needs to know about it. `commands/rename-user.star` in `examples/users` is the
+  case: renames are in the boundary so two concurrent renames conflict, and the fold has no arm for
+  them because `exists` is already settled by the registration. `kiln check` therefore does not
+  report a boundary type with no entry. It does report the other direction, an entry for a type the
+  boundary never returns, which is dead code.
+
+  Build the new state with `dict(state, taken = True)`, or `dict(state, **{key: value})` when the key
+  is computed. `initial` is a frozen module global, so a fold that assigns into `state` fails on the
+  first event it sees; once an arm has returned a dict it built, mutating that one is its own
+  business. There is no way to freeze intermediate state (starlark-rust does not expose a freezer
+  mid-evaluation) and no way to lint a handler body (it does not expose the AST), so the contract is
+  carried by the first-event failure, the `must return the updated state` error on a `None` return,
+  and this paragraph.
+- `handle(input, state)` decides and returns one of three terminal outcomes. It is always a single
+  function: it decides from input and folded state rather than from one event, so per-type dispatch
+  belongs on `fold`.
   - an event, or a list of events, appends them (an empty list means "nothing to append", valid for
     an idempotent command).
   - `reject(code, message)` is a state-dependent refusal: the input was well-formed but the current
@@ -217,8 +251,31 @@ independently retryable.
 A projector consumes events and builds a queryable read model.
 
 **Shape**: entities are declared with `entity(key, fields, indexes)` and collected implicitly from
-module scope. `source` is the event subscription. `handle(event)` returns `put` / `patch` / `delete`
-ops, and may call `get(entity, key)` to read the current row first.
+module scope. `handle` returns `put` / `patch` / `delete` ops, and may call `get(entity, key)` to read
+the current row first. It takes one of two forms:
+
+- a dict mapping query clauses to functions, in which case **the keys are the subscription**: they say
+  which events to read and what to do with each, so there is no `source` list beside them to keep in
+  step. Several clauses may name one event type, and **every arm whose clause matches runs, in
+  declaration order**. No arm can be shadowed by an earlier one, so order fixes only the sequence of
+  ops, never which arms run.
+  ```starlark
+  handle = {
+      order_placed(): lambda event: [put(orders, {...})],
+      order_placed(shop_id = 1): lambda event: [put(shop_one_orders, {...})],
+      order_cancelled(): lambda event: [delete(orders, event.data["order_id"])],
+  }
+  ```
+  A bare `order_placed` is shorthand for `order_placed()`. `all_events()` is a valid key and, under
+  fan-out, an arm that runs for every event.
+- a single `handle(event)` function, which says nothing about which events it wants and so still
+  declares `source`. This is the simpler shape when one body handles everything, and it is the only
+  option over an `all_events()` subscription.
+
+An arm's clause is matched by tephra's own `Matches` predicate, over the very `QueryItem` the
+subscription lowered it to, so an arm's filter and the subscription's filter are the same code and
+cannot drift apart. Matching happens before the payload is decoded, so an event no arm selects costs
+nothing.
 
 **`get()` reads through uncommitted writes in the current batch.** If a handler `put`s a row and a
 later event in the same batch reads it, it must see the write, or batching would silently change
@@ -291,7 +348,11 @@ Effects are the crown jewel and the biggest departure from umari. They perform s
 and via commands, writes) in reaction to events, and they are durable: an effect that crashes
 mid-way resumes without re-firing side effects it already performed.
 
-**Model**: `handle(event)` is straight-line blocking code that calls injected impure builtins.
+**Model**: `handle` is straight-line blocking code that calls injected impure builtins, and takes the
+same two shapes a projector's does (section 6): a clause-keyed dict, whose keys are the subscription
+and where every matching arm runs in declaration order, or a single `handle(event)` function with a
+`source`. Declaration order is what makes fan-out replay-safe: several arms in one invocation journal
+their calls in a fixed sequence, so a replay reproduces it exactly.
 Determinism under replay comes from a journal. Each builtin call looks itself up in the journal
 first: if a result is recorded, it returns that; otherwise it performs the real call and appends the
 result. After a crash, `handle` re-runs from the top, replays journaled calls until it passes the

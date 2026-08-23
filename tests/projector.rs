@@ -479,3 +479,84 @@ fn a_patch_with_no_declared_columns_leaves_the_row_untouched() {
 
     assert_eq!(model.get(entity, ALICE).unwrap().unwrap()["name"], "Alice");
 }
+
+// --- clause-keyed handle dispatch -----------------------------------------
+
+const PER_TYPE_EVENTS: &str = r#"
+added = event(type = "thing.added", fields = {"id": uuid(), "kind": str()})
+removed = event(type = "thing.removed", fields = {"id": uuid(), "kind": str()})
+touched = event(type = "thing.touched", fields = {"id": uuid(), "kind": str()})
+"#;
+
+/// The keys are the subscription, so `thing.touched` is never read. Two clauses name
+/// `thing.added`: the constrained one selects a subset, and both run for an event that
+/// matches both.
+const PER_TYPE_PROJECTOR: &str = r#"
+load("events/thing.star", "added", "removed")
+
+things = entity(key = "id", fields = {"id": uuid(), "kind": str()})
+special = entity(key = "id", fields = {"id": uuid(), "kind": str()})
+
+handle = {
+    added(): lambda event: [put(things, {"id": event.data["id"], "kind": event.data["kind"]})],
+    added(kind = "vip"): lambda event: [
+        put(special, {"id": event.data["id"], "kind": event.data["kind"]}),
+    ],
+    removed(): lambda event: [delete(things, event.data["id"])],
+}
+"#;
+
+#[test]
+fn a_clause_keyed_projector_handle_fans_out_and_subscribes_to_its_arms() {
+    let dir = write_project(&[
+        ("events/thing.star", PER_TYPE_EVENTS),
+        ("projectors/things.star", PER_TYPE_PROJECTOR),
+    ]);
+    let project = load_ok(dir.path());
+    let projector = &project.projectors[0];
+    let ModuleDef::Projector { entities, .. } = &projector.loaded.def else {
+        panic!("expected a projector");
+    };
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let (coordinator, store) = open_store(store_dir.path());
+    let ctx = ctx();
+    for (event_type, id, kind) in [
+        ("thing.added", UUID_A, "vip"),
+        ("thing.added", UUID_B, "plain"),
+        // Not in any key, so the subscription skips it entirely.
+        ("thing.touched", UUID_A, "vip"),
+        ("thing.removed", UUID_B, "plain"),
+    ] {
+        seed_event(
+            &store,
+            &project,
+            &ctx,
+            EmittedEvent {
+                event_type: event_type.to_owned(),
+                data: json!({ "id": id, "kind": kind }),
+                tags: vec![
+                    ("id".to_owned(), Some(id.to_owned())),
+                    ("kind".to_owned(), Some(kind.to_owned())),
+                ],
+            },
+        );
+    }
+
+    let model_dir = tempfile::tempdir().unwrap();
+    let model = ReadModel::open(&model_dir.path().join("things.db"), entities).unwrap();
+    let seen = project_to_head(&store, &projector.loaded, &model, &project.events.by_type).unwrap();
+    assert_eq!(seen, 3, "the unsubscribed type is never read");
+
+    let things = entities.iter().find(|e| e.name == "things").unwrap();
+    let special = entities.iter().find(|e| e.name == "special").unwrap();
+    assert!(model.get(things, UUID_A).unwrap().is_some());
+    assert!(
+        model.get(things, UUID_B).unwrap().is_none(),
+        "the removed row is gone"
+    );
+    // Only the vip add matched the constrained arm, and it also matched the plain one.
+    assert!(model.get(special, UUID_A).unwrap().is_some());
+    assert!(model.get(special, UUID_B).unwrap().is_none());
+    coordinator.shutdown();
+}

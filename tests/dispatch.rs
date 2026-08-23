@@ -129,12 +129,10 @@ def query(input):
         return registered(email = input.email)
     return registered(secret = input.email)
 
-def initial():
-    return {"taken": False}
+initial = {"taken": False}
 
 def fold(state, event):
-    state["taken"] = True
-    return state
+    return dict(state, taken = True)
 
 def handle(input, state):
     if state["taken"]:
@@ -329,8 +327,9 @@ registered = event(
 )
 "#;
 
-/// `fold` falls off the end, so it returns None and the guard it stands behind
-/// (`state["taken"]`) would read as "nothing there".
+/// `fold` builds the new state and falls off the end instead of returning it, so it
+/// returns None and the guard it stands behind (`state["taken"]`) would read as
+/// "nothing there".
 const BROKEN_FOLD: &str = r#"
 load("events/t.star", "registered")
 
@@ -339,11 +338,10 @@ input = schema(id = uuid(), email = str())
 def query(input):
     return registered(email = input.email)
 
-def initial():
-    return {"taken": False}
+initial = {"taken": False}
 
 def fold(state, event):
-    state["taken"] = True
+    updated = dict(state, taken = True)
 
 def handle(input, state):
     if state["taken"]:
@@ -562,5 +560,279 @@ fn badly_typed_scalar_inputs_are_rejected_with_400() {
         "the schema must accept a well-typed body: {:?}",
         ok.body
     );
+    harness.shutdown();
+}
+
+// --- per-type fold dispatch -----------------------------------------------
+
+/// Two event types over one subject, so a boundary can span both.
+const ACCOUNT_EVENTS: &str = r#"
+opened = event(type = "t.opened", fields = {"id": uuid(), "owner": str(max_length = 50)})
+frozen = event(type = "t.frozen", fields = {"id": uuid(), "owner": str(max_length = 50)})
+noticed = event(type = "t.noticed", fields = {"id": uuid(), "owner": str(max_length = 50)})
+"#;
+
+/// A per-type map: one arm per type in the boundary, each returning new state.
+const PER_TYPE_FOLD: &str = r#"
+load("events/t.star", "opened", "frozen")
+
+input = schema(id = uuid(), owner = str())
+
+def query(input):
+    return [opened(owner = input.owner), frozen(owner = input.owner)]
+
+initial = {"opened": False, "frozen": False}
+
+fold = {
+    opened: lambda state, event: dict(state, opened = True),
+    frozen: lambda state, event: dict(state, frozen = True),
+}
+
+def handle(input, state):
+    if state["frozen"]:
+        return reject("frozen", "that owner is frozen")
+    if state["opened"]:
+        return reject("already_open", "that owner already has an account")
+    return opened(id = input.id, owner = input.owner)
+"#;
+
+#[test]
+fn a_per_type_fold_dispatches_by_event_type() {
+    let project = write_project(&[
+        ("events/t.star", ACCOUNT_EVENTS),
+        ("commands/open.star", PER_TYPE_FOLD),
+        ("commands/freeze.star", FREEZE),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    let body = json!({ "id": ALICE, "owner": "kim" });
+    let first = harness.rt.execute("open", body, &ctx(), None).unwrap();
+    assert_eq!(first.status, 200, "{:?}", first.body);
+
+    // The `opened` arm ran, so the second attempt sees `opened` and not `frozen`.
+    let second = harness
+        .rt
+        .execute("open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(second.status, 422, "{:?}", second.body);
+    assert_eq!(second.body["error"]["code"], "already_open");
+
+    // Now the other arm: a frozen event flips the other flag, and the rejection
+    // changes with it, so each arm is genuinely reached by its own type.
+    harness
+        .rt
+        .execute("freeze", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    let third = harness
+        .rt
+        .execute("open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(third.status, 422, "{:?}", third.body);
+    assert_eq!(third.body["error"]["code"], "frozen");
+    harness.shutdown();
+}
+
+/// Emits the second event type, so the per-type fold has something to dispatch on.
+const FREEZE: &str = r#"
+load("events/t.star", "frozen")
+
+input = schema(id = uuid(), owner = str())
+
+def handle(input, state):
+    return frozen(id = input.id, owner = input.owner)
+"#;
+
+/// The boundary is every event, but the map names one type, so everything else is
+/// read into the boundary and left unfolded.
+const ALL_EVENTS_FOLD: &str = r#"
+load("events/t.star", "opened", "frozen")
+
+input = schema(id = uuid(), owner = str())
+
+def query(input):
+    return all_events()
+
+initial = {"seen": 0}
+
+fold = {
+    frozen: lambda state, event: dict(state, seen = state["seen"] + 1),
+}
+
+def handle(input, state):
+    if state["seen"] > 0:
+        return reject("frozen", "saw %d frozen event(s)" % state["seen"])
+    return opened(id = input.id, owner = input.owner)
+"#;
+
+#[test]
+fn an_event_type_with_no_fold_entry_is_read_but_not_folded() {
+    let project = write_project(&[
+        ("events/t.star", ACCOUNT_EVENTS),
+        ("commands/open.star", ALL_EVENTS_FOLD),
+        ("commands/freeze.star", FREEZE),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    // An `opened` event has no arm. It still has to advance `after`, or the next
+    // command's append condition would conflict against history it already read.
+    let first = harness
+        .rt
+        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    let second = harness
+        .rt
+        .execute("open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(
+        second.status, 200,
+        "an unfolded event must not self-conflict: {:?}",
+        second.body
+    );
+
+    // The mapped type does fold, so state is not simply frozen at `initial`.
+    harness
+        .rt
+        .execute("freeze", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    let third = harness
+        .rt
+        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(third.status, 422, "{:?}", third.body);
+    assert_eq!(third.body["error"]["message"], "saw 1 frozen event(s)");
+    harness.shutdown();
+}
+
+/// One arm falls off the end. The failure has to name the entry, not just `fold`.
+const BROKEN_ARM: &str = r#"
+load("events/t.star", "opened", "frozen")
+
+input = schema(id = uuid(), owner = str())
+
+def query(input):
+    return [opened(owner = input.owner), frozen(owner = input.owner)]
+
+initial = {"opened": False}
+
+def bad(state, event):
+    updated = dict(state, opened = True)
+
+fold = {
+    opened: bad,
+    frozen: lambda state, event: state,
+}
+
+def handle(input, state):
+    return opened(id = input.id, owner = input.owner)
+"#;
+
+#[test]
+fn a_fold_entry_that_returns_none_names_the_entry() {
+    let project = write_project(&[
+        ("events/t.star", ACCOUNT_EVENTS),
+        ("commands/open.star", BROKEN_ARM),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    harness
+        .rt
+        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    let err = exec_err(&harness.rt, "open", json!({ "id": BOB, "owner": "kim" }));
+    assert!(
+        err.contains("fold entry for `t.opened()` must return the updated state"),
+        "the failing arm must name itself, got: {err}"
+    );
+    harness.shutdown();
+}
+
+/// `initial` is a frozen module global, so this is the mistake the contract exists
+/// to prevent, caught on the first event the fold ever sees.
+const MUTATING_FOLD: &str = r#"
+load("events/t.star", "opened")
+
+input = schema(id = uuid(), owner = str())
+
+def query(input):
+    return opened(owner = input.owner)
+
+initial = {"opened": False}
+
+def fold(state, event):
+    state["opened"] = True
+    return state
+
+def handle(input, state):
+    return opened(id = input.id, owner = input.owner)
+"#;
+
+#[test]
+fn a_fold_that_mutates_the_state_it_was_handed_fails_with_the_contract() {
+    let project = write_project(&[
+        ("events/t.star", ACCOUNT_EVENTS),
+        ("commands/open.star", MUTATING_FOLD),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    harness
+        .rt
+        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    let err = exec_err(&harness.rt, "open", json!({ "id": BOB, "owner": "kim" }));
+    assert!(
+        err.contains("fold returns the new state"),
+        "a bare `Immutable` is not a usable message, got: {err}"
+    );
+    harness.shutdown();
+}
+
+/// State has to accumulate across events, not restart from `initial` each time.
+const COUNTING_FOLD: &str = r#"
+load("events/t.star", "opened", "noticed")
+
+input = schema(id = uuid(), owner = str())
+
+def query(input):
+    return noticed(owner = input.owner)
+
+initial = {"seen": 0}
+
+fold = {
+    noticed: lambda state, event: dict(state, seen = state["seen"] + 1),
+}
+
+def handle(input, state):
+    if state["seen"] >= 2:
+        return reject("enough", "seen %d" % state["seen"])
+    return noticed(id = input.id, owner = input.owner)
+"#;
+
+#[test]
+fn folded_state_accumulates_across_events() {
+    let project = write_project(&[
+        ("events/t.star", ACCOUNT_EVENTS),
+        ("commands/notice.star", COUNTING_FOLD),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    for id in [ALICE, BOB] {
+        let result = harness
+            .rt
+            .execute("notice", json!({ "id": id, "owner": "kim" }), &ctx(), None)
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+    }
+    let third = harness
+        .rt
+        .execute(
+            "notice",
+            json!({ "id": ALICE, "owner": "kim" }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(third.status, 422, "{:?}", third.body);
+    assert_eq!(third.body["error"]["message"], "seen 2");
     harness.shutdown();
 }

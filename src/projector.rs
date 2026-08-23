@@ -26,12 +26,13 @@ use tephra::{Event, Position, WaitOutcome, WriteHandle};
 
 use crate::context::{EntityReader, ProjectorCtx};
 use crate::dispatch::{self, EventDefs};
+use crate::dispatch::{arm_selects, lower_dispatch};
 use crate::envelope;
 use crate::loader::ProjectorUnit;
 use crate::read_model::ReadModel;
 use crate::starlark_builtins::{
     EntityDef, EventSpec, LoadedModule, ModuleDef, alloc_event, call_handler_with_projector_ctx,
-    parse_entity_ops, thaw,
+    parse_entity_ops, parse_event_dispatch, thaw,
 };
 
 /// Per-handler instruction budget, matching the command dispatch bound.
@@ -568,35 +569,54 @@ fn apply_batch(
 ) -> anyhow::Result<()> {
     let tx = model.begin()?;
     Module::with_temp_heap(|module| {
-        let handle_fn = frozen
+        let handle_owned = frozen
             .get_option("handle")?
             .ok_or_else(|| anyhow::anyhow!("projector has no handle() function"))?;
+        let handle = parse_event_dispatch(thaw(&handle_owned, &module), true)
+            .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
+        // `None` matches how a projector lowers its subscription: filtering a
+        // subject-encrypted field in a `source` is a static error, so no key is needed.
+        let lowered = lower_dispatch(&handle, events, None)
+            .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
         for (_position, event) in batch {
+            // Matching before decoding: an event no arm selects costs nothing, and the
+            // checkpoint still advances past it.
+            let selected: Vec<usize> = lowered
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| arm_selects(item.as_ref(), event.as_ref()))
+                .map(|(index, _)| index)
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            let event_type = event.event_type();
             let (_envelope, data) = envelope::decode(event.data())
                 .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-            let value = alloc_event(
-                &module,
-                event.event_type(),
-                &data,
-                events.get(event.event_type()),
-            );
-            let reader = BatchReader { model, by_id };
-            let ctx = ProjectorCtx { reader: &reader };
-            let result = call_handler_with_projector_ctx(
-                &module,
-                thaw(&handle_fn, &module),
-                &[value],
-                MAX_TICKS,
-                &ctx,
-            )
-            .map_err(|err| anyhow::anyhow!("handle() failed: {err}"))?;
-            for op in parse_entity_ops(result)? {
-                let entity = by_id.get(&op.entity_id).ok_or_else(|| {
-                    anyhow::anyhow!("op references an entity the projector didn't declare")
-                })?;
-                model
-                    .apply_one(entity, op.kind)
-                    .with_context(|| format!("applying an op to entity `{}`", entity.name))?;
+            let value = alloc_event(&module, event_type, &data, events.get(event_type));
+            // Every selecting arm runs in declaration order, and `get()` reads through
+            // the batch's own uncommitted writes, so a later arm sees an earlier one's
+            // ops.
+            for index in selected {
+                let arm = &handle.arms()[index];
+                let reader = BatchReader { model, by_id };
+                let ctx = ProjectorCtx { reader: &reader };
+                let result =
+                    call_handler_with_projector_ctx(&module, arm.func, &[value], MAX_TICKS, &ctx)
+                        .map_err(|err| {
+                        anyhow::anyhow!(
+                            "{} failed: {err}",
+                            handle.label("handle", arm.spec.as_ref())
+                        )
+                    })?;
+                for op in parse_entity_ops(result)? {
+                    let entity = by_id.get(&op.entity_id).ok_or_else(|| {
+                        anyhow::anyhow!("op references an entity the projector didn't declare")
+                    })?;
+                    model
+                        .apply_one(entity, op.kind)
+                        .with_context(|| format!("applying an op to entity `{}`", entity.name))?;
+                }
             }
         }
         anyhow::Ok(())
@@ -660,6 +680,7 @@ fn definition_hash(sources: &[EventSpec], entities: &[EntityDef]) -> String {
             EventSpec::Filter {
                 event_type,
                 constraints,
+                ..
             } => {
                 canonical.push_str(event_type);
                 canonical.push('(');

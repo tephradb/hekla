@@ -44,13 +44,13 @@ use ureq::typestate::{WithBody, WithoutBody};
 
 use crate::config::Config;
 use crate::context::{CommandContext, EffectCtx, EffectHost};
-use crate::dispatch;
+use crate::dispatch::{self, arm_selects, lower_dispatch};
 use crate::envelope::{self, Envelope};
 use crate::loader::EffectUnit;
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
 use crate::runtime::{self, Runtime};
 use crate::starlark_builtins::{
-    LoadedModule, ModuleDef, alloc_event, call_handler_with_effect_ctx, thaw,
+    LoadedModule, ModuleDef, alloc_event, call_handler_with_effect_ctx, parse_event_dispatch, thaw,
 };
 
 /// Per-handler instruction budget. Bounds a runaway script at dispatch time.
@@ -452,6 +452,7 @@ fn run_invocation(
             effect,
             position,
             &env,
+            event,
             &event_type,
             &data,
             loaded,
@@ -503,6 +504,7 @@ fn try_invocation(
     effect: &str,
     position: u64,
     env: &Envelope,
+    event: &Event,
     event_type: &str,
     data: &Value,
     loaded: &LoadedModule,
@@ -521,19 +523,40 @@ fn try_invocation(
         };
         let ctx = EffectCtx { host: &host };
         let outcome = (|| -> anyhow::Result<()> {
-            let handle_fn = loaded
+            let handle_owned = loaded
                 .module
                 .get_option("handle")?
                 .ok_or_else(|| anyhow::anyhow!("effect has no handle() function"))?;
+            let handle = parse_event_dispatch(thaw(&handle_owned, &module), true)
+                .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
+            // `None` matches how the subscription is lowered: filtering a
+            // subject-encrypted field in a `source` is a static error.
+            let lowered = lower_dispatch(&handle, runtime.events_map(), None)
+                .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
+            let selected: Vec<usize> = lowered
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| arm_selects(item.as_ref(), event.as_ref()))
+                .map(|(index, _)| index)
+                .collect();
+            // No arm selects this event, so the effect has decided it needs no side
+            // effect. The invocation still completes, so the cursor advances past it.
+            if selected.is_empty() {
+                return Ok(());
+            }
             let value = alloc_event(&module, event_type, data, runtime.event_def(event_type));
-            call_handler_with_effect_ctx(
-                &module,
-                thaw(&handle_fn, &module),
-                &[value],
-                MAX_TICKS,
-                &ctx,
-            )
-            .map_err(|err| anyhow::anyhow!("handle() failed: {err}"))?;
+            // Every selecting arm runs in declaration order, so a replay journals and
+            // replays the same call sequence.
+            for index in selected {
+                let arm = &handle.arms()[index];
+                call_handler_with_effect_ctx(&module, arm.func, &[value], MAX_TICKS, &ctx)
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "{} failed: {err}",
+                            handle.label("handle", arm.spec.as_ref())
+                        )
+                    })?;
+            }
             Ok(())
         })();
         outcome.map_err(|err| InvocationFailure {

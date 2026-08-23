@@ -15,14 +15,20 @@
 //! the branch the placeholder takes is seen. A `query` that fails on the placeholder
 //! is reported as a warning, not an error, since the failure may be an artefact of
 //! the stub rather than a real defect.
+//!
+//! Per-type dispatch maps (a command's `fold`, a projector's or effect's `handle`)
+//! are cross-checked against those same clauses. A map is a module-level literal with
+//! no branches, so it is always seen in full; the uncertainty is on the other side,
+//! which is why a command-side mismatch is a warning while the same mismatch against
+//! a projector's or effect's static `source` is an error.
 
-use starlark::environment::Module;
+use starlark::environment::{FrozenModule, Module};
 use starlark::values::OwnedFrozenValue;
 
 use crate::loader::{CommandUnit, EventRegistry, Finding, LoadedProject};
 use crate::starlark_builtins::{
     EventDef, EventSpec, FieldKind, InputSchema, ModuleDef, alloc_input,
-    call_handler_with_query_ctx, parse_event_specs, thaw,
+    call_handler_with_query_ctx, parse_event_dispatch, parse_event_specs, thaw,
 };
 
 /// Instruction budget for evaluating a `query` during the check.
@@ -45,30 +51,41 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
     let mut findings = Vec::new();
     check_event_definitions(&project.events, &mut findings);
     for command in &project.commands {
-        check_command_query(command, &project.events, &mut findings);
+        check_command(command, &project.events, &mut findings);
     }
     // Projectors and effects subscribe the same way, so they are checked together:
     // all projectors first, then all effects.
     let subscribers = project
         .projectors
         .iter()
-        .map(|unit| (&unit.loaded.def, unit.rel_path.as_str()))
+        .map(|unit| (&unit.loaded, unit.rel_path.as_str()))
         .chain(
             project
                 .effects
                 .iter()
-                .map(|unit| (&unit.loaded.def, unit.rel_path.as_str())),
+                .map(|unit| (&unit.loaded, unit.rel_path.as_str())),
         );
-    for (def, rel) in subscribers {
-        if let ModuleDef::Projector { sources, .. } | ModuleDef::Effect { sources, .. } = def {
-            validate_specs(
-                sources,
-                &project.events,
-                rel,
-                Context::Source,
-                &mut findings,
-            );
-        }
+    for (loaded, rel) in subscribers {
+        let (ModuleDef::Projector { sources, .. } | ModuleDef::Effect { sources, .. }) =
+            &loaded.def
+        else {
+            continue;
+        };
+        validate_specs(
+            sources,
+            &project.events,
+            rel,
+            Context::Source,
+            &mut findings,
+        );
+        check_dispatch(
+            &loaded.module,
+            "handle",
+            None,
+            &project.events,
+            rel,
+            &mut findings,
+        );
     }
     findings
 }
@@ -113,13 +130,27 @@ fn looks_personal(field: &str) -> bool {
     PERSONAL_NAME_HINTS.iter().any(|hint| lower.contains(hint))
 }
 
-fn check_command_query(command: &CommandUnit, events: &EventRegistry, findings: &mut Vec<Finding>) {
+/// Check a command's boundary and its fold dispatch.
+///
+/// `query` is evaluated once and the clauses it declares are reused for both, so a
+/// command with no `query` is checked for the one thing that is still wrong without
+/// it: a `fold` that can never run.
+fn check_command(command: &CommandUnit, events: &EventRegistry, findings: &mut Vec<Finding>) {
     let ModuleDef::Command { input, .. } = &command.loaded.def else {
         return;
     };
-    let query_fn = match command.loaded.module.get_option("query") {
+    let module = &command.loaded.module;
+    let query_fn = match module.get_option("query") {
         // A command with no invariants omits `query` entirely.
-        Ok(None) => return,
+        Ok(None) => {
+            if matches!(module.get_option("fold"), Ok(Some(_))) {
+                findings.push(Finding::warning(
+                    &command.rel_path,
+                    "command defines `fold` but no `query`, so there is no boundary to fold and handle() only ever sees `initial`; add a query(), or drop `fold`".to_owned(),
+                ));
+            }
+            return;
+        }
         Ok(Some(func)) => func,
         Err(err) => {
             findings.push(Finding::error(
@@ -129,12 +160,107 @@ fn check_command_query(command: &CommandUnit, events: &EventRegistry, findings: 
             return;
         }
     };
-    match evaluate_query(input, &query_fn) {
-        Ok(specs) => validate_specs(&specs, events, &command.rel_path, Context::Query, findings),
-        Err(err) => findings.push(Finding::warning(
-            &command.rel_path,
-            format!("could not statically evaluate query() with placeholder input: {err:#}"),
-        )),
+    let specs = match evaluate_query(input, &query_fn) {
+        Ok(specs) => {
+            validate_specs(&specs, events, &command.rel_path, Context::Query, findings);
+            Some(specs)
+        }
+        Err(err) => {
+            findings.push(Finding::warning(
+                &command.rel_path,
+                format!("could not statically evaluate query() with placeholder input: {err:#}"),
+            ));
+            None
+        }
+    };
+    check_dispatch(
+        module,
+        "fold",
+        specs.as_deref(),
+        events,
+        &command.rel_path,
+        findings,
+    );
+}
+
+/// Check a dispatch map's keys against the event registry.
+///
+/// A projector's or effect's `handle` keys *are* its subscription, so there is nothing
+/// to cross-check them against: `validate_specs` already validates those clauses as
+/// the module's sources. What is left is the one thing neither of those catches, a key
+/// built by calling `event(...)` inline. The loader's module-scope scan
+/// ([`crate::loader`]) only sees definitions bound to a name, so an inline one inside
+/// a dict literal reaches dispatch unregistered and would quietly work.
+///
+/// A command's `fold` is also cross-checked against its boundary, but in one direction
+/// only. An entry the boundary never returns is dead code, so it is worth reporting
+/// (as a warning: `query` is evaluated with a placeholder input, so a branch the
+/// placeholder did not take could legitimately name that type). The reverse is not
+/// reported at all: the boundary is also the append condition, so a type can belong
+/// there to make a concurrent write conflict without telling the decision anything new.
+fn check_dispatch(
+    module: &FrozenModule,
+    global: &str,
+    declared: Option<&[EventSpec]>,
+    events: &EventRegistry,
+    rel: &str,
+    findings: &mut Vec<Finding>,
+) {
+    let Ok(Some(owned)) = module.get_option(global) else {
+        return;
+    };
+    // A malformed map already failed the load with a precise message; repeating a
+    // vaguer version of it here would only double the output.
+    let Ok(dispatch) = parse_event_dispatch(owned.value(), global != "fold") else {
+        return;
+    };
+    if dispatch.is_single() {
+        return;
+    }
+    let specs = dispatch.specs();
+    for spec in &specs {
+        let (Some(event_type), Some(def_id)) = (spec.event_type(), spec.def_id()) else {
+            continue; // `all_events()` is a builtin, not a definition.
+        };
+        match events.by_type.get(event_type) {
+            Some(def) if def.id == def_id => {}
+            Some(_) => findings.push(Finding::error(
+                rel,
+                format!(
+                    "`{global}` maps event `{event_type}` through a definition declared outside events/; load() the events/ definition instead of calling event(type = \"{event_type}\", ...) again"
+                ),
+            )),
+            None => findings.push(Finding::error(
+                rel,
+                format!(
+                    "`{global}` maps unknown event type `{event_type}`; keys must be definitions loaded from events/"
+                ),
+            )),
+        }
+    }
+    let Some(declared) = declared else {
+        return;
+    };
+    // `all_events()` names no types, so there is nothing to cross-check against.
+    if declared.iter().any(|spec| matches!(spec, EventSpec::All)) {
+        return;
+    }
+    for spec in &specs {
+        let Some(event_type) = spec.event_type() else {
+            continue;
+        };
+        if declared
+            .iter()
+            .any(|clause| clause.event_type() == Some(event_type))
+        {
+            continue;
+        }
+        findings.push(Finding::warning(
+            rel,
+            format!(
+                "`{global}` has an entry for `{event_type}`, which query does not include, so it never runs; add a `{event_type}(...)` clause to query(), or drop the entry"
+            ),
+        ));
     }
 }
 
@@ -166,6 +292,7 @@ fn validate_specs(
         let EventSpec::Filter {
             event_type,
             constraints,
+            ..
         } = spec
         else {
             continue; // `all_events()` matches everything; nothing to validate.

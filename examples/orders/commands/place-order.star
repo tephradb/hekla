@@ -17,12 +17,10 @@ input = schema(
 def query(input):
     return order_placed(email = input.email)
 
-def initial():
-    return {"taken": False}
+initial = {"taken": False}
 
 def fold(state, event):
-    state["taken"] = True
-    return state
+    return dict(state, taken = True)
 
 def handle(input, state):
     if state["taken"]:

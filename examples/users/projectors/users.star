@@ -15,13 +15,16 @@ users = entity(
     indexes = [index("by_email", ["email"])],
 )
 
-source = [user_registered(), user_renamed()]
-
-def handle(event):
-    if event.type == "user.registered":
-        return [put(users, {
-            "user_id": event.data["user_id"],
-            "email": event.data["email"],
-            "name": event.data["name"],
-        })]
-    return [patch(users, event.data["user_id"], {"name": event.data["name"]})]
+# The keys are the subscription: they say which events to read and what to do with
+# each, so there is no `source` list to keep in step with them. Every arm whose clause
+# matches runs, in declaration order.
+handle = {
+    user_registered(): lambda event: [put(users, {
+        "user_id": event.data["user_id"],
+        "email": event.data["email"],
+        "name": event.data["name"],
+    })],
+    user_renamed(): lambda event: [
+        patch(users, event.data["user_id"], {"name": event.data["name"]}),
+    ],
+}

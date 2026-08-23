@@ -363,12 +363,10 @@ input = schema(account_id = uuid(), email = str())
 def query(input):
     return account_registered(email = input.email)
 
-def initial():
-    return {"taken": False}
+initial = {"taken": False}
 
 def fold(state, event):
-    state["taken"] = True
-    return state
+    return dict(state, taken = True)
 
 def handle(input, state):
     if state["taken"]:
