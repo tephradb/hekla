@@ -6,8 +6,8 @@ user_registered = event(
     type = "user.registered",
     fields = {
         "user_id": uuid(),
-        "email": text(),
-        "name": text(),
+        "email": str(),
+        "name": str(),
     },
 )
 
@@ -15,7 +15,7 @@ user_renamed = event(
     type = "user.renamed",
     fields = {
         "user_id": uuid(),
-        "name": text(),
+        "name": str(),
     },
 )
 

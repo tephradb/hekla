@@ -13,9 +13,9 @@ orders = entity(
     key = "order_id",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "email": text(subject = "customer_id", max_length = 200),
-        "shipping_address": text(subject = "customer_id", max_length = 200),
+        "customer_id": uint(),
+        "email": str(subject = "customer_id", max_length = 200),
+        "shipping_address": str(subject = "customer_id", max_length = 200),
     },
     indexes = [index("by_customer", ["customer_id"])],
 )

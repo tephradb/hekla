@@ -2,12 +2,12 @@ load("events/order.star", "order_placed")
 
 input = schema(
     order_id = uuid(),
-    customer_id = u64_(),
-    shop_id = u64_(),
-    email = text(),
-    shipping_address = text(),
+    customer_id = uint(),
+    shop_id = uint(),
+    email = str(),
+    shipping_address = str(),
     order_total = money(),
-    notes = text(),
+    notes = str(),
 )
 
 # One order per email address (a launch-day, one-per-person rule). Constraining only

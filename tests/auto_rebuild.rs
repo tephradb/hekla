@@ -48,7 +48,7 @@ fn counter(source: &str) -> String {
         r#"
 load("events/e.star", "one", "two")
 
-totals = entity(key = "id", fields = {{"id": text(), "n": i64_()}})
+totals = entity(key = "id", fields = {{"id": str(), "n": int()}})
 
 source = {source}
 
@@ -68,7 +68,7 @@ fn labelled_counter(source: &str) -> String {
         r#"
 load("events/e.star", "one", "two")
 
-totals = entity(key = "id", fields = {{"id": text(), "n": i64_(), "label": text()}})
+totals = entity(key = "id", fields = {{"id": str(), "n": int(), "label": str()}})
 
 source = {source}
 

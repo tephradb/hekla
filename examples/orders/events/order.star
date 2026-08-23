@@ -9,16 +9,16 @@ order_placed = event(
     fields = {
         "order_id": uuid(),
         # Subject ids stay plaintext: they are how the runtime finds the key.
-        "customer_id": u64_(),
-        "shop_id": u64_(),
+        "customer_id": uint(),
+        "shop_id": uint(),
         # Personal, scoped to the customer. `email` is also `unique`, so a global-key
         # tag enforces one order per email across customers and survives erasure of
         # any one customer (see ARCHITECTURE.md section 15 for the tradeoff).
-        "email": text(subject = "customer_id", unique = True, max_length = 200),
-        "shipping_address": text(subject = "customer_id", max_length = 200),
+        "email": str(subject = "customer_id", unique = True, max_length = 200),
+        "shipping_address": str(subject = "customer_id", max_length = 200),
         # The shop's commercial figure, scoped to the shop.
         "order_total": money(subject = "shop_id"),
         # Free text nobody queries: opt out of tagging (and of being a huge tag).
-        "notes": text(indexed = False),
+        "notes": str(indexed = False),
     },
 )

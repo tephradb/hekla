@@ -34,8 +34,8 @@ user_registered = event(
     type = "user.registered",
     fields = {
         "user_id": uuid(),
-        "email": text(),
-        "name": text(),
+        "email": str(),
+        "name": str(),
     },
 )
 
@@ -48,7 +48,7 @@ user_activated = event(
 const REGISTER_USER: &str = r#"
 load("events/user.star", "user_registered")
 
-input = schema(user_id = uuid(), email = text(), name = text())
+input = schema(user_id = uuid(), email = str(), name = str())
 
 def handle(input, state):
     return user_registered(
@@ -74,8 +74,8 @@ users = entity(
     key = "user_id",
     fields = {
         "user_id": uuid(),
-        "email": text(),
-        "name": text(),
+        "email": str(),
+        "name": str(),
     },
     indexes = [index("by_email", ["email"])],
 )

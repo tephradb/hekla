@@ -47,11 +47,11 @@ def handle(input, state):
 "#;
 
 /// `query` runs away, but only on a branch the static check never evaluates: a
-/// `boolean()` stubs to False, so the project still loads clean.
+/// `bool()` stubs to False, so the project still loads clean.
 const SPIN_QUERY: &str = r#"
 load("events/t.star", "thing")
 
-input = schema(id = uuid(), spin = boolean())
+input = schema(id = uuid(), spin = bool())
 
 def query(input):
     if input.spin:
@@ -111,18 +111,18 @@ registered = event(
     type = "t.registered",
     fields = {
         "id": uuid(),
-        "email": text(max_length = 100),
-        "secret": text(max_length = 100, indexed = False),
+        "email": str(max_length = 100),
+        "secret": str(max_length = 100, indexed = False),
     },
 )
 "#;
 
-/// `mode` is a `u64_()`, which the static check stubs to 0, so it only ever sees the
+/// `mode` is a `uint()`, which the static check stubs to 0, so it only ever sees the
 /// clean `email` branch. The `secret` branch filters a field that is never tagged.
 const BRANCH_TO_NON_INDEXED: &str = r#"
 load("events/t.star", "registered")
 
-input = schema(id = uuid(), email = text(), mode = u64_())
+input = schema(id = uuid(), email = str(), mode = uint())
 
 def query(input):
     if input.mode == 0:
@@ -146,7 +146,7 @@ def handle(input, state):
 const BRANCH_TO_UNDECLARED: &str = r#"
 load("events/t.star", "registered")
 
-input = schema(id = uuid(), email = text(), mode = u64_())
+input = schema(id = uuid(), email = str(), mode = uint())
 
 def query(input):
     if input.mode == 0:
@@ -211,14 +211,14 @@ fn a_query_branch_the_static_check_never_sees_fails_closed() {
 // --- multi-event recovery -------------------------------------------------
 
 const BATCH_EVENTS: &str = r#"
-opened = event(type = "t.opened", fields = {"id": uuid(), "who": text(max_length = 50)})
+opened = event(type = "t.opened", fields = {"id": uuid(), "who": str(max_length = 50)})
 logged = event(type = "t.logged", fields = {"id": uuid()})
 "#;
 
 const OPEN_BATCH: &str = r#"
 load("events/t.star", "opened", "logged")
 
-input = schema(id = uuid(), who = text())
+input = schema(id = uuid(), who = str())
 
 def handle(input, state):
     return [opened(id = input.id, who = input.who), logged(id = input.id)]
@@ -267,7 +267,7 @@ fn a_multi_event_command_replays_byte_identically() {
 // --- a boundary with no fold ----------------------------------------------
 
 const NOTED_EVENTS: &str = r#"
-noted = event(type = "t.noted", fields = {"id": uuid(), "topic": text(max_length = 50)})
+noted = event(type = "t.noted", fields = {"id": uuid(), "topic": str(max_length = 50)})
 "#;
 
 /// A boundary with no `fold`: the events inside it are read (so `after` advances) but
@@ -275,7 +275,7 @@ noted = event(type = "t.noted", fields = {"id": uuid(), "topic": text(max_length
 const NOTE: &str = r#"
 load("events/t.star", "noted")
 
-input = schema(id = uuid(), topic = text())
+input = schema(id = uuid(), topic = str())
 
 def query(input):
     return noted(topic = input.topic)
@@ -325,7 +325,7 @@ fn a_boundaried_command_without_fold_still_commits() {
 const UNIQUE_EMAIL_EVENTS: &str = r#"
 registered = event(
     type = "t.registered",
-    fields = {"id": uuid(), "email": text(max_length = 100)},
+    fields = {"id": uuid(), "email": str(max_length = 100)},
 )
 "#;
 
@@ -334,7 +334,7 @@ registered = event(
 const BROKEN_FOLD: &str = r#"
 load("events/t.star", "registered")
 
-input = schema(id = uuid(), email = text())
+input = schema(id = uuid(), email = str())
 
 def query(input):
     return registered(email = input.email)
@@ -387,7 +387,7 @@ fn a_fold_that_returns_none_fails_the_command() {
 const INVALID_INPUT_COMMAND: &str = r#"
 load("events/t.star", "registered")
 
-input = schema(id = uuid(), email = text())
+input = schema(id = uuid(), email = str())
 
 def handle(input, state):
     if "@" not in input.email:
@@ -492,14 +492,14 @@ fn a_command_that_emits_nothing_commits_with_null_positions() {
 const SCALAR_EVENTS: &str = r#"
 recorded = event(
     type = "t.recorded",
-    fields = {"qty": i64_(), "code": text(max_length = 3)},
+    fields = {"qty": int(), "code": str(max_length = 3)},
 )
 "#;
 
 const RECORD_COMMAND: &str = r#"
 load("events/t.star", "recorded")
 
-input = schema(qty = i64_(), count = u64_(), flag = boolean(), code = text(max_length = 3))
+input = schema(qty = int(), count = uint(), flag = bool(), code = str(max_length = 3))
 
 def handle(input, state):
     return recorded(qty = input.qty, code = input.code)

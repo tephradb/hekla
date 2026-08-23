@@ -8,8 +8,8 @@ load("events/user.star", "user_registered")
 totals = entity(
     key = "id",
     fields = {
-        "id": text(),
-        "count": i64_(),
+        "id": str(),
+        "count": int(),
     },
 )
 

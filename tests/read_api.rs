@@ -385,7 +385,7 @@ async fn a_filter_value_of_the_wrong_type_is_a_400() {
     let dir = write_project(&[
         (
             "events/e.star",
-            r#"scored = event(type = "scored", fields = {"id": uuid(), "n": i64_()})
+            r#"scored = event(type = "scored", fields = {"id": uuid(), "n": int()})
 "#,
         ),
         (
@@ -395,7 +395,7 @@ load("events/e.star", "scored")
 
 scores = entity(
     key = "id",
-    fields = {"id": uuid(), "n": i64_()},
+    fields = {"id": uuid(), "n": int()},
     indexes = [index("by_n", ["n"])],
 )
 
@@ -723,7 +723,7 @@ fn catalog_project() -> TempDir {
     write_project(&[
         (
             "events/item.star",
-            r#"item_added = event(type = "item.added", fields = {"id": uuid(), "bucket": text()})
+            r#"item_added = event(type = "item.added", fields = {"id": uuid(), "bucket": str()})
 "#,
         ),
         (
@@ -731,7 +731,7 @@ fn catalog_project() -> TempDir {
             r#"
 load("events/item.star", "item_added")
 
-input = schema(id = uuid(), bucket = text())
+input = schema(id = uuid(), bucket = str())
 
 def handle(input, state):
     return item_added(id = input.id, bucket = input.bucket)
@@ -744,7 +744,7 @@ load("events/item.star", "item_added")
 
 items = entity(
     key = "id",
-    fields = {"id": uuid(), "bucket": text()},
+    fields = {"id": uuid(), "bucket": str()},
     indexes = [index("by_bucket", ["bucket"])],
 )
 
@@ -833,7 +833,7 @@ async fn an_integer_keyed_entity_reads_and_paginates_by_key() {
     let dir = write_project(&[
         (
             "events/count.star",
-            r#"counted = event(type = "counted", fields = {"n": u64_(), "label": text()})
+            r#"counted = event(type = "counted", fields = {"n": uint(), "label": str()})
 "#,
         ),
         (
@@ -841,7 +841,7 @@ async fn an_integer_keyed_entity_reads_and_paginates_by_key() {
             r#"
 load("events/count.star", "counted")
 
-input = schema(n = u64_(), label = text())
+input = schema(n = uint(), label = str())
 
 def handle(input, state):
     return counted(n = input.n, label = input.label)
@@ -852,7 +852,7 @@ def handle(input, state):
             r#"
 load("events/count.star", "counted")
 
-counters = entity(key = "n", fields = {"n": u64_(), "label": text()})
+counters = entity(key = "n", fields = {"n": uint(), "label": str()})
 
 source = [counted()]
 
@@ -909,7 +909,7 @@ async fn an_entity_field_named_a_sql_keyword_reads_and_writes_end_to_end() {
     let dir = write_project(&[
         (
             "events/item.star",
-            r#"item_added = event(type = "item.added", fields = {"id": uuid(), "group": text()})
+            r#"item_added = event(type = "item.added", fields = {"id": uuid(), "group": str()})
 "#,
         ),
         (
@@ -917,7 +917,7 @@ async fn an_entity_field_named_a_sql_keyword_reads_and_writes_end_to_end() {
             r#"
 load("events/item.star", "item_added")
 
-input = schema(id = uuid(), group = text())
+input = schema(id = uuid(), group = str())
 
 def handle(input, state):
     return item_added(id = input.id, group = input.group)
@@ -928,7 +928,7 @@ def handle(input, state):
             r#"
 load("events/item.star", "item_added")
 
-items = entity(key = "id", fields = {"id": uuid(), "group": text()})
+items = entity(key = "id", fields = {"id": uuid(), "group": str()})
 
 source = [item_added()]
 
@@ -975,7 +975,7 @@ fn keyword_columns_project() -> TempDir {
             "events/row.star",
             r#"row_added = event(
     type = "row.added",
-    fields = {"order": uuid(), "select": text(), "group": text()},
+    fields = {"order": uuid(), "select": str(), "group": str()},
 )
 "#,
         ),
@@ -984,7 +984,7 @@ fn keyword_columns_project() -> TempDir {
             r#"
 load("events/row.star", "row_added")
 
-input = schema(order = uuid(), select = text(), group = text())
+input = schema(order = uuid(), select = str(), group = str())
 
 def handle(input, state):
     return row_added(order = input.order, select = input.select, group = input.group)
@@ -997,7 +997,7 @@ load("events/row.star", "row_added")
 
 rows = entity(
     key = "order",
-    fields = {"order": uuid(), "select": text(), "group": text()},
+    fields = {"order": uuid(), "select": str(), "group": str()},
     indexes = [index("by_select", ["select"])],
 )
 

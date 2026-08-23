@@ -88,21 +88,40 @@ forgotten from the tag list was unqueryable forever (and adding it later missed 
   uniqueness check that survives erasure.
 
 **Field type system** (shared across event schemas, command input `schema()`, and entity schemas):
-`text`, `i64`, `u64`, `bool`, `uuid`, `timestamp`, `money`, `json`, `one_of`, `optional`. This is
-kiln's existing `FieldKind` set. Three representations are pinned so they are not decided
-inconsistently in two places:
+`str`, `int`, `uint`, `bool`, `uuid`, `timestamp`, `money`, `json`, `one_of`, `optional`.
+
+The scalar types deliberately reuse Starlark's builtin names, shadowing the standard `str`, `int`
+and `bool` globals. One rule keeps both meanings reachable: **a positional argument means Starlark's
+conversion, and no positional argument means a field declaration.** So `str(response["status"])`
+converts and `str(max_length = 200)` declares. This works because every standard conversion is
+positional-only while every field option (`indexed`, `subject`, `unique`, `max_length`) is
+named-only, and passing both at once is an error rather than a silent drop. The cost is one idiom:
+`int()` and `bool()` no longer produce `0` and `False`, so write the literals. (`str()` costs
+nothing, since the standard `str` requires its argument.) `uint` shadows nothing, and `one_of` keeps
+a distinct name because the rule cannot reach it: a variant list and starlark-rust's `enum(...)` are
+both positional, leaving nothing to tell them apart.
+
+`float` and `bytes` are intentionally left as plain Starlark conversions, because **there is no float
+field type and there will not be one.** Binary-float rounding in an append-only log is permanent;
+auto-tagging a float needs an encoding that sorts lexicographically, the same problem that stops
+`money` from keying an ordered scan; and float equality under a `unique` index is a trap. Use
+`money` for currency and scaled integers for everything else. A float reaching a typed field is
+rejected at the write boundary. The one door left open is `json`, which validates nothing by design
+and so will store one.
+
+Three representations are pinned so they are not decided inconsistently in two places:
 
 - **`money`**: a decimal string on the wire (JSON event payloads and read-API responses), an integer
   count of minor units in storage.
 - **`one_of`**: the runtime validates value membership only (a written value must be in the declared
   set). It does not validate that a transition between values is legal; transition rules, if ever
   needed, are the author's job in `handle`.
-- **`i64` and `u64`**: both land in a SQLite `INTEGER` column, which is signed 64-bit, so the
-  storable range for either is `i64::MIN..=i64::MAX`. A `u64` above `i64::MAX` is rejected at the
+- **`int` and `uint`**: both land in a SQLite `INTEGER` column, which is signed 64-bit, so the
+  storable range for either is `i64::MIN..=i64::MAX`. A `uint` above `i64::MAX` is rejected at the
   write boundary (command input and event construction), not silently stored. Reinterpreting the
   bits would round-trip the value but sort it below zero, which would quietly break `ORDER BY` and
   the `key > ?` cursor for those rows: the same failure that keeps `money` from keying an ordered
-  scan. So `u64` means "non-negative, up to `i64::MAX`"; widening it would need a storage form that
+  scan. So `uint` means "non-negative, up to `i64::MAX`"; widening it would need a storage form that
   still orders correctly.
 
 **Construct an event via its definition**: `user_registered(user_id = ..., email = ...)`. The

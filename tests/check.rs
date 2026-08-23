@@ -26,14 +26,14 @@ fn warnings(project: &LoadedProject) -> Vec<String> {
 /// A command body with no boundary, for the cases where only the `load()` or the
 /// filename matters.
 const TRIVIAL_COMMAND: &str =
-    "input = schema(x = text())\n\ndef handle(input, state):\n    return []\n";
+    "input = schema(x = str())\n\ndef handle(input, state):\n    return []\n";
 
 /// A shared event file used by the temp-project cases. `note` opts out of tagging,
 /// so a query that filters on it is an error.
 const EVENTS: &str = r#"
 thing_happened = event(
     type = "thing.happened",
-    fields = {"thing_id": uuid(), "note": text(indexed = False)},
+    fields = {"thing_id": uuid(), "note": str(indexed = False)},
 )
 "#;
 
@@ -41,7 +41,7 @@ thing_happened = event(
 const SUBJECT_EVENTS: &str = r#"
 thing = event(
     type = "thing.happened",
-    fields = {"owner": u64_(), "secret": text(subject = "owner", max_length = 50)},
+    fields = {"owner": uint(), "secret": str(subject = "owner", max_length = 50)},
 )
 "#;
 
@@ -104,7 +104,7 @@ fn query_on_non_indexed_field_is_an_error() {
                 r#"
 load("events/thing.star", "thing_happened")
 
-input = schema(thing_id = uuid(), note = text())
+input = schema(thing_id = uuid(), note = str())
 
 def query(input):
     return thing_happened(note = input.note)
@@ -124,11 +124,11 @@ fn command_cannot_load_another_command() {
         &[
             (
                 "commands/a.star",
-                "input = schema(x = text())\n\ndef handle(input, state):\n    return []\n",
+                "input = schema(x = str())\n\ndef handle(input, state):\n    return []\n",
             ),
             (
                 "commands/b.star",
-                "load(\"commands/a.star\", \"handle\")\n\ninput = schema(x = text())\n\ndef handle(input, state):\n    return []\n",
+                "load(\"commands/a.star\", \"handle\")\n\ninput = schema(x = str())\n\ndef handle(input, state):\n    return []\n",
             ),
         ],
         "may only load from events/ or lib/",
@@ -138,7 +138,7 @@ fn command_cannot_load_another_command() {
 #[test]
 fn missing_handle_is_an_error() {
     assert_error(
-        &[("commands/no-handle.star", "input = schema(x = text())\n")],
+        &[("commands/no-handle.star", "input = schema(x = str())\n")],
         "missing required `handle`",
     );
 }
@@ -209,7 +209,7 @@ load("events/thing.star", "thing_happened")
 
 things = entity(
     key = "active",
-    fields = {"thing_id": uuid(), "active": boolean()},
+    fields = {"thing_id": uuid(), "active": bool()},
 )
 
 source = [thing_happened()]
@@ -263,7 +263,7 @@ load("events/thing.star", "thing_happened")
 
 things = entity(
     key = "thing_id",
-    fields = {"thing_id": uuid(), "cursor": text()},
+    fields = {"thing_id": uuid(), "cursor": str()},
     indexes = [index("by_cursor", ["cursor"])],
 )
 
@@ -317,7 +317,7 @@ fn event_field_in_the_reserved_namespace_is_an_error() {
             r#"
 sneaky = event(
     type = "sneaky.happened",
-    fields = {"_kiln_idem": text()},
+    fields = {"_kiln_idem": str()},
 )
 "#,
         )],
@@ -331,7 +331,7 @@ fn unique_without_subject_is_an_error() {
         &[(
             "events/thing.star",
             r#"
-thing = event(type = "thing.happened", fields = {"n": u64_(unique = True)})
+thing = event(type = "thing.happened", fields = {"n": uint(unique = True)})
 "#,
         )],
         "unique = True requires",
@@ -346,7 +346,7 @@ fn subject_on_a_json_field_is_an_error() {
             r#"
 thing = event(
     type = "thing.happened",
-    fields = {"owner": u64_(), "blob": json(subject = "owner")},
+    fields = {"owner": uint(), "blob": json(subject = "owner")},
 )
 "#,
         )],
@@ -362,7 +362,7 @@ fn subject_text_without_max_length_is_an_error() {
             r#"
 thing = event(
     type = "thing.happened",
-    fields = {"owner": u64_(), "secret": text(subject = "owner")},
+    fields = {"owner": uint(), "secret": str(subject = "owner")},
 )
 "#,
         )],
@@ -378,7 +378,7 @@ fn optional_subject_id_is_an_error() {
             r#"
 thing = event(
     type = "thing.happened",
-    fields = {"owner": optional(u64_()), "secret": text(subject = "owner", max_length = 50)},
+    fields = {"owner": optional(uint()), "secret": str(subject = "owner", max_length = 50)},
 )
 "#,
         )],
@@ -396,7 +396,7 @@ fn query_on_an_undeclared_field_is_an_error() {
                 r#"
 load("events/thing.star", "thing_happened")
 
-input = schema(x = text())
+input = schema(x = str())
 
 def query(input):
     return thing_happened(nonexistent = input.x)
@@ -418,7 +418,7 @@ fn subject_referencing_an_unknown_field_is_an_error() {
             r#"
 thing = event(
     type = "thing.happened",
-    fields = {"owner": u64_(), "secret": text(subject = "nope", max_length = 50)},
+    fields = {"owner": uint(), "secret": str(subject = "nope", max_length = 50)},
 )
 "#,
         )],
@@ -443,7 +443,7 @@ load("events/thing.star", "thing")
 
 things = entity(
     key = "id",
-    fields = {"id": uuid(), "secret": text(subject = "owner", max_length = 50)},
+    fields = {"id": uuid(), "secret": str(subject = "owner", max_length = 50)},
 )
 
 source = [thing()]
@@ -469,7 +469,7 @@ load("events/thing.star", "thing")
 
 things = entity(
     key = "owner",
-    fields = {"owner": u64_(), "secret": text(subject = "owner", max_length = 50)},
+    fields = {"owner": uint(), "secret": str(subject = "owner", max_length = 50)},
     indexes = [index("by_secret", ["secret"])],
 )
 
@@ -494,7 +494,7 @@ fn query_on_a_subject_field_without_its_subject_is_an_error() {
                 r#"
 load("events/thing.star", "thing")
 
-input = schema(secret = text())
+input = schema(secret = str())
 
 def query(input):
     return thing(secret = input.secret)
@@ -518,7 +518,7 @@ fn source_filtering_a_subject_encrypted_field_is_an_error() {
                 r#"
 load("events/thing.star", "thing")
 
-things = entity(key = "owner", fields = {"owner": u64_()})
+things = entity(key = "owner", fields = {"owner": uint()})
 
 source = [thing(secret = "x")]
 
@@ -628,7 +628,7 @@ fn a_command_may_not_redeclare_a_type_events_already_declares() {
             (
                 "commands/do-thing.star",
                 r#"
-thing_done = event(type = "thing.done", fields = {"thing_id": uuid(), "note": text()})
+thing_done = event(type = "thing.done", fields = {"thing_id": uuid(), "note": str()})
 
 input = schema(thing_id = uuid())
 
@@ -687,7 +687,7 @@ def blank(value):
             r#"
 load("lib/helpers.star", "thing", "blank")
 
-input = schema(thing_id = uuid(), note = text())
+input = schema(thing_id = uuid(), note = str())
 
 def handle(input, state):
     if blank(input.note):
@@ -712,7 +712,7 @@ fn an_unwalkable_project_subdirectory_is_reported() {
 
     let dir = write_project(&[(
         "commands/a.star",
-        "input = schema(x = text())\n\ndef handle(input, state):\n    return []\n",
+        "input = schema(x = str())\n\ndef handle(input, state):\n    return []\n",
     )]);
     let blocked = dir.path().join("commands/internal");
     fs::create_dir_all(&blocked).unwrap();
@@ -856,8 +856,8 @@ thing = event(
     type = "thing.happened",
     fields = {
         "thing_id": uuid(),
-        "active": boolean(),
-        "count": u64_(),
+        "active": bool(),
+        "count": uint(),
         "status": one_of(["open", "closed"]),
     },
 )
@@ -927,7 +927,7 @@ fn personal_data_and_weak_boundaries_warn_without_failing_the_check() {
         r#"
 signed_up = event(
     type = "person.signed_up",
-    fields = {"person_id": uuid(), "email": text()},
+    fields = {"person_id": uuid(), "email": str()},
 )
 "#,
     )]);
@@ -949,7 +949,7 @@ signed_up = event(
             r#"
 signed_up = event(
     type = "person.signed_up",
-    fields = {"person_id": uuid(), "email": text()},
+    fields = {"person_id": uuid(), "email": str()},
 )
 "#,
         ),

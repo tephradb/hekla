@@ -9,8 +9,8 @@ users = entity(
     key = "user_id",
     fields = {
         "user_id": uuid(),
-        "email": text(),
-        "name": text(),
+        "email": str(),
+        "name": str(),
     },
     indexes = [index("by_email", ["email"])],
 )

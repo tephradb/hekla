@@ -85,7 +85,7 @@ fn get_reads_through_uncommitted_writes_in_a_batch() {
             r#"
 load("events/thing.star", "happened")
 
-totals = entity(key = "id", fields = {"id": text(), "count": i64_()})
+totals = entity(key = "id", fields = {"id": str(), "count": int()})
 
 source = [happened()]
 
@@ -144,7 +144,7 @@ fn a_failed_op_names_the_entity_it_was_applying() {
             r#"
 load("events/thing.star", "happened")
 
-rows = entity(key = "id", fields = {"id": text(), "label": text()})
+rows = entity(key = "id", fields = {"id": str(), "label": str()})
 
 source = [happened()]
 
@@ -195,14 +195,14 @@ def handle(event):
 const BIG_EVENTS: &str = r#"
 counted = event(
     type = "big.counted",
-    fields = {"id": uuid(), "n": u64_()},
+    fields = {"id": uuid(), "n": uint()},
 )
 "#;
 
 const BIG_PROJECTOR: &str = r#"
 load("events/big.star", "counted")
 
-nums = entity(key = "id", fields = {"id": uuid(), "n": u64_()})
+nums = entity(key = "id", fields = {"id": uuid(), "n": uint()})
 
 source = [counted()]
 
@@ -258,7 +258,7 @@ fn a_u64_field_at_exactly_i64_max_round_trips_through_the_read_model() {
 const BIG_COMMAND: &str = r#"
 load("events/big.star", "counted")
 
-input = schema(id = uuid(), n = u64_())
+input = schema(id = uuid(), n = uint())
 
 def handle(input, state):
     return counted(id = input.id, n = input.n)
@@ -378,14 +378,14 @@ fn a_delete_op_removes_the_row_and_is_a_no_op_for_a_missing_key() {
 }
 
 const RENAME_EVENTS: &str = r#"
-registered = event(type = "u.registered", fields = {"id": uuid(), "name": text()})
-renamed = event(type = "u.renamed", fields = {"id": uuid(), "name": text()})
+registered = event(type = "u.registered", fields = {"id": uuid(), "name": str()})
+renamed = event(type = "u.renamed", fields = {"id": uuid(), "name": str()})
 "#;
 
 const RENAME_PROJECTOR: &str = r#"
 load("events/u.star", "registered", "renamed")
 
-people = entity(key = "id", fields = {"id": uuid(), "name": text()})
+people = entity(key = "id", fields = {"id": uuid(), "name": str()})
 
 source = [registered(), renamed()]
 

@@ -95,7 +95,7 @@ fn a_projector_cannot_turn_a_handle_back_into_plaintext() {
         r#"
 load("events/order.star", "order_placed")
 
-leaky = entity(key = "order_id", fields = {"order_id": uuid(), "domain": text()})
+leaky = entity(key = "order_id", fields = {"order_id": uuid(), "domain": str()})
 
 source = [order_placed()]
 
@@ -196,7 +196,7 @@ fn a_handle_into_a_plaintext_column_is_rejected() {
         r#"
 load("events/order.star", "order_placed")
 
-leak = entity(key = "order_id", fields = {"order_id": uuid(), "note": text()})
+leak = entity(key = "order_id", fields = {"order_id": uuid(), "note": str()})
 
 source = [order_placed()]
 
@@ -225,7 +225,7 @@ fn re_emitting_a_folded_subject_value_is_rejected() {
         r#"
 load("events/order.star", "order_placed")
 
-input = schema(order_id = uuid(), customer_id = u64_())
+input = schema(order_id = uuid(), customer_id = uint())
 
 # Fold this customer's orders, capturing the (encrypted) email handle into state,
 # then try to re-emit it: the constructor must reject the handle.
@@ -396,7 +396,7 @@ fn concurrent_plaintext_uniqueness_admits_only_one() {
     let dir = write_project(&[
         (
             "events/thing.star",
-            r#"registered = event(type = "thing.registered", fields = {"id": uuid(), "email": text(max_length = 100)})
+            r#"registered = event(type = "thing.registered", fields = {"id": uuid(), "email": str(max_length = 100)})
 "#,
         ),
         (
@@ -404,7 +404,7 @@ fn concurrent_plaintext_uniqueness_admits_only_one() {
             r#"
 load("events/thing.star", "registered")
 
-input = schema(id = uuid(), email = text())
+input = schema(id = uuid(), email = str())
 
 def query(input):
     return registered(email = input.email)
@@ -497,9 +497,9 @@ orders = entity(
     key = "order_id",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "email": text(subject = "customer_id", max_length = 100),
-        "touches": i64_(),
+        "customer_id": uint(),
+        "email": str(subject = "customer_id", max_length = 100),
+        "touches": int(),
     },
 )
 
@@ -698,10 +698,10 @@ order_placed = event(
     type = "order.placed",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "email": text(subject = "customer_id", max_length = 100),
+        "customer_id": uint(),
+        "email": str(subject = "customer_id", max_length = 100),
         "order_total": money(subject = "customer_id"),
-        "loyalty_points": i64_(subject = "customer_id"),
+        "loyalty_points": int(subject = "customer_id"),
     },
 )
 "#;
@@ -711,10 +711,10 @@ load("events/order.star", "order_placed")
 
 input = schema(
     order_id = uuid(),
-    customer_id = u64_(),
-    email = text(),
+    customer_id = uint(),
+    email = str(),
     order_total = money(),
-    loyalty_points = i64_(),
+    loyalty_points = int(),
 )
 
 def handle(input, state):
@@ -734,10 +734,10 @@ orders = entity(
     key = "order_id",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "email": text(subject = "customer_id", max_length = 100),
+        "customer_id": uint(),
+        "email": str(subject = "customer_id", max_length = 100),
         "order_total": money(subject = "customer_id"),
-        "loyalty_points": i64_(subject = "customer_id"),
+        "loyalty_points": int(subject = "customer_id"),
     },
 )
 
@@ -823,7 +823,7 @@ fn a_scanned_page_decrypts_typed_subject_columns_and_skips_erased_rows() {
 const REORDER_COMMAND: &str = r#"
 load("events/order.star", "order_placed")
 
-input = schema(order_id = uuid(), customer_id = u64_(), email = text())
+input = schema(order_id = uuid(), customer_id = uint(), email = str())
 
 def query(input):
     return order_placed(customer_id = input.customer_id, email = input.email)
@@ -926,7 +926,7 @@ fn a_query_over_an_erased_subject_matches_nothing_and_still_appends() {
 const CHECK_ORDER_COMMAND: &str = r#"
 load("events/order.star", "order_placed")
 
-input = schema(customer_id = u64_(), email = text())
+input = schema(customer_id = uint(), email = str())
 
 def query(input):
     return order_placed(customer_id = input.customer_id, email = input.email)
@@ -1082,9 +1082,9 @@ order_placed = event(
     type = "order.placed",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "shop_id": u64_(),
-        "email": text(subject = "customer_id", max_length = 100),
+        "customer_id": uint(),
+        "shop_id": uint(),
+        "email": str(subject = "customer_id", max_length = 100),
     },
 )
 "#;
@@ -1092,7 +1092,7 @@ order_placed = event(
 const TWO_ID_PLACE_ORDER: &str = r#"
 load("events/order.star", "order_placed")
 
-input = schema(order_id = uuid(), customer_id = u64_(), shop_id = u64_(), email = text())
+input = schema(order_id = uuid(), customer_id = uint(), shop_id = uint(), email = str())
 
 def handle(input, state):
     return order_placed(
@@ -1112,8 +1112,8 @@ misfiled = entity(
     key = "order_id",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "email": text(subject = "customer_id", max_length = 100),
+        "customer_id": uint(),
+        "email": str(subject = "customer_id", max_length = 100),
     },
 )
 
@@ -1135,8 +1135,8 @@ misnamed = entity(
     key = "order_id",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "note": text(subject = "customer_id", max_length = 100),
+        "customer_id": uint(),
+        "note": str(subject = "customer_id", max_length = 100),
     },
 )
 
@@ -1158,8 +1158,8 @@ misscoped = entity(
     key = "order_id",
     fields = {
         "order_id": uuid(),
-        "shop_id": u64_(),
-        "email": text(subject = "shop_id", max_length = 100),
+        "shop_id": uint(),
+        "email": str(subject = "shop_id", max_length = 100),
     },
 )
 

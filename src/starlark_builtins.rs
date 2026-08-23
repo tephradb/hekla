@@ -13,6 +13,7 @@
 use std::fmt;
 use std::hash::Hash;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use allocative::Allocative;
@@ -143,6 +144,43 @@ impl fmt::Display for FieldType {
 #[starlark_value(type = "field_type")]
 impl<'v> StarlarkValue<'v> for FieldType {}
 starlark_simple_value!(FieldType);
+
+/// The standard `str`, `int` and `bool` are shadowed by kiln's field types, so the
+/// conversion half of `int` has to come from somewhere. Keep a private copy of the
+/// standard globals to call into: base prefixes and arbitrary-precision parsing live
+/// behind `StarlarkInt`, which starlark does not export, and reimplementing them
+/// would silently drop bignum support. `str` and `bool` need no such help, since
+/// `Value::to_str` and `Value::to_bool` are public.
+///
+/// The `Globals` is `'static`, so the frozen function outlives every evaluator that
+/// borrows it.
+fn stdlib_int<'v>() -> Value<'v> {
+    static STANDARD: OnceLock<Globals> = OnceLock::new();
+    STANDARD
+        .get_or_init(Globals::standard)
+        .iter()
+        .find(|(name, _)| *name == "int")
+        .expect("starlark always defines int")
+        .1
+        .to_value()
+}
+
+/// Reject field options on a builtin that was called to convert a value. Passing
+/// both means the caller confused the two halves of the overload, and silently
+/// dropping the options would declare nothing while looking like it had.
+fn no_field_options(name: &str, options: &[(&str, bool)]) -> anyhow::Result<()> {
+    let given: Vec<&str> = options
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(option, _)| *option)
+        .collect();
+    if given.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{name}() got a value to convert as well as the field option(s) {given:?}; pass a value to convert it, or only field options to declare a field"
+    )
+}
 
 /// Assemble a [`FieldType`] from a base kind and the shared `indexed`/`subject`/
 /// `unique` policy arguments, applying the kind-independent rules: `unique` requires
@@ -877,25 +915,85 @@ impl ModuleDef {
 #[starlark_module]
 pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     // --- field types -------------------------------------------------------
+    //
+    // The scalar types reuse Starlark's builtin names (`str`, `int`, `bool`),
+    // shadowing the standard globals. One rule keeps both meanings reachable: a
+    // positional argument means Starlark's conversion, and no positional argument
+    // means a field declaration. That works because every stdlib conversion is
+    // positional-only and every field option (`indexed`, `subject`, `unique`,
+    // `max_length`) is named-only.
+    //
+    // The one thing this costs is the zero-value idiom: `int()` and `bool()` no
+    // longer produce `0` and `False`. Write the literals instead. (`str()` costs
+    // nothing at all, since the standard `str` requires its argument.)
 
-    fn text(
+    fn str<'v>(
+        #[starlark(require = pos)] a: Option<Value<'v>>,
         #[starlark(require = named)] max_length: Option<u32>,
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
         #[starlark(require = named)] unique: Option<bool>,
-    ) -> anyhow::Result<FieldType> {
-        field_type(FieldKind::Text { max_length }, indexed, subject, unique)
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        if let Some(a) = a {
+            no_field_options(
+                "str",
+                &[
+                    ("max_length", max_length.is_some()),
+                    ("indexed", indexed.is_some()),
+                    ("subject", subject.is_some()),
+                    ("unique", unique.is_some()),
+                ],
+            )?;
+            // Already a string: hand it back rather than copying, as the standard
+            // `str` does.
+            return Ok(match a.unpack_str() {
+                Some(_) => a,
+                None => eval.heap().alloc(a.to_str()),
+            });
+        }
+        let ft = field_type(FieldKind::Text { max_length }, indexed, subject, unique)?;
+        Ok(eval.heap().alloc(ft))
     }
 
-    fn i64_(
+    fn int<'v>(
+        #[starlark(require = pos)] a: Option<Value<'v>>,
+        base: Option<Value<'v>>,
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
         #[starlark(require = named)] unique: Option<bool>,
-    ) -> anyhow::Result<FieldType> {
-        field_type(FieldKind::I64, indexed, subject, unique)
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        if let Some(a) = a {
+            no_field_options(
+                "int",
+                &[
+                    ("indexed", indexed.is_some()),
+                    ("subject", subject.is_some()),
+                    ("unique", unique.is_some()),
+                ],
+            )?;
+            // Delegate rather than reimplement: base prefixes and arbitrary-precision
+            // parsing live behind starlark's `StarlarkInt`, which is not public.
+            let named: Vec<(&str, Value<'v>)> = match base {
+                Some(base) => vec![("base", base)],
+                None => Vec::new(),
+            };
+            return eval.eval_function(stdlib_int(), &[a], &named);
+        }
+        if let Some(base) = base {
+            return Err(anyhow::anyhow!(
+                "int(base = {}) has no value to convert; int() with no positional argument declares an i64 field",
+                base.to_repr()
+            )
+            .into());
+        }
+        let ft = field_type(FieldKind::I64, indexed, subject, unique)?;
+        Ok(eval.heap().alloc(ft))
     }
 
-    fn u64_(
+    /// No standard global to shadow, so this one is a plain field type.
+    fn uint(
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
         #[starlark(require = named)] unique: Option<bool>,
@@ -903,12 +1001,26 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         field_type(FieldKind::U64, indexed, subject, unique)
     }
 
-    fn boolean(
+    fn bool<'v>(
+        #[starlark(require = pos)] a: Option<Value<'v>>,
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
         #[starlark(require = named)] unique: Option<bool>,
-    ) -> anyhow::Result<FieldType> {
-        field_type(FieldKind::Bool, indexed, subject, unique)
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        if let Some(a) = a {
+            no_field_options(
+                "bool",
+                &[
+                    ("indexed", indexed.is_some()),
+                    ("subject", subject.is_some()),
+                    ("unique", unique.is_some()),
+                ],
+            )?;
+            return Ok(Value::new_bool(a.to_bool()));
+        }
+        let ft = field_type(FieldKind::Bool, indexed, subject, unique)?;
+        Ok(eval.heap().alloc(ft))
     }
 
     fn uuid(
@@ -943,8 +1055,11 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         field_type(FieldKind::Json, indexed, subject, unique)
     }
 
-    /// Named `one_of` rather than `enum` because starlark-rust's extended
-    /// dialect already defines `enum`.
+    /// Named `one_of` rather than `enum` because the overload rule the scalar
+    /// types use does not reach it: `enum(["a", "b"])` and a variant list are both
+    /// positional, so there would be nothing to tell them apart. (`enum` itself is
+    /// free, being a starlark-rust extension rather than standard Starlark, and
+    /// kiln builds standard globals.)
     fn one_of(
         #[starlark(require = pos)] variants: UnpackList<String>,
         #[starlark(require = named)] indexed: Option<bool>,
@@ -958,7 +1073,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     }
 
     /// A nullable field. Inherits the inner field's `indexed`/`subject`/`unique`
-    /// policy, so `optional(text(subject = "customer_id", max_length = 200))` is an
+    /// policy, so `optional(str(subject = "customer_id", max_length = 200))` is an
     /// optional subject-scoped field.
     fn optional(#[starlark(require = pos)] inner: &FieldType) -> anyhow::Result<FieldType> {
         if matches!(inner.0.kind, FieldKind::Optional(_)) {
@@ -2422,6 +2537,111 @@ mod tests {
         ]
     }
 
+    /// Evaluate `expr` against the base globals and return its repr, or the first
+    /// `error:` line if it failed.
+    fn eval_expr(expr: &str) -> String {
+        let ast = parse_module("types.star", expr.to_owned()).unwrap();
+        Module::with_temp_heap(|module| {
+            let mut eval = Evaluator::new(&module);
+            match eval.eval_module(ast, &globals()) {
+                Ok(value) => value.to_repr(),
+                Err(err) => format!("{err}")
+                    .lines()
+                    .find(|line| line.starts_with("error:"))
+                    .unwrap_or("error: <none>")
+                    .to_owned(),
+            }
+        })
+    }
+
+    fn field_kind(expr: &str) -> FieldKind {
+        let ast = parse_module("types.star", format!("ft = {expr}")).unwrap();
+        let frozen = eval_frozen(ast, &globals(), None, false).unwrap();
+        let value = frozen.get("ft").unwrap();
+        value
+            .value()
+            .downcast_ref::<FieldType>()
+            .unwrap()
+            .0
+            .kind
+            .clone()
+    }
+
+    /// The scalar field types shadow standard Starlark globals, which
+    /// `GlobalsBuilder` currently permits silently. Upstream carries a
+    /// "do not quietly ignore redefinitions" TODO, so pin the behaviour here: if a
+    /// starlark upgrade ever starts rejecting or ignoring a redefinition, this
+    /// fails in CI rather than at someone's deploy.
+    #[test]
+    fn the_shadowed_globals_are_kilns_own() {
+        for name in ["str", "int", "bool"] {
+            assert_eq!(
+                globals().names().filter(|n| n.as_str() == name).count(),
+                1,
+                "`{name}` should be bound exactly once"
+            );
+        }
+        // Kiln's meaning won, not the standard one: these are all field types.
+        assert_eq!(field_kind("str()"), FieldKind::Text { max_length: None });
+        assert_eq!(field_kind("int()"), FieldKind::I64);
+        assert_eq!(field_kind("uint()"), FieldKind::U64);
+        assert_eq!(field_kind("bool()"), FieldKind::Bool);
+    }
+
+    /// The rule that lets one name carry both meanings: a positional argument is
+    /// Starlark's conversion, no positional argument is a field declaration.
+    #[test]
+    fn a_positional_argument_still_gets_the_standard_conversion() {
+        assert_eq!(eval_expr("str(7)"), r#""7""#);
+        assert_eq!(eval_expr("str([1, 'x'])"), r#""[1, \"x\"]""#);
+        assert_eq!(eval_expr("bool(0)"), "False");
+        assert_eq!(eval_expr("bool('x')"), "True");
+        assert_eq!(eval_expr("int('16')"), "16");
+        assert_eq!(eval_expr("int(3.9)"), "3");
+        // Delegated to the standard `int`, so base prefixes and bignums survive.
+        assert_eq!(eval_expr("int('16', 16)"), "22");
+        assert_eq!(eval_expr("int('0x1f', 0)"), "31");
+        assert_eq!(
+            eval_expr("int(2 * 1208925819614629174706176)"),
+            "2417851639229258349412352"
+        );
+    }
+
+    #[test]
+    fn field_options_reach_the_field_type() {
+        assert_eq!(
+            field_kind("str(max_length = 200)"),
+            FieldKind::Text {
+                max_length: Some(200)
+            }
+        );
+        let ast = parse_module("types.star", "ft = int(indexed = False)".to_owned()).unwrap();
+        let frozen = eval_frozen(ast, &globals(), None, false).unwrap();
+        let value = frozen.get("ft").unwrap();
+        assert!(!value.value().downcast_ref::<FieldType>().unwrap().0.indexed);
+    }
+
+    /// Mixing the two halves is a confusion, not a shorthand: the options would be
+    /// dropped on the floor while the call looked like a declaration.
+    #[test]
+    fn a_conversion_may_not_also_carry_field_options() {
+        for expr in [
+            "str('a', max_length = 10)",
+            "int(1, indexed = False)",
+            "bool(1, subject = 'customer_id')",
+        ] {
+            let err = eval_expr(expr);
+            assert!(
+                err.contains("pass a value to convert it, or only field options"),
+                "{expr} gave {err}"
+            );
+        }
+        assert!(
+            eval_expr("int(base = 16)").contains("has no value to convert"),
+            "int(base = 16) should not look like a declaration"
+        );
+    }
+
     fn object(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().unwrap().clone()
     }
@@ -2702,7 +2922,7 @@ def bad_patch():
 ev = event(type = "t.happened", fields = {"id": uuid()})
 
 def shadow(input, state):
-    forged = event(type = "t.happened", fields = {"id": uuid(), "secret": text()})
+    forged = event(type = "t.happened", fields = {"id": uuid(), "secret": str()})
     return forged(id = "u1", secret = "alice@example.com")
 
 def unknown(input, state):

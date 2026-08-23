@@ -9,7 +9,7 @@ the language.
 
 The current single-crate code is the baseline:
 
-- `src/starlark_builtins.rs`: field types (`text`, `i64_`, `u64_`, `boolean`, `uuid`, `timestamp`,
+- `src/starlark_builtins.rs`: field types (`str`, `int`, `uint`, `bool`, `uuid`, `timestamp`,
   `money`, `json`, `one_of`, `optional`), `schema()` for command input, `entity()` for implicitly
   collected read-model tables with `key`, fields, and `index(...)`, `event()` for typed event
   definitions with tagged fields, `events()` / `all_events()` with list OR-ing, `put` / `patch` /
@@ -262,7 +262,7 @@ refinements to revisit once real projects exercise them.
   `event.data["email"]`. One access style (dot on both) removes the papercut.
 - **Type-shaped default tagging.** Auto-tagging currently indexes every field unless `indexed=False`. A
   better default could key off the field type: identity-shaped fields (`uuid()`, integers, short
-  `text()`) are worth tagging, while `money()` almost never is. Refines the shipped auto-tagging default.
+  `str()`) are worth tagging, while `money()` almost never is. Refines the shipped auto-tagging default.
 - **Projector rename detection.** Store the projector's source file path in its checkpoint record.
   Moving `customer-orders.star` then produces an explicit "rename or new projector?" error instead of
   silently rebuilding from position zero. Refines the shipped definition-change auto-rebuild.
@@ -286,5 +286,5 @@ An opinionated order for the above, by value-to-effort. Not a commitment, a star
 4. **Only if a real project asks:** deriving `input` from the event schema, and type-shaped default
    tagging. Both are double-edged. Command input legitimately diverges from event fields (plaintext vs
    subject-encrypted, server-derived ids), so at most make derivation opt-in sugar for the 1:1 case.
-   And prefer "do not auto-tag unbounded `text()` / `json()`" (or warn on it) over an allowlist of
+   And prefer "do not auto-tag unbounded `str()` / `json()`" (or warn on it) over an allowlist of
    taggable types, keeping the explicit `indexed=` opt-out predictable.

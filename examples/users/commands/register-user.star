@@ -3,8 +3,8 @@ load("lib/validation.star", "is_blank")
 
 input = schema(
     user_id = uuid(),
-    email = text(),
-    name = text(),
+    email = str(),
+    name = str(),
 )
 
 # The consistency boundary: every prior registration for this email. A typed query

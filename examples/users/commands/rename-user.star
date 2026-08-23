@@ -3,7 +3,7 @@ load("lib/validation.star", "is_blank")
 
 input = schema(
     user_id = uuid(),
-    name = text(),
+    name = str(),
 )
 
 # Both event types carry `user_id`, so the boundary sees this user's whole history

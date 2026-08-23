@@ -253,8 +253,8 @@ order_placed = event(
     type = "order.placed",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "email": text(subject = "customer_id", max_length = 100),
+        "customer_id": uint(),
+        "email": str(subject = "customer_id", max_length = 100),
     },
 )
 "#;
@@ -263,7 +263,7 @@ order_placed = event(
 pub const PLACE_ORDER: &str = r#"
 load("events/order.star", "order_placed")
 
-input = schema(order_id = uuid(), customer_id = u64_(), email = text())
+input = schema(order_id = uuid(), customer_id = uint(), email = str())
 
 def handle(input, state):
     return order_placed(
@@ -281,8 +281,8 @@ orders = entity(
     key = "order_id",
     fields = {
         "order_id": uuid(),
-        "customer_id": u64_(),
-        "email": text(subject = "customer_id", max_length = 100),
+        "customer_id": uint(),
+        "email": str(subject = "customer_id", max_length = 100),
     },
 )
 
@@ -347,7 +347,7 @@ account_registered = event(
     type = "account.registered",
     fields = {
         "account_id": uuid(),
-        "email": text(subject = "account_id", unique = True, max_length = 100),
+        "email": str(subject = "account_id", unique = True, max_length = 100),
     },
 )
 "#;
@@ -356,7 +356,7 @@ account_registered = event(
 pub const REGISTER_ACCOUNT: &str = r#"
 load("events/account.star", "account_registered")
 
-input = schema(account_id = uuid(), email = text())
+input = schema(account_id = uuid(), email = str())
 
 # Uniqueness across all accounts: constrain only the unique field, which resolves to
 # the global-key tag (a per-account scoped tag could not match across accounts).

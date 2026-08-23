@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn a_json_column_that_does_not_parse_reads_back_as_its_raw_text() {
-        // A column declared text() in one deploy and json() in the next, with no
+        // A column declared str() in one deploy and json() in the next, with no
         // rebuild: the surviving plaintext rows must read back as the raw string.
         // Decoding them as null would drop the key from the row entirely, reporting
         // bad data as absent data.

@@ -15,12 +15,12 @@ use support::{Boot, ctx, log_head, orders_project_with, write_project};
 /// The definition lives in `handle`'s body, so the loader's module-level scan never
 /// sees it and the event registry never learns the type.
 const SNEAK_COMMAND: &str = r#"
-input = schema(owner = u64_(), secret = text())
+input = schema(owner = uint(), secret = str())
 
 def handle(input, state):
     sneaky = event(
         type = "thing.sneaked",
-        fields = {"owner": u64_(), "secret": text(subject = "owner", max_length = 50)},
+        fields = {"owner": uint(), "secret": str(subject = "owner", max_length = 50)},
     )
     return sneaky(owner = input.owner, secret = input.secret)
 "#;
@@ -59,16 +59,16 @@ fn an_event_built_inside_handle_is_rejected_instead_of_logged_as_plaintext() {
 /// lowered against it and `email_plain`, which the real definition does not declare,
 /// rode into the log verbatim: never validated, never encrypted, never erasable.
 const SHADOW_COMMAND: &str = r#"
-input = schema(order_id = uuid(), customer_id = u64_(), email = text())
+input = schema(order_id = uuid(), customer_id = uint(), email = str())
 
 def handle(input, state):
     forged = event(
         type = "order.placed",
         fields = {
             "order_id": uuid(),
-            "customer_id": u64_(),
-            "email": text(subject = "customer_id", max_length = 100),
-            "email_plain": text(),
+            "customer_id": uint(),
+            "email": str(subject = "customer_id", max_length = 100),
+            "email_plain": str(),
         },
     )
     return forged(
@@ -123,7 +123,7 @@ load("events/order.star", "order_placed")
 
 Placed = order_placed
 
-input = schema(order_id = uuid(), customer_id = u64_(), email = text())
+input = schema(order_id = uuid(), customer_id = uint(), email = str())
 
 def handle(input, state):
     return Placed(
