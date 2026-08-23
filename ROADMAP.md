@@ -241,11 +241,42 @@ Honest scope for this phase:
   the map form on a single-type projector reintroduces a named-function indirection that reads as a
   naming convention. Four of the five example subscriptions are single-type, so that is the common
   case rather than an edge.
-- **State is still read by subscript** (`state["taken"]`), matching `event.data["email"]`. Unifying
-  field access on dot syntax is its own item below, and flipping only the state half early would have
-  left a fold writing `state.exists` while reading `event.data["email"]`.
+- **State is still read by subscript** (`state["taken"]`). Unifying field access on dot syntax is its
+  own item, delivered for `event.data` in Phase 7; state deliberately stays a dict, for the reason
+  recorded there.
 
-## Phase 7 and beyond (deferred, with triggers)
+## Phase 7: dot access on event payloads (done)
+
+Commands read `input.email` but every handler read its payload as `event.data["email"]`. This phase
+makes `event.data` a struct, so both read the same way, and settles where the dot stops.
+
+- **`event.data` is a struct, read as `event.data.email`.** All 90 payload reads in the examples and
+  tests moved with it; nothing used `event.data` as a whole value, so nothing else had to change.
+- **It is built from the event definition's fields, not from the stored payload.** That is the part
+  worth more than the syntax: a field the payload omits now reads as `None` instead of raising,
+  exactly as an absent optional does on `input`. An unregistered event type has no field list, so it
+  still falls back to whatever the payload carries.
+- **The dot marks a declared shape.** `input` and `event.data` are host-built from a field schema, so
+  a misspelled field is a shape error rather than a silent miss. Handler-built values keep subscript:
+  a command's folded `state` and a `put()` row are the author's own dicts, with nothing to check
+  against.
+
+Honest scope for this phase:
+
+- **Folded state stays a dict, and this is a decision rather than a deferral.** starlark-rust's struct
+  implements attribute reads and nothing else: no `+`, no `|`, no merge. So a struct-shaped state
+  could not express "same state, but with `taken = True`" except by restating every field, and
+  `dict(state, taken = True)` (the idiom two error messages recommend) would stop working. Making it
+  pleasant needs a kiln-owned record type with an update operation, which is new vocabulary and wants
+  arguing on its own merits, not smuggling in under "unify dot syntax".
+- **Projector rows stay dicts too.** `get()` returns a row that `put()` takes straight back, and
+  `put()` takes a dict, so read-modify-write round-trips without a conversion. The subject-handle
+  wrapping is shared between the two paths and now hangs off one helper, so an event payload and a
+  row still wrap identically.
+- **Optional event fields are unexercised in the examples.** No `.star` file declares one, so the
+  absent-reads-as-`None` behaviour is pinned by an integration test rather than by a worked example.
+
+## Phase 8 and beyond (deferred, with triggers)
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
 warranted.
@@ -292,9 +323,9 @@ are journaled (point-in-time-stale on replay).
 Raw considerations from design review, captured so they are not lost. None is scheduled, and none is a
 committed shape: each names the tension it addresses and the open question. Several interact with
 features that already shipped (auto-tagging, effect retry, projector auto-rebuild), so they are
-refinements to revisit once real projects exercise them. One item, per-type folds and the
-mutate-or-return decision, shipped as Phase 6, which also folded a projector's and effect's `source`
-into the dispatch map; the rest stand as written.
+refinements to revisit once real projects exercise them. Two have shipped: per-type folds and the
+mutate-or-return decision as Phase 6 (which also folded a projector's and effect's `source` into the
+dispatch map), and dot access on event payloads as Phase 7. The rest stand as written.
 
 - **Meaningful effect outcomes, idempotency keys, and delivery events.** An effect `handle` return value
   is currently ignored, so `http.post` then a log on failure is at-least-once with silent duplicates and
@@ -310,10 +341,12 @@ into the dispatch map; the rest stand as written.
 - **Derive command input from the event schema.** `input = schema(...)` restates the event's field
   types and will drift from them. Let it derive, e.g. `input = schema(**order_placed.fields)` or a
   partial selection, so the two cannot disagree.
-- **Unify field access on dot syntax.** Commands read `input.email` but folds and effects read
-  `event.data["email"]`, and a command's folded state reads `state["taken"]`. One access style (dot on
-  all three) removes the papercut. Phase 6 left state on subscript deliberately, so the three flip
-  together rather than leaving a fold writing `state.exists` while reading `event.data["email"]`.
+- **A record type for folded state.** The dot-syntax item shipped for `event.data` in Phase 7, which
+  left `state["taken"]` as the only subscript read of a host-threaded value. Closing that gap is not a
+  syntax change: starlark's struct supports attribute reads and nothing else, so state would need a
+  kiln-owned record with an update operation (`state.with(taken = True)`, or a `replace()` builtin)
+  before `state.taken` could work at all. Worth revisiting only if real commands accumulate enough
+  state for `dict(state, ...)` to feel heavy; a two-flag decision state does not.
 - **Type-shaped default tagging.** Auto-tagging currently indexes every field unless `indexed=False`. A
   better default could key off the field type: identity-shaped fields (`uuid()`, integers, short
   `str()`) are worth tagging, while `money()` almost never is. Refines the shipped auto-tagging default.
@@ -334,10 +367,8 @@ dispatch and the fold contract, which used to head this list, shipped as Phase 6
    refinements to the item as written: derive the idempotency key from the event id (envelope, stable
    across replay and rebuild) rather than the raw log position, and route "emit an event back"
    through the existing `invoke_command` path so effects stay out of the event-producer role.
-3. **Ergonomics:** unifying field access on dot syntax, and projector rename detection. Each is small
-   and independent. Dot syntax now covers three surfaces at once (`input`, `event.data`, and a
-   command's folded `state`), which is why Phase 6 deliberately left state on subscript rather than
-   flipping half of it early.
+3. **Ergonomics:** projector rename detection, and a record type for folded state if `dict(state, ...)`
+   ever feels heavy. Each is small and independent.
 4. **Only if a real project asks:** deriving `input` from the event schema, and type-shaped default
    tagging. Both are double-edged. Command input legitimately diverges from event fields (plaintext vs
    subject-encrypted, server-derived ids), so at most make derivation opt-in sugar for the 1:1 case.

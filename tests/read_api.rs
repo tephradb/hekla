@@ -402,7 +402,7 @@ scores = entity(
 source = [scored()]
 
 def handle(event):
-    return [put(scores, {"id": event.data["id"], "n": event.data["n"]})]
+    return [put(scores, {"id": event.data.id, "n": event.data.n})]
 "#,
         ),
     ]);
@@ -483,10 +483,7 @@ async fn status_reports_a_projector_whose_handle_returns_a_non_list() {
     // runtime must surface that as a failed projector naming the shape problem, not
     // freeze at a stale position that merely looks like lag.
     for (handle_body, needle) in [
-        (
-            "    return {\"id\": event.data[\"id\"]}",
-            "must return a list",
-        ),
+        ("    return {\"id\": event.data.id}", "must return a list"),
         ("    return [1]", "projector ops must be put"),
     ] {
         let dir = projector_project(handle_body);
@@ -561,7 +558,7 @@ source = [thing_ok(), thing_bad()]
 def handle(event):
     if event.type == "thing.bad":
         fail("projector boom")
-    return [put(things, {"id": event.data["id"]})]
+    return [put(things, {"id": event.data.id})]
 "#,
         ),
     ]);
@@ -751,7 +748,7 @@ items = entity(
 source = [item_added()]
 
 def handle(event):
-    return [put(items, {"id": event.data["id"], "bucket": event.data["bucket"]})]
+    return [put(items, {"id": event.data.id, "bucket": event.data.bucket})]
 "#,
         ),
     ])
@@ -857,7 +854,7 @@ counters = entity(key = "n", fields = {"n": uint(), "label": str()})
 source = [counted()]
 
 def handle(event):
-    return [put(counters, {"n": event.data["n"], "label": event.data["label"]})]
+    return [put(counters, {"n": event.data.n, "label": event.data.label})]
 "#,
         ),
     ]);
@@ -933,7 +930,7 @@ items = entity(key = "id", fields = {"id": uuid(), "group": str()})
 source = [item_added()]
 
 def handle(event):
-    return [put(items, {"id": event.data["id"], "group": event.data["group"]})]
+    return [put(items, {"id": event.data.id, "group": event.data.group})]
 "#,
         ),
     ]);
@@ -1005,9 +1002,9 @@ source = [row_added()]
 
 def handle(event):
     return [put(rows, {
-        "order": event.data["order"],
-        "select": event.data["select"],
-        "group": event.data["group"],
+        "order": event.data.order,
+        "select": event.data.select,
+        "group": event.data.group,
     })]
 "#,
         ),

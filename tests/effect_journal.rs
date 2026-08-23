@@ -84,9 +84,9 @@ source = [user_registered()]
 
 def handle(event):
     return [put(users, {
-        "user_id": event.data["user_id"],
-        "email": event.data["email"],
-        "name": event.data["name"],
+        "user_id": event.data.user_id,
+        "email": event.data.email,
+        "name": event.data.name,
     })]
 "#;
 
@@ -228,7 +228,7 @@ load("events/user.star", "user_registered")
 source = [user_registered()]
 
 def handle(event):
-    http.post(url = "https://a.test/first", body = {"id": event.data["user_id"]})
+    http.post(url = "https://a.test/first", body = {"id": event.data.user_id})
     http.post(url = "https://a.test/second", body = {})
 "#;
 
@@ -442,7 +442,7 @@ load("events/user.star", "user_activated")
 source = [user_activated()]
 
 def handle(event):
-    row = read("users", "users", event.data["user_id"])
+    row = read("users", "users", event.data.user_id)
     page = scan("users", "users", field = "email", value = row["email"], limit = 10)
     http.post(url = "https://a.test/sync", body = {
         "name": row["name"],
@@ -530,7 +530,7 @@ load("events/user.star", "user_registered")
 source = [user_registered()]
 
 def handle(event):
-    read("nope", "users", event.data["user_id"])
+    read("nope", "users", event.data.user_id)
     http.post(url = "https://a.test/never", body = {})
 "#,
         "no projector `nope`",
@@ -623,7 +623,7 @@ load("events/user.star", "user_registered")
 source = [user_registered()]
 
 def handle(event):
-    http.post(url = "https://a.test/first-v2", body = {"id": event.data["user_id"]})
+    http.post(url = "https://a.test/first-v2", body = {"id": event.data.user_id})
     http.post(url = "https://a.test/second", body = {})
 "#;
 
@@ -739,11 +739,11 @@ load("events/user.star", "user_registered")
 
 handle = {
     user_registered(): lambda event: http.post(
-        url = "https://a.test/welcome/" + event.data["user_id"],
-        body = {"email": event.data["email"]},
+        url = "https://a.test/welcome/" + event.data.user_id,
+        body = {"email": event.data.email},
     ),
     user_registered(name = "VIP"): lambda event: http.post(
-        url = "https://a.test/vip/" + event.data["user_id"],
+        url = "https://a.test/vip/" + event.data.user_id,
         body = {},
     ),
 }

@@ -836,3 +836,72 @@ fn folded_state_accumulates_across_events() {
     assert_eq!(third.body["error"]["message"], "seen 2");
     harness.shutdown();
 }
+
+// --- event.data is schema-shaped ------------------------------------------
+
+/// A note whose body is optional, so a stored payload can legitimately omit it.
+const OPTIONAL_EVENTS: &str = r#"
+noted = event(
+    type = "t.noted",
+    fields = {"id": uuid(), "body": optional(str(max_length = 50))},
+)
+"#;
+
+/// Emits without `body`, so the stored payload has no such key at all.
+const NOTE_WITHOUT_BODY: &str = r#"
+load("events/t.star", "noted")
+
+input = schema(id = uuid())
+
+def handle(input, state):
+    return noted(id = input.id)
+"#;
+
+/// Folds the absent field. Reading it must give `None` rather than raising, the way
+/// `input.body` would: `event.data` is built from the definition's fields, not from
+/// whatever the payload happened to carry.
+const READ_ABSENT_FIELD: &str = r#"
+load("events/t.star", "noted")
+
+input = schema(id = uuid())
+
+def query(input):
+    return noted()
+
+initial = {"body": "unset"}
+
+fold = {
+    noted: lambda state, event: dict(state, body = event.data.body),
+}
+
+def handle(input, state):
+    if state["body"] == None:
+        return reject("absent", "an omitted optional field reads as None")
+    return noted(id = input.id)
+"#;
+
+#[test]
+fn an_omitted_optional_field_reads_as_none() {
+    let project = write_project(&[
+        ("events/t.star", OPTIONAL_EVENTS),
+        ("commands/note.star", NOTE_WITHOUT_BODY),
+        ("commands/read.star", READ_ABSENT_FIELD),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    let first = harness
+        .rt
+        .execute("note", json!({ "id": ALICE }), &ctx(), None)
+        .unwrap();
+    assert_eq!(first.status, 200, "{:?}", first.body);
+
+    // The fold reads `event.data.body` off a payload that never carried it. A
+    // payload-shaped dict would have raised here; a schema-shaped struct gives None.
+    let second = harness
+        .rt
+        .execute("read", json!({ "id": BOB }), &ctx(), None)
+        .unwrap();
+    assert_eq!(second.status, 422, "{:?}", second.body);
+    assert_eq!(second.body["error"]["code"], "absent");
+    harness.shutdown();
+}

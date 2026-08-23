@@ -101,7 +101,7 @@ source = [order_placed()]
 
 def handle(event):
     # Deriving plaintext from the handle: not allowed, so this errors.
-    return [put(leaky, {"order_id": event.data["order_id"], "domain": event.data["email"] + "!"})]
+    return [put(leaky, {"order_id": event.data.order_id, "domain": event.data.email + "!"})]
 "#,
     )]);
     let harness = boot(dir.path());
@@ -202,7 +202,7 @@ source = [order_placed()]
 
 def handle(event):
     # `note` is a plaintext column; storing the encrypted handle there is rejected.
-    return [put(leak, {"order_id": event.data["order_id"], "note": event.data["email"]})]
+    return [put(leak, {"order_id": event.data.order_id, "note": event.data.email})]
 "#,
     )]);
     let harness = boot(dir.path());
@@ -235,7 +235,7 @@ def query(input):
 initial = {"email": None}
 
 def fold(state, event):
-    return dict(state, email = event.data["email"])
+    return dict(state, email = event.data.email)
 
 def handle(input, state):
     return order_placed(
@@ -504,14 +504,14 @@ source = [order_placed(), touched()]
 def handle(event):
     if event.type == "order.placed":
         return [put(orders, {
-            "order_id": event.data["order_id"],
-            "customer_id": event.data["customer_id"],
-            "email": event.data["email"],
+            "order_id": event.data.order_id,
+            "customer_id": event.data.customer_id,
+            "email": event.data.email,
             "touches": 0,
         })]
     # Read-modify-write: re-store the whole row (carrying the encrypted email handle)
     # with an incremented counter.
-    row = get(orders, event.data["order_id"])
+    row = get(orders, event.data.order_id)
     if row == None:
         return []
     return [put(orders, {
@@ -741,11 +741,11 @@ source = [order_placed()]
 
 def handle(event):
     return [put(orders, {
-        "order_id": event.data["order_id"],
-        "customer_id": event.data["customer_id"],
-        "email": event.data["email"],
-        "order_total": event.data["order_total"],
-        "loyalty_points": event.data["loyalty_points"],
+        "order_id": event.data.order_id,
+        "customer_id": event.data.customer_id,
+        "email": event.data.email,
+        "order_total": event.data.order_total,
+        "loyalty_points": event.data.loyalty_points,
     })]
 "#;
 
@@ -1113,9 +1113,9 @@ source = [order_placed()]
 
 def handle(event):
     return [put(misfiled, {
-        "order_id": event.data["order_id"],
-        "customer_id": event.data["shop_id"],
-        "email": event.data["email"],
+        "order_id": event.data.order_id,
+        "customer_id": event.data.shop_id,
+        "email": event.data.email,
     })]
 "#;
 
@@ -1136,9 +1136,9 @@ source = [order_placed()]
 
 def handle(event):
     return [put(misnamed, {
-        "order_id": event.data["order_id"],
-        "customer_id": event.data["customer_id"],
-        "note": event.data["email"],
+        "order_id": event.data.order_id,
+        "customer_id": event.data.customer_id,
+        "note": event.data.email,
     })]
 "#;
 
@@ -1159,9 +1159,9 @@ source = [order_placed()]
 
 def handle(event):
     return [put(misscoped, {
-        "order_id": event.data["order_id"],
-        "shop_id": event.data["shop_id"],
-        "email": event.data["email"],
+        "order_id": event.data.order_id,
+        "shop_id": event.data.shop_id,
+        "email": event.data.email,
     })]
 "#;
 

@@ -20,11 +20,11 @@ users = entity(
 # matches runs, in declaration order.
 handle = {
     user_registered(): lambda event: [put(users, {
-        "user_id": event.data["user_id"],
-        "email": event.data["email"],
-        "name": event.data["name"],
+        "user_id": event.data.user_id,
+        "email": event.data.email,
+        "name": event.data.name,
     })],
     user_renamed(): lambda event: [
-        patch(users, event.data["user_id"], {"name": event.data["name"]}),
+        patch(users, event.data.user_id, {"name": event.data.name}),
     ],
 }

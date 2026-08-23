@@ -140,6 +140,12 @@ to a loaded definition by a second name is the same definition and keeps working
 check runs at load time, so a module-scope redeclaration outside `events/` is a `kiln check` error
 rather than a runtime one.
 
+**Payload access**: `input` and `event.data` are host-built from a declared field schema and read with
+dot access (`input.email`, `event.data.email`); a field the schema does not declare is a shape error,
+and one the payload omits reads as `None`. Values a handler builds itself, a command's folded `state`
+and a `put()` row, stay dicts read by subscript, because there is no declared shape to check them
+against.
+
 **Envelope**: the tephra payload is a JSON envelope wrapping `data` with `correlation_id`,
 `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The host stamps these
 at append; Starlark never sets them.
@@ -263,7 +269,7 @@ the current row first. It takes one of two forms:
   handle = {
       order_placed(): lambda event: [put(orders, {...})],
       order_placed(shop_id = 1): lambda event: [put(shop_one_orders, {...})],
-      order_cancelled(): lambda event: [delete(orders, event.data["order_id"])],
+      order_cancelled(): lambda event: [delete(orders, event.data.order_id)],
   }
   ```
   A bare `order_placed` is shorthand for `order_placed()`. `all_events()` is a valid key and, under

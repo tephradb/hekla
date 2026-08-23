@@ -149,7 +149,7 @@ rows = entity(key = "id", fields = {"id": str(), "label": str()})
 source = [happened()]
 
 def handle(event):
-    return [put(rows, {"id": event.data["id"], "label": "x"})]
+    return [put(rows, {"id": event.data.id, "label": "x"})]
 "#,
         ),
     ]);
@@ -207,7 +207,7 @@ nums = entity(key = "id", fields = {"id": uuid(), "n": uint()})
 source = [counted()]
 
 def handle(event):
-    return [put(nums, {"id": event.data["id"], "n": event.data["n"]})]
+    return [put(nums, {"id": event.data.id, "n": event.data.n})]
 "#;
 
 /// Project one `big.counted` carrying `n` and read the stored value back.
@@ -320,8 +320,8 @@ source = [added(), removed()]
 
 def handle(event):
     if event.type == "thing.added":
-        return [put(things, {"id": event.data["id"]})]
-    return [delete(things, event.data["id"])]
+        return [put(things, {"id": event.data.id})]
+    return [delete(things, event.data.id)]
 "#;
 
 #[test]
@@ -391,8 +391,8 @@ source = [registered(), renamed()]
 
 def handle(event):
     if event.type == "u.registered":
-        return [put(people, {"id": event.data["id"], "name": event.data["name"]})]
-    return [patch(people, event.data["id"], {"name": event.data["name"]})]
+        return [put(people, {"id": event.data.id, "name": event.data.name})]
+    return [patch(people, event.data.id, {"name": event.data.name})]
 "#;
 
 #[test]
@@ -498,11 +498,11 @@ things = entity(key = "id", fields = {"id": uuid(), "kind": str()})
 special = entity(key = "id", fields = {"id": uuid(), "kind": str()})
 
 handle = {
-    added(): lambda event: [put(things, {"id": event.data["id"], "kind": event.data["kind"]})],
+    added(): lambda event: [put(things, {"id": event.data.id, "kind": event.data.kind})],
     added(kind = "vip"): lambda event: [
-        put(special, {"id": event.data["id"], "kind": event.data["kind"]}),
+        put(special, {"id": event.data.id, "kind": event.data.kind}),
     ],
-    removed(): lambda event: [delete(things, event.data["id"])],
+    removed(): lambda event: [delete(things, event.data.id)],
 }
 "#;
 

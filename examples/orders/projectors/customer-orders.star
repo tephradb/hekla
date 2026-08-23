@@ -24,8 +24,8 @@ source = [order_placed()]
 
 def handle(event):
     return [put(orders, {
-        "order_id": event.data["order_id"],
-        "customer_id": event.data["customer_id"],
-        "email": event.data["email"],
-        "shipping_address": event.data["shipping_address"],
+        "order_id": event.data.order_id,
+        "customer_id": event.data.customer_id,
+        "email": event.data.email,
+        "shipping_address": event.data.shipping_address,
     })]

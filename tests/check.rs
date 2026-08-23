@@ -159,7 +159,7 @@ things = entity(key = "thing_id", fields = {"thing_id": uuid()})
 source = [thing_happend()]
 
 def handle(event):
-    return [put(things, {"thing_id": event.data["thing_id"]})]
+    return [put(things, {"thing_id": event.data.thing_id})]
 "#,
         ),
     ]);
@@ -189,7 +189,7 @@ things = entity(
 source = [thing_happened()]
 
 def handle(event):
-    return [put(things, {"thing_id": event.data["thing_id"]})]
+    return [put(things, {"thing_id": event.data.thing_id})]
 "#,
             ),
         ],
@@ -215,7 +215,7 @@ things = entity(
 source = [thing_happened()]
 
 def handle(event):
-    return [put(things, {"thing_id": event.data["thing_id"], "active": True})]
+    return [put(things, {"thing_id": event.data.thing_id, "active": True})]
 "#,
             ),
         ],
@@ -243,7 +243,7 @@ things = entity(
 source = [thing_happened()]
 
 def handle(event):
-    return [put(things, {"thing_id": event.data["thing_id"], "price": "1.00"})]
+    return [put(things, {"thing_id": event.data.thing_id, "price": "1.00"})]
 "#,
             ),
         ],
@@ -270,7 +270,7 @@ things = entity(
 source = [thing_happened()]
 
 def handle(event):
-    return [put(things, {"thing_id": event.data["thing_id"]})]
+    return [put(things, {"thing_id": event.data.thing_id})]
 "#,
             ),
         ],
@@ -449,7 +449,7 @@ things = entity(
 source = [thing()]
 
 def handle(event):
-    return [put(things, {"id": event.data["owner"]})]
+    return [put(things, {"id": event.data.owner})]
 "#,
             ),
         ],
@@ -476,7 +476,7 @@ things = entity(
 source = [thing()]
 
 def handle(event):
-    return [put(things, {"owner": event.data["owner"], "secret": event.data["secret"]})]
+    return [put(things, {"owner": event.data.owner, "secret": event.data.secret})]
 "#,
             ),
         ],
@@ -523,7 +523,7 @@ things = entity(key = "owner", fields = {"owner": uint()})
 source = [thing(secret = "x")]
 
 def handle(event):
-    return [put(things, {"owner": event.data["owner"]})]
+    return [put(things, {"owner": event.data.owner})]
 "#,
             ),
         ],
@@ -1400,8 +1400,8 @@ things = entity(key = "thing_id", fields = {"thing_id": uuid()})
 source = [opened(), closed()]
 
 handle = {
-    opened(): lambda event: [put(things, {"thing_id": event.data["thing_id"]})],
-    closed(): lambda event: [delete(things, event.data["thing_id"])],
+    opened(): lambda event: [put(things, {"thing_id": event.data.thing_id})],
+    closed(): lambda event: [delete(things, event.data.thing_id)],
 }
 "#,
             ),
@@ -1425,7 +1425,7 @@ load("events/t.star", "opened")
 things = entity(key = "thing_id", fields = {"thing_id": uuid()})
 
 def handle(event):
-    return [put(things, {"thing_id": event.data["thing_id"]})]
+    return [put(things, {"thing_id": event.data.thing_id})]
 "#,
             ),
         ],
@@ -1448,7 +1448,7 @@ load("events/thing.star", "thing_happened")
 things = entity(key = "thing_id", fields = {"thing_id": uuid()})
 
 handle = {
-    thing_happened(note = "x"): lambda event: [put(things, {"thing_id": event.data["thing_id"]})],
+    thing_happened(note = "x"): lambda event: [put(things, {"thing_id": event.data.thing_id})],
 }
 "#,
             ),

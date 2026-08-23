@@ -290,9 +290,9 @@ source = [order_placed()]
 
 def handle(event):
     return [put(orders, {
-        "order_id": event.data["order_id"],
-        "customer_id": event.data["customer_id"],
-        "email": event.data["email"],
+        "order_id": event.data.order_id,
+        "customer_id": event.data.customer_id,
+        "email": event.data.email,
     })]
 "#;
 
@@ -306,7 +306,7 @@ source = [order_placed()]
 def handle(event):
     # reveal() is the explicit boundary: the effect decrypts the customer email to
     # send it. A projector could not; only an effect has reveal().
-    email = reveal(event.data["email"])
+    email = reveal(event.data.email)
     http.post(url = "https://mail.test/send", body = {"to": email})
 "#;
 

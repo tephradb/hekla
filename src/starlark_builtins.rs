@@ -2117,9 +2117,21 @@ pub fn alloc_input<'v>(
 }
 
 /// Build the `event` struct passed to `fold` and to a projector/effect `handle`:
-/// `event.type` and `event.data`. When `event_def` is known and declares any
-/// subject-scoped field, those fields in `event.data` are wrapped as opaque
-/// [`CipherHandle`]s (the stored value is ciphertext) rather than exposed as
+/// `event.type` and `event.data`.
+///
+/// `event.data` is a struct, read with dot access (`event.data.email`) exactly as a
+/// command reads `input.email`. Both are host-built from a declared field schema, which
+/// is what earns the dot: a field the definition does not declare is a load-time typo
+/// rather than a `None` at runtime. Handler-built values (a command's folded state, a
+/// `put()` row) stay dicts, because they have no declared shape to check against.
+///
+/// It is built from the definition's fields rather than from the stored payload, so a
+/// field the payload omits reads as `None` instead of raising, matching how
+/// [`alloc_input`] treats an absent optional. An unregistered event type has no field
+/// list, so it falls back to whatever the payload carries.
+///
+/// When the definition declares any subject-scoped field, those values are wrapped as
+/// opaque [`CipherHandle`]s (the stored value is ciphertext) rather than exposed as
 /// strings, so plaintext never enters a handler.
 pub fn alloc_event<'v>(
     module: &Module<'v>,
@@ -2128,61 +2140,95 @@ pub fn alloc_event<'v>(
     event_def: Option<&EventDef>,
 ) -> Value<'v> {
     let heap = module.heap();
-    let data_value = match (event_def, data.as_object()) {
-        (Some(def), Some(obj)) if def.fields.iter().any(|(_, m)| m.subject.is_some()) => {
-            alloc_row_with_handles(heap, &def.fields, obj)
+    let empty = serde_json::Map::new();
+    let obj = data.as_object().unwrap_or(&empty);
+    let pairs = match event_def {
+        Some(def) => {
+            let has_subject = def.fields.iter().any(|(_, m)| m.subject.is_some());
+            let mut pairs = Vec::with_capacity(def.fields.len());
+            for (name, _) in &def.fields {
+                let value = match obj.get(name) {
+                    Some(value) if has_subject => {
+                        wrap_subject_value(heap, &def.fields, obj, name, value)
+                    }
+                    Some(value) => heap.alloc(value.clone()),
+                    None => Value::new_none(),
+                };
+                pairs.push((name.clone(), value));
+            }
+            pairs
         }
-        _ => heap.alloc(data.clone()),
+        // No registered definition, so there is no shape to fill out: expose the
+        // payload as it was stored.
+        None => obj
+            .iter()
+            .map(|(key, value)| (key.clone(), heap.alloc(value.clone())))
+            .collect(),
     };
-    let fields: Vec<(&str, Value<'v>)> =
-        vec![("type", heap.alloc(event_type)), ("data", data_value)];
+    let fields: Vec<(&str, Value<'v>)> = vec![
+        ("type", heap.alloc(event_type)),
+        ("data", heap.alloc(AllocStruct(pairs))),
+    ];
     heap.alloc(AllocStruct(fields))
 }
 
-/// Materialise a stored row (event data, or a projector read-model row) as a Starlark
-/// dict, wrapping every subject-scoped field's ciphertext as an opaque
-/// [`CipherHandle`] so a handler sees a handle, never plaintext or raw ciphertext.
-/// The subject id (a sibling plaintext column) scopes the handle; a present ciphertext
-/// whose subject id is absent or non-scalar is still wrapped (with an empty subject id)
-/// so it survives a read-modify-write, never silently dropped. A null (unset optional)
-/// subject field stays absent. Shared by `alloc_event` and the projector `get()`
-/// builtin, so both read paths wrap identically.
+/// Materialise a stored projector read-model row as a Starlark dict, wrapping every
+/// subject-scoped field's ciphertext as an opaque [`CipherHandle`] so a handler sees a
+/// handle, never plaintext or raw ciphertext.
+///
+/// A row stays a dict (unlike `event.data`, which is a struct) because `put()` takes a
+/// dict, so `get()` then `put()` round-trips without a conversion in between. A null
+/// (unset optional) subject field stays absent.
 pub(crate) fn alloc_row_with_handles<'v>(
     heap: Heap<'v>,
     fields: &[(String, FieldMeta)],
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Value<'v> {
-    let meta_of = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, m)| m);
-    let mut pairs: Vec<(String, Value<'v>)> = Vec::with_capacity(obj.len());
-    for (key, value) in obj {
-        let wrapped = match meta_of(key).and_then(|meta| meta.subject.as_ref()) {
-            Some(subject_field) => match value.as_str() {
-                Some(ciphertext) => {
-                    // A ciphertext is always wrapped so it stays opaque and is preserved
-                    // across a read-modify-write. When the subject id is present the
-                    // handle is fully scoped; when it is absent or non-scalar (a corrupt
-                    // or legacy row the write path could not produce) the handle carries
-                    // an empty subject id, so a `put` that rewrites the row fails loudly
-                    // in `enforce_subject_columns` (the id cannot be reconciled) rather
-                    // than silently nulling the stored ciphertext.
-                    let subject_value = obj
-                        .get(subject_field)
-                        .and_then(scalar_to_string)
-                        .unwrap_or_default();
-                    heap.alloc(CipherHandle {
-                        ciphertext: ciphertext.to_owned(),
-                        field: key.clone(),
-                        subject_field: subject_field.clone(),
-                        subject_value,
-                    })
-                }
-                None => heap.alloc(value.clone()),
-            },
-            None => heap.alloc(value.clone()),
-        };
-        pairs.push((key.clone(), wrapped));
-    }
+    let pairs: Vec<(String, Value<'v>)> = obj
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                wrap_subject_value(heap, fields, obj, key, value),
+            )
+        })
+        .collect();
     heap.alloc(AllocDict(pairs))
+}
+
+/// One stored field as a handler sees it: a subject-scoped field's ciphertext wrapped
+/// as an opaque [`CipherHandle`], anything else as itself.
+///
+/// A ciphertext is always wrapped so it stays opaque and is preserved across a
+/// read-modify-write. When the subject id is present the handle is fully scoped; when
+/// it is absent or non-scalar (a corrupt or legacy row the write path could not
+/// produce) the handle carries an empty subject id, so a `put` that rewrites the row
+/// fails loudly in `enforce_subject_columns` (the id cannot be reconciled) rather than
+/// silently nulling the stored ciphertext.
+pub(crate) fn wrap_subject_value<'v>(
+    heap: Heap<'v>,
+    fields: &[(String, FieldMeta)],
+    obj: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    value: &serde_json::Value,
+) -> Value<'v> {
+    let subject_field = fields
+        .iter()
+        .find(|(n, _)| n == name)
+        .and_then(|(_, meta)| meta.subject.as_ref());
+    let (Some(subject_field), Some(ciphertext)) = (subject_field, value.as_str()) else {
+        return heap.alloc(value.clone());
+    };
+    let subject_value = obj
+        .get(subject_field)
+        .and_then(scalar_to_string)
+        .unwrap_or_default();
+    heap.alloc(CipherHandle {
+        ciphertext: ciphertext.to_owned(),
+        field: name.to_owned(),
+        subject_field: subject_field.clone(),
+        subject_value,
+    })
 }
 
 /// The scalar string form of a JSON value for a tag or a subject id: strings as-is,
