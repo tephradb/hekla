@@ -4,17 +4,17 @@
 //! place that turns a problem into an LSP diagnostic:
 //!
 //! - **parse**, always, and the only tier when a file will not parse;
-//! - **resolve**, pure AST work: kiln's `load()` rules and name resolution
+//! - **resolve**, pure AST work: hekla's `load()` rules and name resolution
 //!   against the builtins the file's directory actually gets;
 //! - **project**, evaluating the buffer against the project's shared modules and
-//!   running kiln's own shape and clause checks over the result.
+//!   running hekla's own shape and clause checks over the result.
 //!
 //! The tiers exist so the expensive one can be switched off and the useful ones
 //! remain, and so a slow project cannot make typing slow: everything shared is
 //! cached elsewhere, and what happens per keystroke is one parse and one module
 //! evaluation.
 //!
-//! The rule the whole design serves: **never report a problem `kiln check` would
+//! The rule the whole design serves: **never report a problem `hekla check` would
 //! not report.** An editor that invents errors is worse than no editor support,
 //! because it teaches people to ignore it.
 
@@ -36,14 +36,14 @@ use crate::{testing, validate};
 
 /// The diagnostic name for a broken `load()`. A file with one is not evaluated,
 /// exactly as the loader does not evaluate it.
-const LOAD_RULE: &str = "kiln-load";
+const LOAD_RULE: &str = "hekla-load";
 
 /// The lints worth showing, and how loudly.
 ///
 /// An allowlist rather than a denylist. Most of starlark-rust's lints are either
 /// already disabled upstream or aimed at large generated Bazel files: unused
-/// bindings are the *product* of a kiln module, and a bare expression statement
-/// is ordinary. The severities here are kiln's own judgement, not upstream's,
+/// bindings are the *product* of a hekla module, and a bare expression statement
+/// is ordinary. The severities here are hekla's own judgement, not upstream's,
 /// which is why they are restated rather than inherited.
 const LINTS: [(&str, EvalSeverity); 7] = [
     // Two bindings of the same name: the second silently wins, so one of the
@@ -58,7 +58,7 @@ const LINTS: [(&str, EvalSeverity); 7] = [
     ("misplaced-load", EvalSeverity::Warning),
 ];
 
-/// Diagnose a document that is not inside a kiln project: it parses or it does
+/// Diagnose a document that is not inside a hekla project: it parses or it does
 /// not, and nothing more can honestly be said about it.
 pub(crate) fn unlocated(rel: &str, src: String) -> (Option<AstModule>, Vec<EvalMessage>) {
     match parse_module(rel, src) {
@@ -70,9 +70,9 @@ pub(crate) fn unlocated(rel: &str, src: String) -> (Option<AstModule>, Vec<EvalM
                 path: rel.to_owned(),
                 span: None,
                 severity: EvalSeverity::Advice,
-                name: "kiln-not-a-module".to_owned(),
+                name: "hekla-not-a-module".to_owned(),
                 description:
-                    "not a kiln module: kiln loads .star files under events/, lib/, commands/, \
+                    "not a hekla module: hekla loads .star files under events/, lib/, commands/, \
                      projectors/, effects/ or tests/ in a project directory, so this file is \
                      never loaded and its builtins are unknown"
                         .to_owned(),
@@ -84,7 +84,7 @@ pub(crate) fn unlocated(rel: &str, src: String) -> (Option<AstModule>, Vec<EvalM
     }
 }
 
-/// Diagnose a document inside a kiln project.
+/// Diagnose a document inside a hekla project.
 ///
 /// Returns the parsed module so the server can keep serving hover, completion and
 /// goto-definition from it.
@@ -106,7 +106,7 @@ pub(crate) fn diagnose(
 
     let mut messages = resolve_tier(&ast, located, globals);
     // A file whose loads are illegal is never evaluated by the loader either, so
-    // stopping here is what keeps the editor agreeing with `kiln check`: evaluating
+    // stopping here is what keeps the editor agreeing with `hekla check`: evaluating
     // it anyway would report the same broken import a second time, in the words the
     // load-time resolver uses rather than the ones the loader reports.
     let loads_resolve = !messages.iter().any(|message| message.name == LOAD_RULE);
@@ -117,7 +117,7 @@ pub(crate) fn diagnose(
     (Some(ast), messages)
 }
 
-/// Parse-only checks: kiln's `load()` rules, name resolution, and the lints.
+/// Parse-only checks: hekla's `load()` rules, name resolution, and the lints.
 fn resolve_tier(ast: &AstModule, located: &Located, globals: &Globals) -> Vec<EvalMessage> {
     let mut messages = check_loads(ast, located);
     messages.extend(check_names(ast, globals, &located.rel));
@@ -125,7 +125,7 @@ fn resolve_tier(ast: &AstModule, located: &Located, globals: &Globals) -> Vec<Ev
     messages
 }
 
-/// Kiln's `load()` restriction, reported where the load is written.
+/// Hekla's `load()` restriction, reported where the load is written.
 ///
 /// The loader reaches these too, but only for files it walks, and only once the
 /// whole project has been read. Doing it here costs a walk of the load statements
@@ -176,7 +176,7 @@ fn check_loads(ast: &AstModule, located: &Located) -> Vec<EvalMessage> {
 ///
 /// Only scope errors are kept. The same pass produces type errors, which are not
 /// reported: they have a history of false positives, they do not check lambdas,
-/// and they degrade to `Any` over kiln's own value types, so they would fail the
+/// and they degrade to `Any` over hekla's own value types, so they would fail the
 /// rule that the editor never invents an error.
 fn check_names(ast: &AstModule, globals: &Globals, rel: &str) -> Vec<EvalMessage> {
     let (errors, _, _, _) = ast.clone().typecheck(globals, &HashMap::new());
@@ -202,7 +202,7 @@ fn check_lints(ast: &AstModule, rel: &str) -> Vec<EvalMessage> {
         .collect()
 }
 
-/// Evaluate the buffer against the project's shared modules, then run kiln's own
+/// Evaluate the buffer against the project's shared modules, then run hekla's own
 /// checks over the result: the ones that need a value, not just a syntax tree.
 fn project_tier(
     ast: &AstModule,
@@ -249,7 +249,7 @@ fn project_tier(
             }
         }
         // A test file has no `ModuleDef`, but it does have a shape: the `cases`
-        // list `kiln test` reads.
+        // list `hekla test` reads.
         None if located.role == crate::loader::Role::Test => {
             if let Err(err) = testing::read_cases(&frozen) {
                 findings.push(Finding::error(rel, format!("{err:#}")));
@@ -281,7 +281,7 @@ fn finding_message(finding: &Finding, ast: &AstModule) -> EvalMessage {
             Severity::Error => EvalSeverity::Error,
             Severity::Warning => EvalSeverity::Warning,
         },
-        name: "kiln".to_owned(),
+        name: "hekla".to_owned(),
         description: finding.message.clone(),
         full_error_with_span: None,
         original: None,
@@ -401,7 +401,7 @@ order_placed = event(
             .collect()
     }
 
-    /// The regression this whole server exists for: a correct kiln module uses
+    /// The regression this whole server exists for: a correct hekla module uses
     /// builtins no generic Starlark server knows, and must come back clean.
     #[test]
     fn a_correct_module_is_clean() {
@@ -530,7 +530,7 @@ handle = {order_placed(): lambda event: [] if now() else []}
     }
 
     #[test]
-    fn kilns_load_rules_are_reported_where_the_load_is_written() {
+    fn heklas_load_rules_are_reported_where_the_load_is_written() {
         let dir = project();
         fs::write(dir.path().join("commands/other.star"), "input = schema()\n").unwrap();
 
@@ -613,7 +613,7 @@ handle = {order_placed(): lambda event: [] if now() else []}
         assert_eq!(messages[0].severity, EvalSeverity::Error);
     }
 
-    /// Unused bindings are the product of a kiln module, not a defect: the whole
+    /// Unused bindings are the product of a hekla module, not a defect: the whole
     /// file is top-level assignments nothing else in it reads.
     #[test]
     fn the_noisy_lints_are_not_reported() {
@@ -631,7 +631,7 @@ handle = {order_placed(): lambda event: [] if now() else []}
         let (ast, messages) = unlocated("scratch.star", "x = schema()\n".to_owned());
         assert!(ast.is_some());
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].name, "kiln-not-a-module");
+        assert_eq!(messages[0].name, "hekla-not-a-module");
         assert_eq!(messages[0].severity, EvalSeverity::Advice);
     }
 }

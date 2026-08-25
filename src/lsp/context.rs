@@ -1,9 +1,9 @@
-//! The kiln half of the language server: what `starlark_lsp` asks, and what kiln
+//! The hekla half of the language server: what `starlark_lsp` asks, and what hekla
 //! answers.
 //!
-//! Every method here is a place where kiln knows something a generic Starlark
+//! Every method here is a place where hekla knows something a generic Starlark
 //! server cannot: which builtins are in scope (the file's directory decides),
-//! where a `load()` path points (the project root, under kiln's restriction), and
+//! where a `load()` path points (the project root, under hekla's restriction), and
 //! what a string literal in a particular position refers to.
 
 use std::fs;
@@ -21,18 +21,18 @@ use crate::lsp::env::{Env, Envs};
 use crate::lsp::project::{Located, Projects};
 use crate::lsp::stubs::stub_dialect;
 
-pub(crate) struct KilnContext {
+pub(crate) struct HeklaContext {
     envs: Envs,
     projects: Projects,
     /// Whether to evaluate each buffer against its project. Off leaves parsing,
-    /// kiln's load rules and name resolution, which is the bulk of the value at a
+    /// hekla's load rules and name resolution, which is the bulk of the value at a
     /// fraction of the cost.
     project_checks: bool,
 }
 
-impl KilnContext {
-    pub(crate) fn new(project_checks: bool) -> KilnContext {
-        KilnContext {
+impl HeklaContext {
+    pub(crate) fn new(project_checks: bool) -> HeklaContext {
+        HeklaContext {
             envs: Envs::new(),
             projects: Projects::new(),
             project_checks,
@@ -48,7 +48,7 @@ impl KilnContext {
     }
 }
 
-impl LspContext for KilnContext {
+impl LspContext for HeklaContext {
     fn parse_file_with_contents(&self, uri: &LspUri, content: String) -> LspEvalResult {
         let (ast, messages) = match uri {
             LspUri::File(path) => match self.projects.locate(path) {
@@ -96,11 +96,11 @@ impl LspContext for KilnContext {
         current_file: &LspUri,
         _workspace_root: Option<&Path>,
     ) -> Result<LspUri, String> {
-        // The workspace root is ignored: kiln finds the project from the document
+        // The workspace root is ignored: hekla finds the project from the document
         // itself, which is strictly more precise when a workspace holds several.
         let located = self
             .locate(current_file)
-            .ok_or_else(|| format!("`{current_file}` is not a module in a kiln project"))?;
+            .ok_or_else(|| format!("`{current_file}` is not a module in a hekla project"))?;
         let normalized = normalize_load_path(path)?;
         if !is_library_path(&normalized) {
             return Err(format!(
@@ -122,16 +122,16 @@ impl LspContext for KilnContext {
     ) -> Result<String, String> {
         // Refusing is the feature, not a failure path. The server calls this for
         // every other open document to decide what to offer in completion, and
-        // skips the ones that error. Refusing anything kiln could not load stops
+        // skips the ones that error. Refusing anything hekla could not load stops
         // it offering a symbol whose auto-inserted `load()` the loader rejects.
         let target = self
             .locate(target)
-            .ok_or_else(|| format!("`{target}` is not a module in a kiln project"))?;
+            .ok_or_else(|| format!("`{target}` is not a module in a hekla project"))?;
         let current = self
             .locate(current_file)
-            .ok_or_else(|| format!("`{current_file}` is not a module in a kiln project"))?;
+            .ok_or_else(|| format!("`{current_file}` is not a module in a hekla project"))?;
         if target.root != current.root {
-            return Err("a module may not load from another kiln project".to_owned());
+            return Err("a module may not load from another hekla project".to_owned());
         }
         if !is_library_path(&target.rel) {
             return Err(format!(
@@ -140,7 +140,7 @@ impl LspContext for KilnContext {
             ));
         }
         // Always project-root-relative. A path relative to the importing file
-        // would be wrong: kiln resolves every load from the root.
+        // would be wrong: hekla resolves every load from the root.
         Ok(target.rel)
     }
 
@@ -150,7 +150,7 @@ impl LspContext for KilnContext {
         current_file: &LspUri,
         _workspace_root: Option<&Path>,
     ) -> Result<Option<StringLiteralResult>, String> {
-        // Only the string shapes kiln gives meaning to. Treating every string as a
+        // Only the string shapes hekla gives meaning to. Treating every string as a
         // path, as the reference implementation does, would try to open a file for
         // an event type, a rejection code or a URL.
         //
@@ -195,7 +195,7 @@ impl LspContext for KilnContext {
     fn get_environment(&self, uri: &LspUri) -> DocModule {
         match self.locate(uri) {
             Some(located) => self.envs.docs(Env::for_role(located.role)).clone(),
-            // Offering kiln's builtins for a file kiln would never load would be
+            // Offering hekla's builtins for a file hekla would never load would be
             // the mistake this server exists to correct, in the other direction.
             None => DocModule::default(),
         }
@@ -208,7 +208,7 @@ impl LspContext for KilnContext {
     ) -> Result<Option<LspUri>, String> {
         // Scoped to the file's own environment, because the same name means
         // different things in different directories: `now` is journaled in an
-        // effect and pinned in a command, and `str` is kiln's, not Starlark's.
+        // effect and pinned in a command, and `str` is hekla's, not Starlark's.
         Ok(self
             .locate(current_file)
             .and_then(|located| self.envs.symbol_uri(Env::for_role(located.role), symbol)))
@@ -229,7 +229,7 @@ impl LspContext for KilnContext {
         let Some(located) = self.locate(document_uri) else {
             return Ok(Vec::new());
         };
-        // Offering exactly the loadable paths turns kiln's restriction from
+        // Offering exactly the loadable paths turns hekla's restriction from
         // something to trip over into the list itself.
         let snapshot = self.projects.snapshot(&located.root);
         Ok(snapshot
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn a_load_resolves_against_the_project_root() {
         let dir = project();
-        let context = KilnContext::new(true);
+        let context = HeklaContext::new(true);
         let from = uri(&dir, "commands/place-order.star");
 
         assert_eq!(
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn an_illegal_load_explains_the_rule() {
         let dir = project();
-        let context = KilnContext::new(true);
+        let context = HeklaContext::new(true);
         let from = uri(&dir, "commands/place-order.star");
 
         let err = context
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn only_shared_modules_render_as_a_load() {
         let dir = project();
-        let context = KilnContext::new(true);
+        let context = HeklaContext::new(true);
         let from = uri(&dir, "commands/place-order.star");
 
         assert_eq!(
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn the_environment_follows_the_directory() {
         let dir = project();
-        let context = KilnContext::new(true);
+        let context = HeklaContext::new(true);
 
         let command = context.get_environment(&uri(&dir, "commands/place-order.star"));
         assert!(command.members.contains_key("now"));
@@ -346,7 +346,7 @@ mod tests {
         assert!(!projector.members.contains_key("now"));
         assert!(projector.members.contains_key("get"));
 
-        // A file kiln would never load gets nothing, rather than a guess.
+        // A file hekla would never load gets nothing, rather than a guess.
         let outside = LspUri::File(dir.path().join("scratch.star"));
         assert!(context.get_environment(&outside).members.is_empty());
     }
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn a_builtin_resolves_to_a_stub_that_parses() {
         let dir = project();
-        let context = KilnContext::new(true);
+        let context = HeklaContext::new(true);
         let from = uri(&dir, "effects/notify.star");
 
         let target = context
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn load_path_completion_offers_exactly_the_loadable_paths() {
         let dir = project();
-        let context = KilnContext::new(true);
+        let context = HeklaContext::new(true);
         let from = uri(&dir, "commands/place-order.star");
 
         let options = context
@@ -399,8 +399,8 @@ mod tests {
 
     #[test]
     fn a_missing_load_target_is_absent_rather_than_an_error() {
-        let context = KilnContext::new(true);
-        let missing = LspUri::File(Path::new("/nonexistent/kiln/events/nope.star").to_path_buf());
+        let context = HeklaContext::new(true);
+        let missing = LspUri::File(Path::new("/nonexistent/hekla/events/nope.star").to_path_buf());
         assert_eq!(context.get_load_contents(&missing), Ok(None));
     }
 }

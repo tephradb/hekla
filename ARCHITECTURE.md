@@ -1,9 +1,9 @@
-# kiln architecture
+# hekla architecture
 
-kiln is a rewrite of [umari](https://github.com/tqwewe/umari), a Rust event-sourcing / DCB
+hekla is a rewrite of [umari](https://github.com/tqwewe/umari), a Rust event-sourcing / DCB
 (Dynamic Consistency Boundary) runtime where you author **commands**, **projectors**, and
 **effects**. umari runs those as WASM component modules (Wasmtime, WIT, Rust/TS SDKs) on the
-[tephra](https://crates.io/crates/tephra) event log. kiln keeps umari's conceptual model and its
+[tephra](https://crates.io/crates/tephra) event log. hekla keeps umari's conceptual model and its
 tephra + SQLite substrate but replaces WASM with **embedded Starlark**.
 
 The swap is not cosmetic. Starlark is pure and sandboxed: no clock, no randomness, no I/O except
@@ -13,7 +13,7 @@ Temporal-style durable-execution model for effects that umari could not express.
 
 This document describes the system as designed. Delivery is phased in [ROADMAP.md](./ROADMAP.md).
 
-## 1. What kiln is
+## 1. What hekla is
 
 A single-app, event-sourced runtime. Business logic is written as small Starlark files (commands,
 projectors, effects) over an immutable tephra event log. Commands are the only writers. Projectors
@@ -55,7 +55,7 @@ project/
   commands/internal/   # internal commands (invokable by effects, NOT HTTP-routed)
   projectors/
   effects/
-  kiln.toml            # operational config (optional)
+  hekla.toml            # operational config (optional)
 ```
 
 - **`load()` is restricted to `events/` and `lib/`.** A command can never import another command,
@@ -70,7 +70,7 @@ project/
   checkpoint, schema-change, and in-flight-invocation questions as deployment, and answering them
   under a file watcher is how the mechanism everything depends on gets subtly wrong. Restart is
   instant and correct. Graceful shutdown drains effects first (section 7).
-- **Configuration (`kiln.toml`)**: a small project-level file for operational knobs that are not
+- **Configuration (`hekla.toml`)**: a small project-level file for operational knobs that are not
   code: the effect blocking-pool size and the retention window for effect journals. Defaults are
   sensible, so a project runs with no config.
 
@@ -138,7 +138,7 @@ identity rather than the type name. That closes the case where a handler builds 
 the event would be lowered against the registry's schema, and any field the real definition does not
 declare would ride into the immutable log verbatim, never validated and never encrypted. Referring
 to a loaded definition by a second name is the same definition and keeps working. The same identity
-check runs at load time, so a module-scope redeclaration outside `events/` is a `kiln check` error
+check runs at load time, so a module-scope redeclaration outside `events/` is a `hekla check` error
 rather than a runtime one.
 
 **Payload access**: a host-built value with a fixed shape is read with **dot access**, and everything
@@ -210,7 +210,7 @@ only writer.
   fields to match, e.g. `user_registered(email = input.email)`, or a list of clauses OR-ed together.
   Within a clause, fields AND; a bare `TaskCreated()` matches every event of that type; `all_events()`
   matches everything. Constraining a field is a subset match, so over-constraining silently matches
-  nothing (which `kiln check` warns about). A subject-encrypted field can only be filtered when its
+  nothing (which `hekla check` warns about). A subject-encrypted field can only be filtered when its
   subject is also constrained (scoped) or it is `unique` (global); see section 15.
 - `initial` is a literal value producing the fold's starting state, never a function: it sees no
   input, no clock and no randomness, so it can only be a constant, and a module-level expression
@@ -237,7 +237,7 @@ only writer.
   write of it should make this command fail; the fold is the decision state, so a type belongs there
   only when `handle` needs to know about it. `commands/rename-user.star` in `examples/users` is the
   case: renames are in the boundary so two concurrent renames conflict, and the fold has no arm for
-  them because `exists` is already settled by the registration. `kiln check` therefore does not
+  them because `exists` is already settled by the registration. `hekla check` therefore does not
   report a boundary type with no entry. It does report the other direction, an entry for a type the
   boundary never returns, which is dead code. That cross-check is by type only: `query` is evaluated
   against a placeholder input, so an arm made dead by its *constraint* rather than its type is not
@@ -280,7 +280,7 @@ concurrent write inside the boundary fails the append, and the caller retries.
 **Built-in idempotency key** is distinct from id-based dedupe. It exists for commands where nothing
 in the input distinguishes intent (approving a claim twice with identical input could be one retry
 or two deliberate approvals, and no domain check can resolve that). `execute` accepts an idempotency
-key; the runtime hashes it together with the command name into a reserved `_kiln_idem` tag, stamps
+key; the runtime hashes it together with the command name into a reserved `_hekla_idem` tag, stamps
 every emitted event with that tag, and guards the append against the tag existing anywhere in the
 log. The guard is whole-log rather than scoped to the boundary, so a duplicate that committed
 anywhere is caught even once the boundary's `after` has moved past it, and it is asserted by the
@@ -292,7 +292,7 @@ so a duplicate racing an in-flight commit recovers that commit rather than repor
 refusal. Hashing the command name in keeps the same key on two commands from colliding, and keeps
 the tag fixed-length whatever the client sent. Nothing is stored outside the log, so nothing has to
 be swept: exactly-once is a property of the append. The client's raw key never reaches an event; the
-derived tag lives in the reserved `_kiln_` namespace, which no event definition can emit and no
+derived tag lives in the reserved `_hekla_` namespace, which no event definition can emit and no
 `query()` can name, so request plumbing never becomes domain vocabulary.
 
 **Commands never invoke commands.** Sharing a boundary would make the callee's query a lie, and
@@ -423,8 +423,8 @@ field the pinning implementation needs later, so writing it now avoids a journal
 **Journal storage** is the shared operational DB, never the event log. HTTP responses are
 operational scratch (tokens, PII), not domain facts; putting them in an immutable log would make
 them permanent and would couple the log to the effect implementation. A background sweeper deletes
-completed invocations older than a configurable retention window (`kiln.toml`), in bounded chunks so
-one sweep never holds the connection across a long scan.
+completed invocations older than a configurable retention window (`hekla.toml`), in bounded chunks
+so one sweep never holds the connection across a long scan.
 
 Sweeping is lazy GC, but it is not unconditionally safe, so the delete is bounded by the effect's own
 cursor: it reclaims only positions at or below the persisted watermark. The driver completes
@@ -491,7 +491,7 @@ effects survive a crash and be replayed.
 
 **Concurrency (v1)**: sequential per effect: one in-flight invocation, strict position order, no
 cross-lane watermark. v1 runs one dedicated thread per effect, which already bounds concurrency at the
-number of effects; the configured blocking-pool size (`kiln.toml`) is validated but reserved for a real
+number of effects; the configured blocking-pool size (`hekla.toml`) is validated but reserved for a real
 shared pool once partition-key parallel lanes land (the watermark-plus-completed-set format enables
 them). Because processing is sequential but events are at-least-once, an effect whose handler is slower
 than its event arrival rate falls behind. Falling behind, visible as lag, is the correct behaviour, not
@@ -527,7 +527,7 @@ silent.
 data/
   events/                # tephra segments (immutable source of truth)
   projectors/{name}.db   # read-model tables + checkpoint (one transaction)
-  kiln.db                # shared operational DB: effect journals, subject keys, module metadata
+  hekla.db                # shared operational DB: effect journals, subject keys, module metadata
 ```
 
 Backup is "copy the directory". Projector databases are rebuildable from the log regardless, so a
@@ -558,12 +558,12 @@ consistent copy is not required for them.
 
 ## 11. CLI and dev loop
 
-- `kiln serve <dir>`: run the runtime and HTTP API from a project directory, loading at startup.
-- `kiln check <dir>`: the only static analysis Starlark gets, so it is thorough. It parses, resolves
-  the load graph, verifies every query filters on tags the event type actually declares, verifies
-  event constructors match field schemas, and verifies projector indexes reference declared fields.
-  For CI and pre-commit.
-- `kiln test <dir>`: events in, assert what the module did, for all three kinds. Every case seeds a
+- `hekla serve <dir>`: run the runtime and HTTP API from a project directory, loading at startup.
+- `hekla check <dir>`: the only static analysis Starlark gets, so it is thorough. It parses,
+  resolves the load graph, verifies every query filters on tags the event type actually declares,
+  verifies event constructors match field schemas, and verifies projector indexes reference declared
+  fields. For CI and pre-commit.
+- `hekla test <dir>`: events in, assert what the module did, for all three kinds. Every case seeds a
   throwaway store with `given` and then runs one module against it: a **command** produces events, a
   rejection or invalid input; a **projector** produces the rows the read API reads back (subject
   columns decrypted, as `GET /read/...` would return them); an **effect** produces the ordered
@@ -576,26 +576,26 @@ consistent copy is not required for them.
   `event.timestamp`, which is the same fixed clock. A case tests
   the author's logic, not the runtime around it: batching, checkpoints, retry, the journal and
   replay are covered elsewhere.
-- `kiln fmt`: starlark-rust ships a formatter, and indentation is syntactically meaningful.
-- `kiln lsp`: the language server, over stdio. Section 11.1.
+- `hekla fmt`: starlark-rust ships a formatter, and indentation is syntactically meaningful.
+- `hekla lsp`: the language server, over stdio. Section 11.1.
 
 ### 11.1 The language server
 
-Kiln modules are Starlark, but not *generic* Starlark, and that is precisely why kiln has to serve
+Hekla modules are Starlark, but not *generic* Starlark, and that is precisely why hekla has to serve
 them itself. Two things a general-purpose Starlark server cannot know: **which builtins are in scope
 depends on the directory** (a projector has `get` and no clock, an effect has `http` and a journaled
 one, a test file has `case`), and **`load()` resolves against the project root** under the
-`events/`-or-`lib/` restriction. Point a Bazel-flavoured server at a kiln project and every builtin
-reads as undefined and every import resolves to the wrong place. `kiln lsp` is built on
-[`starlark_lsp`](https://github.com/facebook/starlark-rust), which supplies the protocol; kiln
+`events/`-or-`lib/` restriction. Point a Bazel-flavoured server at a hekla project and every builtin
+reads as undefined and every import resolves to the wrong place. `hekla lsp` is built on
+[`starlark_lsp`](https://github.com/facebook/starlark-rust), which supplies the protocol; hekla
 supplies the language knowledge.
 
 What it does:
 
-- **Diagnostics**, in three tiers. Parse errors; then kiln's `load()` rules and name resolution
+- **Diagnostics**, in three tiers. Parse errors; then hekla's `load()` rules and name resolution
   against the directory's own builtins; then, unless `--no-project-checks`, the file evaluated
   against the project's `events/` and `lib/` modules with the same shape and clause checks
-  `kiln check` runs. The governing rule is that it never reports a problem `kiln check` would not,
+  `hekla check` runs. The governing rule is that it never reports a problem `hekla check` would not,
   which a test asserts against the shipped examples.
 - **Hover** on any builtin, from the same doc comments the runtime carries.
 - **Goto-definition** into a generated stub for a builtin, and into the real file for a `load()`.
@@ -603,18 +603,18 @@ What it does:
   loadable modules, turning the restriction into a list rather than a rule to trip over.
 
 It does **not** do formatting, rename, document symbols, semantic tokens or code actions: the crate
-advertises none of them. Use `kiln fmt` (or buildifier) as an editor format-on-save task. It also
+advertises none of them. Use `hekla fmt` (or buildifier) as an editor format-on-save task. It also
 does not re-diagnose a file's dependents when a shared module changes, and it has no file watching;
-on-disk changes are picked up by a short poll. Whole-project diagnostics remain `kiln check`'s job,
+on-disk changes are picked up by a short poll. Whole-project diagnostics remain `hekla check`'s job,
 since the protocol only publishes for open documents.
 
 Editor setup. The server takes no project directory: each open file is placed in its own project, so
 one session can span several (this repository's `examples/` holds two).
 
 - **Helix**: this repository carries `.helix/languages.toml`; copy it into a project to use it there.
-- **Neovim**: `vim.lsp.start({ name = "kiln", cmd = { "kiln", "lsp" }, root_dir = ... })`, or a
-  `configs.kiln` entry for `lspconfig` with `filetypes = { "starlark" }`.
-- **VS Code / Zed**: any generic LSP bridge extension, with the command `kiln lsp` for `.star` files.
+- **Neovim**: `vim.lsp.start({ name = "hekla", cmd = { "hekla", "lsp" }, root_dir = ... })`, or a
+  `configs.hekla` entry for `lspconfig` with `filetypes = { "starlark" }`.
+- **VS Code / Zed**: any generic LSP bridge extension, with the command `hekla lsp` for `.star` files.
 
 ## 12. Why Starlark (determinism and purity)
 
@@ -637,10 +637,10 @@ the durable-effect journal sound. Multi-language authoring is permanently out of
 
 ## 14. Code layering
 
-kiln is a single crate. The dependency direction is documented and enforced by discipline, revisited
-only when a seam proves real (embeddability, or compile times that actually hurt): `starlark_builtins`
-and `schema` depend on nothing internal; `dispatch` depends on those; `runtime` (projectors, effects,
-journal, storage) depends on `dispatch`; `api` and `cli` sit on top.
+hekla is a single crate. The dependency direction is documented and enforced by discipline,
+revisited only when a seam proves real (embeddability, or compile times that actually hurt):
+`starlark_builtins` and `schema` depend on nothing internal; `dispatch` depends on those; `runtime`
+(projectors, effects, journal, storage) depends on `dispatch`; `api` and `cli` sit on top.
 
 ## 15. Subject-scoped encryption and erasure
 
@@ -650,7 +650,7 @@ before it reaches tephra. **Erasing a subject is deleting its key**, one O(1) op
 every value scoped to it unmatchable and unreadable across the log and every read model at once, with
 no rewrite, compaction, or index rebuild.
 
-**Two ways to erase**, the same key delete either way. `kiln erase <field> <value>` is the operator
+**Two ways to erase**, the same key delete either way. `hekla erase <field> <value>` is the operator
 path, for a one-off request handled by hand. `erase(subject_field, subject_value)` is the effect
 builtin, for erasure driven by an event: a provider webhook, a retention deadline, an
 `account.closed` your own command emitted. It is journaled like every other effect side effect, and
@@ -677,10 +677,10 @@ match nothing.
 
 **Mechanism.** Encryption is deterministic (AES-SIV): the same plaintext under the same key and field
 yields the same ciphertext, so it works as an equality-matchable tag while staying decryptable. Each
-per-subject key is a random secret stored in `kiln.db`, wrapped with AES-256-GCM under a master key
-from `KILN_MASTER_KEY` and tagged with the wrapping master's id so masters can rotate online:
-`kiln rotate` rewraps every row under a new `KILN_MASTER_KEY`, unwrapping with
-`KILN_MASTER_KEY_PREVIOUS` as needed, without touching any ciphertext. The global uniqueness key
+per-subject key is a random secret stored in `hekla.db`, wrapped with AES-256-GCM under a master key
+from `HEKLA_MASTER_KEY` and tagged with the wrapping master's id so masters can rotate online:
+`hekla rotate` rewraps every row under a new `HEKLA_MASTER_KEY`, unwrapping with
+`HEKLA_MASTER_KEY_PREVIOUS` as needed, without touching any ciphertext. The global uniqueness key
 behind `unique = True` is a wrapped reserved secret, so rotation never changes global tags.
 
 **Information flow.** Plaintext of a subject field exists only at the HTTP command input (the client
@@ -712,11 +712,11 @@ and `order_total` under the shop key, and leaves the ids plaintext.
   it is opt-in per field.
 - **A field appended without a subject cannot be erased** until a segment-rewrite tool exists (out of
   scope): its plaintext is already in the log payload and tag index, and replaying projectors just
-  re-reads it. `kiln check` warns when a personal-looking field name has no subject.
+  re-reads it. `hekla check` warns when a personal-looking field name has no subject.
 - **Range predicates over encrypted tags are foreclosed** (tags are equality-only anyway).
 - **One subject per field**; genuinely joint data (a message between two people) is deferred.
-- **Effect external sinks are outside the boundary.** Erasure shreds kiln's own store; it cannot
+- **Effect external sinks are outside the boundary.** Erasure shreds hekla's own store; it cannot
   un-send an email an effect already delivered. The effect journal holds revealed plaintext only
   transiently, until the retention sweeper reclaims the completed invocation.
-- **Losing `KILN_MASTER_KEY` is total, unrecoverable loss** of every subject-scoped value. Boot fails
+- **Losing `HEKLA_MASTER_KEY` is total, unrecoverable loss** of every subject-scoped value. Boot fails
   fast with a subject-specific message when a project uses subjects and the key is absent or wrong.

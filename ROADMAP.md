@@ -1,8 +1,8 @@
-# kiln roadmap
+# hekla roadmap
 
 Phased delivery of the design in [ARCHITECTURE.md](./ARCHITECTURE.md). Each phase builds on the code
 that already exists, and each is shippable on its own except where noted. A cross-cutting rule: every
-phase keeps `kiln check` honest for whatever it introduces, so the static analysis never falls behind
+phase keeps `hekla check` honest for whatever it introduces, so the static analysis never falls behind
 the language.
 
 ## Phase 0: command and projector core (done)
@@ -41,16 +41,16 @@ Phase 2, so it is scoped honestly as "toolchain, no server" rather than a runnab
 - Deploy-time validation: `query` tag fields and projector/effect `source` types checked against the
   event registry, projector indexes against declared fields. Emit payloads are validated by the event
   constructor itself, at the point of emit.
-- Operational DB (`kiln.db`) skeleton: idempotency table, effect journal table, effect invocation
+- Operational DB (`hekla.db`) skeleton: idempotency table, effect journal table, effect invocation
   table, module metadata, under a versioned migration.
-- `kiln check` (thorough, collects every finding in one pass) and `kiln fmt` (a conservative
+- `hekla check` (thorough, collects every finding in one pass) and `hekla fmt` (a conservative
   whitespace normaliser; AST-level reflow is deferred, since starlark-rust 0.14 exposes no
   pretty-printer).
 
 ## Phase 2: command runtime and HTTP API (done)
 
-The first runnable server: execute commands over HTTP. `kiln serve` opens the tephra store and the
-operational DB, loads the project (refusing to serve if `kiln check` would fail), and runs the
+The first runnable server: execute commands over HTTP. `hekla serve` opens the tephra store and the
+operational DB, loads the project (refusing to serve if `hekla check` would fail), and runs the
 decision cycle behind Axum.
 
 - Command context: correlation id (from the `x-correlation-id` header or generated), a fresh causation
@@ -62,7 +62,7 @@ decision cycle behind Axum.
   causation, optional triggering event); tags stay outside the envelope as tephra tags, and every
   store read unwraps the payload.
 - Built-in per-command idempotency lives in the event log, not the operational DB: a keyed command
-  hashes its key into a reserved `_kiln_idem` tag on every event it emits and guards the append against
+  hashes its key into a reserved `_hekla_idem` tag on every event it emits and guards the append against
   that tag. A replay (or a crash between append and responding) finds the prior commit by that tag and
   rebuilds the original response from those events, so exactly-once is enforced by the log itself with
   nothing to reconcile at startup. A rejected or empty-emit command anchors nothing on the log, so a
@@ -77,12 +77,12 @@ decision cycle behind Axum.
   in-flight work, then joins the writer.
 - Public vs internal commands: `commands/internal/` are invokable by effects (a later phase) but return
   404 over HTTP and are absent from the generated OpenAPI.
-- `kiln test`: `tests/*.star` scenarios seed a throwaway store through the same append path and run the
+- `hekla test`: `tests/*.star` scenarios seed a throwaway store through the same append path and run the
   real command, asserting emitted events (type, data, tags) or the rejection.
 
 ## Phase 3: projectors and generated read API (done)
 
-Read models and the query surface over them. `kiln serve` now runs one thread per projector and serves
+Read models and the query surface over them. `hekla serve` now runs one thread per projector and serves
 a generated read API over the materialised state.
 
 - One sequential thread per projector, subscribing to its `source` from a persisted checkpoint. Each
@@ -115,7 +115,7 @@ Honest scope for this phase:
 
 ## Phase 4: effects (durable execution) (done)
 
-The durable-execution model. `kiln serve` now runs one thread per effect: it subscribes to the effect's
+The durable-execution model. `hekla serve` now runs one thread per effect: it subscribes to the effect's
 `source`, and for each event runs the straight-line `handle` whose impure builtins are journaled, so a
 crash mid-handler resumes by replaying journaled calls and running only the unjournaled tail live.
 
@@ -140,7 +140,7 @@ crash mid-handler resumes by replaying journaled calls and running only the unjo
 - `POST /effects/{name}/skip/{position}`: an explicit, manual operator action to advance a wedged effect
   past a genuinely unprocessable event. Never automatic.
 - Retention sweeper task (lazy GC) for effect journals and command idempotency keys, with configurable
-  windows in `kiln.toml`, sweeping in bounded chunks.
+  windows in `hekla.toml`, sweeping in bounded chunks.
 
 Honest scope for this phase:
 
@@ -202,7 +202,7 @@ folds a projector's and effect's `source` into it, and settles the contract `fol
   calls, which determinism needs, and never which arms run.
 - **The match is tephra's own predicate.** Each arm is lowered to the `QueryItem` the subscription
   already builds and matched with `tephra::Matches`, the single definition of "does this event
-  match" that tephra's index is itself differential-tested against. kiln writes no matcher, so an
+  match" that tephra's index is itself differential-tested against. hekla writes no matcher, so an
   arm's filter and the subscription's filter cannot drift apart, and a subject-scoped constraint
   works because the same lowering encrypted both the tag and the filter.
 - **A command's `fold` keeps bare-definition keys.** Its boundary is `query(input)`, computed per
@@ -218,7 +218,7 @@ folds a projector's and effect's `source` into it, and settles the contract `fol
   so it stays the frozen module global it already was: the per-request JSON round-trip that existed
   solely to hand `fold` something mutable is gone, and a fold that assigns into `state` fails on the
   first event it sees, with a message that names the contract rather than starlark's bare `Immutable`.
-- **`kiln check` reports the one thing neither the loader nor the subscription check catches**: a key
+- **`hekla check` reports the one thing neither the loader nor the subscription check catches**: a key
   built by calling `event(...)` inline. The loader's module-scope scan only sees definitions bound to
   a name, so an inline one inside a dict literal would reach dispatch unregistered and quietly work.
   A command's `fold` is additionally checked for entries its boundary never returns, which is dead
@@ -270,7 +270,7 @@ Honest scope for this phase:
   implements attribute reads and nothing else: no `+`, no `|`, no merge. So a struct-shaped state
   could not express "same state, but with `taken = True`" except by restating every field, and
   `dict(state, taken = True)` (the idiom two error messages recommend) would stop working. Making it
-  pleasant needs a kiln-owned record type with an update operation, which is new vocabulary and wants
+  pleasant needs a hekla-owned record type with an update operation, which is new vocabulary and wants
   arguing on its own merits, not smuggling in under "unify dot syntax".
 - **Projector rows stay dicts too.** `get()` returns a row that `put()` takes straight back, and
   `put()` takes a dict, so read-modify-write round-trips without a conversion. The subject-handle
@@ -318,11 +318,11 @@ one spelling for one meaning is worth more than the convenience of either altern
   same rule rather than an exception: a response `body` is parsed JSON or a string depending on what
   arrived, `headers` is keyed by arbitrary names, and `items` is a list of rows. A read-model row
   stays a dict for the reason Phase 7 recorded, that `put()` takes one.
-- **`kiln check` says each thing once.** With the keys doubling as the subscription, an unregistered
-  type used to be reported twice, once by the clause validation and once by the dispatch check. The
-  dispatch check now keeps only what is genuinely its own: a key built by calling `event(...)` inline,
-  which the loader's module-scope scan cannot see.
-- **`kiln test` covers all three kinds.** `case()` was command-only, which left the two kinds this
+- **`hekla check` says each thing once.** With the keys doubling as the subscription, an
+  unregistered type used to be reported twice, once by the clause validation and once by the
+  dispatch check. The dispatch check now keeps only what is genuinely its own: a key built by
+  calling `event(...)` inline, which the loader's module-scope scan cannot see.
+- **`hekla test` covers all three kinds.** `case()` was command-only, which left the two kinds this
   phase and Phase 6 changed most with no in-language way to check their routing. It now takes
   `projector = ...` (project `given`, assert the rows the read API reads back, subject columns
   decrypted) and `effect = ...` (run `handle` over `given`, stub the replies with `responds`, assert
@@ -373,9 +373,9 @@ Two small additions close it, and they compose:
   whole requirement. `name` is what lets one handler derive several distinct ids from one event.
 
 `build_event` now takes the event id from its caller rather than minting one, which is what lets
-`kiln test` pin it: the nth `given` event gets `00000000-0000-0000-0000-00000000000n`, alongside the
-clock and master key it already pinned. Without that, a case asserting a derived id would be flaky
-rather than failing, and the feature would be untestable in the language it ships for.
+`hekla test` pin it: the nth `given` event gets `00000000-0000-0000-0000-00000000000n`, alongside
+the clock and master key it already pinned. Without that, a case asserting a derived id would be
+flaky rather than failing, and the feature would be untestable in the language it ships for.
 
 **Honest scope:**
 
@@ -398,7 +398,7 @@ rather than failing, and the feature would be untestable in the language it ship
 
 ## Phase 10: erasure from an effect (done)
 
-Erasure was operator-only (`kiln erase`), so an app that receives erasure requests as events (a
+Erasure was operator-only (`hekla erase`), so an app that receives erasure requests as events (a
 provider redact webhook, a retention deadline, an `account.closed`) had no way to act on one. Its
 handler could see the request and do everything except the one thing that matters.
 
@@ -428,11 +428,11 @@ triggering event.
 - **Erasing the global uniqueness subject wedges rather than failing fast.** `crypto::erase_subject`
   refuses it, and a refusal from a handler is an ordinary wedge, retried forever until the code is
   fixed. That matches how every other handler bug behaves, but the subject field is a runtime string,
-  so `kiln check` cannot catch it.
+  so `hekla check` cannot catch it.
 - **The effect journal is not shredded by an erase.** Revealed plaintext that flowed into a journaled
   request body outlives the key until the retention sweeper reclaims the invocation. Already an
   accepted limitation of the model; automating erasure makes it easier to hit.
-- **A `scan`-driven fan-out is not testable in `kiln test`.** *(Closed by Phase 11: `rows = {...}`
+- **A `scan`-driven fan-out is not testable in `hekla test`.** *(Closed by Phase 11: `rows = {...}`
   seeds an effect's projector reads, so the per-row erase loop is now covered by a case.)*
 
 ## Phase 11: an effect case can seed the projectors it reads (done, retired by Phase 13)
@@ -482,7 +482,7 @@ envelope already holds. The architecture said don't, and offered no alternative.
 
 `event.timestamp` sits beside `event.id`, `event.type` and `event.data`, threaded from the envelope
 each dispatch site already decodes. Same stability argument as `event.id`: stamped once at append, so
-a projector rebuild and an effect replay both reproduce it. `kiln test` pins it to the same fixed
+a projector rebuild and an effect replay both reproduce it. `hekla test` pins it to the same fixed
 clock `now()` uses, so a column built from it is assertable.
 
 The rule this settles, now stated in both §4 and the authoring guide: **`event.timestamp` for when
@@ -500,12 +500,12 @@ the event was appended, `now()` for time that is genuinely domain data** (`expir
   not specific to this field.
 - **No formatting or arithmetic on it.** It is an RFC 3339 string; a projector that wants a date
   bucket does its own string slicing, and a fold that wants a duration parses both ends by hand.
-  Starlark has no date library and kiln adds none.
+  Starlark has no date library and hekla adds none.
 
 ## Phase 13: effects fold the log instead of reading projectors (done)
 
 An effect got state from `read(projector, entity, key)` and `scan(...)`, reaching another projector's
-read model by string name. That was the only cross-module coupling in kiln, and it was unsound in a
+read model by string name. That was the only cross-module coupling in hekla, and it was unsound in a
 way Phase 4's honest scope already recorded as the "cold-start empty read": an effect could outrun a
 projector, and because reads were journaled, the miss recorded `null` and **every retry replayed that
 null**. The row could never be observed, even once the projector caught up. The retry loop that
@@ -529,7 +529,7 @@ needed, because re-folding reproduces the answer exactly. The dispatch and effec
 `fold_boundary`, so the two cannot drift on the parts that are not obvious (match before decode,
 lower once outside the loop).
 
-`kiln test` got simpler rather than harder: `rows = {...}` is gone, because `given` is already the
+`hekla test` got simpler rather than harder: `rows = {...}` is gone, because `given` is already the
 state. The boundary folds the same seeded log the case built.
 
 Two smaller consequences fell out. `check_state_shape` is now shared by commands and effects, so
@@ -554,7 +554,7 @@ placeholder event per subscribed type, mirroring the command path's placeholder 
   `query(event)` keeps this to one entity's worth at a time, but an effect that folds an unbounded
   set has no backstop.
 - **Removing `read` is a load error, not a guided migration.** `read(...)` in an effect now fails
-  with starlark's own "Variable `read` not found". `kiln check` catches it, which is the important
+  with starlark's own "Variable `read` not found". `hekla check` catches it, which is the important
   part, but the message does not name `query`/`fold` as the replacement. Registering a stub that
   errors with guidance would have deferred the failure from check time to runtime, which is worse.
 - **Settled reference data now costs a fold.** State that is genuinely old (an access token, a plan's
@@ -576,7 +576,7 @@ warranted.
 - **Fold library** (`event_counter`, `latest_event`, `toggle`): only after roughly fifteen real
   commands exist, and only if it compiles down to the existing `query` / `fold` shape rather than
   becoming a second execution path.
-- **Workspace crate split**: when kiln must be embeddable as a library, or when compile times
+- **Workspace crate split**: when hekla must be embeddable as a library, or when compile times
   actually hurt.
 
 ### Carried-forward gaps from earlier phases
@@ -627,7 +627,7 @@ key language as Phase 8. The rest stand as written.
 - **A record type for folded state.** The dot-syntax item shipped for `event.data` in Phase 7, which
   left `state["taken"]` as the only subscript read of a host-threaded value. Closing that gap is not a
   syntax change: starlark's struct supports attribute reads and nothing else, so state would need a
-  kiln-owned record with an update operation (`state.with(taken = True)`, or a `replace()` builtin)
+  hekla-owned record with an update operation (`state.with(taken = True)`, or a `replace()` builtin)
   before `state.taken` could work at all. Worth revisiting only if real commands accumulate enough
   state for `dict(state, ...)` to feel heavy; a two-flag decision state does not.
 - **Type-shaped default tagging.** Auto-tagging currently indexes every field unless `indexed=False`. A

@@ -1,9 +1,9 @@
-# Authoring kiln modules
+# Authoring hekla modules
 
-A complete reference for writing the Starlark files that make up a kiln project. If you are
+A complete reference for writing the Starlark files that make up a hekla project. If you are
 building an application on this runtime, everything you need to write is described here.
 
-kiln is a single-app event-sourcing / DCB (Dynamic Consistency Boundary) runtime. Business logic is
+hekla is a single-app event-sourcing / DCB (Dynamic Consistency Boundary) runtime. Business logic is
 Starlark over an immutable event log:
 
 - **Commands** validate input, check invariants against replayed history, and append events. They
@@ -11,7 +11,7 @@ Starlark over an immutable event log:
 - **Projectors** consume events and build queryable SQLite read models.
 - **Effects** react to events with durable, replay-safe side effects (HTTP, invoking commands).
 
-Starlark is pure and sandboxed: no clock, no randomness, no I/O except the builtins kiln injects.
+Starlark is pure and sandboxed: no clock, no randomness, no I/O except the builtins hekla injects.
 Determinism is structural, not policed. Deployment is source text; there is no build step.
 
 ---
@@ -28,8 +28,8 @@ project/
   commands/internal/   # internal commands: invokable by effects, NOT HTTP-routed
   projectors/
   effects/
-  tests/               # kiln test scenarios
-  kiln.toml            # operational config, optional
+  tests/               # hekla test scenarios
+  hekla.toml            # operational config, optional
   data/                # created by the runtime: event log, read models, operational DB
 ```
 
@@ -60,7 +60,7 @@ Every module kind requires `handle`. Everything else depends on the kind.
 | `entity(...)` bindings | - | collected implicitly from module scope | - | - |
 | `cases = [...]` | - | - | - | **required** |
 
-There are no registration calls. kiln reads named top-level values off the frozen module.
+There are no registration calls. hekla reads named top-level values off the frozen module.
 
 ## 3. Field types
 
@@ -147,18 +147,18 @@ order_cancelled = event(type = "order.cancelled", fields = {"order_id": uuid()})
 
 One file holds as many definitions as you like; the later sections load these three.
 
-- Field names may not start with `_kiln_`, which the host reserves for its own tags.
+- Field names may not start with `_hekla_`, which the host reserves for its own tags.
 - **The binding is callable, and that call is the one dispatch form.** With field values it
   constructs an event to emit. In a query position (a command's `query`, or the keys of a `fold` or
   `handle` map) it builds a filter clause instead.
 - **Only the registered definition may be emitted.** Each `event(...)` call mints a process-unique
   id and constructed events carry it, so a handler that builds its own `event(type = "order.placed",
   ...)` inside a function body is rejected at append. Declaring an event at module scope outside
-  `events/` is a `kiln check` error. Rebinding a loaded definition to a second name is fine.
+  `events/` is a `hekla check` error. Rebinding a loaded definition to a second name is fine.
 - Constructing an event validates the payload against the field schema. Missing or extra fields fail
   fast.
 
-**Envelope.** kiln wraps each payload with an `event_id`, `correlation_id`, `causation_id`, an
+**Envelope.** hekla wraps each payload with an `event_id`, `correlation_id`, `causation_id`, an
 optional `triggering_event_id`, and the append `timestamp`. Starlark never sets these. Do not restate
 the append time in your payload; use `timestamp()` fields only for domain time (`due_at`,
 `expires_at`).
@@ -174,7 +174,7 @@ field still reads that at `event.data.id` / `event.data.timestamp`.
 `now()` for time that is genuinely domain data: `expires_at`, `due_date`, or a `purchased_at` an
 upstream system reported.
 
-**Deriving ids.** Nothing in a kiln module may mint a random id: a command retry and an effect replay
+**Deriving ids.** Nothing in a hekla module may mint a random id: a command retry and an effect replay
 both re-run the code that would mint it, so a fresh id per attempt turns one intent into several
 entities. `uuid5(namespace, name)` derives a stable one instead (RFC 4122 version 5), usually over
 `event.id`:
@@ -221,7 +221,7 @@ Clauses appear in exactly three positions, and mean the same thing in all of the
 Semantics:
 
 - Constraining a field is a **subset match**, so over-constraining silently matches nothing.
-  `kiln check` warns about clauses that look like copied emit calls.
+  `hekla check` warns about clauses that look like copied emit calls.
 - A field must be declared by that event type and must be indexed, or it is a hard error at check
   time, never a silent empty result.
 - A subject-encrypted field can only be filtered when its subject is also constrained (scoped) or
@@ -313,7 +313,7 @@ computed.
 concurrent write of it should make this command fail. It belongs in `fold` only when `handle` needs
 to know about it. An event type in the boundary with no fold arm is a normal shape, not an
 oversight: it still counts toward the append condition. The reverse (a fold arm for a type the
-boundary never returns) is dead code, and `kiln check` reports it.
+boundary never returns) is dead code, and `hekla check` reports it.
 
 A `fold` key can only filter on constants, because it is module-level and cannot see `input`. Reach
 for a constrained key on enum-shaped fields (`order_placed(status = "cancelled")`) and not much
@@ -347,7 +347,7 @@ alone tells a client whether a retry can help.
 
 Separate from id-based dedupe, for commands where nothing in the input distinguishes intent. The
 client passes an `Idempotency-Key` header; the runtime hashes it with the command name into a
-reserved `_kiln_idem` tag, stamps every emitted event with it, and guards the append against that
+reserved `_hekla_idem` tag, stamps every emitted event with it, and guards the append against that
 tag existing anywhere in the log. On a hit it returns the original commit's events and identity
 verbatim rather than re-running `handle`. A first attempt that rejected appended nothing and left no
 tag, so a retry re-decides.
@@ -572,9 +572,9 @@ Durable state is that fold, the journal, and events written through commands.
 `reveal()` is the explicit boundary an effect crosses to act on personal data. A `reveal` of an
 already-erased subject fails terminally, because no retry can recover the data.
 
-`erase()` is crypto-shredding from a handler: the same key delete `kiln erase` performs, for erasure
-driven by an event (a provider redact webhook, a retention deadline, your own `account.closed`). It
-is **irreversible**. Two rules follow from `reveal` not being journaled:
+`erase()` is crypto-shredding from a handler: the same key delete `hekla erase` performs, for
+erasure driven by an event (a provider redact webhook, a retention deadline, your own
+`account.closed`). It is **irreversible**. Two rules follow from `reveal` not being journaled:
 
 - **Erase last.** An invocation that reveals a subject and then erases it cannot be replayed: the
   replay re-runs `reveal` against a key that is gone and skips terminally. Calls journaled before the
@@ -596,7 +596,7 @@ effect whose handler is slower than its event arrival rate falls behind, and tha
 ## 9. Tests
 
 `tests/*.star` files declare `cases = [...]`. Each case seeds a throwaway store with `given` and
-runs **one** module against it. `kiln test` covers all three module kinds.
+runs **one** module against it. `hekla test` covers all three module kinds.
 
 ```starlark
 # tests/orders.star
@@ -693,12 +693,13 @@ stem. `given` is a list of events, constructed from the event definitions. `name
   derived with `uuid5(event.id, ...)` assertable.
 
 A case tests **your logic**, not the runtime around it. Batching, checkpoints, retry, the journal and
-replay are covered by kiln's own test suite.
+replay are covered by hekla's own test suite.
 
 ## 10. Builtins by directory
 
-Which builtins are in scope depends on the directory. This is why kiln ships its own language server
-(`kiln lsp`): a generic Starlark server has one environment for the language, and kiln has five.
+Which builtins are in scope depends on the directory. This is why hekla ships its own language
+server (`hekla lsp`): a generic Starlark server has one environment for the language, and
+hekla has five.
 
 **Everywhere** (`events/`, `lib/`, `commands/`, `projectors/`, `effects/`, `tests/`), on top of
 standard Starlark:
@@ -733,7 +734,7 @@ A field marked `subject = "sibling_field"` is encrypted under a key scoped to th
 `(subject_field, subject_value)`, in the tag index, the event payload, and any read-model column, all
 before it reaches storage.
 
-**Erasing a subject is deleting its key**: `kiln erase customer_id 42`. One O(1) operation makes
+**Erasing a subject is deleting its key**: `hekla erase customer_id 42`. One O(1) operation makes
 every value scoped to that subject unmatchable and unreadable across the log and every read model at
 once, with no rewrite, compaction, or index rebuild.
 
@@ -762,12 +763,12 @@ Practical rules:
 - `unique = True` keeps a global token past erasure: it still proves "some subject once used this
   value" without revealing it. Opt in per field, and only when you need a uniqueness rule that
   survives erasure.
-- **A field appended without a subject can never be erased.** `kiln check` warns when a
+- **A field appended without a subject can never be erased.** `hekla check` warns when a
   personal-looking field name (`email`, `phone`, `address`, `name`, `dob`, `ssn`, `postcode`, `zip`,
   `birth`) has no subject.
-- `KILN_MASTER_KEY` (32 bytes, base64-encoded) wraps every per-subject key. **Losing it is total, unrecoverable loss**
-  of every subject-scoped value. `kiln rotate` rewraps under a new master, unwrapping with
-  `KILN_MASTER_KEY_PREVIOUS`, without touching any ciphertext.
+- `HEKLA_MASTER_KEY` (32 bytes, base64-encoded) wraps every per-subject key. **Losing it is total, unrecoverable loss**
+  of every subject-scoped value. `hekla rotate` rewraps under a new master, unwrapping with
+  `HEKLA_MASTER_KEY_PREVIOUS`, without touching any ciphertext.
 - Erasure cannot un-send an email an effect already delivered. External sinks are outside the
   boundary.
 
@@ -823,15 +824,15 @@ A field the schema does not declare is a shape error; one the payload omits read
 
 | Command | Purpose |
 |---|---|
-| `kiln check <dir>` | Static analysis: parse, resolve the load graph, verify every clause filters on fields the event type declares and indexes, verify event constructors match field schemas, verify projector indexes reference declared fields. For CI and pre-commit. |
-| `kiln fmt <dir>` (`--check`) | Format `.star` files. Indentation is syntactically meaningful. |
-| `kiln test <dir>` | Run the scenarios under `tests/`. |
-| `kiln serve <dir>` (`--addr`, `--data-dir`) | Run the runtime and HTTP API. |
-| `kiln lsp` | Language server over stdio, for editor integration. |
-| `kiln erase <field> <value> <dir>` | Delete a subject's key. Irreversible. |
-| `kiln rotate <dir>` | Rewrap every subject key under the current `KILN_MASTER_KEY`. |
+| `hekla check <dir>` | Static analysis: parse, resolve the load graph, verify every clause filters on fields the event type declares and indexes, verify event constructors match field schemas, verify projector indexes reference declared fields. For CI and pre-commit. |
+| `hekla fmt <dir>` (`--check`) | Format `.star` files. Indentation is syntactically meaningful. |
+| `hekla test <dir>` | Run the scenarios under `tests/`. |
+| `hekla serve <dir>` (`--addr`, `--data-dir`) | Run the runtime and HTTP API. |
+| `hekla lsp` | Language server over stdio, for editor integration. |
+| `hekla erase <field> <value> <dir>` | Delete a subject's key. Irreversible. |
+| `hekla rotate <dir>` | Rewrap every subject key under the current `HEKLA_MASTER_KEY`. |
 
-`kiln.toml` is optional; every value has a default.
+`hekla.toml` is optional; every value has a default.
 
 ```toml
 [effects]
@@ -844,13 +845,13 @@ effect_journal_days = 7     # completed invocation journals are swept after this
 auto_rebuild = true         # rebuild on a definition change, or leave it to an operator
 ```
 
-Environment: `KILN_MASTER_KEY`, a base64-encoded 32-byte key, required only if any field declares a
-`subject`. `KILN_MASTER_KEY_PREVIOUS` is a comma-separated list of prior masters, read during
+Environment: `HEKLA_MASTER_KEY`, a base64-encoded 32-byte key, required only if any field declares a
+`subject`. `HEKLA_MASTER_KEY_PREVIOUS` is a comma-separated list of prior masters, read during
 rotation.
 
-## 15. What `kiln check` catches
+## 15. What `hekla check` catches
 
-`kiln check` is the only static analysis Starlark gets, so it is thorough. Errors:
+`hekla check` is the only static analysis Starlark gets, so it is thorough. Errors:
 
 - a clause filtering an event type on a field it does not declare, or that is `indexed = False`
 - a constraint value that is not a valid instance of the field's type
@@ -1147,10 +1148,10 @@ cases = [
 Run it:
 
 ```
-export KILN_MASTER_KEY=$(openssl rand -base64 32)
-kiln check .
-kiln test .
-kiln serve . --addr 127.0.0.1:8080
+export HEKLA_MASTER_KEY=$(openssl rand -base64 32)
+hekla check .
+hekla test .
+hekla serve . --addr 127.0.0.1:8080
 ```
 
 ```

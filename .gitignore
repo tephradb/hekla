@@ -14,7 +14,7 @@ devenv.local.yaml
 
 /target
 
-# Runtime data (tephra segments, projector read models, kiln.db)
+# Runtime data (tephra segments, projector read models, hekla.db)
 /data
 *.db
 *.db-wal

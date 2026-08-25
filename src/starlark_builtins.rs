@@ -150,7 +150,7 @@ impl fmt::Display for FieldType {
 impl<'v> StarlarkValue<'v> for FieldType {}
 starlark_simple_value!(FieldType);
 
-/// The standard `str`, `int` and `bool` are shadowed by kiln's field types, so the
+/// The standard `str`, `int` and `bool` are shadowed by hekla's field types, so the
 /// conversion half of `int` has to come from somewhere. Keep a private copy of the
 /// standard globals to call into: base prefixes and arbitrary-precision parsing live
 /// behind `StarlarkInt`, which starlark does not export, and reimplementing them
@@ -1261,7 +1261,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     /// types use does not reach it: `enum(["a", "b"])` and a variant list are both
     /// positional, so there would be nothing to tell them apart. (`enum` itself is
     /// free, being a starlark-rust extension rather than standard Starlark, and
-    /// kiln builds standard globals.)
+    /// hekla builds standard globals.)
     ///
     /// # Arguments
     ///
@@ -1410,7 +1410,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     ///
     /// * `type`: the event type string, as stored in the log.
     /// * `fields`: a dict of field name to field type. Names may not start with
-    ///   `_kiln_`, which the host reserves for its own tags.
+    ///   `_hekla_`, which the host reserves for its own tags.
     fn event<'v>(
         #[starlark(require = named)] r#type: String,
         #[starlark(require = named)] fields: SmallMap<String, Value<'v>>,
@@ -1420,7 +1420,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
             let ft = value.downcast_ref::<FieldType>().ok_or_else(|| {
                 anyhow::anyhow!("event `{}` field `{name}` must be a field type", r#type)
             })?;
-            // The host stamps its own tags in the `_kiln_` namespace (the
+            // The host stamps its own tags in the `_hekla_` namespace (the
             // idempotency tag, and the global uniqueness tag). Reserving the prefix
             // keeps a handler from forging a host tag, and so an append condition.
             if name.starts_with(RESERVED_TAG_PREFIX) {
@@ -1456,7 +1456,7 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     /// Derive a stable UUID from a namespace UUID and a name (RFC 4122 version 5).
     ///
     /// The same pair always yields the same UUID, which is the point: nothing in a
-    /// kiln module may mint a random one, because a command retry and an effect
+    /// hekla module may mint a random one, because a command retry and an effect
     /// replay both re-run the code that would mint it and would produce a different
     /// id each attempt, turning one intent into several entities.
     ///
@@ -2895,7 +2895,7 @@ fn is_decimal_string(text: &str) -> bool {
 /// Subject-scoped fields are left as their plaintext value here; the runtime's emit
 /// lowering ([`crate::dispatch::build_event`]) replaces them with ciphertext (and
 /// adds the global-key tag for a `unique` field), because only the runtime holds the
-/// key store. In pure contexts (a projector fold, `kiln test`) that never reach the
+/// key store. In pure contexts (a projector fold, `hekla test`) that never reach the
 /// store, the plaintext form is what is compared.
 fn derive_tags(
     event_type: &str,
@@ -3129,10 +3129,10 @@ mod tests {
 
     use super::*;
 
-    /// Every kiln builtin, recursing into namespaces, paired with its doc summary.
-    /// Standard Starlark names are excluded: only the ones kiln adds or shadows are
+    /// Every hekla builtin, recursing into namespaces, paired with its doc summary.
+    /// Standard Starlark names are excluded: only the ones hekla adds or shadows are
     /// this crate's to document.
-    fn kiln_documented_names(globals: &Globals) -> Vec<(String, Option<String>)> {
+    fn hekla_documented_names(globals: &Globals) -> Vec<(String, Option<String>)> {
         fn walk(
             prefix: &str,
             module: &starlark::docs::DocModule,
@@ -3154,9 +3154,9 @@ mod tests {
             }
         }
 
-        // A shadowed name (`str`, `int`, `bool`) is kiln's, so subtract by name only
-        // where kiln does not redefine it: the standard set is the baseline, and any
-        // name kiln rebinds carries kiln's docs by the time we see it here.
+        // A shadowed name (`str`, `int`, `bool`) is hekla's, so subtract by name only
+        // where hekla does not redefine it: the standard set is the baseline, and any
+        // name hekla rebinds carries hekla's docs by the time we see it here.
         let standard: HashSet<String> = Globals::standard()
             .names()
             .map(|n| n.as_str().to_owned())
@@ -3173,7 +3173,7 @@ mod tests {
     }
 
     #[test]
-    fn every_kiln_builtin_has_a_doc_summary() {
+    fn every_hekla_builtin_has_a_doc_summary() {
         // The docs are the hover text and the generated stubs the language server
         // serves, so an undocumented builtin is a silently worse editor.
         for (label, globals) in [
@@ -3182,10 +3182,10 @@ mod tests {
             ("projector", projector_globals()),
             ("effect", effect_globals()),
         ] {
-            let documented = kiln_documented_names(&globals);
+            let documented = hekla_documented_names(&globals);
             assert!(
                 !documented.is_empty(),
-                "{label} globals exposed no kiln builtins"
+                "{label} globals exposed no hekla builtins"
             );
             let missing: Vec<&str> = documented
                 .iter()
@@ -3252,7 +3252,7 @@ mod tests {
     /// starlark upgrade ever starts rejecting or ignoring a redefinition, this
     /// fails in CI rather than at someone's deploy.
     #[test]
-    fn the_shadowed_globals_are_kilns_own() {
+    fn the_shadowed_globals_are_heklas_own() {
         for name in ["str", "int", "bool"] {
             assert_eq!(
                 globals().names().filter(|n| n.as_str() == name).count(),
@@ -3260,7 +3260,7 @@ mod tests {
                 "`{name}` should be bound exactly once"
             );
         }
-        // Kiln's meaning won, not the standard one: these are all field types.
+        // Hekla's meaning won, not the standard one: these are all field types.
         assert_eq!(field_kind("str()"), FieldKind::Text { max_length: None });
         assert_eq!(field_kind("int()"), FieldKind::I64);
         assert_eq!(field_kind("uint()"), FieldKind::U64);
@@ -3763,7 +3763,7 @@ b = event(type = "t.b", fields = {"id": uuid()})
     }
 
     /// A definition is not a dispatch key any more, but it stays hashable so that
-    /// rejecting it is kiln's job: an unhashable key would fail while the dict was
+    /// rejecting it is hekla's job: an unhashable key would fail while the dict was
     /// still being built, with starlark's `not hashable` instead of the message that
     /// says to call it.
     #[test]

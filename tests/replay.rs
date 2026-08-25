@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use kiln::read_api;
-use kiln::read_model::ReadModel;
-use kiln::runtime::Runtime;
+use hekla::read_api;
+use hekla::read_model::ReadModel;
+use hekla::runtime::Runtime;
 use tephra::Position;
 
 mod support;

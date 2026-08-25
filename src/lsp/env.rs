@@ -1,8 +1,8 @@
 //! The language environment: which builtins a file sees, and their documentation.
 //!
-//! Kiln gives each project directory a different globals set, which is the whole
-//! reason a generic Starlark language server cannot serve a kiln project: it has
-//! one environment for the language, and kiln has five. Everything here is built
+//! Hekla gives each project directory a different globals set, which is the whole
+//! reason a generic Starlark language server cannot serve a hekla project: it has
+//! one environment for the language, and hekla has five. Everything here is built
 //! once at startup and then only read, because the LSP asks for an environment on
 //! every completion and every hover.
 
@@ -146,7 +146,7 @@ impl Envs {
 
     /// Where goto-definition should send a reader for a global. Scoped to the
     /// environment because the same name can mean different things: `now` exists
-    /// for commands and for effects with different guarantees, and `str` is kiln's
+    /// for commands and for effects with different guarantees, and `str` is hekla's
     /// rather than Starlark's.
     pub(crate) fn symbol_uri(&self, env: Env, symbol: &str) -> Option<LspUri> {
         self.entries[env.index()].symbols.get(symbol).cloned()
@@ -165,7 +165,7 @@ impl Envs {
 /// The leading slash is required: `LspUri::try_from` rejects a `starlark:` URI
 /// whose path does not start with one.
 fn stub_path(env: Env, symbol: &str) -> PathBuf {
-    PathBuf::from(format!("/kiln/{}/{symbol}.star", env.slug()))
+    PathBuf::from(format!("/hekla/{}/{symbol}.star", env.slug()))
 }
 
 /// The synthetic URI for one builtin. Built as the variant directly rather than
@@ -226,10 +226,10 @@ mod tests {
         }
     }
 
-    /// Kiln shadows `str`, `int` and `bool`. The proof the shadow wins is that the
-    /// documentation carries kiln's field options rather than the stdlib's.
+    /// Hekla shadows `str`, `int` and `bool`. The proof the shadow wins is that the
+    /// documentation carries hekla's field options rather than the stdlib's.
     #[test]
-    fn the_shadowed_scalars_document_as_kilns() {
+    fn the_shadowed_scalars_document_as_heklas() {
         let envs = Envs::new();
         for (name, option) in [
             ("str", "max_length"),

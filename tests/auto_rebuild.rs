@@ -9,9 +9,9 @@ use std::thread;
 use std::time::Duration;
 
 use axum::http::{Method, StatusCode};
-use kiln::projector::Readiness;
-use kiln::read_model::ReadModel;
-use kiln::runtime::Runtime;
+use hekla::projector::Readiness;
+use hekla::read_model::ReadModel;
+use hekla::runtime::Runtime;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -39,7 +39,7 @@ def handle(input, state):
     return two(id = input.id)
 "#;
 
-/// `kiln.toml` turning the automatic rebuild off.
+/// `hekla.toml` turning the automatic rebuild off.
 const AUTO_REBUILD_OFF: &str = "[projectors]\nauto_rebuild = false\n";
 
 /// One `handle` arm per clause, all running the same function: the shape the
@@ -98,7 +98,7 @@ fn write_project(dir: &Path, clauses: &str) {
     write_project_with(dir, counter(clauses), None);
 }
 
-/// The same, with an explicit projector module and an optional `kiln.toml`. Passing
+/// The same, with an explicit projector module and an optional `hekla.toml`. Passing
 /// `None` removes any config a previous deploy left, so a redeploy cannot inherit it.
 fn write_project_with(dir: &Path, projector: String, config: Option<&str>) {
     for (rel, content) in [
@@ -111,7 +111,7 @@ fn write_project_with(dir: &Path, projector: String, config: Option<&str>) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
     }
-    let config_path = dir.join("kiln.toml");
+    let config_path = dir.join("hekla.toml");
     match config {
         Some(text) => fs::write(config_path, text).unwrap(),
         None => drop(fs::remove_file(config_path)),
@@ -352,7 +352,7 @@ fn a_legacy_read_model_without_a_definition_hash_is_rebuilt_not_blessed() {
     // wrong count in it so "rebuilt" and "resumed" are distinguishable: a rebuild
     // from position 0 recomputes n=2, while blessing the file leaves n=99.
     let conn = Connection::open(db_path(data.path())).unwrap();
-    conn.execute("UPDATE _kiln_definition SET definition_hash = NULL", [])
+    conn.execute("UPDATE _hekla_definition SET definition_hash = NULL", [])
         .unwrap();
     conn.execute("UPDATE totals SET n = 99", []).unwrap();
     drop(conn);

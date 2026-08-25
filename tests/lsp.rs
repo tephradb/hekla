@@ -2,7 +2,7 @@
 //!
 //! The unit tests in `src/lsp/` call the context's methods directly. These drive
 //! the actual protocol, because a great deal of the behaviour lives in what
-//! `starlark_lsp` does with what kiln returns: which URIs the client is handed,
+//! `starlark_lsp` does with what hekla returns: which URIs the client is handed,
 //! which requests reach the context at all, and what survives a document being
 //! edited.
 
@@ -36,7 +36,7 @@ impl Lsp {
     fn start(root: &Path) -> Lsp {
         let (client, server) = Connection::memory();
         let handle = thread::spawn(move || {
-            kiln::lsp::serve(server, true).expect("the server should shut down cleanly");
+            hekla::lsp::serve(server, true).expect("the server should shut down cleanly");
         });
 
         let mut lsp = Lsp {
@@ -196,7 +196,7 @@ fn orders_project() -> TempDir {
 
 /// The regression the server exists for. Every one of these builtins is undefined
 /// to a generic Starlark server, and `load("events/order.star", ...)` resolves
-/// nowhere without kiln's rules.
+/// nowhere without hekla's rules.
 #[test]
 fn a_correct_project_produces_no_diagnostics() {
     let dir = orders_project();
@@ -313,7 +313,7 @@ fn goto_definition_on_a_builtin_reaches_a_generated_stub() {
 }
 
 #[test]
-fn hover_on_a_kiln_builtin_shows_its_documentation() {
+fn hover_on_a_hekla_builtin_shows_its_documentation() {
     let dir = orders_project();
     let mut lsp = Lsp::start(dir.path());
     let source = "input = schema(order_id = uuid())\n\ndef handle(input, state):\n    return reject(\"no\", \"not allowed\")\n";
@@ -325,12 +325,12 @@ fn hover_on_a_kiln_builtin_shows_its_documentation() {
     assert!(rendered.contains("reject"), "{rendered}");
     assert!(
         rendered.contains("state") || rendered.contains("code"),
-        "expected kiln's own docs for reject, got {rendered}"
+        "expected hekla's own docs for reject, got {rendered}"
     );
     lsp.shutdown();
 }
 
-/// Completion inside a `load()` path offers exactly what kiln permits, which
+/// Completion inside a `load()` path offers exactly what hekla permits, which
 /// turns the restriction into a list rather than a rule to trip over.
 #[test]
 fn load_path_completion_offers_only_loadable_modules() {
@@ -455,19 +455,19 @@ fn module_files(root: &Path) -> Vec<String> {
     found
 }
 
-/// What `kiln check` says about a project, as `(location, message)` pairs.
+/// What `hekla check` says about a project, as `(location, message)` pairs.
 fn check_findings(root: &Path) -> Vec<(String, String)> {
-    let project = kiln::loader::LoadedProject::load(root);
+    let project = hekla::loader::LoadedProject::load(root);
     let mut findings = project.findings.clone();
-    findings.extend(kiln::validate::check(&project));
+    findings.extend(hekla::validate::check(&project));
     findings
         .into_iter()
-        .filter(|finding| finding.severity == kiln::loader::Severity::Error)
+        .filter(|finding| finding.severity == hekla::loader::Severity::Error)
         .map(|finding| (finding.location, finding.message))
         .collect()
 }
 
-/// The rule the design serves: the editor never reports a problem `kiln check`
+/// The rule the design serves: the editor never reports a problem `hekla check`
 /// would not. An editor that invents errors teaches people to ignore it.
 ///
 /// The shipped examples are correct, so for them the subset is the empty set,
@@ -478,7 +478,7 @@ fn the_examples_produce_no_diagnostics() {
         let root = support::example_dir(name);
         assert!(
             check_findings(&root).is_empty(),
-            "{name} should be clean to `kiln check` first"
+            "{name} should be clean to `hekla check` first"
         );
 
         let mut lsp = Lsp::start(&root);
@@ -496,14 +496,14 @@ fn the_examples_produce_no_diagnostics() {
 }
 
 /// And with real errors present, everything the editor reports is something
-/// `kiln check` reports too.
+/// `hekla check` reports too.
 ///
 /// Each fixture file carries exactly one defect on purpose. The editor can report
-/// *more* than `kiln check` for a single file and still be right: name resolution
+/// *more* than `hekla check` for a single file and still be right: name resolution
 /// finds every undefined name, where evaluation stops at the first. What must
-/// never happen is a problem of a kind `kiln check` does not have at all.
+/// never happen is a problem of a kind `hekla check` does not have at all.
 #[test]
-fn every_reported_error_is_one_kiln_check_also_reports() {
+fn every_reported_error_is_one_hekla_check_also_reports() {
     let dir = write_project(&[
         ("events/order.star", ORDER_EVENTS),
         // Three different failures: an illegal load, a builtin from another role,
@@ -536,7 +536,7 @@ fn every_reported_error_is_one_kiln_check_also_reports() {
                         && (expected_message.contains(&message)
                             || message.contains(expected_message.as_str()))
                 }),
-                "the editor reported `{message}` for {rel}, which `kiln check` does not: {expected:?}"
+                "the editor reported `{message}` for {rel}, which `hekla check` does not: {expected:?}"
             );
         }
     }

@@ -35,7 +35,7 @@ use crate::starlark_builtins::{
 
 /// Instruction budget for evaluating a `query` during the check.
 const MAX_TICKS: u64 = 10_000_000;
-/// The `event.timestamp` a placeholder event carries, matching what `kiln test` pins
+/// The `event.timestamp` a placeholder event carries, matching what `hekla test` pins
 /// so an author sees one fixed clock across the check and their scenarios.
 const STUB_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 

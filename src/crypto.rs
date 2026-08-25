@@ -10,7 +10,7 @@
 //!
 //! Key material never leaves this module in the clear on disk: each per-subject
 //! secret is a random AES-SIV key, wrapped with AES-256-GCM under a master key held
-//! only in memory (from `KILN_MASTER_KEY`). The wrapping master is recorded per row
+//! only in memory (from `HEKLA_MASTER_KEY`). The wrapping master is recorded per row
 //! (`master_key_id`) so masters can rotate online, rewrapping row by row without a
 //! stop-the-world pass and without changing any ciphertext. Losing the master is
 //! total, unrecoverable loss of every subject-scoped value.
@@ -42,7 +42,7 @@ const AD_VERSION: u8 = 1;
 
 /// The reserved subject that holds the global uniqueness secret. It backs the
 /// `unique` tags that must survive erasure, so it is never deletable.
-const GLOBAL_SUBJECT_FIELD: &str = "_kiln_global";
+const GLOBAL_SUBJECT_FIELD: &str = "_hekla_global";
 const GLOBAL_SUBJECT_VALUE: &str = "global";
 
 /// The set of master keys the runtime holds, keyed by a fingerprint id. One is the
@@ -83,7 +83,7 @@ impl MasterKeys {
 /// Erase a subject by deleting its key row, which shreds every value encrypted under
 /// it across the log, the tag index, and every read model at once. Refuses to delete
 /// the reserved global uniqueness secret. Returns whether a key was removed. No
-/// master key is needed: this is a plain row delete, so the `kiln erase` CLI can call
+/// master key is needed: this is a plain row delete, so the `hekla erase` CLI can call
 /// it without one.
 pub fn erase_subject(
     opdb: &OpDb,
@@ -103,20 +103,20 @@ fn fingerprint(key: &[u8; MASTER_KEY_LEN]) -> String {
     crate::hash::sha256_hex(key)
 }
 
-/// Read the master keys from the environment: `KILN_MASTER_KEY` (the primary, a
-/// base64 32-byte key) and, optionally, `KILN_MASTER_KEY_PREVIOUS` (a comma-separated
+/// Read the master keys from the environment: `HEKLA_MASTER_KEY` (the primary, a
+/// base64 32-byte key) and, optionally, `HEKLA_MASTER_KEY_PREVIOUS` (a comma-separated
 /// list of prior keys still needed to unwrap rows not yet rotated). Returns `None`
-/// when `KILN_MASTER_KEY` is unset, so a project that uses no subjects needs no key.
+/// when `HEKLA_MASTER_KEY` is unset, so a project that uses no subjects needs no key.
 pub fn master_keys_from_env() -> anyhow::Result<Option<MasterKeys>> {
-    let Ok(primary) = env::var("KILN_MASTER_KEY") else {
+    let Ok(primary) = env::var("HEKLA_MASTER_KEY") else {
         return Ok(None);
     };
-    let primary = decode_master_key(&primary).context("KILN_MASTER_KEY")?;
-    let previous = match env::var("KILN_MASTER_KEY_PREVIOUS") {
+    let primary = decode_master_key(&primary).context("HEKLA_MASTER_KEY")?;
+    let previous = match env::var("HEKLA_MASTER_KEY_PREVIOUS") {
         Ok(list) => list
             .split(',')
             .filter(|part| !part.trim().is_empty())
-            .map(|part| decode_master_key(part).context("KILN_MASTER_KEY_PREVIOUS"))
+            .map(|part| decode_master_key(part).context("HEKLA_MASTER_KEY_PREVIOUS"))
             .collect::<anyhow::Result<Vec<_>>>()?,
         Err(_) => Vec::new(),
     };
@@ -249,7 +249,7 @@ impl KeyStore {
     }
 
     /// Verify every master key referenced by a stored subject row is configured, so a
-    /// wrong or rotated-away `KILN_MASTER_KEY` fails fast at boot with a clear message
+    /// wrong or rotated-away `HEKLA_MASTER_KEY` fails fast at boot with a clear message
     /// rather than silently at first read. A stored id is the SHA-256 fingerprint of
     /// the master's bytes, so a matching id proves the bytes themselves are correct.
     pub fn verify_masters_present(&self) -> anyhow::Result<()> {
@@ -261,7 +261,7 @@ impl KeyStore {
         if !missing.is_empty() {
             let missing = missing.join(", ");
             anyhow::bail!(
-                "stored subject data was wrapped under master key(s) not configured now: {missing}. Set KILN_MASTER_KEY (and KILN_MASTER_KEY_PREVIOUS, comma-separated, for masters mid-rotation) to the master(s) that wrapped this data. Losing a master is permanent, unrecoverable loss of every subject it wrapped"
+                "stored subject data was wrapped under master key(s) not configured now: {missing}. Set HEKLA_MASTER_KEY (and HEKLA_MASTER_KEY_PREVIOUS, comma-separated, for masters mid-rotation) to the master(s) that wrapped this data. Losing a master is permanent, unrecoverable loss of every subject it wrapped"
             );
         }
         Ok(())
@@ -291,7 +291,7 @@ impl KeyStore {
     ) -> anyhow::Result<&[u8; MASTER_KEY_LEN]> {
         self.masters.get(master_id).ok_or_else(|| {
             anyhow!(
-                "cannot unwrap subject `{subject_field}`: master key `{master_id}` is not configured (was KILN_MASTER_KEY rotated away without keeping the previous key?)"
+                "cannot unwrap subject `{subject_field}`: master key `{master_id}` is not configured (was HEKLA_MASTER_KEY rotated away without keeping the previous key?)"
             )
         })
     }

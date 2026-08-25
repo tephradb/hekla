@@ -1,4 +1,4 @@
-//! The `kiln` command-line interface.
+//! The `hekla` command-line interface.
 //!
 //! `check` (thorough static analysis) and `fmt` (whitespace normalisation) are
 //! toolchain commands; `serve` runs the command runtime and HTTP API, and `test`
@@ -24,7 +24,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 #[derive(Parser)]
 #[command(
-    name = "kiln",
+    name = "hekla",
     version,
     about = "event-sourced runtime with Starlark modules"
 )]
@@ -83,8 +83,8 @@ enum Command {
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
-    /// Rewrap every subject key under the primary master key (`KILN_MASTER_KEY`),
-    /// unwrapping with the previous keys (`KILN_MASTER_KEY_PREVIOUS`) as needed. Run
+    /// Rewrap every subject key under the primary master key (`HEKLA_MASTER_KEY`),
+    /// unwrapping with the previous keys (`HEKLA_MASTER_KEY_PREVIOUS`) as needed. Run
     /// after changing the master to migrate rows off the old key. Ciphertext is
     /// unchanged, so reads keep working throughout.
     Rotate {
@@ -138,13 +138,13 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// Rewrap every subject key under the primary master. Needs `KILN_MASTER_KEY` (and
-/// `KILN_MASTER_KEY_PREVIOUS` for the keys rows are currently wrapped under).
+/// Rewrap every subject key under the primary master. Needs `HEKLA_MASTER_KEY` (and
+/// `HEKLA_MASTER_KEY_PREVIOUS` for the keys rows are currently wrapped under).
 fn rotate(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
     let master = match crypto::master_keys_from_env() {
         Ok(Some(master)) => master,
         Ok(None) => {
-            eprintln!("error: KILN_MASTER_KEY must be set to rotate");
+            eprintln!("error: HEKLA_MASTER_KEY must be set to rotate");
             return ExitCode::FAILURE;
         }
         Err(err) => {
@@ -217,7 +217,7 @@ fn erase(
 /// creates the file when it is missing, so a mistyped `--data-dir` would otherwise
 /// let `rotate` and `erase` report success against a fresh empty database.
 fn operational_db(dir: &Path, data_dir: Option<&Path>) -> Result<PathBuf, ExitCode> {
-    let path = runtime::resolve_data_dir(dir, data_dir).join("kiln.db");
+    let path = runtime::resolve_data_dir(dir, data_dir).join("hekla.db");
     if path.exists() {
         Ok(path)
     } else {
@@ -333,7 +333,7 @@ fn run_fmt(dir: &Path, check_only: bool) -> ExitCode {
 }
 
 /// The loader findings plus the semantic checks, sorted by location. Shared with
-/// `kiln test` so every command reports the same findings in the same order.
+/// `hekla test` so every command reports the same findings in the same order.
 pub(crate) fn collect_findings(project: &LoadedProject) -> Vec<Finding> {
     let mut findings = project.findings.clone();
     findings.extend(validate::check(project));
@@ -387,7 +387,7 @@ mod tests {
 
     use super::*;
 
-    /// `OpDb::open` would create the database, so without this guard `kiln erase`
+    /// `OpDb::open` would create the database, so without this guard `hekla erase`
     /// against a mistyped `--data-dir` reports a successful no-op erasure.
     #[test]
     fn a_data_dir_with_no_database_is_refused() {
@@ -396,7 +396,7 @@ mod tests {
 
         let data = dir.path().join("data");
         fs::create_dir_all(&data).unwrap();
-        let db_path = data.join("kiln.db");
+        let db_path = data.join("hekla.db");
         fs::write(&db_path, b"").unwrap();
         assert_eq!(operational_db(dir.path(), None).unwrap(), db_path);
     }

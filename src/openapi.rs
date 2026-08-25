@@ -3,7 +3,7 @@
 //! The document is honest: one concrete path per public command, its request
 //! body derived from the declared input schema (so the field types are real, not
 //! a generic blob), and internal commands are absent because they are not routed.
-//! The field-type mapping mirrors the wire forms kiln validates: `money` is a
+//! The field-type mapping mirrors the wire forms hekla validates: `money` is a
 //! decimal string (not an integer, despite its storage type), `one_of` is a
 //! string enum, and an `optional` field is simply omitted from `required`.
 
@@ -20,7 +20,7 @@ pub fn build(commands: &[(&str, &InputSchema)]) -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "kiln",
+            "title": "hekla",
             "version": env!("CARGO_PKG_VERSION"),
             "description": "generated command API",
         },

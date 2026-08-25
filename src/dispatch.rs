@@ -36,9 +36,9 @@ use crate::starlark_builtins::{
 };
 
 /// The reserved tag-key prefix for the global uniqueness tag of a `unique` field:
-/// `_kiln_uniq_<field>`. Host-stamped, so it lives in the reserved namespace a user
+/// `_hekla_uniq_<field>`. Host-stamped, so it lives in the reserved namespace a user
 /// field can never occupy.
-const UNIQUE_TAG_PREFIX: &str = "_kiln_uniq_";
+const UNIQUE_TAG_PREFIX: &str = "_hekla_uniq_";
 
 /// The global uniqueness tag key for `field`.
 fn unique_tag_key(field: &str) -> String {
@@ -47,7 +47,7 @@ fn unique_tag_key(field: &str) -> String {
 
 /// A reserved tag no event ever carries, added to a query clause whose subject key is
 /// absent so the clause matches nothing (rather than minting a key on the read path).
-const NOMATCH_TAG: &str = "_kiln_nomatch";
+const NOMATCH_TAG: &str = "_hekla_nomatch";
 
 /// The event definitions the dispatch layer needs: type name to its declared field
 /// metadata, for encryption and for wrapping subject fields as opaque handles.
@@ -60,19 +60,19 @@ type TagPairs = Vec<(String, Option<String>)>;
 /// Per-handler instruction budget. Bounds a runaway script at dispatch time.
 const MAX_TICKS: u64 = 10_000_000;
 
-/// The reserved tag-key prefix kiln stamps onto events for host bookkeeping. The
+/// The reserved tag-key prefix hekla stamps onto events for host bookkeeping. The
 /// loader rejects this namespace on both sides: an event tag field can't emit one
 /// (so a handler can't forge a host tag, or an append condition) and a `query()` /
 /// `events()` tag can't name one (so a handler can't fold over other requests' host
 /// tags).
-pub const RESERVED_TAG_PREFIX: &str = "_kiln_";
+pub const RESERVED_TAG_PREFIX: &str = "_hekla_";
 
 /// The reserved tag key carrying a command's per-request idempotency identity. Every
 /// event a keyed command emits gets this tag, and the append is guarded against it,
 /// so exactly-once is enforced by the log itself rather than by op-DB bookkeeping.
-const IDEMPOTENCY_TAG_KEY: &str = "_kiln_idem";
+const IDEMPOTENCY_TAG_KEY: &str = "_hekla_idem";
 
-/// The idempotency tag for a `(command, key)` pair: `_kiln_idem:<sha256(command\0key)>`.
+/// The idempotency tag for a `(command, key)` pair: `_hekla_idem:<sha256(command\0key)>`.
 /// Hashing binds the tag to the command (so the same key on two commands cannot
 /// collide) and yields a fixed-length, fixed-charset value regardless of the client's
 /// raw key.
@@ -313,7 +313,7 @@ pub fn run_command(
                     Err(err @ AppendError::Corrupt(_)) => Err(anyhow::anyhow!(
                         "append aborted on a corrupt event in the boundary: {err}"
                     )),
-                    // Empty (guarded above) and AfterBeyondTip (a position kiln
+                    // Empty (guarded above) and AfterBeyondTip (a position hekla
                     // never hands out) are host bugs; Log is a durable write failure.
                     Err(err) => Err(anyhow::anyhow!("append failed: {err}")),
                 }
@@ -527,7 +527,7 @@ pub(crate) fn to_query_item(
             Some(subject_field) => {
                 let ks = keystore.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "filtering encrypted field `{field}` needs a master key (set KILN_MASTER_KEY)"
+                        "filtering encrypted field `{field}` needs a master key (set HEKLA_MASTER_KEY)"
                     )
                 })?;
                 let subject_value = constraints
@@ -606,7 +606,7 @@ pub(crate) fn arm_selects(item: Option<&QueryItem>, event: EventRef<'_>) -> bool
 ///
 /// `event_id` is the caller's, rather than minted here, because a handler can now
 /// read it back as `event.id` and derive ids from it: a live append wants a fresh
-/// `Uuid::new_v4()`, and `kiln test` wants a fixed one so a derived id is the same
+/// `Uuid::new_v4()`, and `hekla test` wants a fixed one so a derived id is the same
 /// on every run.
 pub fn build_event(
     event: &EmittedEvent,
@@ -687,7 +687,7 @@ fn lower_event(
                 )?;
                 let ks = keystore.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "event `{}` has subject-encrypted field `{name}` but no master key is configured (set KILN_MASTER_KEY)",
+                        "event `{}` has subject-encrypted field `{name}` but no master key is configured (set HEKLA_MASTER_KEY)",
                         event.event_type
                     )
                 })?;
@@ -809,8 +809,8 @@ fn find_committed_outcome(
         }
         // Report the same tags a fresh commit does: plaintext, non-subject indexed
         // fields only. Subject fields are stored as ciphertext (and the recovery path
-        // deliberately cannot decrypt), and the reserved host tags (`_kiln_idem`, the
-        // `_kiln_uniq_` global tags) are internal, so both are dropped.
+        // deliberately cannot decrypt), and the reserved host tags (`_hekla_idem`, the
+        // `_hekla_uniq_` global tags) are internal, so both are dropped.
         let def = event_defs.get(seq.event.event_type());
         let mut tags: Vec<String> = seq
             .event

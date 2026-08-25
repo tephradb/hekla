@@ -1,10 +1,10 @@
-//! Project configuration (`kiln.toml`).
+//! Project configuration (`hekla.toml`).
 //!
 //! A small, optional file for operational knobs that are not code: the effect
 //! blocking-pool size and the effect-journal retention window. Defaults are
 //! sensible, so a project runs with no config. The retention window drives the
 //! sweeper; the pool size is validated but reserved (v1 runs one thread per
-//! effect). Validating here means a malformed `kiln.toml` fails at load, not at
+//! effect). Validating here means a malformed `hekla.toml` fails at load, not at
 //! the moment the sweeper first reaches for a setting.
 
 use std::path::Path;
@@ -14,7 +14,7 @@ use anyhow::Context;
 use serde::Deserialize;
 
 /// The config file name, resolved relative to the project root.
-pub const FILE_NAME: &str = "kiln.toml";
+pub const FILE_NAME: &str = "hekla.toml";
 
 /// The largest retention window we accept, in days (100 years). Bounds the
 /// sweeper's date arithmetic and turns an absurd typo into a clear error.
@@ -75,7 +75,7 @@ impl Default for Retention {
 }
 
 impl Config {
-    /// Load `<root>/kiln.toml`, falling back to defaults when it is absent.
+    /// Load `<root>/hekla.toml`, falling back to defaults when it is absent.
     pub fn load(root: &Path) -> anyhow::Result<Config> {
         let path = root.join(FILE_NAME);
         let text = match fs::read_to_string(&path) {
@@ -90,7 +90,7 @@ impl Config {
 
     /// Parse config from TOML text, then validate the values.
     pub fn parse(text: &str) -> anyhow::Result<Config> {
-        let config: Config = toml::from_str(text).context("invalid kiln.toml")?;
+        let config: Config = toml::from_str(text).context("invalid hekla.toml")?;
         config.validate()?;
         Ok(config)
     }

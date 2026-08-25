@@ -2,9 +2,9 @@
 //! must unwrap `.data` in `project_to_head` (not only in the command fold), or a
 //! projector would see the metadata wrapper instead of the payload.
 
-use kiln::projector::project_to_head;
-use kiln::read_model::ReadModel;
-use kiln::starlark_builtins::{EmittedEvent, EntityOpKind, ModuleDef};
+use hekla::projector::project_to_head;
+use hekla::read_model::ReadModel;
+use hekla::starlark_builtins::{EmittedEvent, EntityOpKind, ModuleDef};
 use serde_json::json;
 use uuid::Uuid;
 

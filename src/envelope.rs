@@ -1,6 +1,6 @@
 //! The host-stamped event envelope.
 //!
-//! tephra stores opaque payload bytes and no metadata, so kiln wraps each event's
+//! tephra stores opaque payload bytes and no metadata, so hekla wraps each event's
 //! data in a JSON envelope carrying the identity and causation the runtime stamps
 //! at append: a fresh event id, the append timestamp, and the correlation and
 //! causation ids. The idempotency key is deliberately absent (it is request

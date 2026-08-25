@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kiln::effect::{HttpClient, HttpResponse, StubHttpClient};
-use kiln::runtime::Runtime;
+use hekla::effect::{HttpClient, HttpResponse, StubHttpClient};
+use hekla::runtime::Runtime;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -182,7 +182,7 @@ fn wait_for_failures(harness: &Harness, at_least: u64) {
 // --- reading the operational DB back --------------------------------------
 
 fn open_db(data_dir: &Path) -> Connection {
-    Connection::open(data_dir.join("kiln.db")).unwrap()
+    Connection::open(data_dir.join("hekla.db")).unwrap()
 }
 
 /// Every journal row for one invocation, as `(call_hash, disambiguator, result)`,

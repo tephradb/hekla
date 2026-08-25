@@ -26,7 +26,7 @@ pub const MAX_LIMIT: usize = 500;
 
 /// Query params the read endpoints consume as controls (pagination plus the
 /// read-your-writes wait), never as an indexed filter. The single source of truth
-/// for both the scan handler (which must not treat one as a filter) and `kiln
+/// for both the scan handler (which must not treat one as a filter) and `hekla
 /// check` (which rejects an entity field that would collide with one). Keep in sync
 /// with the keys the read handlers read off the query string.
 pub const RESERVED_QUERY_PARAMS: [&str; 4] = ["limit", "cursor", "after", "timeout_ms"];

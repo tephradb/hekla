@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use kiln::crypto::{KeyStore, MasterKeys, master_keys_from_env};
-use kiln::opdb::OpDb;
+use hekla::crypto::{KeyStore, MasterKeys, master_keys_from_env};
+use hekla::opdb::OpDb;
 
 const PRIMARY: [u8; 32] = [1u8; 32];
 const PREVIOUS_A: [u8; 32] = [2u8; 32];
@@ -34,34 +34,34 @@ fn env_error(label: &str) -> String {
 
 #[test]
 fn master_keys_from_env_reads_the_primary_and_previous_keys() {
-    clear("KILN_MASTER_KEY");
-    clear("KILN_MASTER_KEY_PREVIOUS");
+    clear("HEKLA_MASTER_KEY");
+    clear("HEKLA_MASTER_KEY_PREVIOUS");
 
     // No primary: a project that uses no subjects boots with no key at all.
     assert!(
         master_keys_from_env().unwrap().is_none(),
-        "an unset KILN_MASTER_KEY must not be an error"
+        "an unset HEKLA_MASTER_KEY must not be an error"
     );
 
     // A stray previous list without a primary is still no key, not a failure.
     set(
-        "KILN_MASTER_KEY_PREVIOUS",
+        "HEKLA_MASTER_KEY_PREVIOUS",
         &URL_SAFE_NO_PAD.encode(PREVIOUS_A),
     );
     assert!(master_keys_from_env().unwrap().is_none());
 
     // The real rotation shape: mixed alphabets, padding, whitespace and an empty
     // entry, all of which a hand-edited env file produces.
-    set("KILN_MASTER_KEY", &URL_SAFE_NO_PAD.encode(PRIMARY));
+    set("HEKLA_MASTER_KEY", &URL_SAFE_NO_PAD.encode(PRIMARY));
     let previous_list = format!(
         "{} , ,{}",
         URL_SAFE_NO_PAD.encode(PREVIOUS_A),
         STANDARD.encode(PREVIOUS_B)
     );
-    set("KILN_MASTER_KEY_PREVIOUS", &previous_list);
+    set("HEKLA_MASTER_KEY_PREVIOUS", &previous_list);
     let masters = master_keys_from_env()
         .unwrap()
-        .expect("a set KILN_MASTER_KEY yields a key set");
+        .expect("a set HEKLA_MASTER_KEY yields a key set");
 
     // Prove each previous key really survived the parse, rather than just counting
     // them: a key silently dropped mid-rotation makes every not-yet-rewrapped
@@ -100,38 +100,38 @@ fn master_keys_from_env_reads_the_primary_and_previous_keys() {
             .unwrap()
             .as_deref(),
         Some("bob@example.com"),
-        "new writes must wrap under KILN_MASTER_KEY, not a previous key"
+        "new writes must wrap under HEKLA_MASTER_KEY, not a previous key"
     );
 
     // A bad primary fails loudly, naming the variable the operator has to fix.
-    set("KILN_MASTER_KEY", "nope");
+    set("HEKLA_MASTER_KEY", "nope");
     let message = env_error("an undecodable primary");
     assert!(
-        message.contains("KILN_MASTER_KEY"),
+        message.contains("HEKLA_MASTER_KEY"),
         "the error must name the variable, got: {message}"
     );
 
     // A key of the wrong length is base64 but not a master key.
-    set("KILN_MASTER_KEY", &URL_SAFE_NO_PAD.encode([1u8; 16]));
+    set("HEKLA_MASTER_KEY", &URL_SAFE_NO_PAD.encode([1u8; 16]));
     let message = env_error("a 16-byte primary");
     assert!(
-        message.contains("KILN_MASTER_KEY"),
+        message.contains("HEKLA_MASTER_KEY"),
         "the error must name the variable, got: {message}"
     );
 
     // A bad entry in the previous list is fatal too: booting without it would leave
     // rows wrapped under it silently unreadable.
-    set("KILN_MASTER_KEY", &URL_SAFE_NO_PAD.encode(PRIMARY));
+    set("HEKLA_MASTER_KEY", &URL_SAFE_NO_PAD.encode(PRIMARY));
     set(
-        "KILN_MASTER_KEY_PREVIOUS",
+        "HEKLA_MASTER_KEY_PREVIOUS",
         &format!("{},nope", URL_SAFE_NO_PAD.encode(PREVIOUS_A)),
     );
     let message = env_error("an undecodable previous key");
     assert!(
-        message.contains("KILN_MASTER_KEY_PREVIOUS"),
+        message.contains("HEKLA_MASTER_KEY_PREVIOUS"),
         "the error must name the variable, got: {message}"
     );
 
-    clear("KILN_MASTER_KEY");
-    clear("KILN_MASTER_KEY_PREVIOUS");
+    clear("HEKLA_MASTER_KEY");
+    clear("HEKLA_MASTER_KEY_PREVIOUS");
 }

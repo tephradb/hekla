@@ -17,17 +17,17 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use kiln::context::CommandContext;
-use kiln::crypto::MasterKeys;
-use kiln::dispatch::build_event;
-use kiln::effect::{EffectRuntime, HttpClient, StubHttpClient};
-use kiln::loader::{Finding, LoadedProject, Severity};
-use kiln::projector::ProjectorSet;
-use kiln::read_api;
-use kiln::runtime::Runtime;
-use kiln::server;
-use kiln::starlark_builtins::EmittedEvent;
-use kiln::validate;
+use hekla::context::CommandContext;
+use hekla::crypto::MasterKeys;
+use hekla::dispatch::build_event;
+use hekla::effect::{EffectRuntime, HttpClient, StubHttpClient};
+use hekla::loader::{Finding, LoadedProject, Severity};
+use hekla::projector::ProjectorSet;
+use hekla::read_api;
+use hekla::runtime::Runtime;
+use hekla::server;
+use hekla::starlark_builtins::EmittedEvent;
+use hekla::validate;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tephra::{SegmentConfig, SegmentSet, WriteCoordinator, WriteHandle, WriterConfig};
@@ -48,7 +48,7 @@ pub const UUID_C: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 /// A fixed, non-secret master key for the tests.
 pub const MASTER_KEY: [u8; 32] = [0x11; 32];
 
-/// A fixed clock, matching the one `kiln test` pins, for events seeded straight
+/// A fixed clock, matching the one `hekla test` pins, for events seeded straight
 /// into a store.
 pub const TEST_NOW: &str = "1970-01-01T00:00:00Z";
 
@@ -233,11 +233,11 @@ pub fn write_project(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
-/// Delete `kiln.db` (and its WAL sidecars) while the event log survives. Command
+/// Delete `hekla.db` (and its WAL sidecars) while the event log survives. Command
 /// idempotency lives entirely in the log, so a reopen after this proves a replay
 /// recovers across a restart even with the operational DB gone.
 pub fn drop_op_db(data_dir: &Path) {
-    for name in ["kiln.db", "kiln.db-wal", "kiln.db-shm"] {
+    for name in ["hekla.db", "hekla.db-wal", "hekla.db-shm"] {
         let path = data_dir.join(name);
         if path.exists() {
             fs::remove_file(path).unwrap();

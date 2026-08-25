@@ -5,7 +5,7 @@
 # column cannot be indexed, since a filter arrives as plaintext).
 #
 # `GET /read/orders/orders/{order_id}` returns one order with the personal fields
-# decrypted; after `kiln erase customer_id <id>` those fields read back as absent.
+# decrypted; after `hekla erase customer_id <id>` those fields read back as absent.
 
 load("events/order.star", "order_placed")
 

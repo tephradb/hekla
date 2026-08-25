@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kiln::context::CommandContext;
-use kiln::effect::{HttpClient, StubHttpClient};
-use kiln::runtime::Runtime;
+use hekla::context::CommandContext;
+use hekla::effect::{HttpClient, StubHttpClient};
+use hekla::runtime::Runtime;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use uuid::Uuid;
@@ -41,7 +41,7 @@ fn effect_position(rt: &Runtime) -> u64 {
 /// The operational DB, read directly: the durable side of the effect state that
 /// the in-memory health signals only summarise.
 fn open_op_db(data: &Path) -> Connection {
-    Connection::open(data.join("kiln.db")).unwrap()
+    Connection::open(data.join("hekla.db")).unwrap()
 }
 
 fn invocation_status(db: &Connection, position: i64) -> Option<String> {

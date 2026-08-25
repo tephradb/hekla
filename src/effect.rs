@@ -560,7 +560,7 @@ pub(crate) struct Invocation<'a> {
 ///
 /// This is the dispatch half only. The durable half (journal, retry, completion) stays
 /// in [`try_invocation`], which is why the host arrives as a trait object: anything
-/// that can serve the impure builtins can drive a handler, including `kiln test`.
+/// that can serve the impure builtins can drive a handler, including `hekla test`.
 ///
 /// The fold is deliberately **not** journaled. It is derived from the log prefix and
 /// the triggering position, so every attempt and every replay reproduces it exactly;

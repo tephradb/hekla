@@ -5,7 +5,7 @@
 //! map onto `INSERT OR REPLACE` / `UPDATE` / `DELETE`. Values are bound as typed
 //! columns per the entity's declared `FieldKind`s.
 //!
-//! Alongside the entity tables sits a single-row `_kiln_checkpoint`, so a batch
+//! Alongside the entity tables sits a single-row `_hekla_checkpoint`, so a batch
 //! of ops and the position it advances to commit in one transaction: state and
 //! progress can never disagree. The read API opens the same file read-only.
 
@@ -26,17 +26,17 @@ use crate::starlark_builtins::{EntityDef, EntityOpKind, FieldKind, FieldMeta};
 /// processed above `position`; it is always empty under the sequential model,
 /// reserved so parallel lanes need no schema migration.
 const INTERNAL_DDL: &str = "\
-CREATE TABLE IF NOT EXISTS _kiln_checkpoint (
+CREATE TABLE IF NOT EXISTS _hekla_checkpoint (
     id              INTEGER PRIMARY KEY CHECK (id = 0),
     position        INTEGER NOT NULL,
     completed_above TEXT    NOT NULL DEFAULT '[]'
 );
-INSERT OR IGNORE INTO _kiln_checkpoint (id, position) VALUES (0, 0);
-CREATE TABLE IF NOT EXISTS _kiln_definition (
+INSERT OR IGNORE INTO _hekla_checkpoint (id, position) VALUES (0, 0);
+CREATE TABLE IF NOT EXISTS _hekla_definition (
     id              INTEGER PRIMARY KEY CHECK (id = 0),
     definition_hash TEXT
 );
-INSERT OR IGNORE INTO _kiln_definition (id, definition_hash) VALUES (0, NULL);";
+INSERT OR IGNORE INTO _hekla_definition (id, definition_hash) VALUES (0, NULL);";
 
 /// A projector's materialised read model: one SQLite table per entity.
 pub struct ReadModel {
@@ -95,7 +95,7 @@ impl ReadModel {
         let position: i64 = self
             .conn
             .query_row(
-                "SELECT position FROM _kiln_checkpoint WHERE id = 0",
+                "SELECT position FROM _hekla_checkpoint WHERE id = 0",
                 [],
                 |row| row.get(0),
             )
@@ -107,7 +107,7 @@ impl ReadModel {
     /// batch's ops, so state and position move together or not at all.
     pub fn write_checkpoint(&self, position: Position, tx: &Transaction) -> anyhow::Result<()> {
         tx.execute(
-            "UPDATE _kiln_checkpoint SET position = ?1, completed_above = '[]' WHERE id = 0",
+            "UPDATE _hekla_checkpoint SET position = ?1, completed_above = '[]' WHERE id = 0",
             [position.get() as i64],
         )
         .context("writing the projector checkpoint")?;
@@ -131,7 +131,7 @@ impl ReadModel {
     pub fn read_definition(&self) -> anyhow::Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT definition_hash FROM _kiln_definition WHERE id = 0",
+                "SELECT definition_hash FROM _hekla_definition WHERE id = 0",
                 [],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -143,7 +143,7 @@ impl ReadModel {
     pub fn set_definition(&self, definition_hash: &str) -> anyhow::Result<()> {
         self.conn
             .execute(
-                "UPDATE _kiln_definition SET definition_hash = ?1 WHERE id = 0",
+                "UPDATE _hekla_definition SET definition_hash = ?1 WHERE id = 0",
                 [definition_hash],
             )
             .context("recording the projector definition hash")?;

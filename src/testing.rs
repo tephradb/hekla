@@ -1,4 +1,4 @@
-//! `kiln test`: events in, assert what the module did.
+//! `hekla test`: events in, assert what the module did.
 //!
 //! A test file under `tests/` declares a module-level `cases` list of `case(...)`
 //! scenarios. Every case seeds a throwaway store with its `given` events through the
@@ -60,7 +60,7 @@ use crate::starlark_builtins::{
 const TEST_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 /// A fixed clock so a `now()`-using command is reproducible under test.
 const TEST_NOW: &str = "1970-01-01T00:00:00Z";
-/// A fixed, non-secret master key so `kiln test` can exercise subject-scoped
+/// A fixed, non-secret master key so `hekla test` can exercise subject-scoped
 /// encryption deterministically without any environment setup. Test assertions
 /// compare plaintext events, so the ciphertext values never surface.
 const TEST_MASTER_KEY: [u8; 32] = [0x2a; 32];
@@ -537,11 +537,11 @@ pub(crate) fn test_globals() -> Globals {
         .build()
 }
 
-/// Run `kiln test` over the project at `dir`.
+/// Run `hekla test` over the project at `dir`.
 pub fn run(dir: &Path) -> ExitCode {
     let project = LoadedProject::load(dir);
-    // Reuse the CLI's collection so `kiln test` reports the same findings, in the
-    // same location order, as `kiln check` and `kiln serve`.
+    // Reuse the CLI's collection so `hekla test` reports the same findings, in the
+    // same location order, as `hekla check` and `hekla serve`.
     let findings = crate::cli::collect_findings(&project);
     let errors: Vec<_> = findings
         .iter()

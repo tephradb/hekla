@@ -3,8 +3,8 @@
 use std::fs;
 use std::process::ExitCode;
 
-use kiln::loader::{LoadedProject, Severity};
-use kiln::testing;
+use hekla::loader::{LoadedProject, Severity};
+use hekla::testing;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -319,11 +319,11 @@ fn event_field_in_the_reserved_namespace_is_an_error() {
             r#"
 sneaky = event(
     type = "sneaky.happened",
-    fields = {"_kiln_idem": str()},
+    fields = {"_hekla_idem": str()},
 )
 "#,
         )],
-        "reserved `_kiln_` prefix",
+        "reserved `_hekla_` prefix",
     );
 }
 
@@ -704,7 +704,7 @@ def handle(input, state):
     assert_eq!(project.events.by_type.len(), 1);
 }
 
-/// A subtree the loader cannot walk used to vanish from the load, so `kiln check`
+/// A subtree the loader cannot walk used to vanish from the load, so `hekla check`
 /// reported success on a project whose commands were only partly read.
 #[cfg(unix)]
 #[test]
@@ -851,7 +851,7 @@ fn duplicate_module_names_and_bad_filenames_are_errors() {
     );
 }
 
-/// An event whose fields exercise every kind [`kiln::validate`] type-checks a query
+/// An event whose fields exercise every kind [`hekla::validate`] type-checks a query
 /// constraint against.
 const TYPED_EVENTS: &str = r#"
 thing = event(
@@ -1026,7 +1026,7 @@ def handle(input, state):
     assert!(errors(&example).is_empty());
 }
 
-/// A `kiln test` file over the accounts project. The second case is the load-bearing
+/// A `hekla test` file over the accounts project. The second case is the load-bearing
 /// one: it passes only if the seeded event's global-unique tag (written under the
 /// runner's fixed test master key) matches the tag the query lowers to, and only if
 /// `expect` is compared against plaintext.
@@ -1063,7 +1063,7 @@ cases = [
 "#;
 
 #[test]
-fn kiln_test_runs_a_scenario_over_a_subject_encrypted_event() {
+fn hekla_test_runs_a_scenario_over_a_subject_encrypted_event() {
     let dir = write_project(&[
         ("events/account.star", ACCOUNT_EVENTS),
         ("commands/register-account.star", REGISTER_ACCOUNT),
@@ -1077,7 +1077,7 @@ fn kiln_test_runs_a_scenario_over_a_subject_encrypted_event() {
 }
 
 #[test]
-fn kiln_test_reports_a_scenario_whose_expectation_does_not_hold() {
+fn hekla_test_reports_a_scenario_whose_expectation_does_not_hold() {
     // The negative control for the case above: without it, a runner that silently
     // executed nothing would still report success.
     let wrong = r#"
@@ -1180,7 +1180,7 @@ fn assert_scenario(scenario: &str, expected: ExitCode, what: &str) {
 const ID: &str = "11111111-1111-1111-1111-111111111111";
 
 #[test]
-fn kiln_test_projects_given_events_and_asserts_the_rows() {
+fn hekla_test_projects_given_events_and_asserts_the_rows() {
     assert_scenario(
         &format!(
             r#"
@@ -1203,7 +1203,7 @@ cases = [
 /// The negative control: without it, a runner that projected nothing would still pass
 /// a case whose expectation happened to be empty.
 #[test]
-fn kiln_test_reports_a_row_that_does_not_match() {
+fn hekla_test_reports_a_row_that_does_not_match() {
     assert_scenario(
         &format!(
             r#"
@@ -1224,7 +1224,7 @@ cases = [
 }
 
 #[test]
-fn kiln_test_runs_an_effect_and_asserts_its_calls_in_order() {
+fn hekla_test_runs_an_effect_and_asserts_its_calls_in_order() {
     assert_scenario(
         &format!(
             r#"
@@ -1275,7 +1275,7 @@ cases = [
 /// Order is part of the assertion, not just membership: an effect's call sequence is
 /// what a replay has to reproduce.
 #[test]
-fn kiln_test_reports_calls_made_in_the_wrong_order() {
+fn hekla_test_reports_calls_made_in_the_wrong_order() {
     assert_scenario(
         &format!(
             r#"
@@ -1848,11 +1848,11 @@ handle = {
     );
 }
 
-/// A handler can derive an id from `event.id`, and `kiln test` seeds a fixed id per
+/// A handler can derive an id from `event.id`, and `hekla test` seeds a fixed id per
 /// `given` event so the derivation is assertable. A random seed id would make this
 /// scenario flaky rather than failing, which is why the ids are pinned.
 #[test]
-fn kiln_test_seeds_a_fixed_event_id_so_a_derived_id_is_assertable() {
+fn hekla_test_seeds_a_fixed_event_id_so_a_derived_id_is_assertable() {
     // The first `given` event's id, and the value `uuid5` must produce from it.
     let derived = Uuid::new_v5(&Uuid::from_u128(1), b"relay").to_string();
     let project = write_project(&[
@@ -1919,7 +1919,7 @@ cases = [
 /// invoke, and the erase really runs against the case's own key store, so a `reveal`
 /// after it fails exactly as it would live.
 #[test]
-fn kiln_test_asserts_an_erase_and_the_key_is_really_gone() {
+fn hekla_test_asserts_an_erase_and_the_key_is_really_gone() {
     fn files(scenario: &str) -> Vec<(&str, &str)> {
         vec![
             (
@@ -2001,7 +2001,7 @@ cases = [
     );
 }
 
-/// `event.timestamp` reaches every handler position, and `kiln test` pins it along
+/// `event.timestamp` reaches every handler position, and `hekla test` pins it along
 /// with the clock, so a case can assert on a column built from it.
 #[test]
 fn event_timestamp_is_readable_in_a_fold_and_an_effect() {
@@ -2264,7 +2264,7 @@ handle = {{placed(): probe}}
 "#
         ));
         let errs = errors(&LoadedProject::load(dir.path()));
-        // A load error, so `kiln check` catches it rather than leaving it to wedge an
+        // A load error, so `hekla check` catches it rather than leaving it to wedge an
         // invocation at runtime.
         let name = call.split('(').next().unwrap();
         assert!(

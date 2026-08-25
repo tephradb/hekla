@@ -1,8 +1,8 @@
-//! Finding the kiln project a document belongs to, and keeping its shared half
+//! Finding the hekla project a document belongs to, and keeping its shared half
 //! loaded.
 //!
 //! Two problems, with the same answer. A document arrives as a bare path, and
-//! nothing in the protocol says which project it is part of: `kiln.toml` is
+//! nothing in the protocol says which project it is part of: `hekla.toml` is
 //! optional, and one workspace can hold several projects (`examples/` here holds
 //! two). And diagnosing a buffer means evaluating it against the project's
 //! `events/` and `lib/` modules, which would be far too slow to redo per
@@ -26,18 +26,18 @@ use crate::loader::{LoadedProject, Role, rel_to_string, role_for};
 /// How often a project's files may be stat-ed to see whether the snapshot is
 /// stale. There is no file watching to be had: the server registers no
 /// `didChangeWatchedFiles` capability and is never told about saves, so polling
-/// is what lets a `git checkout`, a second editor or `kiln fmt` correct itself
+/// is what lets a `git checkout`, a second editor or `hekla fmt` correct itself
 /// without a restart.
 const STAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How long to remember that a directory is not inside a kiln project. Short,
+/// How long to remember that a directory is not inside a hekla project. Short,
 /// because creating the project is exactly the thing that makes it wrong.
 const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How far up the tree to look for a project root before giving up.
 const MAX_ASCENT: usize = 64;
 
-/// A document placed inside a kiln project.
+/// A document placed inside a hekla project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Located {
     pub(crate) root: PathBuf,
@@ -146,12 +146,12 @@ fn find_root(dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Whether a directory looks like a kiln project root.
+/// Whether a directory looks like a hekla project root.
 ///
-/// `kiln.toml` is optional, so the directory convention has to stand on its own.
+/// `hekla.toml` is optional, so the directory convention has to stand on its own.
 /// `tests/` and `lib/` are deliberately not enough: both are ordinary names that
 /// any repository might have (this one has both), and mistaking a repository for
-/// a kiln project would attach kiln's builtins to unrelated Starlark.
+/// a hekla project would attach hekla's builtins to unrelated Starlark.
 fn is_project_root(dir: &Path) -> bool {
     dir.join(config::FILE_NAME).is_file()
         || ["events", "commands", "projectors", "effects"]
@@ -168,7 +168,7 @@ fn is_project_root(dir: &Path) -> bool {
 fn fingerprint(root: &Path) -> String {
     let mut parts: Vec<String> = Vec::new();
     for entry in [config::FILE_NAME].iter().map(|name| root.join(name)) {
-        parts.push(stamp(&entry, "kiln.toml"));
+        parts.push(stamp(&entry, "hekla.toml"));
     }
     for subdir in ["events", "lib"] {
         let dir = root.join(subdir);
@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(located.role, Role::Events);
     }
 
-    /// `kiln.toml` is optional, so the directory convention alone has to place a
+    /// `hekla.toml` is optional, so the directory convention alone has to place a
     /// document; and where it is present it should place one on its own.
     #[test]
     fn a_root_is_found_with_or_without_a_config() {
@@ -256,7 +256,7 @@ mod tests {
         );
 
         let bare = TempDir::new().unwrap();
-        fs::write(bare.path().join("kiln.toml"), "").unwrap();
+        fs::write(bare.path().join("hekla.toml"), "").unwrap();
         fs::create_dir_all(bare.path().join("tests")).unwrap();
         fs::write(bare.path().join("tests/a.star"), "cases = []\n").unwrap();
         let projects = Projects::new();
@@ -280,8 +280,8 @@ mod tests {
         assert_eq!(located.root, inner);
     }
 
-    /// A repository that merely has `tests/` and `lib/` is not a kiln project.
-    /// Getting this wrong would attach kiln's builtins to unrelated Starlark, the
+    /// A repository that merely has `tests/` and `lib/` is not a hekla project.
+    /// Getting this wrong would attach hekla's builtins to unrelated Starlark, the
     /// exact failure this server exists to fix.
     #[test]
     fn an_ordinary_repository_is_not_a_project() {

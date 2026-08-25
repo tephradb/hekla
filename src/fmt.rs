@@ -1,4 +1,4 @@
-//! `kiln fmt`: a conservative whitespace normaliser for `.star` files.
+//! `hekla fmt`: a conservative whitespace normaliser for `.star` files.
 //!
 //! Starlark indentation is syntactically meaningful, so this deliberately does
 //! not reflow code. It normalises line endings to `\n`, strips trailing
@@ -14,7 +14,7 @@ use walkdir::WalkDir;
 use crate::loader::rel_to_string;
 
 /// Directories that never hold project source and are skipped when walking.
-const SKIP_DIRS: [&str; 4] = [".git", "target", "kiln-data", "data"];
+const SKIP_DIRS: [&str; 4] = [".git", "target", "hekla-data", "data"];
 
 pub struct Outcome {
     /// Files whose contents differ from their normalised form.

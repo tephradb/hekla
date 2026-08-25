@@ -1,4 +1,4 @@
-//! The operational database (`kiln.db`).
+//! The operational database (`hekla.db`).
 //!
 //! One shared SQLite database holding runtime bookkeeping that is not domain
 //! truth and never belongs in the event log: the effect journal and its per-effect
@@ -49,7 +49,7 @@ pub enum InvocationState {
 }
 
 impl OpDb {
-    /// Open (or create) `kiln.db` at `path` and bring its schema up to date.
+    /// Open (or create) `hekla.db` at `path` and bring its schema up to date.
     /// Idempotent: opening an already-migrated database is a no-op.
     pub fn open(path: &Path) -> anyhow::Result<OpDb> {
         let conn = Connection::open(path)
@@ -72,7 +72,7 @@ impl OpDb {
         // for the in-memory database used in tests.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_row| Ok(()))
             .context("enabling WAL")?;
-        // A second connection (the `kiln erase`/`rotate` CLI against a live server)
+        // A second connection (the `hekla erase`/`rotate` CLI against a live server)
         // waits for the write lock rather than failing immediately with SQLITE_BUSY.
         conn.busy_timeout(Duration::from_secs(5))
             .context("setting busy timeout")?;
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn reopening_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kiln.db");
+        let path = dir.path().join("hekla.db");
         OpDb::open(&path).unwrap();
         let reopened = OpDb::open(&path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), SCHEMA_VERSION);
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn a_migration_that_fails_partway_leaves_nothing_behind() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kiln.db");
+        let path = dir.path().join("hekla.db");
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(SCHEMA_V1).unwrap();

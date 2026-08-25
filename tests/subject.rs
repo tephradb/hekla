@@ -7,12 +7,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use kiln::crypto::{KeyStore, MasterKeys};
-use kiln::effect::StubHttpClient;
-use kiln::opdb::OpDb;
-use kiln::read_api;
-use kiln::read_model::ReadModel;
-use kiln::runtime::{ExecResult, Runtime};
+use hekla::crypto::{KeyStore, MasterKeys};
+use hekla::effect::StubHttpClient;
+use hekla::opdb::OpDb;
+use hekla::read_api;
+use hekla::read_model::ReadModel;
+use hekla::runtime::{ExecResult, Runtime};
 use serde_json::{Value, json};
 
 mod support;
@@ -46,7 +46,7 @@ fn boot_without_a_master_key_fails_when_a_project_uses_subjects() {
     };
     let message = format!("{err:#}");
     assert!(
-        message.contains("KILN_MASTER_KEY"),
+        message.contains("HEKLA_MASTER_KEY"),
         "expected a master-key boot error, got: {message}"
     );
 }
@@ -1045,7 +1045,7 @@ fn rotating_the_master_survives_a_restart_and_a_wrong_master_fails_boot() {
     // Rotate offline, keeping the old master so the stored wrapping can be unwrapped.
     {
         let opdb = Arc::new(Mutex::new(
-            OpDb::open(&data.path().join("kiln.db")).unwrap(),
+            OpDb::open(&data.path().join("hekla.db")).unwrap(),
         ));
         let keystore = KeyStore::new(opdb, MasterKeys::new(NEXT_MASTER_KEY, vec![MASTER_KEY]));
         assert_eq!(
@@ -1072,7 +1072,7 @@ fn rotating_the_master_survives_a_restart_and_a_wrong_master_fails_boot() {
         Err(err) => format!("{err:#}"),
     };
     assert!(
-        err.contains("KILN_MASTER_KEY"),
+        err.contains("HEKLA_MASTER_KEY"),
         "the boot guard names the key to set: {err}"
     );
 }
@@ -1259,7 +1259,7 @@ fn an_effect_erases_a_subject_and_shreds_its_data() {
         effect.position() >= 1
     });
 
-    // The same shred `kiln erase` performs, reached from a handler: the read model's
+    // The same shred `hekla erase` performs, reached from a handler: the read model's
     // ciphertext no longer decrypts, while the plaintext ids stay.
     let row = read_row(&harness, "orders", "orders", ORDER, 1).expect("the order row survives");
     assert!(
@@ -1312,7 +1312,7 @@ fn an_effect_erase_is_journaled_so_a_replay_reports_the_first_answer() {
     // journal holds both answers. A replay returns these rather than re-running the
     // deletion, which is what keeps a replayed handler on the branch it first took:
     // live, both calls would now answer `false`.
-    let db = rusqlite::Connection::open(data.path().join("kiln.db")).unwrap();
+    let db = rusqlite::Connection::open(data.path().join("hekla.db")).unwrap();
     let mut stmt = db
         .prepare("SELECT result FROM effect_journal WHERE effect = 'shred' ORDER BY disambiguator")
         .unwrap();

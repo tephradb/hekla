@@ -1,4 +1,4 @@
-//! The command runtime: the live process behind `kiln serve`.
+//! The command runtime: the live process behind `hekla serve`.
 //!
 //! A [`Runtime`] owns the tephra store handle, the operational DB, and the loaded
 //! command modules, and turns an HTTP request into a decision cycle. It layers
@@ -94,7 +94,7 @@ impl Runtime {
         let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default())
             .context("starting the write coordinator")?;
 
-        let opdb = OpDb::open(&data_dir.join("kiln.db"))?;
+        let opdb = OpDb::open(&data_dir.join("hekla.db"))?;
         let now = now_rfc3339();
 
         let mut commands = HashMap::new();
@@ -131,7 +131,7 @@ impl Runtime {
             .any(|def| def.fields.iter().any(|(_, meta)| meta.subject.is_some()));
         if uses_subjects && master.is_none() {
             anyhow::bail!(
-                "this project uses subject-scoped encryption (a field with subject = \"...\"), so KILN_MASTER_KEY must be set"
+                "this project uses subject-scoped encryption (a field with subject = \"...\"), so HEKLA_MASTER_KEY must be set"
             );
         }
 
@@ -167,7 +167,7 @@ impl Runtime {
         let opdb = Arc::new(Mutex::new(opdb));
         let keystore = master.map(|master| KeyStore::new(opdb.clone(), master));
         // Fail fast if a stored subject key was wrapped under a master that is not
-        // configured now (a wrong or rotated-away KILN_MASTER_KEY), rather than
+        // configured now (a wrong or rotated-away HEKLA_MASTER_KEY), rather than
         // surfacing it as a read error after boot.
         if let Some(keystore) = &keystore {
             keystore.verify_masters_present()?;

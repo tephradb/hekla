@@ -17,8 +17,8 @@ use starlark::typing::Ty;
 
 /// The dialect stubs are parsed with.
 ///
-/// Not [`Dialect::Standard`], which kiln uses for real modules, because a
-/// generated signature uses syntax kiln's own dialect forbids: `/` and `*`
+/// Not [`Dialect::Standard`], which hekla uses for real modules, because a
+/// generated signature uses syntax hekla's own dialect forbids: `/` and `*`
 /// parameter separators whenever a builtin mixes positional-only and named-only
 /// parameters (`str`, `schema`, `event`, `entity`, `put`, `scan` and more all
 /// do), and type annotations wherever a type is known. Parsing a stub under
@@ -91,13 +91,13 @@ fn render_value(name: &str, docs: Option<&DocString>) -> String {
     out
 }
 
-/// A namespace (kiln has one, `http`) as a `struct(...)` binding over private
+/// A namespace (hekla has one, `http`) as a `struct(...)` binding over private
 /// member functions.
 ///
 /// The literal callee name `struct` is load-bearing: goto-definition on a dotted
 /// expression walks exactly this shape, matching the callee by name, so `http.get`
 /// lands on the `def` rather than merely on the file. `struct` is not one of
-/// kiln's globals, but a stub is only ever parsed, never evaluated.
+/// hekla's globals, but a stub is only ever parsed, never evaluated.
 fn render_namespace(name: &str, module: &DocModule) -> String {
     let mut out = String::new();
     for (member, item) in &module.members {

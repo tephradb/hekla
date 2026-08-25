@@ -11,7 +11,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use kiln::runtime::Runtime;
+use hekla::runtime::Runtime;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -478,7 +478,7 @@ def handle(input, state):
 
 #[tokio::test]
 async fn status_reports_a_projector_whose_handle_returns_a_non_list() {
-    // `kiln check` cannot see what `handle` returns, so a projector that returns a
+    // `hekla check` cannot see what `handle` returns, so a projector that returns a
     // dict (or a list of non-ops) loads clean and only breaks at the first event. The
     // runtime must surface that as a failed projector naming the shape problem, not
     // freeze at a stale position that merely looks like lag.

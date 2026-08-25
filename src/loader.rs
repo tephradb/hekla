@@ -1,7 +1,7 @@
 //! The project loader: directory convention, `load()` resolution, event
 //! registry.
 //!
-//! A kiln project is a directory tree. Kind comes from the directory
+//! A hekla project is a directory tree. Kind comes from the directory
 //! (`commands/`, `projectors/`, `effects/`), name from the file stem, and shared
 //! code lives in `events/` and `lib/`. This module walks that tree, resolves
 //! each file's `load()` imports (restricted to `events/` and `lib/`), evaluates
@@ -9,7 +9,7 @@
 //! reads every command, projector and effect into a [`ModuleDef`].
 //!
 //! Loading is resilient: rather than bail on the first bad file, it collects
-//! [`Finding`]s so `kiln check` can report every problem in one pass. The
+//! [`Finding`]s so `hekla check` can report every problem in one pass. The
 //! semantic checks that need the event registry (query tags, source types) live
 //! in [`crate::validate`], which runs on the [`LoadedProject`] this produces.
 
@@ -31,7 +31,7 @@ use crate::starlark_builtins::{
     module_name_from_path, parse_module,
 };
 
-/// How severe a [`Finding`] is. Only errors fail `kiln check`.
+/// How severe a [`Finding`] is. Only errors fail `hekla check`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -130,7 +130,7 @@ pub struct LoadedProject {
     /// `load()` targets, listed whether or not each one evaluated, so a caller can
     /// offer them even while the project has errors.
     pub library_paths: Vec<String>,
-    /// Problems found while loading. `kiln check` adds semantic findings on top.
+    /// Problems found while loading. `hekla check` adds semantic findings on top.
     pub findings: Vec<Finding>,
 }
 
@@ -258,8 +258,8 @@ impl LoadedProject {
     }
 }
 
-/// The directories a kiln project is made of. `tests/` is last because the loader
-/// does not walk it: `kiln test` does, and the language server needs to know the
+/// The directories a hekla project is made of. `tests/` is last because the loader
+/// does not walk it: `hekla test` does, and the language server needs to know the
 /// convention either way.
 pub const MODULE_DIRS: [&str; 6] = [
     "events",
@@ -281,7 +281,7 @@ pub enum Role {
     },
     Projector,
     Effect,
-    /// A `kiln test` scenario file. Never loaded as part of a deployment, so it
+    /// A `hekla test` scenario file. Never loaded as part of a deployment, so it
     /// has no [`ModuleKind`], but it is part of the directory convention.
     Test,
 }
@@ -310,9 +310,9 @@ impl Role {
     }
 }
 
-/// The role a project-relative path falls under, or `None` when it is not a kiln
+/// The role a project-relative path falls under, or `None` when it is not a hekla
 /// module. The single source of truth for the directory convention: the loader,
-/// `kiln test` and the language server all route through it, so the three cannot
+/// `hekla test` and the language server all route through it, so the three cannot
 /// drift.
 ///
 /// `rel` is project-relative with forward slashes, as [`rel_to_string`] produces.
@@ -373,7 +373,7 @@ struct EventCollector {
 fn discover_and_parse(root: &Path, units: bool, findings: &mut Vec<Finding>) -> Vec<ParsedFile> {
     let mut files = Vec::new();
     // `tests/` is deliberately skipped: it is part of the convention but not part
-    // of a deployment, so `kiln test` walks it separately. Unit directories are
+    // of a deployment, so `hekla test` walks it separately. Unit directories are
     // skipped too when the caller only wants the library half.
     let wanted: &[&str] = if units {
         &["events", "lib", "commands", "projectors", "effects"]
@@ -851,7 +851,7 @@ pub fn normalize_load_path(raw: &str) -> Result<String, String> {
 
 /// The `.star` files under `dir`, in a stable order. A subtree that cannot be
 /// walked is reported rather than dropped: a silently missing command would let
-/// `kiln check` pass on a project the runtime cannot fully load.
+/// `hekla check` pass on a project the runtime cannot fully load.
 pub(crate) fn star_files(dir: &Path, findings: &mut Vec<Finding>) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for entry in WalkDir::new(dir).sort_by_file_name() {
@@ -916,7 +916,7 @@ mod role_tests {
 
     #[test]
     fn a_path_outside_the_convention_has_no_role() {
-        assert_eq!(role_for("kiln.toml"), None);
+        assert_eq!(role_for("hekla.toml"), None);
         assert_eq!(role_for("src/main.star"), None);
         assert_eq!(role_for("commands/notes.md"), None);
         // A bare directory is not a module, and neither is a directory that merely
@@ -941,7 +941,7 @@ mod library_load_tests {
 
     /// The cheap load has to agree with the full one about the shared half, or a
     /// caller that uses it (the language server) would resolve `load()`s and event
-    /// clauses differently from `kiln check`.
+    /// clauses differently from `hekla check`.
     #[test]
     fn loading_libraries_only_agrees_with_a_full_load() {
         for name in ["users", "orders"] {

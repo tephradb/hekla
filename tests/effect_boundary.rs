@@ -6,13 +6,13 @@
 //! triggering event, so it is identical on every attempt and every replay, and it can
 //! never observe a race with anything downstream.
 //!
-//! The semantics live here as `kiln test` scenarios, which run the real dispatch path.
+//! The semantics live here as `hekla test` scenarios, which run the real dispatch path.
 //! The live-runtime properties (position bounding under lag, and the fold not touching
 //! the journal) are in `tests/effect_journal.rs`, where the op-DB is readable.
 
 use std::process::ExitCode;
 
-use kiln::testing;
+use hekla::testing;
 use tempfile::TempDir;
 
 mod support;
@@ -319,7 +319,7 @@ def probe(event, state):
 handle = {placed(): probe}
 "#;
     let project = write_project(&files(scoped));
-    let findings = support::errors(&kiln::loader::LoadedProject::load(project.path()));
+    let findings = support::errors(&hekla::loader::LoadedProject::load(project.path()));
     assert!(
         findings.is_empty(),
         "a scoped subject filter is fine: {findings:?}"
@@ -335,7 +335,7 @@ def probe(event, state):
 handle = {placed(owner = 1, secret = "s"): probe}
 "#;
     let project = write_project(&files(in_handle));
-    let findings = support::errors(&kiln::loader::LoadedProject::load(project.path()));
+    let findings = support::errors(&hekla::loader::LoadedProject::load(project.path()));
     assert!(
         findings.iter().any(|err| err.contains("secret")),
         "a handle key must not filter an encrypted field: {findings:?}"

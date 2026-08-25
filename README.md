@@ -1,4 +1,4 @@
-# kiln
+# hekla
 
 A single-app event-sourcing runtime you write in Starlark, over the Dynamic Consistency Boundary.
 
@@ -8,12 +8,12 @@ depends on, and append events; **projectors** consume events into queryable SQLi
 there is nothing to compile. Deploy is restart.
 
 Starlark is pure and sandboxed, so determinism is structural rather than policed: a handler has no
-clock, no randomness and no I/O beyond the builtins kiln injects. That is what lets a projector
+clock, no randomness and no I/O beyond the builtins hekla injects. That is what lets a projector
 rebuild and an effect replay reproduce exactly what they did the first time, and what lets the
 runtime give effects a Temporal-style journal so a crash mid-handler resumes without re-firing what
 already happened.
 
-kiln runs on [tephra] for the event log and SQLite for read models. It is a rewrite of [umari],
+hekla runs on [tephra] for the event log and SQLite for read models. It is a rewrite of [umari],
 which expressed the same model as WASM component modules.
 
 [tephra]: https://github.com/tephradb/tephra
@@ -68,13 +68,13 @@ reference UI at `/docs`.
 cargo run -- check examples/orders          # static analysis, for CI and pre-commit
 cargo run -- test examples/orders           # scenarios under tests/
 
-KILN_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
+HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
   cargo run -- serve examples/orders        # the API on 127.0.0.1:8080
 ```
 
 `check` is thorough on purpose: it resolves the load graph, verifies every clause filters on a field
 its event declares and indexes, and warns about a personal-looking field with no `subject`. Also
-`kiln fmt`, `kiln lsp` for editors, and `kiln erase` / `kiln rotate` for key management.
+`hekla fmt`, `hekla lsp` for editors, and `hekla erase` / `hekla rotate` for key management.
 
 ## Learn more
 
@@ -90,4 +90,4 @@ its event declares and indexes, and warns about a personal-looking field with no
 
 Apache-2.0.
 
-kiln was built with AI use and careful review.
+hekla was built with AI use and careful review.

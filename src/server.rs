@@ -53,7 +53,7 @@ pub async fn serve(
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    tracing::info!("kiln listening on http://{addr}");
+    tracing::info!("hekla listening on http://{addr}");
     axum::serve(listener, service)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -87,7 +87,7 @@ pub fn app(shared: Shared) -> Router {
 const SCALAR_HTML: &str = r#"<!doctype html>
 <html>
   <head>
-    <title>kiln API reference</title>
+    <title>hekla API reference</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
   </head>

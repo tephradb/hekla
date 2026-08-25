@@ -7,7 +7,7 @@
 
 use std::thread;
 
-use kiln::runtime::Runtime;
+use hekla::runtime::Runtime;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
