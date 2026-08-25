@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use kiln::loader::{LoadedProject, Severity};
 use kiln::testing;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 mod support;
 
@@ -1845,4 +1846,71 @@ handle = {
         ],
         "is not indexed",
     );
+}
+
+/// A handler can derive an id from `event.id`, and `kiln test` seeds a fixed id per
+/// `given` event so the derivation is assertable. A random seed id would make this
+/// scenario flaky rather than failing, which is why the ids are pinned.
+#[test]
+fn kiln_test_seeds_a_fixed_event_id_so_a_derived_id_is_assertable() {
+    // The first `given` event's id, and the value `uuid5` must produce from it.
+    let derived = Uuid::new_v5(&Uuid::from_u128(1), b"relay").to_string();
+    let project = write_project(&[
+        (
+            "events/t.star",
+            r#"
+happened = event(type = "t.happened", fields = {"id": uuid(), "note": str()})
+"#,
+        ),
+        (
+            "commands/emit.star",
+            r#"
+load("events/t.star", "happened")
+
+input = schema(id = uuid(), note = str())
+
+def handle(input, state):
+    return happened(id = input.id, note = input.note)
+"#,
+        ),
+        (
+            "effects/relay.star",
+            r#"
+load("events/t.star", "happened")
+
+def relay(event):
+    invoke_command("emit", {"id": uuid5(event.id, "relay"), "note": event.data.note})
+
+handle = {happened(): relay}
+"#,
+        ),
+        (
+            "tests/scenario.star",
+            &format!(
+                r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        effect = "relay",
+        given = [happened(id = "{ID}", note = "hi")],
+        expect = [command_call("emit", {{
+            "id": uuid5("00000000-0000-0000-0000-000000000001", "relay"),
+            "note": "hi",
+        }})],
+    ),
+]
+"#
+            ),
+        ),
+    ]);
+    assert_eq!(
+        format!("{:?}", testing::run(project.path())),
+        format!("{:?}", ExitCode::SUCCESS),
+        "an id derived from event.id should be assertable"
+    );
+
+    // Pinned as a literal too: the case above would still pass if both sides changed
+    // together, and the version nibble (`5`) and variant (`8`) are the RFC 4122 shape.
+    assert_eq!(derived, "17c1189a-b7ca-57a0-8dce-6711368809ac");
 }

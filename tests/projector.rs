@@ -556,3 +556,80 @@ fn a_clause_keyed_projector_handle_fans_out_and_subscribes_to_its_arms() {
     assert!(model.get(special, UUID_B).unwrap().is_none());
     coordinator.shutdown();
 }
+
+const ID_EVENTS: &str = r#"
+happened = event(type = "thing.happened", fields = {"id": uuid()})
+"#;
+
+const ID_PROJECTOR: &str = r#"
+load("events/thing.star", "happened")
+
+things = entity(
+    key = "id",
+    fields = {"id": uuid(), "event_id": uuid(), "derived": uuid()},
+)
+
+handle = {
+    happened(): lambda event: [put(things, {
+        "id": event.data.id,
+        "event_id": event.id,
+        "derived": uuid5(event.id, "line-item"),
+    })],
+}
+"#;
+
+/// `event.id` is the envelope's id, and it does not move: rebuilding a read model
+/// from position 0 has to reproduce the same value, or an id derived from it would
+/// change under a replay and the rows would disagree with everything already written
+/// from them.
+#[test]
+fn event_id_is_readable_and_survives_a_rebuild() {
+    let dir = write_project(&[
+        ("events/thing.star", ID_EVENTS),
+        ("projectors/things.star", ID_PROJECTOR),
+    ]);
+    let project = load_ok(dir.path());
+    let projector = &project.projectors[0];
+    let ModuleDef::Projector { entities, .. } = &projector.loaded.def else {
+        panic!("expected a projector");
+    };
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let (coordinator, store) = open_store(store_dir.path());
+    seed_event(
+        &store,
+        &project,
+        &ctx(),
+        EmittedEvent {
+            event_type: "thing.happened".to_owned(),
+            data: json!({ "id": UUID_A }),
+            tags: vec![("id".to_owned(), Some(UUID_A.to_owned()))],
+        },
+    );
+
+    let project_once = || {
+        let model_dir = tempfile::tempdir().unwrap();
+        let model = ReadModel::open(&model_dir.path().join("things.db"), entities).unwrap();
+        project_to_head(&store, &projector.loaded, &model, &project.events.by_type).unwrap();
+        let things = entities.iter().find(|e| e.name == "things").unwrap();
+        model.get(things, UUID_A).unwrap().expect("the row")
+    };
+
+    let row = project_once();
+    let event_id = Uuid::parse_str(row["event_id"].as_str().expect("event_id is a string"))
+        .expect("event.id is a uuid");
+    assert_ne!(
+        event_id,
+        Uuid::nil(),
+        "the envelope's id, not a placeholder"
+    );
+    assert_eq!(
+        row["derived"],
+        json!(Uuid::new_v5(&event_id, b"line-item").to_string()),
+        "uuid5 derives RFC 4122 version 5 from the event id"
+    );
+
+    // The whole point: a fresh model built from the same log lands on the same ids.
+    assert_eq!(project_once(), row);
+    coordinator.shutdown();
+}

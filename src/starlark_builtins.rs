@@ -37,6 +37,7 @@ use starlark::values::{
     Heap, NoSerialize, OwnedFrozenValue, StarlarkValue, Value, ValueLike, starlark_value,
 };
 use starlark::{starlark_module, starlark_simple_value};
+use uuid::Uuid;
 
 use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx, QueryCtx};
 use crate::dispatch::{EventDefs, RESERVED_TAG_PREFIX};
@@ -1450,6 +1451,45 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         Ok(EventSpec::All)
     }
 
+    // --- derived identity --------------------------------------------------
+
+    /// Derive a stable UUID from a namespace UUID and a name (RFC 4122 version 5).
+    ///
+    /// The same pair always yields the same UUID, which is the point: nothing in a
+    /// kiln module may mint a random one, because a command retry and an effect
+    /// replay both re-run the code that would mint it and would produce a different
+    /// id each attempt, turning one intent into several entities.
+    ///
+    /// The usual namespace is `event.id`, which is stamped once at append and stable
+    /// across a projector rebuild and an effect replay, with `name` distinguishing
+    /// the ids one handler derives from one event:
+    ///
+    /// ```starlark
+    /// invoke_command("record-notified", {
+    ///     "notification_id": uuid5(event.id, "welcome-email"),
+    ///     "order_id": event.data.order_id,
+    /// })
+    /// ```
+    ///
+    /// Prefer an identity that already exists (the entity id the fact is about, or
+    /// an id an external system returned in a journaled response) over deriving a
+    /// new one. Derive only when the id has no anchor outside this handler.
+    ///
+    /// # Arguments
+    ///
+    /// * `namespace`: a UUID in canonical form, as `event.id` and every `uuid()`
+    ///   field carries.
+    /// * `name`: the name to derive within that namespace.
+    fn uuid5(
+        #[starlark(require = pos)] namespace: String,
+        #[starlark(require = pos)] name: String,
+    ) -> anyhow::Result<String> {
+        let namespace = Uuid::parse_str(namespace.trim()).map_err(|err| {
+            anyhow::anyhow!("uuid5() namespace must be a UUID, got `{namespace}`: {err}")
+        })?;
+        Ok(Uuid::new_v5(&namespace, name.as_bytes()).to_string())
+    }
+
     // --- control flow ------------------------------------------------------
 
     /// Refuse a command because the current state forbids it, as in
@@ -2335,7 +2375,7 @@ fn alloc_fixed<'v>(heap: Heap<'v>, result: &serde_json::Value, keys: &[&'static 
 }
 
 /// Build the `event` struct passed to `fold` and to a projector/effect `handle`:
-/// `event.type` and `event.data`.
+/// `event.id`, `event.type` and `event.data`.
 ///
 /// `event.data` is a struct, read with dot access (`event.data.email`) exactly as a
 /// command reads `input.email`. Both are host-built from a declared field schema, which
@@ -2351,8 +2391,15 @@ fn alloc_fixed<'v>(heap: Heap<'v>, result: &serde_json::Value, keys: &[&'static 
 /// When the definition declares any subject-scoped field, those values are wrapped as
 /// opaque [`CipherHandle`]s (the stored value is ciphertext) rather than exposed as
 /// strings, so plaintext never enters a handler.
+///
+/// `event.id` is the envelope's event id, not the tephra position: it is stamped once
+/// at append and never moves, so it survives a projector rebuild and an effect replay
+/// alike. That is what makes it the input to derive a stable id from, via
+/// [`uuid5`](runtime_builtins::uuid5). It sits beside `data` rather than in it, so an
+/// event that declares its own `id` field keeps it at `event.data.id`.
 pub fn alloc_event<'v>(
     module: &Module<'v>,
+    event_id: Uuid,
     event_type: &str,
     data: &serde_json::Value,
     event_def: Option<&EventDef>,
@@ -2384,6 +2431,7 @@ pub fn alloc_event<'v>(
             .collect(),
     };
     let fields: Vec<(&str, Value<'v>)> = vec![
+        ("id", heap.alloc(event_id.to_string())),
         ("type", heap.alloc(event_type)),
         ("data", heap.alloc(AllocStruct(pairs))),
     ];
@@ -3900,5 +3948,45 @@ len(d)
             });
             assert_eq!(got, is_function, "{src}");
         }
+    }
+
+    /// The properties `uuid5` exists for: same inputs give the same answer, a
+    /// different name gives a different one, and the result is a version 5 UUID
+    /// (so it round-trips through a `uuid()` field).
+    #[test]
+    fn uuid5_is_deterministic_and_rfc_shaped() {
+        const NS: &str = "00000000-0000-0000-0000-000000000001";
+        let derive = |ns: &str, name: &str| eval_expr(&format!("uuid5(\"{ns}\", \"{name}\")"));
+
+        let first = derive(NS, "line-item");
+        assert_eq!(first, derive(NS, "line-item"), "same inputs, same id");
+        assert_ne!(first, derive(NS, "other"), "the name discriminates");
+        assert_ne!(
+            first,
+            derive("00000000-0000-0000-0000-000000000002", "line-item"),
+            "the namespace discriminates"
+        );
+
+        let parsed = Uuid::parse_str(first.trim_matches('"')).expect("a uuid");
+        assert_eq!(parsed.get_version_num(), 5);
+    }
+
+    /// A namespace that is not a UUID is the likely mistake (passing `event.type`,
+    /// or a bare string), so it names what it got rather than deriving from garbage.
+    #[test]
+    fn uuid5_rejects_a_namespace_that_is_not_a_uuid() {
+        let err = eval_expr("uuid5(\"order.placed\", \"x\")");
+        assert!(
+            err.contains("uuid5() namespace must be a UUID") && err.contains("order.placed"),
+            "{err}"
+        );
+    }
+
+    /// Every `uuid()` field carries a canonical UUID, so an event's own id field is
+    /// a legal namespace too, not only `event.id`.
+    #[test]
+    fn uuid5_accepts_any_canonical_uuid_as_a_namespace() {
+        let got = eval_expr("uuid5(\"11111111-1111-1111-1111-111111111111\", \"x\")");
+        assert!(Uuid::parse_str(got.trim_matches('"')).is_ok(), "{got}");
     }
 }

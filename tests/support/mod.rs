@@ -511,6 +511,7 @@ pub fn seed_event(
         ctx,
         TEST_NOW,
         None,
+        Uuid::new_v4(),
     )
     .unwrap();
     store.append(vec![event], None).unwrap();

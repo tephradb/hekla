@@ -232,10 +232,10 @@ pub fn run_command(
                     continue;
                 }
                 let event_type = seq.event.event_type();
-                let (_envelope, data) = envelope::decode(seq.event.data())
+                let (envelope, data) = envelope::decode(seq.event.data())
                     .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
                 let def = events.get(event_type);
-                let event = alloc_event(&module, event_type, &data, def);
+                let event = alloc_event(&module, envelope.event_id, event_type, &data, def);
                 // Every selecting arm runs, threading state through them in declaration
                 // order.
                 for index in selected {
@@ -301,6 +301,7 @@ pub fn run_command(
                             ctx,
                             now,
                             idem_tag,
+                            Uuid::new_v4(),
                         )
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -533,6 +534,11 @@ pub(crate) fn arm_selects(item: Option<&QueryItem>, event: EventRef<'_>) -> bool
 /// still matches on them. When `idem_tag` is set it is added as an extra host tag,
 /// so the append condition and a later recovery read can find this request's events.
 /// This is the only place enveloping happens.
+///
+/// `event_id` is the caller's, rather than minted here, because a handler can now
+/// read it back as `event.id` and derive ids from it: a live append wants a fresh
+/// `Uuid::new_v4()`, and `kiln test` wants a fixed one so a derived id is the same
+/// on every run.
 pub fn build_event(
     event: &EmittedEvent,
     event_def: Option<&EventDef>,
@@ -540,6 +546,7 @@ pub fn build_event(
     ctx: &CommandContext,
     now: &str,
     idem_tag: Option<&str>,
+    event_id: Uuid,
 ) -> anyhow::Result<Event> {
     let ty = EventType::new(event.event_type.as_str())
         .map_err(|err| anyhow::anyhow!("invalid event type `{}`: {err}", event.event_type))?;
@@ -547,7 +554,7 @@ pub fn build_event(
     let extra = idem_tag.as_slice();
     let tags = to_tags(&derived, extra)?;
     let envelope = Envelope {
-        event_id: Uuid::new_v4(),
+        event_id,
         timestamp: now.to_owned(),
         correlation_id: ctx.correlation_id,
         causation_id: ctx.causation_id,

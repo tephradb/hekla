@@ -38,9 +38,10 @@ One word per concept, no synonyms.
 - **Read model**: a projector's SQLite database. A rebuildable cache, never a source of truth.
 - **Journal**: an effect's durable record of its side-effect calls, keyed by content hash, used to
   replay the effect deterministically after a crash. Lives in the operational DB, never the log.
-- **Envelope**: host-stamped per-event metadata: `correlation_id`, `causation_id`, an optional
-  `triggering_event_id`, and an append `timestamp`. The `id` and `position` are tephra's. The
-  client's idempotency key is not on the event; a reserved tag derived from it is (section 5).
+- **Envelope**: host-stamped per-event metadata: an `event_id`, `correlation_id`, `causation_id`, an
+  optional `triggering_event_id`, and an append `timestamp`. The `position` is tephra's; the id is
+  the envelope's, and a handler reads it as `event.id` (section 4). The client's idempotency key is
+  not on the event; a reserved tag derived from it is (section 5).
 
 ## 3. Module layout and deployment
 
@@ -145,7 +146,8 @@ else is a dict read by subscript.
 
 Dot: `input` and `event.data`, built from a declared field schema (`input.email`,
 `event.data.email`), where a field the schema does not declare is a shape error and one the payload
-omits reads as `None`. Also the three fixed-shape wrappers an effect gets back: `http.*` returns
+omits reads as `None`. `event.id` sits beside them, so an event that declares its own `id` field
+keeps it at `event.data.id`. Also the three fixed-shape wrappers an effect gets back: `http.*` returns
 `{status, body, headers}`, `invoke_command` returns `{status, body}`, and `scan` returns
 `{items, next_cursor}`.
 
@@ -157,9 +159,32 @@ string otherwise, `headers` is keyed by arbitrary header names, and `items` is a
 A read-model row from `get()` or `read()` stays a dict for a second reason: `put()` takes a dict, so
 read-modify-write has to round-trip without a conversion in between.
 
-**Envelope**: the tephra payload is a JSON envelope wrapping `data` with `correlation_id`,
-`causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The host stamps these
-at append; Starlark never sets them.
+**Envelope**: the tephra payload is a JSON envelope wrapping `data` with an `event_id`,
+`correlation_id`, `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The
+host stamps these at append; Starlark never sets them.
+
+One envelope field is exposed to handlers: **`event.id`**, beside `event.type` and `event.data`. It
+is the envelope's id rather than the tephra position, so it is stamped once and never moves: a
+projector rebuild and an effect replay both see the value the original append wrote. That stability
+is what makes it the input to derive from.
+
+**Deriving ids**: no module may mint a random one. Commands take new-entity ids from their input
+(see section 5), and a handler that needs an id with no such source derives one with
+`uuid5(namespace, name)`, RFC 4122 version 5, usually over `event.id`:
+
+```starlark
+invoke_command("record-notified", {
+    "notification_id": uuid5(event.id, "confirmation"),
+    "order_id": event.data.order_id,
+})
+```
+
+The `name` argument is what lets one handler derive several distinct ids from one event. Randomness
+here would not merely be unavailable, it would be wrong: a command retry and an effect replay both
+re-run the code that mints the id, so a fresh id per attempt would turn one intent into several
+entities, which is the same failure host-minted ids have. Deriving is the third choice, not the
+first: prefer an identity that already exists (the entity the fact is about) or one an external
+system returned in a journaled response.
 
 **Deploy-time validation** is the reason event definitions are shared. A query that filters an event
 type on a field that type does not declare (or declares `indexed = False`) is a hard error, never a
@@ -525,8 +550,11 @@ consistent copy is not required for them.
   columns decrypted, as `GET /read/...` would return them); an **effect** produces the ordered
   sequence of `http_call(...)` and `command_call(...)` it made, with `responds` stubbing the replies.
   Pure functions with declared inputs make the harness small, and it is what earns trust in an
-  untyped language. A case tests the author's logic, not the runtime around it: batching,
-  checkpoints, retry, the journal and replay are covered elsewhere.
+  untyped language. Everything a handler can observe is pinned so a case is reproducible: the clock,
+  the master key, and each `given` event's `event.id`, which counts from
+  `00000000-0000-0000-0000-000000000001` so an id derived with `uuid5` is assertable. A case tests
+  the author's logic, not the runtime around it: batching, checkpoints, retry, the journal and
+  replay are covered elsewhere.
 - `kiln fmt`: starlark-rust ships a formatter, and indentation is syntactically meaningful.
 - `kiln lsp`: the language server, over stdio. Section 11.1.
 
@@ -550,7 +578,7 @@ What it does:
   which a test asserts against the shipped examples.
 - **Hover** on any builtin, from the same doc comments the runtime carries.
 - **Goto-definition** into a generated stub for a builtin, and into the real file for a `load()`.
-- **Completion** of the directory's builtins, and of `load()` paths — which offers exactly the
+- **Completion** of the directory's builtins, and of `load()` paths, which offers exactly the
   loadable modules, turning the restriction into a list rather than a rule to trip over.
 
 It does **not** do formatting, rename, document symbols, semantic tokens or code actions: the crate

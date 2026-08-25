@@ -591,9 +591,15 @@ fn apply_batch(
                 continue;
             }
             let event_type = event.event_type();
-            let (_envelope, data) = envelope::decode(event.data())
+            let (envelope, data) = envelope::decode(event.data())
                 .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-            let value = alloc_event(&module, event_type, &data, events.get(event_type));
+            let value = alloc_event(
+                &module,
+                envelope.event_id,
+                event_type,
+                &data,
+                events.get(event_type),
+            );
             // Every selecting arm runs in declaration order, and `get()` reads through
             // the batch's own uncommitted writes, so a later arm sees an earlier one's
             // ops.

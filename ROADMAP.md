@@ -352,7 +352,47 @@ Honest scope for this phase:
 - **`response.body` is still a union**, dict or string depending on whether the bytes parse as JSON.
   A struct field makes the shape look more declared than it is.
 
-## Phase 9 and beyond (deferred, with triggers)
+## Phase 9: derived identity (done)
+
+A handler had no way to produce an id. Commands take new-entity ids from their input, which is right
+for a command (a retry carries the same id, so DCB dedupes it), but an effect is the caller in
+`invoke_command` and had nothing to pass. Randomness is not the missing piece and never was: a replay
+re-runs the code that would mint it, so a random id would make each attempt a different domain fact
+and break the exactly-once guarantee `invoke_command` exists to give.
+
+Two small additions close it, and they compose:
+
+- **`event.id`**, beside `event.type` and `event.data`. It is the envelope's `event_id`, not the
+  tephra position: stamped once at append and stable across a projector rebuild and an effect replay.
+  All three dispatch sites already decoded the envelope and discarded it, so this is a field on
+  `alloc_event`, not a new plumbing path. It sits beside `data`, so an event declaring its own `id`
+  field keeps it at `event.data.id`.
+- **`uuid5(namespace, name)`**, RFC 4122 version 5. Deterministic by construction, which is the
+  whole requirement. `name` is what lets one handler derive several distinct ids from one event.
+
+`build_event` now takes the event id from its caller rather than minting one, which is what lets
+`kiln test` pin it: the nth `given` event gets `00000000-0000-0000-0000-00000000000n`, alongside the
+clock and master key it already pinned. Without that, a case asserting a derived id would be flaky
+rather than failing, and the feature would be untestable in the language it ships for.
+
+**Honest scope:**
+
+- **Deriving is documented as the third choice, not the first.** Prefer an identity that already
+  exists (the entity the fact is about), then one an external system returned in a journaled
+  response, then a derivation. The docs say so in both places the question comes up.
+- **Only `id` is exposed, not the rest of the envelope.** `correlation_id`, `causation_id` and the
+  append `timestamp` stay host-side; each would need its own argument for why a handler should branch
+  on it, and none has one yet. Adding one later is a one-line change to `alloc_event`.
+- **The namespace must be a canonical UUID.** Passing `event.type` or a bare string is the likely
+  mistake, so it errors naming what it got rather than deriving from garbage. That does mean a
+  project wanting a fixed namespace constant has to write a UUID literal.
+- **A derived id is not secret.** Version 5 is a hash, not a MAC, so anyone holding the namespace and
+  the name can recompute it. Fine for entity ids, wrong for anything used as a capability token.
+- **`ARCHITECTURE.md` §2 was wrong about this** and is corrected here: it said "the `id` and
+  `position` are tephra's", but tephra's `Event` carries only type, tags and payload. The id was
+  always the envelope's.
+
+## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
 warranted.
@@ -441,9 +481,10 @@ dispatch and the fold contract, which used to head this list, shipped as Phase 6
    historical events is the exact migration this item exists to avoid.
 2. **Effect outcomes.** The `ok()` / `retry(after)` / `dead_letter(reason)` return is the largest
    remaining operational win, and it closes the deferred automatic-dead-lettering gap. Two
-   refinements to the item as written: derive the idempotency key from the event id (envelope, stable
-   across replay and rebuild) rather than the raw log position, and route "emit an event back"
-   through the existing `invoke_command` path so effects stay out of the event-producer role.
+   refinements to the item as written: derive the idempotency key from the event id rather than the
+   raw log position (Phase 9 exposed it as `event.id` for the same stability reason, so the value is
+   already threaded to where this needs it), and route "emit an event back" through the existing
+   `invoke_command` path so effects stay out of the event-producer role.
 3. **Ergonomics:** projector rename detection, and a record type for folded state if `dict(state, ...)`
    ever feels heavy. Each is small and independent.
 4. **Only if a real project asks:** deriving `input` from the event schema, and type-shaped default

@@ -9,6 +9,7 @@ use std::thread;
 
 use kiln::runtime::Runtime;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 mod support;
 
@@ -976,5 +977,67 @@ fn an_omitted_optional_field_reads_as_none() {
         .unwrap();
     assert_eq!(second.status, 422, "{:?}", second.body);
     assert_eq!(second.body["error"]["code"], "absent");
+    harness.shutdown();
+}
+
+// --- event.id ---------------------------------------------------------------
+
+const OPENED_EVENTS: &str = r#"
+opened = event(type = "t.opened", fields = {"id": uuid()})
+"#;
+
+/// Folds the boundary's own event id into state, so the rejection message carries a
+/// value only `event.id` could have produced.
+const FOLD_READS_EVENT_ID: &str = r#"
+load("events/t.star", "opened")
+
+input = schema(id = uuid())
+
+def query(input):
+    return opened(id = input.id)
+
+initial = {"seen": ""}
+
+fold = {opened(): lambda state, event: dict(state, seen = uuid5(event.id, "audit"))}
+
+def handle(input, state):
+    if state["seen"] != "":
+        return reject("seen", state["seen"])
+    return opened(id = input.id)
+"#;
+
+/// A fold reads `event.id`, and gets the same id every replay. The fold re-reads the
+/// boundary on every execution, so two rejections that disagreed would mean the id
+/// moved between reads, and any id derived from it in a real command would name a
+/// different entity each time.
+#[test]
+fn a_fold_reads_a_stable_event_id() {
+    let project = write_project(&[
+        ("events/t.star", OPENED_EVENTS),
+        ("commands/open.star", FOLD_READS_EVENT_ID),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    let open = || {
+        harness
+            .rt
+            .execute("open", json!({ "id": ALICE }), &ctx(), None)
+            .unwrap()
+    };
+    assert_eq!(open().status, 200, "the first open has an empty boundary");
+
+    let second = open();
+    assert_eq!(second.status, 422, "{:?}", second.body);
+    let derived = second.body["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        Uuid::parse_str(&derived).is_ok(),
+        "the fold saw a real event id, got `{derived}`"
+    );
+
+    let third = open();
+    assert_eq!(
+        third.body["error"]["message"], derived,
+        "a second fold over the same event derives the same id"
+    );
     harness.shutdown();
 }

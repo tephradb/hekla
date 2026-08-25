@@ -64,6 +64,17 @@ const TEST_NOW: &str = "1970-01-01T00:00:00Z";
 /// compare plaintext events, so the ciphertext values never surface.
 const TEST_MASTER_KEY: [u8; 32] = [0x2a; 32];
 
+/// The event id of the nth `given` event, counting from 1.
+///
+/// Fixed rather than random for the same reason the clock and the master key are:
+/// a handler may now read `event.id` and derive an id from it with `uuid5`, and a
+/// case asserting on that derived id has to get the same answer on every run. The
+/// low-numbered form is also writable by hand, so a test can name the id it expects
+/// (`"00000000-0000-0000-0000-000000000001"` is the first `given` event).
+fn seeded_event_id(index: usize) -> Uuid {
+    Uuid::from_u128(index as u128 + 1)
+}
+
 /// Which module kind a scenario drives, and the inputs only that kind takes.
 #[derive(Debug, Clone, Allocative)]
 enum Target {
@@ -638,7 +649,7 @@ fn seed(case: &TestCase, events: &EventDefs) -> anyhow::Result<Seeded> {
 
     let seed_ctx = CommandContext::new(Uuid::new_v4());
     let mut packed = Vec::with_capacity(case.given.len());
-    for event in &case.given {
+    for (index, event) in case.given.iter().enumerate() {
         let data = serde_json::from_str(&event.data_json).unwrap_or(serde_json::Value::Null);
         let emitted = EmittedEvent {
             event_type: event.event_type.clone(),
@@ -652,6 +663,7 @@ fn seed(case: &TestCase, events: &EventDefs) -> anyhow::Result<Seeded> {
             &seed_ctx,
             TEST_NOW,
             None,
+            seeded_event_id(index),
         )?);
     }
     if !packed.is_empty() {
@@ -906,13 +918,14 @@ fn run_effect_case(
     let mut reads = seeded.store.read(&Query::All, Position::ZERO, None);
     while let Some(item) = reads.next() {
         let seq = item.map_err(|err| anyhow::anyhow!("reading seeded events: {err}"))?;
-        let (_envelope, data) = envelope::decode(seq.event.data())
+        let (envelope, data) = envelope::decode(seq.event.data())
             .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
         let event = seq.event.to_owned();
         effect::run_handle(
             &effect.loaded,
             events,
             &event,
+            envelope.event_id,
             event.event_type(),
             &data,
             &host,
