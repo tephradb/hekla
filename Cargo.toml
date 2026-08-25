@@ -7,9 +7,9 @@ edition = "2024"
 aes-gcm = "0.11"
 aes-siv = "0.8"
 allocative = "0.3"
-anyhow = "1.0"
+anyhow = "1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
 # Both are pinned to what starlark_lsp 0.14 was built against rather than to the
@@ -27,12 +27,13 @@ starlark = "0.14"
 # `Globals` and `DocModule`, so a version skew would give two of each.
 starlark_lsp = "0.14"
 tempfile = "3"
-# Pinned to the fail_if_exists existence-clause commit (tephra PR #31), unreleased.
-# Switch to a crates.io version once tephra publishes it.
-tephra = { git = "https://github.com/tephradb/tephra", rev = "56b2af215914ccdd20f154af30e5c782c59c036a", features = ["async", "tracing"] }
+tephra = { version = "0.3.6", features = ["async", "tracing"] }
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["full"] }
-toml = "1.1"
+# `full` pulled in fs, process, io-std and the rest; these four are what the code
+# actually reaches for. `macros` is test-only (`#[tokio::test]`), so it sits in
+# dev-dependencies: there is no `#[tokio::main]`, cli.rs builds the runtime by hand.
+tokio = { version = "1", features = ["net", "rt-multi-thread", "signal", "time"] }
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "3", features = ["json"] }
@@ -41,4 +42,5 @@ walkdir = "2"
 zeroize = "1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }

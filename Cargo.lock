@@ -276,12 +276,6 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
-
-[[package]]
-name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
@@ -1509,7 +1503,7 @@ dependencies = [
  "allocative",
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64",
  "clap",
  "getrandom 0.4.3",
  "lsp-server",
@@ -2283,7 +2277,8 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "seglog"
 version = "0.3.5"
-source = "git+https://github.com/tephradb/tephra?rev=56b2af215914ccdd20f154af30e5c782c59c036a#56b2af215914ccdd20f154af30e5c782c59c036a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af06af3a093e749256896a4f89cb9d00a6a513d08a401e8f4d2c8571bbc232e7"
 dependencies = [
  "crc32fast",
  "nix 0.31.3",
@@ -2738,8 +2733,9 @@ dependencies = [
 
 [[package]]
 name = "tephra"
-version = "0.3.5"
-source = "git+https://github.com/tephradb/tephra?rev=56b2af215914ccdd20f154af30e5c782c59c036a#56b2af215914ccdd20f154af30e5c782c59c036a"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "489670c38cae3ed5fe1820ff3f289133320952545f036d3a99e6f32059932147"
 dependencies = [
  "crc32fast",
  "dashmap",
@@ -2756,8 +2752,9 @@ dependencies = [
 
 [[package]]
 name = "tephra-types"
-version = "0.1.4"
-source = "git+https://github.com/tephradb/tephra?rev=56b2af215914ccdd20f154af30e5c782c59c036a#56b2af215914ccdd20f154af30e5c782c59c036a"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3265e6985461b399ec415a80b256c87b8d3ec4c88aeb9a04458cda17f38aabc2"
 dependencies = [
  "smallvec",
  "thiserror",
@@ -2847,10 +2844,8 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
- "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -3101,7 +3096,7 @@ version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "972d7902c8735f2695410b8aed7df6ed12a47394aa1c8d7af49f0497b731a94d"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "cookie_store",
  "flate2",
  "log",
@@ -3121,7 +3116,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da5f78b09e6941e1a0f2e30e695e4b120377b54d5e0aec11b594bb57b3971613"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "http",
  "httparse",
  "log",
