@@ -130,6 +130,22 @@ pub trait EffectHost {
     /// Emit a trace line. Not journaled.
     fn log(&self, message: &str);
 
+    /// Delete a subject's encryption key, making every value scoped to it
+    /// unreadable and unmatchable across the log and every read model at once.
+    /// Returns whether a key was there to delete. Irreversible.
+    ///
+    /// Journaled, so a replay reports what the first run found rather than
+    /// re-deleting; the deletion is idempotent besides, so the journal is about a
+    /// stable answer rather than about safety.
+    ///
+    /// The ordering rule `reveal` states applies in reverse here: erase last. An
+    /// invocation that reveals a subject and then erases it cannot be replayed,
+    /// because the replay re-runs the (unjournaled) `reveal` against a key that is
+    /// now gone and fails terminally. Journaled calls made before the erase stay
+    /// done, so nothing re-fires, but the invocation is recorded as a terminal skip
+    /// rather than a completion.
+    fn erase(&self, subject_field: &str, subject_value: &str) -> anyhow::Result<bool>;
+
     /// Decrypt a subject-encrypted handle to its plaintext, the explicit boundary an
     /// effect crosses to act on personal data (e.g. to send mail). Deterministic, so
     /// it is re-run rather than cached on replay: if the subject was erased in the

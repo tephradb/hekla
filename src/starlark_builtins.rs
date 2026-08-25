@@ -2111,6 +2111,41 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    /// Delete a subject's encryption key, making every value scoped to it
+    /// unreadable and unmatchable across the log and every read model at once.
+    /// Returns True when a key was there to delete, False when the subject was
+    /// already erased or never had one.
+    ///
+    /// This is crypto-shredding, and it is **irreversible**: no rewrite, no
+    /// compaction, no index rebuild, and no undo. Journaled, and idempotent
+    /// besides, so a replay neither repeats it nor reports a different answer.
+    ///
+    /// Two ordering rules follow from `reveal()` not being journaled:
+    ///
+    /// - **Erase last.** An invocation that reveals a subject and then erases it
+    ///   cannot be replayed: the replay re-runs the `reveal` against a key that is
+    ///   gone and fails terminally. Journaled calls made before the erase stay done,
+    ///   so nothing re-fires, but the invocation is recorded as a terminal skip.
+    /// - **Do not depend on reading a subject you are about to erase.** A handler
+    ///   that must know which subjects to erase should take them from plaintext
+    ///   fields or a read model, not from a value scoped to a key it is destroying.
+    ///
+    /// A later event that writes a subject-scoped field for the same subject mints a
+    /// fresh key, so new values become readable while everything written before the
+    /// erase stays shredded. Erasure is a point-in-time shred, not a tombstone.
+    ///
+    /// # Arguments
+    ///
+    /// * `subject_field`: the subject field, as declared by `subject = "..."`.
+    /// * `subject_value`: the subject id whose key is deleted.
+    fn erase(
+        #[starlark(require = pos)] subject_field: String,
+        #[starlark(require = pos)] subject_value: String,
+        eval: &mut Evaluator,
+    ) -> anyhow::Result<bool> {
+        effect_host(eval, "erase()")?.erase(&subject_field, &subject_value)
+    }
+
     /// Decrypt a subject-encrypted value read from an event to its plaintext. The
     /// explicit boundary an effect crosses to act on personal data; only effects have
     /// it. Fails (terminally) if the subject has been erased.

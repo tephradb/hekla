@@ -18,9 +18,9 @@ use serde_json::{Value, json};
 mod support;
 
 use support::{
-    ALICE, BOB, Boot, Harness, MASTER_KEY, ORDER_EVENTS, PLACE_ORDER, UUID_A as ORDER, UUID_B,
-    UUID_C, accounts_project, ctx, orders_project, orders_project_with, orders_with_notify_effect,
-    place_order, read_row, wait_position, wait_until, write_project,
+    ALICE, BOB, Boot, Harness, MASTER_KEY, ORDER_EVENTS, ORDERS_PROJECTOR, PLACE_ORDER,
+    UUID_A as ORDER, UUID_B, UUID_C, accounts_project, ctx, orders_project, orders_project_with,
+    orders_with_notify_effect, place_order, read_row, wait_position, wait_until, write_project,
 };
 
 /// The extra event the read-modify-write projector also sources.
@@ -1229,4 +1229,97 @@ fn a_handle_filed_under_the_wrong_subject_id_is_rejected() {
     }
 
     harness.shutdown();
+}
+
+/// An effect that shreds the customer it was told to, the shape a GDPR redact handler
+/// takes: the subject id it erases comes from a plaintext field, not from a value
+/// scoped to the key it is about to destroy.
+const SHRED_EFFECT: &str = r#"
+load("events/order.star", "order_placed")
+
+def shred(event):
+    erase("customer_id", str(event.data.customer_id))
+
+# Constrained to one customer, so the assertion that erasure is scoped to the subject
+# it named is not a race against a second order.
+handle = {order_placed(customer_id = 42): shred}
+"#;
+
+#[test]
+fn an_effect_erases_a_subject_and_shreds_its_data() {
+    let dir = orders_project_with(&[
+        ("effects/shred.star", SHRED_EFFECT),
+        ("projectors/orders.star", ORDERS_PROJECTOR),
+    ]);
+    let harness = boot(dir.path());
+    place_order(&harness.rt, ORDER, 42, "alice@example.com");
+
+    let effect = harness.rt.effect("shred").unwrap().clone();
+    wait_until("the effect to erase the first customer", || {
+        effect.position() >= 1
+    });
+
+    // The same shred `kiln erase` performs, reached from a handler: the read model's
+    // ciphertext no longer decrypts, while the plaintext ids stay.
+    let row = read_row(&harness, "orders", "orders", ORDER, 1).expect("the order row survives");
+    assert!(
+        row.get("email").is_none(),
+        "the erased email must be absent: {row}"
+    );
+    assert_eq!(row["customer_id"].as_i64(), Some(42));
+
+    // Scoped to the subject it named, not a blanket decrypt failure. The handler's
+    // clause selects only customer 42, so 43 is never erased.
+    place_order(&harness.rt, UUID_B, 43, "bob@example.com");
+    let row = read_row(&harness, "orders", "orders", UUID_B, 2).expect("bob's row");
+    assert_eq!(row["email"], "bob@example.com");
+
+    // Erasing is not a failure: the invocation completed rather than wedging or
+    // recording a terminal skip.
+    assert_eq!(effect.consecutive_failures(), 0);
+    assert_eq!(effect.terminal_skips(), 0);
+    harness.shutdown();
+}
+
+/// Erases the same subject twice in one invocation. Identical calls get successive
+/// disambiguators, so both are journalled separately.
+const DOUBLE_SHRED_EFFECT: &str = r#"
+load("events/order.star", "order_placed")
+
+def shred(event):
+    erase("customer_id", str(event.data.customer_id))
+    erase("customer_id", str(event.data.customer_id))
+
+handle = {order_placed(): shred}
+"#;
+
+#[test]
+fn an_effect_erase_is_journaled_so_a_replay_reports_the_first_answer() {
+    let dir = orders_project_with(&[("effects/shred.star", DOUBLE_SHRED_EFFECT)]);
+    let data = tempfile::tempdir().unwrap();
+    let harness = Boot::new(dir.path())
+        .data_dir(data.path())
+        .http_status(200)
+        .with_master_key()
+        .start();
+    place_order(&harness.rt, ORDER, 42, "alice@example.com");
+
+    let effect = harness.rt.effect("shred").unwrap().clone();
+    wait_until("the effect to complete", || effect.position() >= 1);
+    harness.shutdown();
+
+    // The first call deleted a key and the second found none already gone, so the
+    // journal holds both answers. A replay returns these rather than re-running the
+    // deletion, which is what keeps a replayed handler on the branch it first took:
+    // live, both calls would now answer `false`.
+    let db = rusqlite::Connection::open(data.path().join("kiln.db")).unwrap();
+    let mut stmt = db
+        .prepare("SELECT result FROM effect_journal WHERE effect = 'shred' ORDER BY disambiguator")
+        .unwrap();
+    let results: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(results, vec!["true".to_owned(), "false".to_owned()]);
 }

@@ -1914,3 +1914,89 @@ cases = [
     // together, and the version nibble (`5`) and variant (`8`) are the RFC 4122 shape.
     assert_eq!(derived, "17c1189a-b7ca-57a0-8dce-6711368809ac");
 }
+
+/// An effect case asserts an `erase` the same way it asserts an HTTP call or an
+/// invoke, and the erase really runs against the case's own key store, so a `reveal`
+/// after it fails exactly as it would live.
+#[test]
+fn kiln_test_asserts_an_erase_and_the_key_is_really_gone() {
+    fn files(scenario: &str) -> Vec<(&str, &str)> {
+        vec![
+            (
+                "events/t.star",
+                r#"
+happened = event(
+    type = "t.happened",
+    fields = {"id": uuid(), "who": uint(), "secret": str(subject = "who", max_length = 50)},
+)
+"#,
+            ),
+            (
+                "effects/shred.star",
+                r#"
+load("events/t.star", "happened")
+
+def shred(event):
+    erase("who", str(event.data.who))
+
+handle = {happened(): shred}
+"#,
+            ),
+            (
+                "effects/shred-then-read.star",
+                r#"
+load("events/t.star", "happened")
+
+def shred(event):
+    erase("who", str(event.data.who))
+    log(reveal(event.data.secret))
+
+handle = {happened(): shred}
+"#,
+            ),
+            ("tests/scenario.star", scenario),
+        ]
+    }
+    let scenario = |effect: &str, expect: &str| {
+        format!(
+            r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        effect = "{effect}",
+        given = [happened(id = "{ID}", who = 7, secret = "s")],
+        expect = {expect},
+    ),
+]
+"#
+        )
+    };
+
+    assert_eq!(
+        format!(
+            "{:?}",
+            testing::run(
+                write_project(&files(&scenario("shred", "[erase_call(\"who\", \"7\")]"))).path()
+            )
+        ),
+        format!("{:?}", ExitCode::SUCCESS),
+        "an erase should be assertable by subject"
+    );
+
+    // Erasing then revealing the same subject fails, in the harness as in production.
+    assert_eq!(
+        format!(
+            "{:?}",
+            testing::run(
+                write_project(&files(&scenario(
+                    "shred-then-read",
+                    "[erase_call(\"who\", \"7\")]"
+                )))
+                .path()
+            )
+        ),
+        format!("{:?}", ExitCode::FAILURE),
+        "a reveal after an erase of the same subject should fail the case"
+    );
+}

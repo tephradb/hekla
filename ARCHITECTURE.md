@@ -433,8 +433,8 @@ belonging to a permanently wedged or removed effect, are kept past the window un
 over them.
 
 **Builtins (v1)**: journaled `http.{get,post,...}`; `invoke_command(name, input)` targeting a public
-or internal command; `now()`; `log()`; and a journaled `read(projector, entity, key)` plus
-filter/scan variant, so effects query read models instead of keeping a local database. There is no
+or internal command; `now()`; `log()`; `reveal()` and `erase()` (section 15); and a journaled
+`read(projector, entity, key)` plus filter/scan variant, so effects query read models instead of keeping a local database. There is no
 effect-local SQLite: durable state is the journal plus events written through commands. Whether
 `read()` is journaled is a deliberate tradeoff. Journaling it (the chosen default) gives full replay
 determinism, so a replayed effect makes the same decisions it originally made, at the cost of seeing
@@ -625,9 +625,34 @@ journal, storage) depends on `dispatch`; `api` and `cli` sit on top.
 
 A field marked `subject = "sibling_field"` is encrypted under a key scoped to that subject's identity
 `(subject_field, subject_value)`, in the tag index, the event payload, and any read-model column, all
-before it reaches tephra. **Erasing a subject is deleting its key** (`kiln erase <field> <value>`),
-one O(1) operation that makes every value scoped to it unmatchable and unreadable across the log and
-every read model at once, with no rewrite, compaction, or index rebuild.
+before it reaches tephra. **Erasing a subject is deleting its key**, one O(1) operation that makes
+every value scoped to it unmatchable and unreadable across the log and every read model at once, with
+no rewrite, compaction, or index rebuild.
+
+**Two ways to erase**, the same key delete either way. `kiln erase <field> <value>` is the operator
+path, for a one-off request handled by hand. `erase(subject_field, subject_value)` is the effect
+builtin, for erasure driven by an event: a provider webhook, a retention deadline, an
+`account.closed` your own command emitted. It is journaled like every other effect side effect, and
+idempotent besides, so a replay neither repeats the deletion nor reports a different answer than the
+first run saw.
+
+Erasure from a handler has two ordering rules, both consequences of `reveal()` deliberately not being
+journaled (it re-decrypts every attempt, which is what makes an erased subject fail rather than
+replay stale plaintext):
+
+- **Erase last.** An invocation that reveals a subject and then erases it cannot be replayed: the
+  replay re-runs `reveal` against a key that is gone. That is a terminal skip, not a wedge, so the
+  position is completed and the effect advances, and journaled calls made before the erase stay done
+  rather than re-firing. But the work after the reveal does not run on that replay.
+- **Do not read a subject to decide whether to erase it.** A handler needs the subject ids it erases
+  in plaintext, from a declared field or a read model, not from a value scoped to the key it is about
+  to destroy. Otherwise a second erasure request for an already-erased subject cannot be read at all.
+
+**Erasure is a point-in-time shred, not a tombstone.** A later event writing a subject-scoped field
+for the same subject mints a fresh key (`encrypt_subject` creates on first use), so values written
+after the erase are readable while everything before it stays shredded. A read path never resurrects
+a key: `encrypt_subject_existing` returns `None` for a missing subject and the clause is lowered to
+match nothing.
 
 **Mechanism.** Encryption is deterministic (AES-SIV): the same plaintext under the same key and field
 yields the same ciphertext, so it works as an equality-matchable tag while staying decryptable. Each

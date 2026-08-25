@@ -392,6 +392,47 @@ rather than failing, and the feature would be untestable in the language it ship
   `position` are tephra's", but tephra's `Event` carries only type, tags and payload. The id was
   always the envelope's.
 
+## Phase 10: erasure from an effect (done)
+
+Erasure was operator-only (`kiln erase`), so an app that receives erasure requests as events (a
+provider redact webhook, a retention deadline, an `account.closed`) had no way to act on one. Its
+handler could see the request and do everything except the one thing that matters.
+
+`erase(subject_field, subject_value)` is an effect builtin, journaled like every other side effect
+and idempotent besides, returning whether a key was there to delete. `EffectHost` gains one method,
+`TestEffectHost` performs it against the case's own key store, and `erase_call(field, value)` joins
+`http_call` and `command_call` as an assertable expectation.
+
+**Why a builtin rather than a declarative subscription.** The obvious alternative was a marker on an
+event definition ("this event erases this subject"), which is safer: no handler code could erase by
+accident. It was rejected on evidence from a real production handler, which needs two things it
+cannot express: the subject id read out of an untyped webhook payload rather than a declared field,
+and a fan-out that erases every customer of a shop, a set computed by scanning a read model. A
+declarative marker covers only the case where the subject is a single declared field of the
+triggering event.
+
+**Honest scope:**
+
+- **`reveal` is still not journaled, and that constrains ordering.** An invocation that reveals a
+  subject and then erases it cannot be replayed: the replay re-runs `reveal` against a deleted key
+  and takes the existing terminal-skip path, so the position completes and journaled calls do not
+  re-fire, but work after the reveal does not run. Documented as "erase last" rather than fixed.
+  Fixing it properly means either journaling `reveal` (which would put plaintext in the journal
+  systematically) or deferring erases to the invocation's terminal record (which risks losing an
+  erasure if the process dies between the handler finishing and the flush). Neither trade is worth
+  making before a real handler needs it.
+- **Erasing the global uniqueness subject wedges rather than failing fast.** `crypto::erase_subject`
+  refuses it, and a refusal from a handler is an ordinary wedge, retried forever until the code is
+  fixed. That matches how every other handler bug behaves, but the subject field is a runtime string,
+  so `kiln check` cannot catch it.
+- **The effect journal is not shredded by an erase.** Revealed plaintext that flowed into a journaled
+  request body outlives the key until the retention sweeper reclaims the invocation. Already an
+  accepted limitation of the model; automating erasure makes it easier to hit.
+- **A `scan`-driven fan-out is not testable in `kiln test`.** `TestEffectHost` serves `read` and
+  `scan` as empty, so a handler that erases one subject per scanned row can only be covered by a
+  Rust integration test. A `rows = {...}` case parameter would close this and is the obvious next
+  step if a project needs it.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

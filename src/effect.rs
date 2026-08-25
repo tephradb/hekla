@@ -835,6 +835,27 @@ impl EffectHost for EffectHostImpl<'_> {
         tracing::info!("effect `{}` @ {}: {message}", self.effect, self.position);
     }
 
+    fn erase(&self, subject_field: &str, subject_value: &str) -> anyhow::Result<bool> {
+        // Auditable like `reveal`, and for a stronger reason: this one is the
+        // irreversible half of the pair.
+        tracing::info!(
+            "effect `{}` @ {}: erase {subject_field}={subject_value}",
+            self.effect,
+            self.position
+        );
+        let hash = call_hash(
+            "erase",
+            &json!({ "subject_field": subject_field, "subject_value": subject_value }),
+        );
+        let result = self.journaled(&hash, |_| {
+            let keystore = self.runtime.keystore().ok_or_else(|| {
+                anyhow::anyhow!("erase() needs a master key, but none is configured")
+            })?;
+            Ok(json!(keystore.erase(subject_field, subject_value)?))
+        })?;
+        Ok(result.as_bool().unwrap_or(false))
+    }
+
     fn reveal(
         &self,
         subject_field: &str,

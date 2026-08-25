@@ -178,6 +178,10 @@ pub(crate) enum ExpectedCall {
         name: String,
         input: String,
     },
+    Erase {
+        subject_field: String,
+        subject_value: String,
+    },
 }
 
 impl fmt::Display for ExpectedCall {
@@ -187,6 +191,10 @@ impl fmt::Display for ExpectedCall {
                 write!(f, "{} {url}", method.as_deref().unwrap_or("any"))
             }
             ExpectedCall::Command { name, .. } => write!(f, "invoke_command(\"{name}\")"),
+            ExpectedCall::Erase {
+                subject_field,
+                subject_value,
+            } => write!(f, "erase(\"{subject_field}\", \"{subject_value}\")"),
         }
     }
 }
@@ -207,6 +215,10 @@ pub(crate) enum MadeCall {
         name: String,
         input: serde_json::Value,
     },
+    Erase {
+        subject_field: String,
+        subject_value: String,
+    },
 }
 
 impl fmt::Display for MadeCall {
@@ -214,6 +226,10 @@ impl fmt::Display for MadeCall {
         match self {
             MadeCall::Http { method, url, .. } => write!(f, "{method} {url}"),
             MadeCall::Command { name, .. } => write!(f, "invoke_command(\"{name}\")"),
+            MadeCall::Erase {
+                subject_field,
+                subject_value,
+            } => write!(f, "erase(\"{subject_field}\", \"{subject_value}\")"),
         }
     }
 }
@@ -334,6 +350,17 @@ pub(crate) fn test_builtins(builder: &mut GlobalsBuilder) {
         Ok(ExpectedCall::Command {
             name,
             input: input.to_string(),
+        })
+    }
+
+    /// An `erase` an effect case expects, naming the subject whose key it deleted.
+    fn erase_call(
+        #[starlark(require = pos)] subject_field: String,
+        #[starlark(require = pos)] subject_value: String,
+    ) -> anyhow::Result<ExpectedCall> {
+        Ok(ExpectedCall::Erase {
+            subject_field,
+            subject_value,
         })
     }
 }
@@ -880,6 +907,17 @@ impl EffectHost for TestEffectHost<'_> {
 
     fn log(&self, _message: &str) {}
 
+    /// Recorded like the other side effects, and really performed against the case's
+    /// own key store, so a `reveal()` after an `erase()` in the same handler fails
+    /// exactly as it would live.
+    fn erase(&self, subject_field: &str, subject_value: &str) -> anyhow::Result<bool> {
+        self.calls.borrow_mut().push(MadeCall::Erase {
+            subject_field: subject_field.to_owned(),
+            subject_value: subject_value.to_owned(),
+        });
+        self.keystore.erase(subject_field, subject_value)
+    }
+
     fn reveal(
         &self,
         subject_field: &str,
@@ -1114,6 +1152,22 @@ fn compare_calls(expected: &[ExpectedCall], actual: &[MadeCall]) -> Result<(), S
                 if &want != got_input {
                     return Err(format!(
                         "call {idx}: expected input {want}, got {got_input}"
+                    ));
+                }
+            }
+            (
+                ExpectedCall::Erase {
+                    subject_field,
+                    subject_value,
+                },
+                MadeCall::Erase {
+                    subject_field: got_field,
+                    subject_value: got_value,
+                },
+            ) => {
+                if subject_field != got_field || subject_value != got_value {
+                    return Err(format!(
+                        "call {idx}: expected erase(`{subject_field}`, `{subject_value}`), got (`{got_field}`, `{got_value}`)"
                     ));
                 }
             }
