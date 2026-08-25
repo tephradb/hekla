@@ -596,6 +596,7 @@ fn apply_batch(
             let value = alloc_event(
                 &module,
                 envelope.event_id,
+                &envelope.timestamp,
                 event_type,
                 &data,
                 events.get(event_type),

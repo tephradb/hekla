@@ -11,8 +11,8 @@ use uuid::Uuid;
 mod support;
 
 use support::{
-    ALICE, Boot, MISSING, UUID_A, UUID_B, UUID_C, ctx, example_dir, load_ok, log_head, open_store,
-    seed_event, write_project,
+    ALICE, Boot, MISSING, TEST_NOW, UUID_A, UUID_B, UUID_C, ctx, example_dir, load_ok, log_head,
+    open_store, seed_event, write_project,
 };
 
 #[test]
@@ -566,7 +566,12 @@ load("events/thing.star", "happened")
 
 things = entity(
     key = "id",
-    fields = {"id": uuid(), "event_id": uuid(), "derived": uuid()},
+    fields = {
+        "id": uuid(),
+        "event_id": uuid(),
+        "derived": uuid(),
+        "at": timestamp(),
+    },
 )
 
 handle = {
@@ -574,16 +579,17 @@ handle = {
         "id": event.data.id,
         "event_id": event.id,
         "derived": uuid5(event.id, "line-item"),
+        "at": event.timestamp,
     })],
 }
 "#;
 
-/// `event.id` is the envelope's id, and it does not move: rebuilding a read model
-/// from position 0 has to reproduce the same value, or an id derived from it would
-/// change under a replay and the rows would disagree with everything already written
-/// from them.
+/// `event.id` and `event.timestamp` are the envelope's, and they do not move:
+/// rebuilding a read model from position 0 has to reproduce both, or an id derived from
+/// the first would change under a replay and a column holding the second would drift
+/// from what the log says happened.
 #[test]
-fn event_id_is_readable_and_survives_a_rebuild() {
+fn the_envelope_fields_are_readable_and_survive_a_rebuild() {
     let dir = write_project(&[
         ("events/thing.star", ID_EVENTS),
         ("projectors/things.star", ID_PROJECTOR),
@@ -629,7 +635,11 @@ fn event_id_is_readable_and_survives_a_rebuild() {
         "uuid5 derives RFC 4122 version 5 from the event id"
     );
 
-    // The whole point: a fresh model built from the same log lands on the same ids.
+    // `seed_event` stamps the envelope with the shared test clock, so the column holds
+    // the append time rather than a value the command restated in its payload.
+    assert_eq!(row["at"], json!(TEST_NOW));
+
+    // The whole point: a fresh model built from the same log lands on the same values.
     assert_eq!(project_once(), row);
     coordinator.shutdown();
 }

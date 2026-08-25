@@ -41,7 +41,6 @@ use starlark::environment::Module;
 use tephra::{Event, Position, WaitOutcome};
 use ureq::Agent;
 use ureq::typestate::{WithBody, WithoutBody};
-use uuid::Uuid;
 
 use crate::config::Config;
 use crate::context::{CommandContext, EffectCtx, EffectHost};
@@ -525,7 +524,7 @@ fn try_invocation(
         loaded,
         runtime.events_map(),
         event,
-        env.event_id,
+        env,
         event_type,
         data,
         &host,
@@ -546,7 +545,7 @@ pub(crate) fn run_handle(
     loaded: &LoadedModule,
     events: &EventDefs,
     event: &Event,
-    event_id: Uuid,
+    env: &Envelope,
     event_type: &str,
     data: &Value,
     host: &dyn EffectHost,
@@ -574,7 +573,14 @@ pub(crate) fn run_handle(
         if selected.is_empty() {
             return Ok(());
         }
-        let value = alloc_event(&module, event_id, event_type, data, events.get(event_type));
+        let value = alloc_event(
+            &module,
+            env.event_id,
+            &env.timestamp,
+            event_type,
+            data,
+            events.get(event_type),
+        );
         // Every selecting arm runs in declaration order, so a replay journals and
         // replays the same call sequence.
         for index in selected {

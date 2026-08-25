@@ -2410,7 +2410,7 @@ fn alloc_fixed<'v>(heap: Heap<'v>, result: &serde_json::Value, keys: &[&'static 
 }
 
 /// Build the `event` struct passed to `fold` and to a projector/effect `handle`:
-/// `event.id`, `event.type` and `event.data`.
+/// `event.id`, `event.timestamp`, `event.type` and `event.data`.
 ///
 /// `event.data` is a struct, read with dot access (`event.data.email`) exactly as a
 /// command reads `input.email`. Both are host-built from a declared field schema, which
@@ -2427,14 +2427,18 @@ fn alloc_fixed<'v>(heap: Heap<'v>, result: &serde_json::Value, keys: &[&'static 
 /// opaque [`CipherHandle`]s (the stored value is ciphertext) rather than exposed as
 /// strings, so plaintext never enters a handler.
 ///
-/// `event.id` is the envelope's event id, not the tephra position: it is stamped once
-/// at append and never moves, so it survives a projector rebuild and an effect replay
-/// alike. That is what makes it the input to derive a stable id from, via
-/// [`uuid5`](runtime_builtins::uuid5). It sits beside `data` rather than in it, so an
-/// event that declares its own `id` field keeps it at `event.data.id`.
+/// `event.id` and `event.timestamp` come from the envelope, so both are stamped once
+/// at append and never move: a projector rebuild and an effect replay see what the
+/// original append wrote. That is what makes `id` the input to derive a stable id from
+/// via [`uuid5`](runtime_builtins::uuid5), and what makes `timestamp` usable as a
+/// read-model column without a command restating the clock in its payload.
+///
+/// Both sit beside `data` rather than in it, so an event declaring its own `id` or
+/// `timestamp` field keeps it at `event.data.id` / `event.data.timestamp`.
 pub fn alloc_event<'v>(
     module: &Module<'v>,
     event_id: Uuid,
+    timestamp: &str,
     event_type: &str,
     data: &serde_json::Value,
     event_def: Option<&EventDef>,
@@ -2467,6 +2471,7 @@ pub fn alloc_event<'v>(
     };
     let fields: Vec<(&str, Value<'v>)> = vec![
         ("id", heap.alloc(event_id.to_string())),
+        ("timestamp", heap.alloc(timestamp)),
         ("type", heap.alloc(event_type)),
         ("data", heap.alloc(AllocStruct(pairs))),
     ];

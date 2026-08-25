@@ -163,10 +163,19 @@ read-modify-write has to round-trip without a conversion in between.
 `correlation_id`, `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The
 host stamps these at append; Starlark never sets them.
 
-One envelope field is exposed to handlers: **`event.id`**, beside `event.type` and `event.data`. It
-is the envelope's id rather than the tephra position, so it is stamped once and never moves: a
-projector rebuild and an effect replay both see the value the original append wrote. That stability
-is what makes it the input to derive from.
+Two envelope fields are exposed to handlers, beside `event.type` and `event.data`: **`event.id`** and
+**`event.timestamp`**. Both are stamped once at append and never move, so a projector rebuild and an
+effect replay see what the original append wrote. That stability is what makes `id` the input to
+derive from, and what lets `timestamp` be the source for a `created_at`-style read-model column.
+
+**Prefer `event.timestamp` over restating the clock.** A command using `now()` for a field that only
+records when the event was appended duplicates what the envelope already holds; the rule in section 5
+stands, and this is what makes it followable. `now()` remains right for time that is genuinely domain
+data and not the append instant (`expires_at`, `due_date`, a `purchased_at` an upstream system
+reported).
+
+The rest of the envelope (`correlation_id`, `causation_id`, `triggering_event_id`) stays host-side:
+each would need its own argument for why a handler should branch on it.
 
 **Deriving ids**: no module may mint a random one. Commands take new-entity ids from their input
 (see section 5), and a handler that needs an id with no such source derives one with
@@ -548,11 +557,13 @@ consistent copy is not required for them.
   throwaway store with `given` and then runs one module against it: a **command** produces events, a
   rejection or invalid input; a **projector** produces the rows the read API reads back (subject
   columns decrypted, as `GET /read/...` would return them); an **effect** produces the ordered
-  sequence of `http_call(...)` and `command_call(...)` it made, with `responds` stubbing the replies.
+  sequence of `http_call(...)`, `command_call(...)` and `erase_call(...)` it made, with `responds`
+  stubbing the HTTP replies and `rows` seeding the projectors it reads.
   Pure functions with declared inputs make the harness small, and it is what earns trust in an
   untyped language. Everything a handler can observe is pinned so a case is reproducible: the clock,
-  the master key, and each `given` event's `event.id`, which counts from
-  `00000000-0000-0000-0000-000000000001` so an id derived with `uuid5` is assertable. A case tests
+  the master key, each `given` event's `event.id` (counting from
+  `00000000-0000-0000-0000-000000000001`, so an id derived with `uuid5` is assertable), and its
+  `event.timestamp`, which is the same fixed clock. A case tests
   the author's logic, not the runtime around it: batching, checkpoints, retry, the journal and
   replay are covered elsewhere.
 - `kiln fmt`: starlark-rust ships a formatter, and indentation is syntactically meaningful.

@@ -235,7 +235,14 @@ pub fn run_command(
                 let (envelope, data) = envelope::decode(seq.event.data())
                     .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
                 let def = events.get(event_type);
-                let event = alloc_event(&module, envelope.event_id, event_type, &data, def);
+                let event = alloc_event(
+                    &module,
+                    envelope.event_id,
+                    &envelope.timestamp,
+                    event_type,
+                    &data,
+                    def,
+                );
                 // Every selecting arm runs, threading state through them in declaration
                 // order.
                 for index in selected {

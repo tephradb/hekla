@@ -348,7 +348,8 @@ Honest scope for this phase:
   integration tests, which keeps a case a statement about the author's own logic.
 - **An effect case stubs `read` and `scan` rather than asserting them.** They return nothing, the
   same answer a live effect gets for a row its projector has not built, and `invoke_command` is
-  recorded rather than executed: a command's behaviour belongs in a command case.
+  recorded rather than executed: a command's behaviour belongs in a command case. *(The first half
+  was reversed in Phase 11: `rows = {...}` now seeds them. They are still not asserted.)*
 - **`response.body` is still a union**, dict or string depending on whether the bytes parse as JSON.
   A struct field makes the shape look more declared than it is.
 
@@ -382,7 +383,9 @@ rather than failing, and the feature would be untestable in the language it ship
   response, then a derivation. The docs say so in both places the question comes up.
 - **Only `id` is exposed, not the rest of the envelope.** `correlation_id`, `causation_id` and the
   append `timestamp` stay host-side; each would need its own argument for why a handler should branch
-  on it, and none has one yet. Adding one later is a one-line change to `alloc_event`.
+  on it, and none has one yet. Adding one later is a one-line change to `alloc_event`. *(Phase 12
+  added `timestamp` on exactly that basis: a port needed `created_at` read-model columns and the
+  alternative was six commands restating the clock. The other two stay host-side.)*
 - **The namespace must be a canonical UUID.** Passing `event.type` or a bare string is the likely
   mistake, so it errors naming what it got rather than deriving from garbage. That does mean a
   project wanting a fixed namespace constant has to write a UUID literal.
@@ -428,10 +431,70 @@ triggering event.
 - **The effect journal is not shredded by an erase.** Revealed plaintext that flowed into a journaled
   request body outlives the key until the retention sweeper reclaims the invocation. Already an
   accepted limitation of the model; automating erasure makes it easier to hit.
-- **A `scan`-driven fan-out is not testable in `kiln test`.** `TestEffectHost` serves `read` and
-  `scan` as empty, so a handler that erases one subject per scanned row can only be covered by a
-  Rust integration test. A `rows = {...}` case parameter would close this and is the obvious next
-  step if a project needs it.
+- **A `scan`-driven fan-out is not testable in `kiln test`.** *(Closed by Phase 11: `rows = {...}`
+  seeds an effect's projector reads, so the per-row erase loop is now covered by a case.)*
+
+## Phase 11: an effect case can seed the projectors it reads (done)
+
+`TestEffectHost` served `read` and `scan` as empty, so every effect that reads a projector was
+untestable in the language it ships for: the interesting branch never ran, and the case could only
+assert the do-nothing path. That is most non-trivial effects, and it was found by planning a real
+port whose riskiest handlers are exactly the read-dependent ones.
+
+`rows = {projector: {entity: [row, ...]}}` on an effect case seeds them. The implementation is not a
+stub: `seed_models` opens one real `ReadModel` per projector in the project and applies the declared
+rows through `apply_one`, and the host serves `read`/`scan` through `read_api::get_one` and
+`read_api::scan`. So key lookup, index validation, ordering, cursor paging and subject decryption all
+behave as they do live, by construction rather than by imitation.
+
+Subject columns are written as plaintext in the case and stored encrypted under the case's key store
+(`encrypt_row`), so a `read` decrypts them back. A scenario never contains ciphertext, and the
+plaintext an effect sees is the plaintext the real read path would hand it.
+
+**Honest scope:**
+
+- **`read` and `scan` are still not assertable.** A case declares what they find; it cannot assert
+  that the handler asked. The contract of an effect is the calls it makes outward, and a read is not
+  one of those.
+- **Every projector in the project gets a temp read model per effect case**, not only the declared
+  ones. That is what lets an undeclared projector read as empty (the live answer when a projector has
+  not caught up) while a projector name the case got wrong still fails by name. It costs one SQLite
+  open per projector per effect case.
+- **The rows are a snapshot, with no relationship to `given`.** A case can declare rows that the
+  seeded events would never have produced. That is deliberate (it is how you set up a precondition),
+  but it means a case can describe an impossible world.
+- **Filterability is checked in the host rather than shared with the runtime.** `scan_projector` and
+  the test host now both call `read_api::is_filterable` in the same order, but they are two call
+  sites that must stay in step. A test asserts the unindexed-filter rejection so a drift shows up.
+
+## Phase 12: event.timestamp (done)
+
+A read model that wants a `created_at` column had nowhere to get one. The envelope has held the
+append `timestamp` since Phase 1, but only `event.id` was exposed, so the only route was a command
+stamping `now()` into its payload, which section 5 explicitly warns against: it duplicates what the
+envelope already holds. The architecture said don't, and offered no alternative.
+
+`event.timestamp` sits beside `event.id`, `event.type` and `event.data`, threaded from the envelope
+each dispatch site already decodes. Same stability argument as `event.id`: stamped once at append, so
+a projector rebuild and an effect replay both reproduce it. `kiln test` pins it to the same fixed
+clock `now()` uses, so a column built from it is assertable.
+
+The rule this settles, now stated in both §4 and the authoring guide: **`event.timestamp` for when
+the event was appended, `now()` for time that is genuinely domain data** (`expires_at`, `due_date`, a
+`purchased_at` an upstream system reported).
+
+**Honest scope:**
+
+- **`correlation_id`, `causation_id` and `triggering_event_id` stay host-side.** Phase 9's reasoning
+  is unchanged for them: no handler has yet needed to branch on one. The seam is now proven, so
+  adding one is a parameter and a struct field.
+- **A handler can build a non-deterministic value from a deterministic one.** `event.timestamp` is
+  stable, but nothing stops a projector deriving a column that a later code change would compute
+  differently, which a rebuild would then silently rewrite. That is true of every handler body and is
+  not specific to this field.
+- **No formatting or arithmetic on it.** It is an RFC 3339 string; a projector that wants a date
+  bucket does its own string slicing, and a fold that wants a duration parses both ends by hand.
+  Starlark has no date library and kiln adds none.
 
 ## Deferred, with triggers
 

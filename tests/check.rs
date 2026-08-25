@@ -2000,3 +2000,221 @@ cases = [
         "a reveal after an erase of the same subject should fail the case"
     );
 }
+
+/// A project whose effect reports back what its projector reads found, so a scenario
+/// can assert on them through `command_call`.
+fn rows_project(effect_body: &str, scenario: &str) -> TempDir {
+    write_project(&[
+        (
+            "events/t.star",
+            r#"
+happened = event(type = "t.happened", fields = {"id": uuid()})
+"#,
+        ),
+        (
+            "commands/noop.star",
+            r#"
+load("events/t.star", "happened")
+
+input = schema(seen = json())
+
+def handle(input, state):
+    return []
+"#,
+        ),
+        (
+            "projectors/dir.star",
+            r#"
+load("events/t.star", "happened")
+
+people = entity(
+    key = "id",
+    fields = {
+        "id": str(max_length = 64),
+        "who": uint(),
+        "email": str(subject = "who", max_length = 100),
+    },
+    indexes = [index("by_who", ["who"])],
+)
+
+# Rows come from the case's `rows`, never from an event.
+handle = {happened(): lambda event: []}
+"#,
+        ),
+        ("effects/probe.star", effect_body),
+        ("tests/scenario.star", scenario),
+    ])
+}
+
+fn probe(effect_body: &str, scenario: &str) -> ExitCode {
+    testing::run(rows_project(effect_body, scenario).path())
+}
+
+const GIVEN: &str = r#"
+load("events/t.star", "happened")
+
+cases = [case(effect = "probe", given = [happened(id = "11111111-1111-1111-1111-111111111111")],"#;
+
+/// `rows` seeds what an effect's `read` and `scan` find, and a subject column is
+/// written plaintext, stored encrypted and read back decrypted, exactly as live.
+#[test]
+fn rows_seed_an_effects_projector_reads() {
+    let effect = r#"
+load("events/t.star", "happened")
+
+def probe(event):
+    row = read("dir", "people", "p1")
+    page = scan("dir", "people", field = "who", value = "7")
+    invoke_command("noop", {"seen": [row["email"]] + [r["email"] for r in page.items]})
+
+handle = {happened(): probe}
+"#;
+    let scenario = format!(
+        r#"{GIVEN}
+    rows = {{"dir": {{"people": [
+        {{"id": "p1", "who": 7, "email": "a@b.c"}},
+        {{"id": "p2", "who": 7, "email": "d@e.f"}},
+        {{"id": "p3", "who": 9, "email": "x@y.z"}},
+    ]}}}},
+    expect = [command_call("noop", {{"seen": ["a@b.c", "a@b.c", "d@e.f"]}})],
+)]
+"#
+    );
+    assert_eq!(
+        format!("{:?}", probe(effect, &scenario)),
+        format!("{:?}", ExitCode::SUCCESS),
+        "read by key, an indexed scan, and decrypted subject columns"
+    );
+}
+
+/// A projector with no `rows` entry reads as empty, which is what a live effect sees
+/// before its projector has caught up. That is what makes a missing-row case
+/// expressible at all.
+#[test]
+fn an_undeclared_projector_reads_as_empty() {
+    let effect = r#"
+load("events/t.star", "happened")
+
+def probe(event):
+    row = read("dir", "people", "p1")
+    page = scan("dir", "people")
+    invoke_command("noop", {"seen": [row == None, len(page.items)]})
+
+handle = {happened(): probe}
+"#;
+    let scenario =
+        format!("{GIVEN}\n    expect = [command_call(\"noop\", {{\"seen\": [True, 0]}})],\n)]\n");
+    assert_eq!(
+        format!("{:?}", probe(effect, &scenario)),
+        format!("{:?}", ExitCode::SUCCESS),
+    );
+}
+
+/// The read path is the real one, so its rules hold in a case: a filter on a field
+/// that is neither the key nor a declared index is an error rather than a table scan.
+#[test]
+fn a_scan_in_a_case_still_refuses_an_unindexed_filter() {
+    let effect = r#"
+load("events/t.star", "happened")
+
+def probe(event):
+    scan("dir", "people", field = "email", value = "a@b.c")
+
+handle = {happened(): probe}
+"#;
+    let scenario = format!("{GIVEN}\n    expect = [],\n)]\n");
+    assert_eq!(
+        format!("{:?}", probe(effect, &scenario)),
+        format!("{:?}", ExitCode::FAILURE),
+    );
+}
+
+/// A projector named in `rows` that the project does not have is a typo worth
+/// naming, not rows that silently never get read.
+#[test]
+fn rows_naming_an_unknown_projector_fails_the_case() {
+    let effect = r#"
+load("events/t.star", "happened")
+
+handle = {happened(): lambda event: None}
+"#;
+    let scenario =
+        format!("{GIVEN}\n    rows = {{\"nope\": {{\"people\": []}}}},\n    expect = [],\n)]\n");
+    assert_eq!(
+        format!("{:?}", probe(effect, &scenario)),
+        format!("{:?}", ExitCode::FAILURE),
+    );
+}
+
+/// `event.timestamp` reaches every handler position, and `kiln test` pins it along
+/// with the clock, so a case can assert on a column built from it.
+#[test]
+fn event_timestamp_is_readable_in_a_fold_and_an_effect() {
+    let project = write_project(&[
+        (
+            "events/t.star",
+            r#"
+happened = event(type = "t.happened", fields = {"id": uuid()})
+"#,
+        ),
+        (
+            "commands/emit.star",
+            r#"
+load("events/t.star", "happened")
+
+input = schema(id = uuid())
+
+def query(input):
+    return happened(id = input.id)
+
+initial = {"at": ""}
+
+fold = {happened(): lambda state, event: dict(state, at = event.timestamp)}
+
+def handle(input, state):
+    if state["at"] != "":
+        return reject("seen", state["at"])
+    return happened(id = input.id)
+"#,
+        ),
+        (
+            "effects/relay.star",
+            r#"
+load("events/t.star", "happened")
+
+def relay(event):
+    invoke_command("emit", {"id": event.data.id, "at": event.timestamp})
+
+handle = {happened(): relay}
+"#,
+        ),
+        (
+            "tests/scenario.star",
+            &format!(
+                r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        name = "a fold reads the append time",
+        command = "emit",
+        given = [happened(id = "{ID}")],
+        input = {{"id": "{ID}"}},
+        expect = reject("seen", "1970-01-01T00:00:00Z"),
+    ),
+    case(
+        name = "an effect reads the append time",
+        effect = "relay",
+        given = [happened(id = "{ID}")],
+        expect = [command_call("emit", {{"id": "{ID}", "at": "1970-01-01T00:00:00Z"}})],
+    ),
+]
+"#
+            ),
+        ),
+    ]);
+    assert_eq!(
+        format!("{:?}", testing::run(project.path())),
+        format!("{:?}", ExitCode::SUCCESS),
+    );
+}
