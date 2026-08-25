@@ -22,10 +22,10 @@ initial = {"exists": False}
 # append condition and the fold is the decision state, so they answer different
 # questions and need not name the same types.
 #
-# Keys are the loaded definitions rather than type strings, so a typo fails at load.
+# Keys are query clauses built from the loaded definitions, so a typo fails at load.
 # The arm returns the new state; `initial` is frozen, so mutating it would fail.
 fold = {
-    user_registered: lambda state, event: dict(state, exists = True),
+    user_registered(): lambda state, event: dict(state, exists = True),
 }
 
 def handle(input, state):

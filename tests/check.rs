@@ -156,10 +156,10 @@ load("events/thing.star", "thing_happened")
 
 things = entity(key = "thing_id", fields = {"thing_id": uuid()})
 
-source = [thing_happend()]
-
-def handle(event):
+def on_event(event):
     return [put(things, {"thing_id": event.data.thing_id})]
+
+handle = {thing_happend(): on_event}
 "#,
         ),
     ]);
@@ -186,10 +186,10 @@ things = entity(
     indexes = [index("by_note", ["note"])],
 )
 
-source = [thing_happened()]
-
-def handle(event):
+def on_event(event):
     return [put(things, {"thing_id": event.data.thing_id})]
+
+handle = {thing_happened(): on_event}
 "#,
             ),
         ],
@@ -212,10 +212,10 @@ things = entity(
     fields = {"thing_id": uuid(), "active": bool()},
 )
 
-source = [thing_happened()]
-
-def handle(event):
+def on_event(event):
     return [put(things, {"thing_id": event.data.thing_id, "active": True})]
+
+handle = {thing_happened(): on_event}
 "#,
             ),
         ],
@@ -240,10 +240,10 @@ things = entity(
     fields = {"thing_id": uuid(), "price": money()},
 )
 
-source = [thing_happened()]
-
-def handle(event):
+def on_event(event):
     return [put(things, {"thing_id": event.data.thing_id, "price": "1.00"})]
+
+handle = {thing_happened(): on_event}
 "#,
             ),
         ],
@@ -267,10 +267,10 @@ things = entity(
     indexes = [index("by_cursor", ["cursor"])],
 )
 
-source = [thing_happened()]
-
-def handle(event):
+def on_event(event):
     return [put(things, {"thing_id": event.data.thing_id})]
+
+handle = {thing_happened(): on_event}
 "#,
             ),
         ],
@@ -446,10 +446,10 @@ things = entity(
     fields = {"id": uuid(), "secret": str(subject = "owner", max_length = 50)},
 )
 
-source = [thing()]
-
-def handle(event):
+def on_event(event):
     return [put(things, {"id": event.data.owner})]
+
+handle = {thing(): on_event}
 "#,
             ),
         ],
@@ -473,10 +473,10 @@ things = entity(
     indexes = [index("by_secret", ["secret"])],
 )
 
-source = [thing()]
-
-def handle(event):
+def on_event(event):
     return [put(things, {"owner": event.data.owner, "secret": event.data.secret})]
+
+handle = {thing(): on_event}
 "#,
             ),
         ],
@@ -520,10 +520,10 @@ load("events/thing.star", "thing")
 
 things = entity(key = "owner", fields = {"owner": uint()})
 
-source = [thing(secret = "x")]
-
-def handle(event):
+def on_event(event):
     return [put(things, {"owner": event.data.owner})]
+
+handle = {thing(secret = "x"): on_event}
 "#,
             ),
         ],
@@ -1140,7 +1140,7 @@ def handle(input, state):
 /// Both arms present: the shape every other case in this section deviates from.
 fn both_arms() -> String {
     pair_command(
-        "fold = {\n    opened: lambda state, event: dict(state, open = True),\n    closed: lambda state, event: dict(state, open = False),\n}",
+        "fold = {\n    opened(): lambda state, event: dict(state, open = True),\n    closed(): lambda state, event: dict(state, open = False),\n}",
     )
 }
 
@@ -1153,7 +1153,7 @@ fn a_well_formed_fold_map_checks_clean() {
 }
 
 #[test]
-fn a_fold_map_key_that_is_not_an_event_definition_is_an_error() {
+fn a_fold_map_key_that_is_not_a_clause_is_an_error() {
     assert_error(
         &[
             ("events/t.star", PAIR_EVENTS),
@@ -1162,7 +1162,7 @@ fn a_fold_map_key_that_is_not_an_event_definition_is_an_error() {
                 &pair_command("fold = {\"t.opened\": lambda state, event: state}"),
             ),
         ],
-        "keys must be event definitions loaded from events/",
+        "keys must be query clauses from an events/ definition",
     );
 }
 
@@ -1171,7 +1171,7 @@ fn a_fold_map_value_that_is_not_a_function_is_an_error() {
     assert_error(
         &[
             ("events/t.star", PAIR_EVENTS),
-            ("commands/thing.star", &pair_command("fold = {opened: 7}")),
+            ("commands/thing.star", &pair_command("fold = {opened(): 7}")),
         ],
         "entry for `t.opened()` must be a function",
     );
@@ -1184,7 +1184,7 @@ fn an_empty_fold_map_is_an_error() {
             ("events/t.star", PAIR_EVENTS),
             ("commands/thing.star", &pair_command("fold = {}")),
         ],
-        "maps no event definitions",
+        "maps no clauses",
     );
 }
 
@@ -1195,7 +1195,7 @@ fn a_fold_that_is_neither_a_function_nor_a_map_is_an_error() {
             ("events/t.star", PAIR_EVENTS),
             ("commands/thing.star", &pair_command("fold = 7")),
         ],
-        "must be a function, or a dict mapping event definitions to functions",
+        "must be a dict mapping query clauses to functions",
     );
 }
 
@@ -1210,7 +1210,7 @@ fn a_fold_map_key_built_inline_is_an_error() {
             (
                 "commands/thing.star",
                 &pair_command(
-                    "fold = {event(type = \"t.opened\", fields = {\"thing_id\": uuid()}): lambda state, event: state}",
+                    "fold = {event(type = \"t.opened\", fields = {\"thing_id\": uuid()})(): lambda state, event: state}",
                 ),
             ),
         ],
@@ -1254,7 +1254,7 @@ fn an_initial_that_is_not_data_is_an_error() {
 #[test]
 fn a_fold_entry_outside_the_boundary_is_a_warning() {
     let source = pair_command(
-        "fold = {\n    opened: lambda state, event: dict(state, open = True),\n    closed: lambda state, event: state,\n}",
+        "fold = {\n    opened(): lambda state, event: dict(state, open = True),\n    closed(): lambda state, event: state,\n}",
     )
     .replace(
         "return [opened(thing_id = input.thing_id), closed(thing_id = input.thing_id)]",
@@ -1283,7 +1283,7 @@ fn a_fold_entry_outside_the_boundary_is_a_warning() {
 /// map form for being explicit where a `def fold` ignoring a type says nothing.
 #[test]
 fn a_boundary_type_with_no_fold_entry_is_not_reported() {
-    let source = pair_command("fold = {opened: lambda state, event: dict(state, open = True)}");
+    let source = pair_command("fold = {opened(): lambda state, event: dict(state, open = True)}");
     let dir = write_project(&[
         ("events/t.star", PAIR_EVENTS),
         ("commands/thing.star", &source),
@@ -1308,7 +1308,7 @@ input = schema(thing_id = uuid())
 
 initial = {"open": False}
 
-fold = {opened: lambda state, event: dict(state, open = True)}
+fold = {opened(): lambda state, event: dict(state, open = True)}
 
 def handle(input, state):
     return []
@@ -1331,7 +1331,7 @@ def handle(input, state):
 /// `all_events()` names no types, so neither direction has anything to compare.
 #[test]
 fn a_fold_map_against_an_all_events_boundary_is_not_cross_checked() {
-    let source = pair_command("fold = {opened: lambda state, event: dict(state, open = True)}")
+    let source = pair_command("fold = {opened(): lambda state, event: dict(state, open = True)}")
         .replace(
             "return [opened(thing_id = input.thing_id), closed(thing_id = input.thing_id)]",
             "return all_events()",
@@ -1363,7 +1363,7 @@ def query(input):
 
 initial = {"open": False}
 
-fold = {opened: lambda state, event: dict(state, open = True)}
+fold = {opened(): lambda state, event: dict(state, open = True)}
 
 def handle(input, state):
     return []
@@ -1383,10 +1383,10 @@ def handle(input, state):
     assert!(errors(&project).is_empty());
 }
 
-/// A map's keys are the subscription, so a `source` beside them is a second list to
-/// keep in step: exactly the shape this design removes.
+/// `source` is gone: the keys are the subscription. A leftover one is rejected rather
+/// than ignored, since a silently ignored subscription reads as a working one.
 #[test]
-fn a_projector_with_both_source_and_a_handle_map_is_an_error() {
+fn a_projector_that_still_declares_source_is_an_error() {
     assert_error(
         &[
             ("events/t.star", PAIR_EVENTS),
@@ -1406,14 +1406,14 @@ handle = {
 "#,
             ),
         ],
-        "`handle`'s keys are the subscription",
+        "`source` is no longer declared separately",
     );
 }
 
-/// The single-function form says nothing about which events it wants, so it still
-/// needs `source`.
+/// The single-function form is gone. The message names `all_events()`, since that is
+/// how a handler keeps seeing every event.
 #[test]
-fn a_projector_with_a_function_handle_and_no_source_is_an_error() {
+fn a_projector_with_a_function_handle_is_an_error() {
     assert_error(
         &[
             ("events/t.star", PAIR_EVENTS),
@@ -1429,8 +1429,135 @@ def handle(event):
 "#,
             ),
         ],
-        "or key `handle` by the events it wants",
+        "all_events()",
     );
+}
+
+/// A `fold` key is a query clause, so its constraints get the same checks a `query`
+/// clause gets. Nothing validated `fold` keys before they could carry a filter, so an
+/// unindexed one would have matched nothing at runtime with nothing said here.
+#[test]
+fn a_fold_clause_on_a_non_indexed_field_is_an_error() {
+    assert_error(
+        &[
+            ("events/thing.star", EVENTS),
+            (
+                "commands/thing.star",
+                r#"
+load("events/thing.star", "thing_happened")
+
+input = schema(thing_id = uuid())
+
+def query(input):
+    return thing_happened(thing_id = input.thing_id)
+
+initial = {"seen": False}
+
+fold = {thing_happened(note = "x"): lambda state, event: dict(state, seen = True)}
+
+def handle(input, state):
+    return []
+"#,
+            ),
+        ],
+        "is not indexed",
+    );
+}
+
+/// A `fold` key is lowered with the command's keystore, the way `query` is, so a
+/// subject-scoped filter resolves: the rule is the boundary's, not the subscription's.
+#[test]
+fn a_fold_clause_on_a_scoped_subject_field_is_clean_and_an_unscoped_one_is_not() {
+    let command = |fold: &str| {
+        format!(
+            r#"
+load("events/thing.star", "thing")
+
+input = schema(owner = uint())
+
+def query(input):
+    return thing(owner = input.owner)
+
+initial = {{"seen": False}}
+
+{fold}
+
+def handle(input, state):
+    return []
+"#
+        )
+    };
+    assert_clean(&[
+        ("events/thing.star", SUBJECT_EVENTS),
+        (
+            "commands/thing.star",
+            &command(
+                "fold = {thing(owner = 1, secret = \"s\"): lambda state, event: dict(state, seen = True)}",
+            ),
+        ),
+    ]);
+    assert_error(
+        &[
+            ("events/thing.star", SUBJECT_EVENTS),
+            (
+                "commands/thing.star",
+                &command(
+                    "fold = {thing(secret = \"s\"): lambda state, event: dict(state, seen = True)}",
+                ),
+            ),
+        ],
+        "without its subject `owner`",
+    );
+}
+
+/// A `handle` key is lowered with no keystore, so unlike a `fold` key it can only
+/// filter plaintext however the subject is constrained.
+#[test]
+fn a_handle_clause_on_a_subject_field_is_an_error_even_when_scoped() {
+    assert_error(
+        &[
+            ("events/thing.star", SUBJECT_EVENTS),
+            (
+                "projectors/things.star",
+                r#"
+load("events/thing.star", "thing")
+
+things = entity(key = "owner", fields = {"owner": uint()})
+
+handle = {
+    thing(owner = 1, secret = "s"): lambda event: [put(things, {"owner": event.data.owner})],
+}
+"#,
+            ),
+        ],
+        "a subscription can only filter plaintext fields",
+    );
+}
+
+/// `validate_specs` owns unknown types for every clause position, so the dispatch
+/// check does not repeat it. The regression this pins is a doubled report: the keys
+/// are also the subscription, so two passes over one list would say it twice.
+#[test]
+fn an_unknown_event_type_in_a_handle_map_is_reported_once() {
+    let dir = write_project(&[
+        ("events/t.star", PAIR_EVENTS),
+        (
+            "projectors/things.star",
+            r#"
+load("events/t.star", "opened")
+
+things = entity(key = "thing_id", fields = {"thing_id": uuid()})
+
+handle = {
+    event(type = "t.missing", fields = {"thing_id": uuid()})(): lambda event: [],
+}
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let errs = errors(&project);
+    assert_eq!(errs.len(), 1, "expected exactly one error, got {errs:?}");
+    assert!(errs[0].contains("unknown event type"), "{errs:?}");
 }
 
 /// A clause key is validated as a subscription clause, so an unindexed filter is

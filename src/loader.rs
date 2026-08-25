@@ -579,9 +579,10 @@ fn evaluate_units(
             ModuleKind::Effect => effect_globals,
             ModuleKind::Projector => projector_globals,
         };
-        // A projector's or effect's `source` calls event definitions as query
-        // clauses at module top level, so evaluate those in query mode.
-        let query_mode = matches!(kind, ModuleKind::Projector | ModuleKind::Effect);
+        // Every kind names query clauses at module top level: a projector's or
+        // effect's `handle` keys, a command's `fold` keys. Events are constructed
+        // inside `handle`, which runs in its own evaluator, so this cannot reach it.
+        let query_mode = true;
         let frozen = match eval_frozen(ast, globals, Some(&loader), query_mode) {
             Ok(frozen) => frozen,
             Err(err) => {

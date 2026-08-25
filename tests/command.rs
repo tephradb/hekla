@@ -328,8 +328,10 @@ def query(input):
 
 initial = False
 
-def fold(state, event):
+def fold_event(state, event):
     return True
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     if state:

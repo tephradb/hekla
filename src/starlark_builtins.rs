@@ -4,9 +4,9 @@
 //!
 //! Module layout: each `.star` file is one command, projector or effect,
 //! identified by its filename (slug-validated). Handlers (`query`, `fold`,
-//! `handle`) and schema globals (`input`, `initial`, entities, `source`) are named
-//! top-level values; there are no registration calls. An event-driven handler is
-//! either one function or a dict keyed by event definitions (see
+//! `handle`) and schema globals (`input`, `initial`, entities) are named top-level
+//! values; there are no registration calls. An event-driven handler is a dict keyed
+//! by query clauses (see
 //! [`EventDispatch`]), and a command's `fold` returns the new state rather than
 //! mutating the one it was handed. Events are declared with `event(...)` in
 //! `events/` and constructed by calling the definition (`user_registered(...)`),
@@ -1499,9 +1499,9 @@ pub fn eval_frozen(
             if let Some(loader) = loader {
                 eval.set_loader(loader);
             }
-            // A projector's or effect's top-level `source` calls event definitions as
-            // query clauses, so those calls must see query mode; a command's module
-            // body only defines functions, so it is evaluated without it.
+            // A module body's dispatch keys call event definitions as query clauses, so
+            // those calls must see query mode. Events are constructed inside `handle`,
+            // which runs in its own evaluator, so this never reaches one.
             if query_mode {
                 eval.extra = Some(&query_ctx);
             }
@@ -1515,7 +1515,7 @@ pub fn eval_frozen(
 /// Read a frozen module's declarations into a `ModuleDef` for the given kind.
 ///
 /// Handlers (`query`, `fold`, `handle`) and schema globals (a command's `input` and
-/// `initial`; a projector's entities and `source`; an effect's `source`) are named
+/// `initial`; a projector's entities) are named
 /// top-level values read off the frozen module; there are no registration calls.
 /// `handle` is always required; the rest depends on the kind. Failing here means
 /// failing at load rather than on the first request. Messages name the global, not the
@@ -1541,7 +1541,7 @@ pub fn module_def_from_frozen(
             }
         }
         ModuleKind::Projector => {
-            let sources = read_event_handler(module, "projector")?;
+            let sources = read_event_handler(module)?;
             ModuleDef::Projector {
                 name,
                 entities: read_entities(module)?,
@@ -1550,7 +1550,7 @@ pub fn module_def_from_frozen(
         }
         ModuleKind::Effect => ModuleDef::Effect {
             name,
-            sources: read_event_handler(module, "effect")?,
+            sources: read_event_handler(module)?,
         },
     })
 }
@@ -1558,8 +1558,8 @@ pub fn module_def_from_frozen(
 /// Check a command's `initial`, `fold` and `handle` shapes.
 ///
 /// `initial` is a plain value and never a function (see [`initial_state`]); `fold` is
-/// a function or a per-type map; `handle` decides from input and folded state rather
-/// than from one event, so per-type dispatch belongs on `fold`, not on it.
+/// a clause-keyed map; `handle` decides from input and folded state rather than from
+/// one event, so per-clause dispatch belongs on `fold`, not on it.
 fn check_command_handlers(module: &FrozenModule) -> anyhow::Result<()> {
     if let Some(owned) = module.get_option("initial")? {
         let val = owned.value();
@@ -1578,14 +1578,13 @@ fn check_command_handlers(module: &FrozenModule) -> anyhow::Result<()> {
         }
     }
     if let Some(owned) = module.get_option("fold")? {
-        parse_event_dispatch(owned.value(), false)
-            .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
+        parse_event_dispatch(owned.value()).map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
     }
     if let Some(owned) = module.get_option("handle")?
         && owned.value().get_type() != FUNCTION_TYPE
     {
         anyhow::bail!(
-            "a command's `handle` takes (input, state) and must be a single function, got {}; per-type dispatch belongs on `fold`",
+            "a command's `handle` takes (input, state) and must be a single function, got {}; per-clause dispatch belongs on `fold`",
             owned.value().get_type()
         );
     }
@@ -1594,30 +1593,19 @@ fn check_command_handlers(module: &FrozenModule) -> anyhow::Result<()> {
 
 /// Check a projector's or effect's `handle`, and read the subscription it implies.
 ///
-/// A per-clause map *is* the subscription: its keys say which events to read and what
-/// to do with each, so there is no `source` to keep in step with them, and declaring
-/// one anyway is a mistake rather than a way to widen the subscription. A single
-/// `handle(event)` function says nothing about which events it wants, so that form
-/// still needs `source`.
-fn read_event_handler(module: &FrozenModule, kind: &str) -> anyhow::Result<Vec<EventSpec>> {
+/// The map *is* the subscription: its keys say which events to read and what to do
+/// with each, so there is no `source` to keep in step with them. A leftover `source`
+/// is rejected rather than ignored, because a silently ignored subscription reads as
+/// a working one.
+fn read_event_handler(module: &FrozenModule) -> anyhow::Result<Vec<EventSpec>> {
     let Some(owned) = module.get_option("handle")? else {
-        anyhow::bail!("missing required `handle` function");
+        anyhow::bail!("missing required `handle` map");
     };
-    let dispatch = parse_event_dispatch(owned.value(), true)
-        .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
-    let declared = module.get_option("source")?;
-    if dispatch.is_single() {
-        let Some(declared) = declared else {
-            anyhow::bail!(
-                "{kind} must define `source = ...` (an event definition call like `order_placed(...)`, `all_events()`, or a list of them), or key `handle` by the events it wants"
-            );
-        };
-        return parse_event_specs(declared.value())
-            .map_err(|err| anyhow::anyhow!("`source` {err}"));
-    }
-    if declared.is_some() {
+    let dispatch =
+        parse_event_dispatch(owned.value()).map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
+    if module.get_option("source")?.is_some() {
         anyhow::bail!(
-            "`handle`'s keys are the subscription, so `source` would be a second list to keep in step with them; drop `source`, or use a single `handle(event)` function"
+            "`source` is no longer declared separately; `handle`'s keys are the subscription, so move each clause into the key that handles it"
         );
     }
     Ok(dispatch.specs())
@@ -1635,7 +1623,7 @@ fn read_schema(module: &FrozenModule) -> anyhow::Result<InputSchema> {
     Ok(schema.clone())
 }
 
-/// Collect a projector's entities and read its `source` subscription.
+/// Collect a projector's entities.
 ///
 /// Entities are gathered implicitly: every global bound to an `entity(...)` is a
 /// table, named after its binding unless it carries an explicit `name=`. There
@@ -2694,8 +2682,8 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Interpret a `query` result or a projector `source`: a single event-definition
-/// call or `all_events()`, or a list of them OR'd together. The specs lower to a
+/// Interpret a `query` result: a single event-definition call or `all_events()`, or a
+/// list of them OR'd together. The specs lower to a
 /// tephra `Query` (OR across items, AND within an item's tags).
 pub fn parse_event_specs(val: Value<'_>) -> anyhow::Result<Vec<EventSpec>> {
     if let Some(spec) = val.downcast_ref::<EventSpec>() {
@@ -2731,18 +2719,17 @@ pub fn parse_event_specs(val: Value<'_>) -> anyhow::Result<Vec<EventSpec>> {
 /// One arm of a dispatch: the clause that selects its events, and the function to run
 /// for them.
 pub struct DispatchArm<'v> {
-    /// What this arm subscribes to, or `None` for the single-function form and for
-    /// `all_events()`, both of which select every event. Lowered to a tephra
+    /// What this arm subscribes to, or `None` for `all_events()`, which selects every
+    /// event. Lowered to a tephra
     /// `QueryItem` once per run and then used as the match predicate, so the store's
     /// filter and the arm's filter are the same code on the same item.
     pub spec: Option<EventSpec>,
     pub func: Value<'v>,
 }
 
-/// How a handler that sees an event stream is dispatched: one function for every
-/// event, or a set of clauses each with its own function.
-///
-/// The clause form is a dict keyed by event definitions, called or bare:
+/// How a handler that sees an event stream is dispatched: a dict of query clauses,
+/// each with its own function. There is one form, for a command's `fold` and for a
+/// projector's or effect's `handle` alike.
 ///
 /// ```starlark
 /// handle = {
@@ -2756,17 +2743,11 @@ pub struct DispatchArm<'v> {
 /// shadowed by an earlier one, so order fixes only the sequence of ops or journaled
 /// calls (which determinism needs), never which arms run at all.
 ///
-/// For a projector or effect the keys are also the subscription, so there is no
-/// `source` to keep in step with them. A command's boundary comes from `query(input)`
-/// and is per-request, so a command's `fold` keys stay bare definitions.
-///
-/// A single function is held as one arm with no clause, so a caller loops the same way
-/// whichever form it got.
+/// For a projector or effect the keys are also the subscription, so there is no second
+/// list beside them to keep in step. `all_events()` is the clause that selects
+/// everything, which is how one arm handles every event.
 pub struct EventDispatch<'v> {
     arms: Vec<DispatchArm<'v>>,
-    /// Whether this came from a single function rather than a map. Only the map form
-    /// declares a subscription or names an entry in an error.
-    single: bool,
 }
 
 impl<'v> EventDispatch<'v> {
@@ -2775,39 +2756,26 @@ impl<'v> EventDispatch<'v> {
         &self.arms
     }
 
-    /// The clauses this subscribes to. Empty for the single-function form, which
-    /// declares nothing and needs a `source`.
+    /// The clauses this subscribes to.
     pub fn specs(&self) -> Vec<EventSpec> {
-        if self.single {
-            return Vec::new();
-        }
         self.arms
             .iter()
             .map(|arm| arm.spec.clone().unwrap_or(EventSpec::All))
             .collect()
     }
 
-    /// Whether this is the single-function form.
-    pub fn is_single(&self) -> bool {
-        self.single
-    }
-
-    /// How to name a failure: the global itself for the single-function form, the
-    /// specific clause for an arm, so an error points at the line that has to change.
+    /// How to name a failure: the clause of the arm that failed, so an error points at
+    /// the line that has to change.
     pub fn label(&self, global: &str, spec: Option<&EventSpec>) -> String {
         match spec {
-            Some(spec) if !self.single => format!("{global} entry for `{spec}`"),
-            _ => format!("{global}()"),
+            Some(spec) => format!("{global} entry for `{spec}`"),
+            None => format!("{global} entry for `all_events()`"),
         }
     }
 }
 
-/// Interpret a `fold` or an event-driven `handle`: a single function, or a dict
-/// mapping event definitions (bare, or called with field constraints) to functions.
-///
-/// `clause_keys` is false for a command's `fold`, whose boundary comes from
-/// `query(input)` rather than from these keys, so a constraint here would be a filter
-/// the boundary never applied.
+/// Interpret a `fold` or an event-driven `handle`: a dict mapping query clauses to
+/// functions, one arm each.
 ///
 /// Every arm is copied out of the dict so the borrow is released before the caller
 /// runs any of them; holding a `DictRef` across a handler call would keep a `RefCell`
@@ -2815,33 +2783,26 @@ impl<'v> EventDispatch<'v> {
 ///
 /// Errors read as predicates so callers can prefix them with the global's name, the
 /// way [`parse_event_specs`] is consumed.
-pub fn parse_event_dispatch<'v>(
-    val: Value<'v>,
-    clause_keys: bool,
-) -> anyhow::Result<EventDispatch<'v>> {
+pub fn parse_event_dispatch<'v>(val: Value<'v>) -> anyhow::Result<EventDispatch<'v>> {
     if val.get_type() == FUNCTION_TYPE {
-        return Ok(EventDispatch {
-            arms: vec![DispatchArm {
-                spec: None,
-                func: val,
-            }],
-            single: true,
-        });
+        anyhow::bail!(
+            "must be a dict mapping query clauses to functions, not a single function; write `{{order_placed(): on_placed}}`, or `{{all_events(): on_any}}` for one arm that runs for every event"
+        );
     }
     let dict = DictRef::from_value(val).ok_or_else(|| {
         anyhow::anyhow!(
-            "must be a function, or a dict mapping event definitions to functions, got {}",
+            "must be a dict mapping query clauses to functions, got {}",
             val.get_type()
         )
     })?;
     if dict.is_empty() {
         anyhow::bail!(
-            "maps no event definitions, so it would never run; give each event type an entry, or use a single function"
+            "maps no clauses, so it would never run; give each event a clause key, or use `{{all_events(): ...}}`"
         );
     }
     let mut arms = Vec::with_capacity(dict.len());
     for (key, func) in dict.iter() {
-        let spec = key_spec(key, clause_keys)?;
+        let spec = key_spec(key)?;
         if func.get_type() != FUNCTION_TYPE {
             let named = spec.clone().unwrap_or(EventSpec::All);
             anyhow::bail!(
@@ -2852,53 +2813,35 @@ pub fn parse_event_dispatch<'v>(
         arms.push(DispatchArm { spec, func });
     }
     drop(dict);
-    if !clause_keys {
-        // Bare keys carry no constraints, so two arms of one type would be the same
-        // predicate twice: a copy-paste, not a fan-out.
-        for (index, arm) in arms.iter().enumerate() {
-            let Some(spec) = &arm.spec else { continue };
-            if arms[..index]
-                .iter()
-                .filter_map(|prior| prior.spec.as_ref())
-                .any(|prior| prior.same_type(spec))
-            {
-                anyhow::bail!(
-                    "maps event type `{spec}` twice; each event type may have only one entry"
-                );
-            }
-        }
-    }
-    Ok(EventDispatch {
-        arms,
-        single: false,
-    })
+    Ok(EventDispatch { arms })
 }
 
 /// The clause a dispatch key names, or `None` for `all_events()`, which selects every
-/// event. A bare definition is shorthand for the unconstrained clause, which reads
-/// better when there is nothing to filter on.
-fn key_spec(key: Value<'_>, clause_keys: bool) -> anyhow::Result<Option<EventSpec>> {
+/// event.
+///
+/// A key is always a call, never a bare definition, so one spelling covers the
+/// unconstrained and the constrained arm and agrees with `query`, which has only ever
+/// taken clauses. Rejecting the bare form here rather than dropping [`EventDef`]'s
+/// hashability is deliberate: an unhashable key would fail while the dict was still
+/// being built, with starlark's message instead of this one.
+fn key_spec(key: Value<'_>) -> anyhow::Result<Option<EventSpec>> {
     if let Some(def) = key.downcast_ref::<EventDef>() {
-        return Ok(Some(EventSpec::Filter {
-            event_type: def.event_type.clone(),
-            def_id: def.id,
-            constraints: Vec::new(),
-        }));
+        // Naming the event type rather than the binding, which a Starlark value does
+        // not carry: the type locates the line, the example shows the fix.
+        anyhow::bail!(
+            "maps event `{}` through a bare definition; keys must be query clauses, so call it: `order_placed()`, or `order_placed(shop_id = 1)` to filter",
+            def.event_type
+        );
     }
     let Some(spec) = key.downcast_ref::<EventSpec>() else {
         anyhow::bail!(
-            "keys must be event definitions loaded from events/ (e.g. `order_placed` or `order_placed(...)`), got {}",
+            "keys must be query clauses from an events/ definition (e.g. `order_placed()`), got {}",
             key.get_type()
         );
     };
-    if !clause_keys {
-        anyhow::bail!(
-            "keys must be plain event definitions (e.g. `order_placed`, not `{spec}`); a command's boundary comes from query(input), so `fold` dispatches on event type alone, and a single fold(state, event) function already sees every event in it"
-        );
-    }
     Ok(match spec {
         // `all_events()` names no type, so it selects everything. In a map that is a
-        // meaningful arm (one that runs for every event), unlike in a `source` list
+        // meaningful arm (one that runs for every event), unlike in a `query` list
         // where combining it with filters is a mistake.
         EventSpec::All => None,
         spec => Some(spec.clone()),
@@ -3450,21 +3393,20 @@ b = event(type = "t.b", fields = {"id": uuid()})
 "#;
 
     /// Freeze a module and hand its globals to `f`, so a dispatch map is inspected the
-    /// way the runtime sees it: after `Module::freeze`, not before. `query_mode`
-    /// matches how projector and effect bodies evaluate, which is what turns a
-    /// `user_registered()` key into a clause.
-    fn with_frozen<T>(src: &str, query_mode: bool, f: impl FnOnce(&FrozenModule) -> T) -> T {
+    /// way the runtime sees it: after `Module::freeze`, not before. Every module kind
+    /// evaluates in query mode, which is what turns a `a()` key into a clause.
+    fn with_frozen<T>(src: &str, f: impl FnOnce(&FrozenModule) -> T) -> T {
         let ast = parse_module("d.star", src.to_owned()).unwrap();
-        let frozen = eval_frozen(ast, &globals(), None, query_mode).unwrap();
+        let frozen = eval_frozen(ast, &globals(), None, true).unwrap();
         f(&frozen)
     }
 
     /// The arms a dispatch declares, rendered as `type(constraint=value, ...)` in
     /// declaration order, which is the order they would run in.
-    fn parse_global(src: &str, name: &str, clause_keys: bool) -> anyhow::Result<Vec<String>> {
-        with_frozen(src, clause_keys, |frozen| {
+    fn parse_global(src: &str, name: &str) -> anyhow::Result<Vec<String>> {
+        with_frozen(src, |frozen| {
             let owned = frozen.get(name).unwrap();
-            let dispatch = parse_event_dispatch(owned.value(), clause_keys)?;
+            let dispatch = parse_event_dispatch(owned.value())?;
             Ok(dispatch.specs().iter().map(render_spec).collect())
         })
     }
@@ -3486,8 +3428,10 @@ b = event(type = "t.b", fields = {"id": uuid()})
         }
     }
 
-    /// Without `write_hash` on `EventDef` the map literal cannot even be built, so
-    /// this fails at evaluation rather than at lookup.
+    /// A definition is not a dispatch key any more, but it stays hashable so that
+    /// rejecting it is kiln's job: an unhashable key would fail while the dict was
+    /// still being built, with starlark's `not hashable` instead of the message that
+    /// says to call it.
     #[test]
     fn an_event_definition_can_key_a_dict() {
         let src = format!("{TWO_EVENTS}\nd = {{a: 1, b: 2}}\nd[b]");
@@ -3498,12 +3442,20 @@ b = event(type = "t.b", fields = {"id": uuid()})
     /// pre-freeze hash through unverified, so a hash that moved on freeze would leave
     /// the arm unreachable in the frozen module the runtime actually reads.
     #[test]
-    fn a_definition_keyed_map_survives_the_module_freeze() {
-        let src = format!("{TWO_EVENTS}\nfold = {{a: lambda s, e: s, b: lambda s, e: s}}");
-        assert_eq!(
-            parse_global(&src, "fold", false).unwrap(),
-            ["t.a()", "t.b()"]
-        );
+    fn a_clause_keyed_map_survives_the_module_freeze() {
+        let src = format!("{TWO_EVENTS}\nfold = {{a(): lambda s, e: s, b(): lambda s, e: s}}");
+        assert_eq!(parse_global(&src, "fold").unwrap(), ["t.a()", "t.b()"]);
+    }
+
+    /// A command's `fold` takes the same clause keys a `handle` does, constraints and
+    /// all. Its module body evaluates in query mode for exactly this reason.
+    #[test]
+    fn a_fold_key_may_carry_a_constraint() {
+        let src = r#"
+a = event(type = "t.a", fields = {"id": uuid(), "shop": str()})
+fold = {a(): lambda s, e: s, a(shop = "s"): lambda s, e: s}
+"#;
+        assert_eq!(parse_global(src, "fold").unwrap(), ["t.a()", "t.a(shop=s)"]);
     }
 
     /// Arms run in declaration order, so the parser must preserve it: a `HashMap` here
@@ -3512,7 +3464,7 @@ b = event(type = "t.b", fields = {"id": uuid()})
     #[test]
     fn arms_keep_declaration_order() {
         let src = format!("{TWO_EVENTS}\nh = {{b(): lambda e: e, a(): lambda e: e}}");
-        assert_eq!(parse_global(&src, "h", true).unwrap(), ["t.b()", "t.a()"]);
+        assert_eq!(parse_global(&src, "h").unwrap(), ["t.b()", "t.a()"]);
     }
 
     /// Several clauses may name one type: that is the fan-out the clause form exists
@@ -3523,14 +3475,15 @@ b = event(type = "t.b", fields = {"id": uuid()})
             "{TWO_EVENTS}\nh = {{a(): lambda e: e, a(id = \"x\"): lambda e: e, a(id = \"y\"): lambda e: e}}"
         );
         assert_eq!(
-            parse_global(&src, "h", true).unwrap(),
+            parse_global(&src, "h").unwrap(),
             ["t.a()", "t.a(id=x)", "t.a(id=y)"]
         );
     }
 
     /// Constraints are sorted at construction, so one predicate is one key however the
     /// call was written. Starlark then rejects the repeat itself, which is a better
-    /// answer than silently keeping one of two arms that would both have fired.
+    /// answer than silently keeping one of two arms that would both have fired, and is
+    /// why the parser needs no duplicate scan of its own.
     #[test]
     fn constraint_order_does_not_make_a_second_arm() {
         let src = r#"
@@ -3543,14 +3496,11 @@ h = {a(id = "x", shop = "s"): lambda e: e, a(shop = "s", id = "x"): lambda e: e}
     }
 
     /// `all_events()` selects everything, so in a map it is an arm that runs for every
-    /// event: the shared-prologue shape, without a second global to declare it.
+    /// event. It is what replaced the single-function form.
     #[test]
     fn all_events_is_a_catch_all_arm() {
         let src = format!("{TWO_EVENTS}\nh = {{all_events(): lambda e: e, a(): lambda e: e}}");
-        assert_eq!(
-            parse_global(&src, "h", true).unwrap(),
-            ["all_events()", "t.a()"]
-        );
+        assert_eq!(parse_global(&src, "h").unwrap(), ["all_events()", "t.a()"]);
     }
 
     /// Two definitions of the same type are distinct keys, matching the identity rule
@@ -3566,67 +3516,72 @@ len(d)
         assert_eq!(eval_expr(src), "2");
     }
 
-    #[test]
-    fn a_single_function_dispatch_declares_no_subscription() {
-        let src = "def fold(state, event):\n    return state\n";
-        assert!(parse_global(src, "fold", false).unwrap().is_empty());
-        let src = "fold = lambda state, event: state\n";
-        assert!(parse_global(src, "fold", false).unwrap().is_empty());
-    }
-
-    fn dispatch_err(src: &str, clause_keys: bool) -> String {
-        match parse_global(src, "fold", clause_keys) {
+    fn dispatch_err(src: &str) -> String {
+        match parse_global(src, "fold") {
             Ok(arms) => panic!("expected a rejection, got {arms:?}"),
             Err(err) => format!("{err:#}"),
         }
     }
 
+    /// The single-function form is gone, and the message has to say what replaced it,
+    /// since "use a dict" alone does not tell an author how to keep handling everything.
+    #[test]
+    fn a_single_function_dispatch_is_rejected() {
+        for src in [
+            "def fold(state, event):\n    return state\n",
+            "fold = lambda state, event: state\n",
+        ] {
+            let err = dispatch_err(src);
+            assert!(err.contains("all_events()"), "{err}");
+        }
+    }
+
     #[test]
     fn a_dispatch_that_is_neither_function_nor_dict_is_rejected() {
-        assert!(dispatch_err("fold = 7", false).contains("must be a function, or a dict"));
+        assert!(dispatch_err("fold = 7").contains("must be a dict mapping query clauses"));
     }
 
     #[test]
     fn an_empty_dispatch_map_is_rejected() {
-        assert!(dispatch_err("fold = {}", false).contains("maps no event definitions"));
+        assert!(dispatch_err("fold = {}").contains("maps no clauses"));
     }
 
     #[test]
-    fn a_non_definition_key_is_rejected() {
+    fn a_non_clause_key_is_rejected() {
         let src = "fold = {\"t.a\": lambda s, e: s}";
-        assert!(
-            dispatch_err(src, false).contains("keys must be event definitions loaded from events/")
-        );
+        assert!(dispatch_err(src).contains("keys must be query clauses"));
     }
 
-    /// A command module does not evaluate in query mode, so a clause key is only
-    /// reachable through `all_events()`, which needs no mode. Rejecting it points at
-    /// the form that already means "every event in the boundary".
+    /// The one spelling rule: a key is a call. A bare definition is the mistake this
+    /// message exists to name, since it used to be the only accepted form in a `fold`.
     #[test]
-    fn a_clause_key_in_a_fold_is_rejected() {
-        let src = format!("{TWO_EVENTS}\nfold = {{all_events(): lambda s, e: s}}");
-        let err = dispatch_err(&src, false);
-        assert!(err.contains("dispatches on event type alone"), "{err}");
+    fn a_bare_definition_key_is_rejected() {
+        let src = format!("{TWO_EVENTS}\nfold = {{a: lambda s, e: s}}");
+        let err = dispatch_err(&src);
+        assert!(err.contains("bare definition"), "{err}");
+        assert!(err.contains("`t.a`"), "{err}");
     }
 
     #[test]
     fn a_non_function_arm_is_rejected() {
-        let src = format!("{TWO_EVENTS}\nfold = {{a: 7}}");
-        let err = dispatch_err(&src, false);
+        let src = format!("{TWO_EVENTS}\nfold = {{a(): 7}}");
+        let err = dispatch_err(&src);
         assert!(
             err.contains("entry for `t.a()` must be a function"),
             "{err}"
         );
     }
 
+    /// The query-mode flip, from the other side: a command body that calls a definition
+    /// gets a clause, so it can no longer build an event there. Nothing needs to, and
+    /// pinning it keeps the flip from being reverted silently.
     #[test]
-    fn a_type_mapped_twice_by_bare_keys_is_rejected() {
-        let src = r#"
-a = event(type = "t.a", fields = {"id": uuid()})
-b = event(type = "t.a", fields = {"id": uuid()})
-fold = {a: lambda s, e: s, b: lambda s, e: s}
-"#;
-        assert!(dispatch_err(src, false).contains("twice"));
+    fn a_module_body_call_yields_a_clause_not_an_event() {
+        let src = format!("{TWO_EVENTS}\nx = a(id = \"11111111-1111-1111-1111-111111111111\")");
+        let got = with_frozen(&src, |frozen| {
+            frozen.get("x").unwrap().value().get_type().to_owned()
+        });
+        assert_eq!(got, "event_spec");
     }
 
     /// The literal-versus-function split `initial` rests on.
@@ -3638,7 +3593,7 @@ fold = {a: lambda s, e: s, b: lambda s, e: s}
             ("initial = lambda: 1", true),
             ("def initial():\n    return 1\n", true),
         ] {
-            let got = with_frozen(src, false, |frozen| {
+            let got = with_frozen(src, |frozen| {
                 frozen.get("initial").unwrap().value().get_type() == FUNCTION_TYPE
             });
             assert_eq!(got, is_function, "{src}");

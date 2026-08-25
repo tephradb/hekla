@@ -87,12 +87,12 @@ load("events/thing.star", "happened")
 
 totals = entity(key = "id", fields = {"id": str(), "count": int()})
 
-source = [happened()]
-
-def handle(event):
+def on_event(event):
     row = get(totals, "all")
     count = (row["count"] if row else 0) + 1
     return [put(totals, {"id": "all", "count": count})]
+
+handle = {happened(): on_event}
 "#,
         ),
     ]);
@@ -146,10 +146,10 @@ load("events/thing.star", "happened")
 
 rows = entity(key = "id", fields = {"id": str(), "label": str()})
 
-source = [happened()]
-
-def handle(event):
+def on_event(event):
     return [put(rows, {"id": event.data.id, "label": "x"})]
+
+handle = {happened(): on_event}
 "#,
         ),
     ]);
@@ -204,10 +204,10 @@ load("events/big.star", "counted")
 
 nums = entity(key = "id", fields = {"id": uuid(), "n": uint()})
 
-source = [counted()]
-
-def handle(event):
+def on_event(event):
     return [put(nums, {"id": event.data.id, "n": event.data.n})]
+
+handle = {counted(): on_event}
 "#;
 
 /// Project one `big.counted` carrying `n` and read the stored value back.
@@ -316,12 +316,10 @@ load("events/thing.star", "added", "removed")
 
 things = entity(key = "id", fields = {"id": uuid()})
 
-source = [added(), removed()]
-
-def handle(event):
-    if event.type == "thing.added":
-        return [put(things, {"id": event.data.id})]
-    return [delete(things, event.data.id)]
+handle = {
+    added(): lambda event: [put(things, {"id": event.data.id})],
+    removed(): lambda event: [delete(things, event.data.id)],
+}
 "#;
 
 #[test]
@@ -387,12 +385,10 @@ load("events/u.star", "registered", "renamed")
 
 people = entity(key = "id", fields = {"id": uuid(), "name": str()})
 
-source = [registered(), renamed()]
-
-def handle(event):
-    if event.type == "u.registered":
-        return [put(people, {"id": event.data.id, "name": event.data.name})]
-    return [patch(people, event.data.id, {"name": event.data.name})]
+handle = {
+    registered(): lambda event: [put(people, {"id": event.data.id, "name": event.data.name})],
+    renamed(): lambda event: [patch(people, event.data.id, {"name": event.data.name})],
+}
 "#;
 
 #[test]

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 mod support;
 
-use support::{ALICE, BOB, Boot, ctx, log_head, write_project};
+use support::{ALICE, BOB, Boot, CAROL, ctx, log_head, write_project};
 
 /// Run a command that must fail at dispatch and return its rendered error.
 /// `ExecResult` is not `Debug`, so `Result::unwrap_err` is unavailable here.
@@ -131,8 +131,10 @@ def query(input):
 
 initial = {"taken": False}
 
-def fold(state, event):
+def fold_event(state, event):
     return dict(state, taken = True)
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     if state["taken"]:
@@ -340,8 +342,10 @@ def query(input):
 
 initial = {"taken": False}
 
-def fold(state, event):
+def fold_event(state, event):
     updated = dict(state, taken = True)
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     if state["taken"]:
@@ -373,7 +377,7 @@ fn a_fold_that_returns_none_fails_the_command() {
         json!({ "id": BOB, "email": "dup@example.com" }),
     );
     assert!(
-        err.contains("fold() must return the updated state"),
+        err.contains("must return the updated state"),
         "a fold that falls off the end must fail loudly, got: {err}"
     );
     assert_eq!(log_head(&harness.rt), 1, "the duplicate must not commit");
@@ -584,8 +588,8 @@ def query(input):
 initial = {"opened": False, "frozen": False}
 
 fold = {
-    opened: lambda state, event: dict(state, opened = True),
-    frozen: lambda state, event: dict(state, frozen = True),
+    opened(): lambda state, event: dict(state, opened = True),
+    frozen(): lambda state, event: dict(state, frozen = True),
 }
 
 def handle(input, state):
@@ -632,6 +636,73 @@ fn a_per_type_fold_dispatches_by_event_type() {
     harness.shutdown();
 }
 
+/// Two clauses on one type, the narrower a subset of the wider. A command's `fold`
+/// could not express this before its keys became clauses.
+const FAN_OUT_FOLD: &str = r#"
+load("events/t.star", "opened", "frozen")
+
+input = schema(id = uuid(), owner = str())
+
+def query(input):
+    return [opened(owner = input.owner), frozen(owner = input.owner)]
+
+initial = {"seen": 0, "kim": 0}
+
+fold = {
+    opened(): lambda state, event: dict(state, seen = state["seen"] + 1),
+    opened(owner = "kim"): lambda state, event: dict(state, kim = state["kim"] + 1),
+}
+
+def handle(input, state):
+    if state["seen"] != state["kim"]:
+        return reject("wider_only", "the wide arm ran without the narrow one")
+    if state["seen"] > 0:
+        return reject("both_ran", "both arms ran")
+    return opened(id = input.id, owner = input.owner)
+"#;
+
+/// Both arms run for an event the narrow one selects, and only the wide one runs for
+/// an event it does not: the fan-out rule, on the command side.
+#[test]
+fn a_fold_fans_out_across_two_clauses_of_one_type() {
+    let project = write_project(&[
+        ("events/t.star", ACCOUNT_EVENTS),
+        ("commands/open.star", FAN_OUT_FOLD),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    let first = harness
+        .rt
+        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(first.status, 200, "{:?}", first.body);
+
+    // `owner = "kim"` matches both clauses, so both counters moved together.
+    let second = harness
+        .rt
+        .execute("open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(second.status, 422, "{:?}", second.body);
+    assert_eq!(second.body["error"]["code"], "both_ran");
+
+    // A different owner is a different boundary, so this starts from `initial` and
+    // commits; the point is that the narrow clause did not fire for it.
+    let third = harness
+        .rt
+        .execute("open", json!({ "id": CAROL, "owner": "sam" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(third.status, 200, "{:?}", third.body);
+
+    // Now only the wide arm has run for `sam`, so the counters disagree.
+    let fourth = harness
+        .rt
+        .execute("open", json!({ "id": ALICE, "owner": "sam" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(fourth.status, 422, "{:?}", fourth.body);
+    assert_eq!(fourth.body["error"]["code"], "wider_only");
+    harness.shutdown();
+}
+
 /// Emits the second event type, so the per-type fold has something to dispatch on.
 const FREEZE: &str = r#"
 load("events/t.star", "frozen")
@@ -655,7 +726,7 @@ def query(input):
 initial = {"seen": 0}
 
 fold = {
-    frozen: lambda state, event: dict(state, seen = state["seen"] + 1),
+    frozen(): lambda state, event: dict(state, seen = state["seen"] + 1),
 }
 
 def handle(input, state):
@@ -719,8 +790,8 @@ def bad(state, event):
     updated = dict(state, opened = True)
 
 fold = {
-    opened: bad,
-    frozen: lambda state, event: state,
+    opened(): bad,
+    frozen(): lambda state, event: state,
 }
 
 def handle(input, state):
@@ -759,9 +830,11 @@ def query(input):
 
 initial = {"opened": False}
 
-def fold(state, event):
+def fold_event(state, event):
     state["opened"] = True
     return state
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     return opened(id = input.id, owner = input.owner)
@@ -799,7 +872,7 @@ def query(input):
 initial = {"seen": 0}
 
 fold = {
-    noticed: lambda state, event: dict(state, seen = state["seen"] + 1),
+    noticed(): lambda state, event: dict(state, seen = state["seen"] + 1),
 }
 
 def handle(input, state):
@@ -871,7 +944,7 @@ def query(input):
 initial = {"body": "unset"}
 
 fold = {
-    noted: lambda state, event: dict(state, body = event.data.body),
+    noted(): lambda state, event: dict(state, body = event.data.body),
 }
 
 def handle(input, state):

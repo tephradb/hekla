@@ -1,6 +1,6 @@
 //! The effect runtime: durable execution of side effects.
 //!
-//! One dedicated thread per effect subscribes to its `source` and processes
+//! One dedicated thread per effect subscribes to its `handle` keys and processes
 //! matching events strictly in order, one invocation per event. An invocation
 //! runs the effect's straight-line `handle`, whose impure builtins (`http.*`,
 //! `invoke_command`, `read`, `scan`, `now`) are journaled: each call records its
@@ -527,10 +527,10 @@ fn try_invocation(
                 .module
                 .get_option("handle")?
                 .ok_or_else(|| anyhow::anyhow!("effect has no handle() function"))?;
-            let handle = parse_event_dispatch(thaw(&handle_owned, &module), true)
+            let handle = parse_event_dispatch(thaw(&handle_owned, &module))
                 .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
             // `None` matches how the subscription is lowered: filtering a
-            // subject-encrypted field in a `source` is a static error.
+            // subject-encrypted field in a `handle` key is a static error.
             let lowered = lower_dispatch(&handle, runtime.events_map(), None)
                 .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
             let selected: Vec<usize> = lowered

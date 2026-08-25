@@ -97,11 +97,11 @@ load("events/order.star", "order_placed")
 
 leaky = entity(key = "order_id", fields = {"order_id": uuid(), "domain": str()})
 
-source = [order_placed()]
-
-def handle(event):
+def on_event(event):
     # Deriving plaintext from the handle: not allowed, so this errors.
     return [put(leaky, {"order_id": event.data.order_id, "domain": event.data.email + "!"})]
+
+handle = {order_placed(): on_event}
 "#,
     )]);
     let harness = boot(dir.path());
@@ -198,11 +198,11 @@ load("events/order.star", "order_placed")
 
 leak = entity(key = "order_id", fields = {"order_id": uuid(), "note": str()})
 
-source = [order_placed()]
-
-def handle(event):
+def on_event(event):
     # `note` is a plaintext column; storing the encrypted handle there is rejected.
     return [put(leak, {"order_id": event.data.order_id, "note": event.data.email})]
+
+handle = {order_placed(): on_event}
 "#,
     )]);
     let harness = boot(dir.path());
@@ -234,8 +234,10 @@ def query(input):
 
 initial = {"email": None}
 
-def fold(state, event):
+def fold_event(state, event):
     return dict(state, email = event.data.email)
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     return order_placed(
@@ -409,8 +411,10 @@ def query(input):
 
 initial = {"taken": False}
 
-def fold(state, event):
+def fold_event(state, event):
     return dict(state, taken = True)
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     if state["taken"]:
@@ -499,18 +503,17 @@ orders = entity(
     },
 )
 
-source = [order_placed(), touched()]
+def on_placed(event):
+    return [put(orders, {
+        "order_id": event.data.order_id,
+        "customer_id": event.data.customer_id,
+        "email": event.data.email,
+        "touches": 0,
+    })]
 
-def handle(event):
-    if event.type == "order.placed":
-        return [put(orders, {
-            "order_id": event.data.order_id,
-            "customer_id": event.data.customer_id,
-            "email": event.data.email,
-            "touches": 0,
-        })]
-    # Read-modify-write: re-store the whole row (carrying the encrypted email handle)
-    # with an incremented counter.
+# Read-modify-write: re-store the whole row (carrying the encrypted email handle)
+# with an incremented counter.
+def on_touched(event):
     row = get(orders, event.data.order_id)
     if row == None:
         return []
@@ -520,6 +523,11 @@ def handle(event):
         "email": row["email"],
         "touches": row["touches"] + 1,
     })]
+
+handle = {
+    order_placed(): on_placed,
+    touched(): on_touched,
+}
 "#,
         ),
     ]);
@@ -737,9 +745,7 @@ orders = entity(
     },
 )
 
-source = [order_placed()]
-
-def handle(event):
+def on_event(event):
     return [put(orders, {
         "order_id": event.data.order_id,
         "customer_id": event.data.customer_id,
@@ -747,6 +753,8 @@ def handle(event):
         "order_total": event.data.order_total,
         "loyalty_points": event.data.loyalty_points,
     })]
+
+handle = {order_placed(): on_event}
 "#;
 
 #[test]
@@ -826,8 +834,10 @@ def query(input):
 
 initial = {"seen": False}
 
-def fold(state, event):
+def fold_event(state, event):
     return dict(state, seen = True)
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     if state["seen"]:
@@ -927,8 +937,10 @@ def query(input):
 
 initial = {"found": False}
 
-def fold(state, event):
+def fold_event(state, event):
     return dict(state, found = True)
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     return []
@@ -1109,14 +1121,14 @@ misfiled = entity(
     },
 )
 
-source = [order_placed()]
-
-def handle(event):
+def on_event(event):
     return [put(misfiled, {
         "order_id": event.data.order_id,
         "customer_id": event.data.shop_id,
         "email": event.data.email,
     })]
+
+handle = {order_placed(): on_event}
 "#;
 
 /// The handle is encrypted for `email`, but stored into a column named `note`.
@@ -1132,14 +1144,14 @@ misnamed = entity(
     },
 )
 
-source = [order_placed()]
-
-def handle(event):
+def on_event(event):
     return [put(misnamed, {
         "order_id": event.data.order_id,
         "customer_id": event.data.customer_id,
         "note": event.data.email,
     })]
+
+handle = {order_placed(): on_event}
 "#;
 
 /// The column is scoped to `shop_id`, but the handle is scoped to `customer_id`.
@@ -1155,14 +1167,14 @@ misscoped = entity(
     },
 )
 
-source = [order_placed()]
-
-def handle(event):
+def on_event(event):
     return [put(misscoped, {
         "order_id": event.data.order_id,
         "shop_id": event.data.shop_id,
         "email": event.data.email,
     })]
+
+handle = {order_placed(): on_event}
 "#;
 
 #[test]

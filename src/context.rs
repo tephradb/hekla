@@ -9,7 +9,7 @@
 //! names runs, so a builtin that needs one errors everywhere else: [`HandleCtx`]
 //! for a command's `handle`, holding the request's pinned `now()` so repeated
 //! calls agree and so `query` and `fold` cannot reach a clock; [`QueryCtx`] while
-//! a `query` or a `source` is evaluated; [`ProjectorCtx`] for a projector's
+//! a `query` or a dispatch key is evaluated; [`ProjectorCtx`] for a projector's
 //! `handle`, behind `get()`; and [`EffectCtx`] for an effect's `handle`, behind
 //! the impure builtins. [`EntityReader`] and [`EffectHost`] are the host seams the
 //! last two carry, declared here so the builtins layer stays independent of the
@@ -58,7 +58,7 @@ pub struct HandleCtx {
 }
 
 /// Marker set on the evaluator while a command's `query` runs and while a
-/// projector's or effect's `source` is evaluated at load. Its presence tells an
+/// a module body is evaluated at load, where a dispatch key is a clause. Its presence tells an
 /// event-definition call it is being used as a query filter (a subset match) rather
 /// than to construct an event to emit (which requires every field). It is distinct
 /// from [`HandleCtx`], so `now()` still errors in `query`.

@@ -207,7 +207,8 @@ folds a projector's and effect's `source` into it, and settles the contract `fol
 - **A command's `fold` keeps bare-definition keys.** Its boundary is `query(input)`, computed per
   request, so a constraint on a key would be a filter the boundary never applied; a clause key there
   is a load error saying so. The dispatch rule is the same for all three, `fold` simply cannot
-  express overlapping keys.
+  express overlapping keys. *(Reversed in Phase 8: the reasoning conflated the evaluation mode with
+  the semantics. Reading a subset of what the boundary locked is safe.)*
 - **An event no arm selects is skipped before its envelope is decoded**, so a map over a wide
   boundary pays nothing per irrelevant event. For a projector or effect it is not even read, since
   the keys are the subscription.
@@ -240,7 +241,8 @@ Honest scope for this phase:
   single-function form stays because any multi-statement handler needs a `def` anyway, and forcing
   the map form on a single-type projector reintroduces a named-function indirection that reads as a
   naming convention. Four of the five example subscriptions are single-type, so that is the common
-  case rather than an edge.
+  case rather than an edge. *(Reversed in Phase 8, on evidence: rewriting those four subscriptions
+  showed the map form is the same line count, because the `source` line becomes the `handle` line.)*
 - **State is still read by subscript** (`state["taken"]`). Unifying field access on dot syntax is its
   own item, delivered for `event.data` in Phase 7; state deliberately stays a dict, for the reason
   recorded there.
@@ -276,7 +278,55 @@ Honest scope for this phase:
 - **Optional event fields are unexercised in the examples.** No `.star` file declares one, so the
   absent-reads-as-`None` behaviour is pinned by an integration test rather than by a worked example.
 
-## Phase 8 and beyond (deferred, with triggers)
+## Phase 8: one way to handle events (done)
+
+Phases 6 and 7 each left a second way to do something. This phase removes them, on the principle that
+one spelling for one meaning is worth more than the convenience of either alternative.
+
+- **One dispatch form.** A projector's or effect's `source` plus `def handle(event)` is gone, as is a
+  command's `def fold(state, event)`. Every event-driven handler is a clause-keyed map. Phase 6 kept
+  the function form on the reasoning that a multi-statement handler needs a `def` anyway, so the map
+  form would reintroduce a named-function indirection. Rewriting all four example subscriptions
+  showed that was wrong: the map form is the **same line count**, because the `source` line becomes
+  the `handle` line and the generic name `handle` becomes a real one. What the function form did cost
+  was real: a second list that could drift from the body, and the `if event.type == ...` chain that
+  Phase 6 existed to kill, still reachable for any multi-type subscription.
+- **`all_events()` is what replaced it**, in all three kinds. `{all_events(): f}` means exactly what
+  `def fold(state, event)` and `source = [all_events()]` plus `def handle(event)` meant, so the
+  collapse loses nothing. Under fan-out it also composes: an `all_events()` arm beside typed arms is
+  a prologue rather than a replacement for them.
+- **One key language: a key is a query clause.** `fold` took bare definitions, `handle` took clauses
+  and quietly accepted bare ones too, and nothing taught the rule. The split was not a design
+  decision; it fell out of only projectors and effects evaluating their module body in query mode.
+  Now every kind does, so `fold = {order_placed(): ...}` works and a bare key is a load error naming
+  the fix. The spelling now matches `query`, which has only ever accepted clauses.
+- **The old failure was invisible.** A clause key in a `fold` used to report ``missing required field
+  `user_id` `` (it was building an *event*), or starlark's ``Value of type `event` is not hashable``
+  if every field was supplied. Neither named `fold`, dispatch, or keys, and the carefully-worded
+  error written for the case was nearly dead code: it could only fire for `all_events()`.
+- **Constrained `fold` keys follow, and are safe.** An arm reads a subset of what the boundary
+  already locked, and reading less than you locked never breaks DCB. `validate_specs` now runs over
+  dispatch keys in every position, so a `fold` arm filtering an unindexed or subject-encrypted field
+  is caught at check time. The guardrails differ by position because the lowering does: a `fold` key
+  is lowered with the command's keystore like `query`, a `handle` key with none, so only the first
+  can filter a subject-scoped field.
+- **`kiln check` says each thing once.** With the keys doubling as the subscription, an unregistered
+  type used to be reported twice, once by the clause validation and once by the dispatch check. The
+  dispatch check now keeps only what is genuinely its own: a key built by calling `event(...)` inline,
+  which the loader's module-scope scan cannot see.
+
+Honest scope for this phase:
+
+- **A constraint-level dead arm is not detected.** A `fold` key whose filter cannot overlap the
+  boundary (`query` returns `order_placed(shop_id = 1)`, the arm keys `order_placed(shop_id = 2)`) is
+  silent dead code. The cross-check is by type only, because `query` is evaluated against a
+  placeholder input, so constraint *values* are not statically known.
+- **`fold` keys can only filter on constants**, being module-level. That makes them worth reaching
+  for on enum-shaped fields and little else; the docs say so rather than advertising the capability.
+- **Naming a handler is now mandatory** for any multi-statement body. That is the one real cost, and
+  it buys a name better than `handle`: the map puts the subscription and the handler on one line.
+
+## Phase 9 and beyond (deferred, with triggers)
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
 warranted.
@@ -323,9 +373,10 @@ are journaled (point-in-time-stale on replay).
 Raw considerations from design review, captured so they are not lost. None is scheduled, and none is a
 committed shape: each names the tension it addresses and the open question. Several interact with
 features that already shipped (auto-tagging, effect retry, projector auto-rebuild), so they are
-refinements to revisit once real projects exercise them. Two have shipped: per-type folds and the
+refinements to revisit once real projects exercise them. Three have shipped: per-type folds and the
 mutate-or-return decision as Phase 6 (which also folded a projector's and effect's `source` into the
-dispatch map), and dot access on event payloads as Phase 7. The rest stand as written.
+dispatch map), dot access on event payloads as Phase 7, and the collapse to one dispatch form and one
+key language as Phase 8. The rest stand as written.
 
 - **Meaningful effect outcomes, idempotency keys, and delivery events.** An effect `handle` return value
   is currently ignored, so `http.post` then a log on failure is at-least-once with silent duplicates and

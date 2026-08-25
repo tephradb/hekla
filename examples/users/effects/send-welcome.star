@@ -9,9 +9,7 @@
 
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def send_welcome(event):
     response = http.post(
         url = "https://example.test/welcome",
         body = {"email": event.data.email},
@@ -20,3 +18,5 @@ def handle(event):
         log("welcome email rejected with status " + str(response["status"]))
         return
     invoke_command("record-welcome", {"user_id": event.data.user_id})
+
+handle = {user_registered(): send_welcome}

@@ -17,10 +17,9 @@ input = schema(
 def query(input):
     return user_welcomed(user_id = input.user_id)
 
-def fold(state, event):
-    return True
-
 initial = False
+
+fold = {user_welcomed(): lambda state, event: True}
 
 def handle(input, state):
     if state:

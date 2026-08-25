@@ -16,7 +16,7 @@ users = entity(
 )
 
 # The keys are the subscription: they say which events to read and what to do with
-# each, so there is no `source` list to keep in step with them. Every arm whose clause
+# each, so there is no second list to keep in step with them. Every arm whose clause
 # matches runs, in declaration order.
 handle = {
     user_registered(): lambda event: [put(users, {

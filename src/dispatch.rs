@@ -205,7 +205,7 @@ pub fn run_command(
             let fold_owned = frozen.get_option("fold")?;
             let fold = fold_owned
                 .as_ref()
-                .map(|owned| parse_event_dispatch(thaw(owned, &module), false))
+                .map(|owned| parse_event_dispatch(thaw(owned, &module)))
                 .transpose()
                 .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
             let lowered = match &fold {
@@ -500,7 +500,7 @@ pub(crate) fn to_query_item(
 
 /// Lower each arm's clause to the store's own match predicate, in declaration order.
 /// `None` at a position means that arm selects every event: either the
-/// single-function form, or an `all_events()` key.
+/// `all_events()` key, which selects everything.
 ///
 /// Lowering is where a bad constraint is caught (undeclared, non-indexed, or a subject
 /// field with no derivable key), so a map whose clause could never be honoured fails

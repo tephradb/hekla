@@ -42,47 +42,60 @@ def handle(input, state):
 /// `kiln.toml` turning the automatic rebuild off.
 const AUTO_REBUILD_OFF: &str = "[projectors]\nauto_rebuild = false\n";
 
-/// The counter projector, parameterised by which event types it sources.
-fn counter(source: &str) -> String {
+/// One `handle` arm per clause, all running the same function: the shape the
+/// parameterised fixtures below vary.
+fn arms(clauses: &str, func: &str) -> String {
+    clauses
+        .split(", ")
+        .map(|clause| format!("    {clause}: {func},\n"))
+        .collect()
+}
+
+/// The counter projector, parameterised by which clauses it subscribes to.
+fn counter(clauses: &str) -> String {
+    let arms = arms(clauses, "bump");
     format!(
         r#"
 load("events/e.star", "one", "two")
 
 totals = entity(key = "id", fields = {{"id": str(), "n": int()}})
 
-source = {source}
-
-def handle(event):
+def bump(event):
     row = get(totals, "all")
     n = (row["n"] if row else 0) + 1
     return [put(totals, {{"id": "all", "n": n}})]
+
+handle = {{
+{arms}}}
 "#
     )
 }
 
 /// The same projector with an extra `label` column, so a redeploy changes the entity
-/// schema rather than the source set. `ReadModel::open` creates tables with
+/// schema rather than the subscription. `ReadModel::open` creates tables with
 /// `IF NOT EXISTS`, so the column only appears if a rebuild ran first.
-fn labelled_counter(source: &str) -> String {
+fn labelled_counter(clauses: &str) -> String {
+    let arms = arms(clauses, "bump");
     format!(
         r#"
 load("events/e.star", "one", "two")
 
 totals = entity(key = "id", fields = {{"id": str(), "n": int(), "label": str()}})
 
-source = {source}
-
-def handle(event):
+def bump(event):
     row = get(totals, "all")
     n = (row["n"] if row else 0) + 1
     return [put(totals, {{"id": "all", "n": n, "label": "x"}})]
+
+handle = {{
+{arms}}}
 "#
     )
 }
 
 /// Rewrite the project in place, so the next boot sees the redeployed definition.
-fn write_project(dir: &Path, counter_source: &str) {
-    write_project_with(dir, counter(counter_source), None);
+fn write_project(dir: &Path, clauses: &str) {
+    write_project_with(dir, counter(clauses), None);
 }
 
 /// The same, with an explicit projector module and an optional `kiln.toml`. Passing
@@ -189,7 +202,7 @@ fn a_source_set_change_rebuilds_the_projector() {
     let data = tempfile::tempdir().unwrap();
 
     // Deploy A: the projector counts only `e.one`.
-    write_project(project.path(), "[one()]");
+    write_project(project.path(), "one()");
     let a = boot(project.path(), data.path());
     for _ in 0..2 {
         emit(&a.rt, "emit-one");
@@ -201,7 +214,7 @@ fn a_source_set_change_rebuilds_the_projector() {
     // Deploy B on the same data: the projector now also sources `e.two`. Its source
     // set changed, so it rebuilds from position 0 and counts all four events, rather
     // than resuming past the e.two events already in the log.
-    write_project(project.path(), "[one(), two()]");
+    write_project(project.path(), "one(), two()");
     let b = boot(project.path(), data.path());
     assert!(
         wait_count(&b.rt, 4),
@@ -215,7 +228,7 @@ fn an_unchanged_definition_does_not_rebuild() {
     let project = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
 
-    write_project(project.path(), "[one()]");
+    write_project(project.path(), "one()");
     let a = boot(project.path(), data.path());
     emit(&a.rt, "emit-one");
     assert!(wait_count(&a.rt, 1));
@@ -238,7 +251,7 @@ fn an_added_entity_field_rebuilds_with_the_new_column() {
     let project = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
 
-    write_project(project.path(), "[one()]");
+    write_project(project.path(), "one()");
     let a = boot(project.path(), data.path());
     emit(&a.rt, "emit-one");
     emit(&a.rt, "emit-one");
@@ -248,7 +261,7 @@ fn an_added_entity_field_rebuilds_with_the_new_column() {
     // Deploy B keeps the same source set but grows the entity by one column. The
     // rebuild has to run before the first batch: an `INSERT` naming `label` against
     // the old table would fail on the missing column and wedge the thread for good.
-    write_project_with(project.path(), labelled_counter("[one()]"), None);
+    write_project_with(project.path(), labelled_counter("one()"), None);
     let b = boot(project.path(), data.path());
     assert!(
         wait_row(&b.rt, |row| row["n"].as_i64() == Some(2)
@@ -268,7 +281,7 @@ fn auto_rebuild_off_idles_stale_and_leaves_the_definition_unstamped() {
     let project = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
 
-    write_project_with(project.path(), counter("[one()]"), Some(AUTO_REBUILD_OFF));
+    write_project_with(project.path(), counter("one()"), Some(AUTO_REBUILD_OFF));
     let a = boot(project.path(), data.path());
     for _ in 0..2 {
         emit(&a.rt, "emit-one");
@@ -283,7 +296,7 @@ fn auto_rebuild_off_idles_stale_and_leaves_the_definition_unstamped() {
     // rather than applying batches on top of it.
     write_project_with(
         project.path(),
-        counter("[one(), two()]"),
+        counter("one(), two()"),
         Some(AUTO_REBUILD_OFF),
     );
     let b = boot(project.path(), data.path());
@@ -313,7 +326,7 @@ fn auto_rebuild_off_idles_stale_and_leaves_the_definition_unstamped() {
 
     // Deploy C is deploy B with auto-rebuild back on. The mismatch is still there to
     // be found, so it rebuilds and counts all five events (2x e.one, 3x e.two).
-    write_project_with(project.path(), counter("[one(), two()]"), None);
+    write_project_with(project.path(), counter("one(), two()"), None);
     let c = boot(project.path(), data.path());
     assert!(
         wait_count(&c.rt, 5),
@@ -328,7 +341,7 @@ fn a_legacy_read_model_without_a_definition_hash_is_rebuilt_not_blessed() {
     let project = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
 
-    write_project(project.path(), "[one()]");
+    write_project(project.path(), "one()");
     let a = boot(project.path(), data.path());
     emit(&a.rt, "emit-one");
     emit(&a.rt, "emit-one");
@@ -346,7 +359,7 @@ fn a_legacy_read_model_without_a_definition_hash_is_rebuilt_not_blessed() {
 
     // With auto-rebuild off, an unverifiable shape is `stale`, not `ready`: the model
     // is left untouched and its hash stays NULL so the next boot can still act on it.
-    write_project_with(project.path(), counter("[one()]"), Some(AUTO_REBUILD_OFF));
+    write_project_with(project.path(), counter("one()"), Some(AUTO_REBUILD_OFF));
     let b = boot(project.path(), data.path());
     assert_eq!(
         b.rt.projector("counter").unwrap().readiness(),
@@ -362,7 +375,7 @@ fn a_legacy_read_model_without_a_definition_hash_is_rebuilt_not_blessed() {
 
     // With auto-rebuild on, the same unverifiable model is rebuilt from position 0
     // and only then records the definition it was built under.
-    write_project(project.path(), "[one()]");
+    write_project(project.path(), "one()");
     let c = boot(project.path(), data.path());
     assert!(
         wait_count(&c.rt, 2),
@@ -381,7 +394,7 @@ fn shutdown_drains_pending_events_to_head() {
     let project = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
 
-    write_project(project.path(), "[one()]");
+    write_project(project.path(), "one()");
     let a = boot(project.path(), data.path());
     // Deliberately no wait: the shutdown lands while the projector is still behind,
     // and the loop must drain to head before it exits rather than dropping the tail.
@@ -424,7 +437,7 @@ async fn a_failed_rebuild_idles_and_a_replay_recovers_it() {
     let project = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
 
-    write_project(project.path(), "[one()]");
+    write_project(project.path(), "one()");
     let a = boot(project.path(), data.path());
     for _ in 0..2 {
         emit(&a.rt, "emit-one");
@@ -435,7 +448,7 @@ async fn a_failed_rebuild_idles_and_a_replay_recovers_it() {
 
     // Deploy B changes the source set, so boot plans a rebuild; the blocker fails it.
     let blocker = block_rebuild(data.path());
-    write_project(project.path(), "[one(), two()]");
+    write_project(project.path(), "one(), two()");
     let b = boot(project.path(), data.path());
     let shared = Arc::clone(b.rt.projector("counter").unwrap());
     wait_until("the rebuild to fail", || {

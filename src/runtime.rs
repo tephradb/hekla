@@ -563,7 +563,7 @@ impl Runtime {
         self.events.get(event_type)
     }
 
-    /// The full event-definition map, for lowering an effect's `source` to a query.
+    /// The full event-definition map, for lowering an effect's subscription to a query.
     pub fn events_map(&self) -> &EventDefs {
         &self.events
     }

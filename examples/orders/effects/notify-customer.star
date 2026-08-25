@@ -5,9 +5,7 @@
 
 load("events/order.star", "order_placed")
 
-source = [order_placed()]
-
-def handle(event):
+def notify(event):
     email = reveal(event.data.email)
     response = http.post(
         url = "https://mail.example/confirm",
@@ -15,3 +13,5 @@ def handle(event):
     )
     if response["status"] >= 400:
         log("confirmation rejected with status " + str(response["status"]))
+
+handle = {order_placed(): notify}

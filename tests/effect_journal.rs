@@ -80,14 +80,14 @@ users = entity(
     indexes = [index("by_email", ["email"])],
 )
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     return [put(users, {
         "user_id": event.data.user_id,
         "email": event.data.email,
         "name": event.data.name,
     })]
+
+handle = {user_registered(): on_event}
 "#;
 
 /// A project whose only effect is `effects/notify.star`, with the given body.
@@ -225,11 +225,11 @@ fn invocation_status(data_dir: &Path, position: u64) -> Option<String> {
 const TWO_POSTS: &str = r#"
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     http.post(url = "https://a.test/first", body = {"id": event.data.user_id})
     http.post(url = "https://a.test/second", body = {})
+
+handle = {user_registered(): on_event}
 "#;
 
 #[test]
@@ -329,12 +329,12 @@ fn a_crashed_invocation_resumes_from_the_journal_and_runs_only_the_tail() {
 const NOW_THEN_POST: &str = r#"
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     t = now()
     http.post(url = "https://a.test/at", body = {"t": t})
     http.post(url = "https://a.test/fail", body = {})
+
+handle = {user_registered(): on_event}
 "#;
 
 #[test]
@@ -381,12 +381,12 @@ fn now_replays_the_recorded_timestamp_on_every_retry() {
 const IDENTICAL_TWICE: &str = r#"
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     http.post(url = "https://a.test/twice", body = {"n": 1})
     http.post(url = "https://a.test/twice", body = {"n": 1})
     http.post(url = "https://a.test/fail", body = {})
+
+handle = {user_registered(): on_event}
 "#;
 
 #[test]
@@ -439,9 +439,7 @@ fn identical_repeated_calls_journal_under_separate_disambiguators() {
 const READ_AND_SCAN: &str = r#"
 load("events/user.star", "user_activated")
 
-source = [user_activated()]
-
-def handle(event):
+def on_event(event):
     row = read("users", "users", event.data.user_id)
     page = scan("users", "users", field = "email", value = row["email"], limit = 10)
     http.post(url = "https://a.test/sync", body = {
@@ -449,6 +447,8 @@ def handle(event):
         "found": len(page["items"]),
         "cursor": page["next_cursor"],
     })
+
+handle = {user_activated(): on_event}
 "#;
 
 #[test]
@@ -527,11 +527,11 @@ fn read_and_scan_reject_an_unknown_projector_and_an_unindexed_filter() {
         r#"
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     read("nope", "users", event.data.user_id)
     http.post(url = "https://a.test/never", body = {})
+
+handle = {user_registered(): on_event}
 "#,
         "no projector `nope`",
     );
@@ -540,11 +540,11 @@ def handle(event):
         r#"
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     scan("users", "users", field = "name", value = "U")
     http.post(url = "https://a.test/never", body = {})
+
+handle = {user_registered(): on_event}
 "#,
         "not indexed",
     );
@@ -553,12 +553,12 @@ def handle(event):
 const READ_A_MISSING_ROW: &str = r#"
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     row = read("users", "users", "99999999-9999-9999-9999-999999999999")
     http.post(url = "https://a.test/seen", body = {"found": row != None})
     http.post(url = "https://a.test/fail", body = {})
+
+handle = {user_registered(): on_event}
 "#;
 
 #[test]
@@ -620,11 +620,11 @@ fn a_journaled_read_miss_is_frozen_across_retries() {
 const TWO_POSTS_V2: &str = r#"
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     http.post(url = "https://a.test/first-v2", body = {"id": event.data.user_id})
     http.post(url = "https://a.test/second", body = {})
+
+handle = {user_registered(): on_event}
 "#;
 
 #[test]
@@ -683,12 +683,12 @@ fn an_edited_effect_replays_an_in_flight_invocation_against_the_new_code() {
 const RUNAWAY: &str = r#"
 load("events/user.star", "user_registered")
 
-source = [user_registered()]
-
-def handle(event):
+def on_event(event):
     for i in range(100000000):
         pass
     http.post(url = "https://a.test/never", body = {})
+
+handle = {user_registered(): on_event}
 "#;
 
 #[test]
@@ -709,7 +709,7 @@ fn a_runaway_handler_is_cut_off_by_the_tick_budget_and_wedges() {
     });
 
     let error = harness.rt.effect(EFFECT).unwrap().last_error().unwrap();
-    assert!(error.contains("handle() failed"), "{error}");
+    assert!(error.contains("handle entry for"), "{error}");
     assert_eq!(stub.call_count(), 0, "the loop never reached the http call");
     assert!(journal_rows(data.path(), 1).is_empty());
 

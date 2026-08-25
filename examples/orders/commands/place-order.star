@@ -19,8 +19,7 @@ def query(input):
 
 initial = {"taken": False}
 
-def fold(state, event):
-    return dict(state, taken = True)
+fold = {order_placed(): lambda state, event: dict(state, taken = True)}
 
 def handle(input, state):
     if state["taken"]:

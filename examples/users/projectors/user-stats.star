@@ -13,9 +13,9 @@ totals = entity(
     },
 )
 
-source = [user_registered()]
-
-def handle(event):
+def count_registration(event):
     row = get(totals, "all")
     count = (row["count"] if row else 0) + 1
     return [put(totals, {"id": "all", "count": count})]
+
+handle = {user_registered(): count_registration}

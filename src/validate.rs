@@ -2,12 +2,13 @@
 //!
 //! The loader ([`crate::loader`]) already fails a module that will not parse,
 //! evaluate, or freeze, and an entity whose index names an undeclared field. This
-//! pass adds the checks that need the event registry: a command's `query` and a
-//! projector's or effect's `source` are typed clauses (event definitions called with
-//! field constraints), so every constrained field must exist on that event type, be
-//! indexed, be well-typed, and, when subject-scoped, have a derivable key. A clause
-//! that filtered a field an event does not index would silently match nothing at
-//! runtime, so catching it here is the point of sharing event definitions.
+//! pass adds the checks that need the event registry. A command's `query`, a command's
+//! `fold` keys, and a projector's or effect's `handle` keys are all typed clauses
+//! (event definitions called with field constraints), so every constrained field must
+//! exist on that event type, be indexed, be well-typed, and, when subject-scoped, have
+//! a derivable key. A clause that filtered a field an event does not index would
+//! silently match nothing at runtime, so catching it here is the point of sharing
+//! event definitions.
 //!
 //! `query` is a pure function of input, so it is evaluated (in query mode) with a
 //! placeholder input built from the command's schema and the resulting clauses
@@ -16,11 +17,11 @@
 //! is reported as a warning, not an error, since the failure may be an artefact of
 //! the stub rather than a real defect.
 //!
-//! Per-type dispatch maps (a command's `fold`, a projector's or effect's `handle`)
-//! are cross-checked against those same clauses. A map is a module-level literal with
-//! no branches, so it is always seen in full; the uncertainty is on the other side,
-//! which is why a command-side mismatch is a warning while the same mismatch against
-//! a projector's or effect's static `source` is an error.
+//! A command's `fold` keys are additionally cross-checked against the boundary those
+//! clauses describe. A dispatch map is a module-level literal with no branches, so it
+//! is always seen in full; the uncertainty is on the `query` side, which is why a dead
+//! `fold` entry is a warning rather than an error. A projector's or effect's keys need
+//! no such cross-check at all, being the subscription itself.
 
 use starlark::environment::{FrozenModule, Module};
 use starlark::values::OwnedFrozenValue;
@@ -66,21 +67,18 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
                 .map(|unit| (&unit.loaded, unit.rel_path.as_str())),
         );
     for (loaded, rel) in subscribers {
-        let (ModuleDef::Projector { sources, .. } | ModuleDef::Effect { sources, .. }) =
-            &loaded.def
-        else {
+        if !matches!(
+            &loaded.def,
+            ModuleDef::Projector { .. } | ModuleDef::Effect { .. }
+        ) {
             continue;
-        };
-        validate_specs(
-            sources,
-            &project.events,
-            rel,
-            Context::Source,
-            &mut findings,
-        );
+        }
+        // `sources` on the ModuleDef is `handle`'s keys, so checking the map covers
+        // the subscription too; validating both would report each clause twice.
         check_dispatch(
             &loaded.module,
             "handle",
+            Context::Handle,
             None,
             &project.events,
             rel,
@@ -90,20 +88,33 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
     findings
 }
 
-/// Whether a clause is a command's append boundary or a projector/effect
-/// subscription. The two have different guardrails.
+/// Which position a clause sits in. All three are query clauses, but they lower
+/// differently, so their guardrails differ.
+///
+/// A `fold` key is lowered with the command's keystore, the way `query` is, so a
+/// subject-scoped constraint resolves there; a `handle` key is lowered with no
+/// keystore, so it can only filter plaintext. Selectivity is a boundary concern only:
+/// a bare `order_placed()` dispatch key legitimately constrains nothing.
 #[derive(Clone, Copy, PartialEq)]
 enum Context {
     Query,
-    Source,
+    Fold,
+    Handle,
 }
 
 impl Context {
     fn label(self) -> &'static str {
         match self {
             Context::Query => "query",
-            Context::Source => "source",
+            Context::Fold => "fold",
+            Context::Handle => "handle",
         }
+    }
+
+    /// Whether a subject-encrypted field can be filtered here at all. Mirrors whether
+    /// the lowering has a keystore to encrypt the filter value with.
+    fn can_filter_encrypted(self) -> bool {
+        matches!(self, Context::Query | Context::Fold)
     }
 }
 
@@ -176,6 +187,7 @@ fn check_command(command: &CommandUnit, events: &EventRegistry, findings: &mut V
     check_dispatch(
         module,
         "fold",
+        Context::Fold,
         specs.as_deref(),
         events,
         &command.rel_path,
@@ -183,14 +195,19 @@ fn check_command(command: &CommandUnit, events: &EventRegistry, findings: &mut V
     );
 }
 
-/// Check a dispatch map's keys against the event registry.
+/// Validate a dispatch map's keys, and for a command cross-check them against the
+/// boundary.
 ///
-/// A projector's or effect's `handle` keys *are* its subscription, so there is nothing
-/// to cross-check them against: `validate_specs` already validates those clauses as
-/// the module's sources. What is left is the one thing neither of those catches, a key
-/// built by calling `event(...)` inline. The loader's module-scope scan
-/// ([`crate::loader`]) only sees definitions bound to a name, so an inline one inside
-/// a dict literal reaches dispatch unregistered and would quietly work.
+/// The keys are query clauses, so they get the same constraint checks a `query` clause
+/// gets, through [`validate_specs`]. That is not optional now that a key can carry a
+/// filter: a `fold` arm constraining an unindexed field would otherwise match nothing
+/// at runtime with nothing said at check time.
+///
+/// On top of that sits the one thing `validate_specs` cannot see, a key built by
+/// calling `event(...)` inline. The loader's module-scope scan ([`crate::loader`]) only
+/// sees definitions bound to a name, so an inline one inside a dict literal reaches
+/// dispatch unregistered and would quietly work. An unregistered *type* needs no
+/// separate report here, since `validate_specs` already rejects it.
 ///
 /// A command's `fold` is also cross-checked against its boundary, but in one direction
 /// only. An entry the boundary never returns is dead code, so it is worth reporting
@@ -198,9 +215,12 @@ fn check_command(command: &CommandUnit, events: &EventRegistry, findings: &mut V
 /// placeholder did not take could legitimately name that type). The reverse is not
 /// reported at all: the boundary is also the append condition, so a type can belong
 /// there to make a concurrent write conflict without telling the decision anything new.
+/// The cross-check is by type only, because `query`'s constraint *values* come from a
+/// placeholder, so an arm made dead by its filter rather than its type is not visible.
 fn check_dispatch(
     module: &FrozenModule,
     global: &str,
+    context: Context,
     declared: Option<&[EventSpec]>,
     events: &EventRegistry,
     rel: &str,
@@ -211,31 +231,26 @@ fn check_dispatch(
     };
     // A malformed map already failed the load with a precise message; repeating a
     // vaguer version of it here would only double the output.
-    let Ok(dispatch) = parse_event_dispatch(owned.value(), global != "fold") else {
+    let Ok(dispatch) = parse_event_dispatch(owned.value()) else {
         return;
     };
-    if dispatch.is_single() {
-        return;
-    }
     let specs = dispatch.specs();
+    validate_specs(&specs, events, rel, context, findings);
     for spec in &specs {
         let (Some(event_type), Some(def_id)) = (spec.event_type(), spec.def_id()) else {
             continue; // `all_events()` is a builtin, not a definition.
         };
-        match events.by_type.get(event_type) {
-            Some(def) if def.id == def_id => {}
-            Some(_) => findings.push(Finding::error(
+        if events
+            .by_type
+            .get(event_type)
+            .is_some_and(|def| def.id != def_id)
+        {
+            findings.push(Finding::error(
                 rel,
                 format!(
                     "`{global}` maps event `{event_type}` through a definition declared outside events/; load() the events/ definition instead of calling event(type = \"{event_type}\", ...) again"
                 ),
-            )),
-            None => findings.push(Finding::error(
-                rel,
-                format!(
-                    "`{global}` maps unknown event type `{event_type}`; keys must be definitions loaded from events/"
-                ),
-            )),
+            ));
         }
     }
     let Some(declared) = declared else {
@@ -355,11 +370,11 @@ fn validate_constraint(
         ));
     }
     if let Some(subject_field) = &meta.subject {
-        if context == Context::Source {
+        if !context.can_filter_encrypted() {
             findings.push(Finding::error(
                 rel,
                 format!(
-                    "source filters event `{}` on subject-encrypted `{field}`; a source can only filter plaintext fields (filter by the subject id `{subject_field}` instead)",
+                    "{ctx} filters event `{}` on subject-encrypted `{field}`; a subscription can only filter plaintext fields (filter by the subject id `{subject_field}` instead)",
                     def.event_type
                 ),
             ));
@@ -370,7 +385,7 @@ fn validate_constraint(
             findings.push(Finding::error(
                 rel,
                 format!(
-                    "query filters event `{}` on subject-encrypted `{field}` without its subject `{subject_field}`; also constrain `{subject_field}` (scoped), or mark `{field}` unique (global)",
+                    "{ctx} filters event `{}` on subject-encrypted `{field}` without its subject `{subject_field}`; also constrain `{subject_field}` (scoped), or mark `{field}` unique (global)",
                     def.event_type
                 ),
             ));

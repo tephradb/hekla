@@ -15,10 +15,9 @@ def query(input):
 
 initial = {"taken": False}
 
-# One event type in the boundary, so a single function is the simpler shape. The
-# fold returns the new state; it never mutates the one it is handed.
-def fold(state, event):
-    return dict(state, taken = True)
+# One arm per clause. The arm returns the new state; it never mutates the one it is
+# handed, and `initial` is frozen, so an attempt to would fail on the first event.
+fold = {user_registered(): lambda state, event: dict(state, taken = True)}
 
 def handle(input, state):
     if is_blank(input.name):

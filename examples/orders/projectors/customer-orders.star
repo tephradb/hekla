@@ -20,12 +20,11 @@ orders = entity(
     indexes = [index("by_customer", ["customer_id"])],
 )
 
-source = [order_placed()]
-
-def handle(event):
-    return [put(orders, {
+handle = {
+    order_placed(): lambda event: [put(orders, {
         "order_id": event.data.order_id,
         "customer_id": event.data.customer_id,
         "email": event.data.email,
         "shipping_address": event.data.shipping_address,
-    })]
+    })],
+}

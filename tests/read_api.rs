@@ -336,10 +336,10 @@ load("events/e.star", "boom")
 
 things = entity(key = "id", fields = {"id": uuid()})
 
-source = [boom()]
-
-def handle(event):
+def on_event(event):
     fail("projector boom")
+
+handle = {boom(): on_event}
 "#,
         ),
     ]);
@@ -399,10 +399,10 @@ scores = entity(
     indexes = [index("by_n", ["n"])],
 )
 
-source = [scored()]
-
-def handle(event):
+def on_event(event):
     return [put(scores, {"id": event.data.id, "n": event.data.n})]
+
+handle = {scored(): on_event}
 "#,
         ),
     ]);
@@ -449,10 +449,10 @@ load("events/e.star", "boom")
 
 things = entity(key = "id", fields = {{"id": uuid()}})
 
-source = [boom()]
-
-def handle(event):
+def on_event(event):
 {handle_body}
+
+handle = {{boom(): on_event}}
 "#
     );
     write_project(&[
@@ -553,12 +553,10 @@ load("events/thing.star", "thing_ok", "thing_bad")
 
 things = entity(key = "id", fields = {"id": uuid()})
 
-source = [thing_ok(), thing_bad()]
-
-def handle(event):
-    if event.type == "thing.bad":
-        fail("projector boom")
-    return [put(things, {"id": event.data.id})]
+handle = {
+    thing_ok(): lambda event: [put(things, {"id": event.data.id})],
+    thing_bad(): lambda event: fail("projector boom"),
+}
 "#,
         ),
     ]);
@@ -745,10 +743,10 @@ items = entity(
     indexes = [index("by_bucket", ["bucket"])],
 )
 
-source = [item_added()]
-
-def handle(event):
+def on_event(event):
     return [put(items, {"id": event.data.id, "bucket": event.data.bucket})]
+
+handle = {item_added(): on_event}
 "#,
         ),
     ])
@@ -851,10 +849,10 @@ load("events/count.star", "counted")
 
 counters = entity(key = "n", fields = {"n": uint(), "label": str()})
 
-source = [counted()]
-
-def handle(event):
+def on_event(event):
     return [put(counters, {"n": event.data.n, "label": event.data.label})]
+
+handle = {counted(): on_event}
 "#,
         ),
     ]);
@@ -927,10 +925,10 @@ load("events/item.star", "item_added")
 
 items = entity(key = "id", fields = {"id": uuid(), "group": str()})
 
-source = [item_added()]
-
-def handle(event):
+def on_event(event):
     return [put(items, {"id": event.data.id, "group": event.data.group})]
+
+handle = {item_added(): on_event}
 "#,
         ),
     ]);
@@ -998,14 +996,14 @@ rows = entity(
     indexes = [index("by_select", ["select"])],
 )
 
-source = [row_added()]
-
-def handle(event):
+def on_event(event):
     return [put(rows, {
         "order": event.data.order,
         "select": event.data.select,
         "group": event.data.group,
     })]
+
+handle = {row_added(): on_event}
 "#,
         ),
     ])

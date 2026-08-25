@@ -286,14 +286,14 @@ orders = entity(
     },
 )
 
-source = [order_placed()]
-
-def handle(event):
+def on_event(event):
     return [put(orders, {
         "order_id": event.data.order_id,
         "customer_id": event.data.customer_id,
         "email": event.data.email,
     })]
+
+handle = {order_placed(): on_event}
 "#;
 
 /// An effect that `reveal()`s the customer email and posts it, exercising the
@@ -301,13 +301,13 @@ def handle(event):
 pub const NOTIFY_EFFECT: &str = r#"
 load("events/order.star", "order_placed")
 
-source = [order_placed()]
-
-def handle(event):
+def on_event(event):
     # reveal() is the explicit boundary: the effect decrypts the customer email to
     # send it. A projector could not; only an effect has reveal().
     email = reveal(event.data.email)
     http.post(url = "https://mail.test/send", body = {"to": email})
+
+handle = {order_placed(): on_event}
 "#;
 
 /// The orders event module and its `place-order` command, plus `extra` modules.
@@ -365,8 +365,10 @@ def query(input):
 
 initial = {"taken": False}
 
-def fold(state, event):
+def fold_event(state, event):
     return dict(state, taken = True)
+
+fold = {all_events(): fold_event}
 
 def handle(input, state):
     if state["taken"]:

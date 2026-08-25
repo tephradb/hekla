@@ -1,7 +1,7 @@
 //! The projector runtime: one sequential task per projector.
 //!
 //! Each projector owns a SQLite read model at `data/projectors/{name}.db` and a
-//! dedicated thread. The thread subscribes to the projector's `source` from its
+//! dedicated thread. The thread subscribes to the projector's `handle` keys from its
 //! persisted checkpoint, and for each batch of events runs `handle`, applies the
 //! emitted ops, and advances the checkpoint, all in one transaction, so state and
 //! progress can never disagree. `get()` inside a handler reads through the batch's
@@ -572,10 +572,10 @@ fn apply_batch(
         let handle_owned = frozen
             .get_option("handle")?
             .ok_or_else(|| anyhow::anyhow!("projector has no handle() function"))?;
-        let handle = parse_event_dispatch(thaw(&handle_owned, &module), true)
+        let handle = parse_event_dispatch(thaw(&handle_owned, &module))
             .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
         // `None` matches how a projector lowers its subscription: filtering a
-        // subject-encrypted field in a `source` is a static error, so no key is needed.
+        // subject-encrypted field in a `handle` key is a static error, so no key is needed.
         let lowered = lower_dispatch(&handle, events, None)
             .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
         for (_position, event) in batch {
