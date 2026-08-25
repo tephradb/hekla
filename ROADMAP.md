@@ -278,7 +278,7 @@ Honest scope for this phase:
 - **Optional event fields are unexercised in the examples.** No `.star` file declares one, so the
   absent-reads-as-`None` behaviour is pinned by an integration test rather than by a worked example.
 
-## Phase 8: one way to handle events (done)
+## Phase 8: one way to handle events, and tests for all three kinds (done)
 
 Phases 6 and 7 each left a second way to do something. This phase removes them, on the principle that
 one spelling for one meaning is worth more than the convenience of either alternative.
@@ -321,6 +321,17 @@ one spelling for one meaning is worth more than the convenience of either altern
   type used to be reported twice, once by the clause validation and once by the dispatch check. The
   dispatch check now keeps only what is genuinely its own: a key built by calling `event(...)` inline,
   which the loader's module-scope scan cannot see.
+- **`kiln test` covers all three kinds.** `case()` was command-only, which left the two kinds this
+  phase and Phase 6 changed most with no in-language way to check their routing. It now takes
+  `projector = ...` (project `given`, assert the rows the read API reads back, subject columns
+  decrypted) and `effect = ...` (run `handle` over `given`, stub the replies with `responds`, assert
+  the ordered `http_call(...)` / `command_call(...)` sequence). A projector case needed no new
+  machinery: `project_to_head` was already the non-runtime entry point. An effect case needed one
+  extraction, splitting `try_invocation` into the durable wrapper and a `run_handle` that takes the
+  host as a trait object, which is a better shape regardless.
+- **`expect` is read against the case's kind, not its own type.** An empty list means "no events"
+  for a command and "no calls" for an effect, and nothing about `[]` says which. Reading it against
+  the target also lets every mismatch name the form that kind actually takes.
 
 Honest scope for this phase:
 
@@ -332,6 +343,14 @@ Honest scope for this phase:
   for on enum-shaped fields and little else; the docs say so rather than advertising the capability.
 - **Naming a handler is now mandatory** for any multi-statement body. That is the one real cost, and
   it buys a name better than `handle`: the map puts the subscription and the handler on one line.
+- **A test case runs the handler, not the runtime.** Batching, checkpoints, retry, the journal and
+  replay are not exercised by a case, deliberately: they belong to the runtime and are covered by the
+  integration tests, which keeps a case a statement about the author's own logic.
+- **An effect case stubs `read` and `scan` rather than asserting them.** They return nothing, the
+  same answer a live effect gets for a row its projector has not built, and `invoke_command` is
+  recorded rather than executed: a command's behaviour belongs in a command case.
+- **`response.body` is still a union**, dict or string depending on whether the bytes parse as JSON.
+  A struct field makes the shape look more declared than it is.
 
 ## Phase 9 and beyond (deferred, with triggers)
 

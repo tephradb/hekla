@@ -519,8 +519,14 @@ consistent copy is not required for them.
   the load graph, verifies every query filters on tags the event type actually declares, verifies
   event constructors match field schemas, and verifies projector indexes reference declared fields.
   For CI and pre-commit.
-- `kiln test <dir>`: events in, assert events out, for commands. Pure functions with declared inputs
-  make the harness small, and it is what earns trust in an untyped language.
+- `kiln test <dir>`: events in, assert what the module did, for all three kinds. Every case seeds a
+  throwaway store with `given` and then runs one module against it: a **command** produces events, a
+  rejection or invalid input; a **projector** produces the rows the read API reads back (subject
+  columns decrypted, as `GET /read/...` would return them); an **effect** produces the ordered
+  sequence of `http_call(...)` and `command_call(...)` it made, with `responds` stubbing the replies.
+  Pure functions with declared inputs make the harness small, and it is what earns trust in an
+  untyped language. A case tests the author's logic, not the runtime around it: batching,
+  checkpoints, retry, the journal and replay are covered elsewhere.
 - `kiln fmt`: starlark-rust ships a formatter, and indentation is syntactically meaningful.
 
 ## 12. Why Starlark (determinism and purity)

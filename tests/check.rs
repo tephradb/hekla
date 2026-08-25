@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use kiln::loader::{LoadedProject, Severity};
 use kiln::testing;
+use tempfile::TempDir;
 
 mod support;
 
@@ -1106,6 +1107,268 @@ cases = [
         format!("{:?}", ExitCode::FAILURE),
         "a mismatched expectation must fail the suite"
     );
+}
+
+// --- projector and effect scenarios ----------------------------------------
+
+/// One event, one projector over it, and one effect reacting to it: enough for a case
+/// of each kind to have something real to assert.
+const SCENARIO_PROJECT: [(&str, &str); 4] = [
+    (
+        "events/t.star",
+        r#"
+happened = event(type = "t.happened", fields = {"id": uuid(), "note": str()})
+"#,
+    ),
+    (
+        "commands/emit.star",
+        r#"
+load("events/t.star", "happened")
+
+input = schema(id = uuid(), note = str())
+
+def handle(input, state):
+    return happened(id = input.id, note = input.note)
+"#,
+    ),
+    (
+        "projectors/notes.star",
+        r#"
+load("events/t.star", "happened")
+
+notes = entity(key = "id", fields = {"id": uuid(), "note": str()})
+
+handle = {
+    happened(): lambda event: [put(notes, {"id": event.data.id, "note": event.data.note})],
+}
+"#,
+    ),
+    (
+        "effects/relay.star",
+        r#"
+load("events/t.star", "happened")
+
+def relay(event):
+    response = http.post(url = "https://a.test/relay", body = {"note": event.data.note})
+    if response.status < 400:
+        invoke_command("emit", {"id": event.data.id, "note": "relayed"})
+
+handle = {happened(): relay}
+"#,
+    ),
+];
+
+fn scenario_project(scenario: &str) -> TempDir {
+    let mut files = SCENARIO_PROJECT.to_vec();
+    files.push(("tests/scenario.star", scenario));
+    write_project(&files)
+}
+
+fn run_scenario(scenario: &str) -> ExitCode {
+    testing::run(scenario_project(scenario).path())
+}
+
+fn assert_scenario(scenario: &str, expected: ExitCode, what: &str) {
+    assert_eq!(
+        format!("{:?}", run_scenario(scenario)),
+        format!("{:?}", expected),
+        "{what}"
+    );
+}
+
+const ID: &str = "11111111-1111-1111-1111-111111111111";
+
+#[test]
+fn kiln_test_projects_given_events_and_asserts_the_rows() {
+    assert_scenario(
+        &format!(
+            r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        projector = "notes",
+        given = [happened(id = "{ID}", note = "hi")],
+        expect = {{"notes": [{{"id": "{ID}", "note": "hi"}}]}},
+    ),
+]
+"#
+        ),
+        ExitCode::SUCCESS,
+        "a projector case should project and read back",
+    );
+}
+
+/// The negative control: without it, a runner that projected nothing would still pass
+/// a case whose expectation happened to be empty.
+#[test]
+fn kiln_test_reports_a_row_that_does_not_match() {
+    assert_scenario(
+        &format!(
+            r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        projector = "notes",
+        given = [happened(id = "{ID}", note = "hi")],
+        expect = {{"notes": [{{"id": "{ID}", "note": "bye"}}]}},
+    ),
+]
+"#
+        ),
+        ExitCode::FAILURE,
+        "a wrong row must fail the suite",
+    );
+}
+
+#[test]
+fn kiln_test_runs_an_effect_and_asserts_its_calls_in_order() {
+    assert_scenario(
+        &format!(
+            r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        effect = "relay",
+        given = [happened(id = "{ID}", note = "hi")],
+        responds = [http_response(status = 200)],
+        expect = [
+            http_call(method = "POST", url = "https://a.test/relay", body = {{"note": "hi"}}),
+            command_call("emit", {{"id": "{ID}", "note": "relayed"}}),
+        ],
+    ),
+]
+"#
+        ),
+        ExitCode::SUCCESS,
+        "an effect case should record both calls in order",
+    );
+}
+
+/// The stubbed status drives the branch, so a 4xx must stop before the command: the
+/// case that proves `responds` is genuinely reaching the handler.
+#[test]
+fn a_stubbed_status_drives_the_handlers_branch() {
+    assert_scenario(
+        &format!(
+            r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        effect = "relay",
+        given = [happened(id = "{ID}", note = "hi")],
+        responds = [http_response(status = 422)],
+        expect = [http_call(url = "https://a.test/relay")],
+    ),
+]
+"#
+        ),
+        ExitCode::SUCCESS,
+        "a 4xx should stop the handler before invoke_command",
+    );
+}
+
+/// Order is part of the assertion, not just membership: an effect's call sequence is
+/// what a replay has to reproduce.
+#[test]
+fn kiln_test_reports_calls_made_in_the_wrong_order() {
+    assert_scenario(
+        &format!(
+            r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        effect = "relay",
+        given = [happened(id = "{ID}", note = "hi")],
+        responds = [http_response(status = 200)],
+        expect = [
+            command_call("emit", {{"id": "{ID}", "note": "relayed"}}),
+            http_call(method = "POST", url = "https://a.test/relay"),
+        ],
+    ),
+]
+"#
+        ),
+        ExitCode::FAILURE,
+        "calls asserted out of order must fail",
+    );
+}
+
+/// Running past the declared responses is the case's bug, not the handler's, so it
+/// fails rather than serving a default.
+#[test]
+fn an_effect_case_that_runs_out_of_responses_fails() {
+    assert_scenario(
+        &format!(
+            r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        effect = "relay",
+        given = [happened(id = "{ID}", note = "hi")],
+        expect = [http_call(url = "https://a.test/relay")],
+    ),
+]
+"#
+        ),
+        ExitCode::FAILURE,
+        "a handler with no declared response must fail the case",
+    );
+}
+
+/// An event no arm selects reaches no handler, so the effect makes no calls. The empty
+/// list is meaningful here, which is why `expect` is read against the case's kind.
+#[test]
+fn an_effect_case_can_assert_no_calls() {
+    assert_scenario(
+        r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        effect = "relay",
+        given = [],
+        expect = [],
+    ),
+]
+"#,
+        ExitCode::SUCCESS,
+        "no events means no calls",
+    );
+}
+
+#[test]
+fn a_case_must_name_exactly_one_target() {
+    for (scenario, what) in [
+        ("cases = [case(expect = [])]", "naming no target"),
+        (
+            "cases = [case(command = \"emit\", projector = \"notes\", input = {}, expect = [])]",
+            "naming two targets",
+        ),
+        (
+            "cases = [case(projector = \"notes\", input = {}, expect = {})]",
+            "giving a projector an input",
+        ),
+        (
+            "cases = [case(command = \"emit\", input = {}, responds = [], expect = [])]",
+            "giving a command responses",
+        ),
+        (
+            "cases = [case(projector = \"nope\", expect = {})]",
+            "naming an unknown projector",
+        ),
+        (
+            "cases = [case(effect = \"nope\", expect = [])]",
+            "naming an unknown effect",
+        ),
+    ] {
+        assert_scenario(scenario, ExitCode::FAILURE, what);
+    }
 }
 
 // --- per-type dispatch maps -----------------------------------------------

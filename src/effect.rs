@@ -44,7 +44,7 @@ use ureq::typestate::{WithBody, WithoutBody};
 
 use crate::config::Config;
 use crate::context::{CommandContext, EffectCtx, EffectHost};
-use crate::dispatch::{self, arm_selects, lower_dispatch};
+use crate::dispatch::{self, EventDefs, arm_selects, lower_dispatch};
 use crate::envelope::{self, Envelope};
 use crate::loader::EffectUnit;
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
@@ -511,58 +511,75 @@ fn try_invocation(
     runtime: &Arc<Runtime>,
     http: &dyn HttpClient,
 ) -> Result<(), InvocationFailure> {
-    Module::with_temp_heap(|module| {
-        let host = EffectHostImpl {
-            runtime,
-            http,
-            env: env.clone(),
-            effect: effect.to_owned(),
-            position,
-            disambiguators: RefCell::new(HashMap::new()),
-            terminal: Cell::new(false),
-        };
-        let ctx = EffectCtx { host: &host };
-        let outcome = (|| -> anyhow::Result<()> {
-            let handle_owned = loaded
-                .module
-                .get_option("handle")?
-                .ok_or_else(|| anyhow::anyhow!("effect has no handle() function"))?;
-            let handle = parse_event_dispatch(thaw(&handle_owned, &module))
-                .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
-            // `None` matches how the subscription is lowered: filtering a
-            // subject-encrypted field in a `handle` key is a static error.
-            let lowered = lower_dispatch(&handle, runtime.events_map(), None)
-                .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
-            let selected: Vec<usize> = lowered
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| arm_selects(item.as_ref(), event.as_ref()))
-                .map(|(index, _)| index)
-                .collect();
-            // No arm selects this event, so the effect has decided it needs no side
-            // effect. The invocation still completes, so the cursor advances past it.
-            if selected.is_empty() {
-                return Ok(());
-            }
-            let value = alloc_event(&module, event_type, data, runtime.event_def(event_type));
-            // Every selecting arm runs in declaration order, so a replay journals and
-            // replays the same call sequence.
-            for index in selected {
-                let arm = &handle.arms()[index];
-                call_handler_with_effect_ctx(&module, arm.func, &[value], MAX_TICKS, &ctx)
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "{} failed: {err}",
-                            handle.label("handle", arm.spec.as_ref())
-                        )
-                    })?;
-            }
-            Ok(())
-        })();
-        outcome.map_err(|err| InvocationFailure {
+    let host = EffectHostImpl {
+        runtime,
+        http,
+        env: env.clone(),
+        effect: effect.to_owned(),
+        position,
+        disambiguators: RefCell::new(HashMap::new()),
+        terminal: Cell::new(false),
+    };
+    run_handle(loaded, runtime.events_map(), event, event_type, data, &host).map_err(|err| {
+        InvocationFailure {
             message: format!("{err:#}"),
             terminal: host.terminal.get(),
-        })
+        }
+    })
+}
+
+/// Route one event through an effect's `handle` and run every arm whose clause selects
+/// it, in declaration order.
+///
+/// This is the dispatch half only. The durable half (journal, retry, completion) stays
+/// in [`try_invocation`], which is why the host arrives as a trait object: anything
+/// that can serve the impure builtins can drive a handler, including `kiln test`.
+pub(crate) fn run_handle(
+    loaded: &LoadedModule,
+    events: &EventDefs,
+    event: &Event,
+    event_type: &str,
+    data: &Value,
+    host: &dyn EffectHost,
+) -> anyhow::Result<()> {
+    Module::with_temp_heap(|module| {
+        let ctx = EffectCtx { host };
+        let handle_owned = loaded
+            .module
+            .get_option("handle")?
+            .ok_or_else(|| anyhow::anyhow!("effect has no handle map"))?;
+        let handle = parse_event_dispatch(thaw(&handle_owned, &module))
+            .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
+        // `None` matches how the subscription is lowered: filtering a
+        // subject-encrypted field in a `handle` key is a static error.
+        let lowered = lower_dispatch(&handle, events, None)
+            .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
+        let selected: Vec<usize> = lowered
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| arm_selects(item.as_ref(), event.as_ref()))
+            .map(|(index, _)| index)
+            .collect();
+        // No arm selects this event, so the effect has decided it needs no side
+        // effect. The invocation still completes, so the cursor advances past it.
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let value = alloc_event(&module, event_type, data, events.get(event_type));
+        // Every selecting arm runs in declaration order, so a replay journals and
+        // replays the same call sequence.
+        for index in selected {
+            let arm = &handle.arms()[index];
+            call_handler_with_effect_ctx(&module, arm.func, &[value], MAX_TICKS, &ctx).map_err(
+                |err| {
+                    anyhow::anyhow!(
+                        "{} failed: {err}",
+                        handle.label("handle", arm.spec.as_ref())
+                    )
+                },
+            )?;
+        }
+        Ok(())
     })
 }
 
