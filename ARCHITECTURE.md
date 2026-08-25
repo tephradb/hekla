@@ -528,6 +528,44 @@ consistent copy is not required for them.
   untyped language. A case tests the author's logic, not the runtime around it: batching,
   checkpoints, retry, the journal and replay are covered elsewhere.
 - `kiln fmt`: starlark-rust ships a formatter, and indentation is syntactically meaningful.
+- `kiln lsp`: the language server, over stdio. Section 11.1.
+
+### 11.1 The language server
+
+Kiln modules are Starlark, but not *generic* Starlark, and that is precisely why kiln has to serve
+them itself. Two things a general-purpose Starlark server cannot know: **which builtins are in scope
+depends on the directory** (a projector has `get` and no clock, an effect has `http` and a journaled
+one, a test file has `case`), and **`load()` resolves against the project root** under the
+`events/`-or-`lib/` restriction. Point a Bazel-flavoured server at a kiln project and every builtin
+reads as undefined and every import resolves to the wrong place. `kiln lsp` is built on
+[`starlark_lsp`](https://github.com/facebook/starlark-rust), which supplies the protocol; kiln
+supplies the language knowledge.
+
+What it does:
+
+- **Diagnostics**, in three tiers. Parse errors; then kiln's `load()` rules and name resolution
+  against the directory's own builtins; then, unless `--no-project-checks`, the file evaluated
+  against the project's `events/` and `lib/` modules with the same shape and clause checks
+  `kiln check` runs. The governing rule is that it never reports a problem `kiln check` would not,
+  which a test asserts against the shipped examples.
+- **Hover** on any builtin, from the same doc comments the runtime carries.
+- **Goto-definition** into a generated stub for a builtin, and into the real file for a `load()`.
+- **Completion** of the directory's builtins, and of `load()` paths — which offers exactly the
+  loadable modules, turning the restriction into a list rather than a rule to trip over.
+
+It does **not** do formatting, rename, document symbols, semantic tokens or code actions: the crate
+advertises none of them. Use `kiln fmt` (or buildifier) as an editor format-on-save task. It also
+does not re-diagnose a file's dependents when a shared module changes, and it has no file watching;
+on-disk changes are picked up by a short poll. Whole-project diagnostics remain `kiln check`'s job,
+since the protocol only publishes for open documents.
+
+Editor setup. The server takes no project directory: each open file is placed in its own project, so
+one session can span several (this repository's `examples/` holds two).
+
+- **Helix**: this repository carries `.helix/languages.toml`; copy it into a project to use it there.
+- **Neovim**: `vim.lsp.start({ name = "kiln", cmd = { "kiln", "lsp" }, root_dir = ... })`, or a
+  `configs.kiln` entry for `lspconfig` with `filetypes = { "starlark" }`.
+- **VS Code / Zed**: any generic LSP bridge extension, with the command `kiln lsp` for `.star` files.
 
 ## 12. Why Starlark (determinism and purity)
 

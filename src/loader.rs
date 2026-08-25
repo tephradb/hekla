@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use starlark::codemap::ResolvedSpan;
 use starlark::environment::{FrozenModule, Globals};
 use starlark::eval::FileLoader;
 use starlark::syntax::AstModule;
@@ -44,6 +45,11 @@ pub struct Finding {
     /// The project-relative path (or config file name) the finding concerns.
     pub location: String,
     pub message: String,
+    /// Where in `location` the problem is, when it came from something that
+    /// carries a span (a parse error, a `load()` statement, an evaluation
+    /// failure). Findings about a file as a whole leave it `None`. Line and
+    /// column are 0-based.
+    pub span: Option<ResolvedSpan>,
 }
 
 impl Finding {
@@ -52,6 +58,7 @@ impl Finding {
             severity: Severity::Error,
             location: location.into(),
             message: message.into(),
+            span: None,
         }
     }
 
@@ -60,6 +67,25 @@ impl Finding {
             severity: Severity::Warning,
             location: location.into(),
             message: message.into(),
+            span: None,
+        }
+    }
+
+    /// Anchor this finding to a source span.
+    pub fn with_span(mut self, span: ResolvedSpan) -> Finding {
+        self.span = Some(span);
+        self
+    }
+
+    /// An error finding from a starlark error: parse failures and evaluation
+    /// failures carry a span, so take the bare message and report the position
+    /// separately. Without a span the rendered form (traceback and source
+    /// excerpt) is the only positional information there is, so keep it.
+    pub fn from_starlark_error(location: impl Into<String>, err: &starlark::Error) -> Finding {
+        match err.span() {
+            Some(span) => Finding::error(location, err.without_diagnostic().to_string())
+                .with_span(span.resolve_span()),
+            None => Finding::error(location, format!("{err}")),
         }
     }
 }
@@ -100,42 +126,54 @@ pub struct LoadedProject {
     pub commands: Vec<CommandUnit>,
     pub projectors: Vec<ProjectorUnit>,
     pub effects: Vec<EffectUnit>,
+    /// Every `events/` and `lib/` file found, sorted. These are exactly the legal
+    /// `load()` targets, listed whether or not each one evaluated, so a caller can
+    /// offer them even while the project has errors.
+    pub library_paths: Vec<String>,
     /// Problems found while loading. `kiln check` adds semantic findings on top.
     pub findings: Vec<Finding>,
 }
 
-impl LoadedProject {
-    /// Load a project from `root`, collecting findings rather than bailing.
-    pub fn load(root: &Path) -> LoadedProject {
-        let mut findings = Vec::new();
+/// The shared body of [`LoadedProject::load`] and [`LoadedProject::load_libraries`].
+/// `units` decides whether commands, projectors and effects are parsed and
+/// evaluated at all; the library half is identical either way.
+fn load_inner(root: &Path, units: bool) -> LoadedProject {
+    let mut findings = Vec::new();
 
-        let config = match Config::load(root) {
-            Ok(config) => config,
-            Err(err) => {
-                findings.push(Finding::error(config::FILE_NAME, format!("{err:#}")));
-                Config::default()
-            }
-        };
+    let config = match Config::load(root) {
+        Ok(config) => config,
+        Err(err) => {
+            findings.push(Finding::error(config::FILE_NAME, format!("{err:#}")));
+            Config::default()
+        }
+    };
 
-        let base = starlark_builtins::globals();
+    let base = starlark_builtins::globals();
+    let mut parsed = discover_and_parse(root, units, &mut findings);
+
+    let mut library_paths: Vec<String> = parsed
+        .iter()
+        .filter_map(|file| file.load_path.clone())
+        .collect();
+    library_paths.sort();
+
+    // Libraries (`events/`, `lib/`) are pure, so they evaluate against the
+    // base globals regardless of who imports them.
+    let mut cache: HashMap<String, FrozenModule> = HashMap::new();
+    let mut collector = EventCollector::default();
+    evaluate_libraries(
+        &mut parsed,
+        &base,
+        &mut cache,
+        &mut collector,
+        &mut findings,
+    );
+
+    let (commands, projectors, effects) = if units {
         let command = starlark_builtins::command_globals();
         let projector = starlark_builtins::projector_globals();
         let effect = starlark_builtins::effect_globals();
-        let mut parsed = discover_and_parse(root, &mut findings);
-
-        // Libraries (`events/`, `lib/`) are pure, so they evaluate against the
-        // base globals regardless of who imports them.
-        let mut cache: HashMap<String, FrozenModule> = HashMap::new();
-        let mut collector = EventCollector::default();
-        evaluate_libraries(
-            &mut parsed,
-            &base,
-            &mut cache,
-            &mut collector,
-            &mut findings,
-        );
-
-        let (commands, projectors, effects) = evaluate_units(
+        let units = evaluate_units(
             &mut parsed,
             &command,
             &projector,
@@ -144,21 +182,40 @@ impl LoadedProject {
             &collector.by_type,
             &mut findings,
         );
+        check_name_collisions(&units.0, &units.1, &units.2, &mut findings);
+        units
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
 
-        check_name_collisions(&commands, &projectors, &effects, &mut findings);
+    LoadedProject {
+        root: root.to_path_buf(),
+        config,
+        events: EventRegistry {
+            by_type: collector.by_type,
+            library: cache,
+        },
+        commands,
+        projectors,
+        effects,
+        library_paths,
+        findings,
+    }
+}
 
-        LoadedProject {
-            root: root.to_path_buf(),
-            config,
-            events: EventRegistry {
-                by_type: collector.by_type,
-                library: cache,
-            },
-            commands,
-            projectors,
-            effects,
-            findings,
-        }
+impl LoadedProject {
+    /// Load a project from `root`, collecting findings rather than bailing.
+    pub fn load(root: &Path) -> LoadedProject {
+        load_inner(root, true)
+    }
+
+    /// Load only the shared half of a project: the config, the event registry and
+    /// the evaluated `events/`/`lib/` modules, with no commands, projectors or
+    /// effects. Enough to evaluate one module against, and much cheaper than a
+    /// full load, so a caller that re-reads a project repeatedly (the language
+    /// server) can do so without evaluating every unit each time.
+    pub fn load_libraries(root: &Path) -> LoadedProject {
+        load_inner(root, false)
     }
 
     pub fn has_errors(&self) -> bool {
@@ -167,56 +224,115 @@ impl LoadedProject {
             .any(|finding| finding.severity == Severity::Error)
     }
 
-    /// Evaluate an extra module (a `kiln test` file) against this project's
-    /// library cache, so it can `load()` from `events/` and `lib/` exactly as a
-    /// command would. The module is frozen against `globals` (the test globals).
+    /// Evaluate an extra module against this project's library cache, so it can
+    /// `load()` from `events/` and `lib/` exactly as a deployed module would. The
+    /// module is frozen against `globals`, which must be the set its role gets.
+    ///
+    /// `query_mode` must match the role: a command, projector or effect names
+    /// query clauses at module top level, a test file constructs events instead.
     pub fn eval_against_libraries(
         &self,
         filename: &str,
         src: String,
         globals: &Globals,
+        query_mode: bool,
     ) -> anyhow::Result<FrozenModule> {
         let ast = parse_module(filename, src).map_err(|err| anyhow::anyhow!("{err}"))?;
+        self.eval_ast_against_libraries(ast, globals, query_mode)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    /// As [`Self::eval_against_libraries`], but over an already-parsed module and
+    /// keeping the starlark error, which carries a span. A caller that has parsed
+    /// the source for its own reasons should not pay to parse it twice.
+    pub fn eval_ast_against_libraries(
+        &self,
+        ast: AstModule,
+        globals: &Globals,
+        query_mode: bool,
+    ) -> starlark::Result<FrozenModule> {
         let loader = LibraryLoader {
             cache: &self.events.library,
         };
-        // Test files call event definitions in `given`/`expect` to construct events,
-        // not to filter, so this is not query mode.
-        eval_frozen(ast, globals, Some(&loader), false).map_err(|err| anyhow::anyhow!("{err}"))
+        eval_frozen(ast, globals, Some(&loader), query_mode)
     }
 }
 
+/// The directories a kiln project is made of. `tests/` is last because the loader
+/// does not walk it: `kiln test` does, and the language server needs to know the
+/// convention either way.
+pub const MODULE_DIRS: [&str; 6] = [
+    "events",
+    "lib",
+    "commands",
+    "projectors",
+    "effects",
+    "tests",
+];
+
 /// Which directory convention a file falls under. `Command` also records whether
 /// the file sits in `commands/internal/`.
-#[derive(Debug, Clone, Copy)]
-enum Role {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
     Events,
     Lib,
-    Command { internal: bool },
+    Command {
+        internal: bool,
+    },
     Projector,
     Effect,
+    /// A `kiln test` scenario file. Never loaded as part of a deployment, so it
+    /// has no [`ModuleKind`], but it is part of the directory convention.
+    Test,
 }
 
 impl Role {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Role::Events => "event module",
             Role::Lib => "library module",
             Role::Command { .. } => "command",
             Role::Projector => "projector",
             Role::Effect => "effect",
+            Role::Test => "test module",
         }
     }
 
-    /// The module kind for a command, projector or effect; `None` for library
-    /// files, which have no `ModuleDef`.
-    fn module_kind(self) -> Option<ModuleKind> {
+    /// The module kind for a command, projector or effect; `None` for library and
+    /// test files, which have no `ModuleDef`.
+    pub fn module_kind(self) -> Option<ModuleKind> {
         match self {
             Role::Command { .. } => Some(ModuleKind::Command),
             Role::Projector => Some(ModuleKind::Projector),
             Role::Effect => Some(ModuleKind::Effect),
-            Role::Events | Role::Lib => None,
+            Role::Events | Role::Lib | Role::Test => None,
         }
+    }
+}
+
+/// The role a project-relative path falls under, or `None` when it is not a kiln
+/// module. The single source of truth for the directory convention: the loader,
+/// `kiln test` and the language server all route through it, so the three cannot
+/// drift.
+///
+/// `rel` is project-relative with forward slashes, as [`rel_to_string`] produces.
+pub fn role_for(rel: &str) -> Option<Role> {
+    let dir = rel.split('/').next()?;
+    if !rel.ends_with(".star") || rel.len() <= dir.len() + 1 {
+        return None;
+    }
+    match dir {
+        "events" => Some(Role::Events),
+        "lib" => Some(Role::Lib),
+        // Nesting is free, so `commands/billing/refund.star` is public; only the
+        // literal `commands/internal/` prefix marks a command internal.
+        "commands" => Some(Role::Command {
+            internal: rel.starts_with("commands/internal/"),
+        }),
+        "projectors" => Some(Role::Projector),
+        "effects" => Some(Role::Effect),
+        "tests" => Some(Role::Test),
+        _ => None,
     }
 }
 
@@ -254,24 +370,25 @@ struct EventCollector {
     defined_in: HashMap<String, String>,
 }
 
-fn discover_and_parse(root: &Path, findings: &mut Vec<Finding>) -> Vec<ParsedFile> {
+fn discover_and_parse(root: &Path, units: bool, findings: &mut Vec<Finding>) -> Vec<ParsedFile> {
     let mut files = Vec::new();
-    for subdir in ["events", "lib", "commands", "projectors", "effects"] {
+    // `tests/` is deliberately skipped: it is part of the convention but not part
+    // of a deployment, so `kiln test` walks it separately. Unit directories are
+    // skipped too when the caller only wants the library half.
+    let wanted: &[&str] = if units {
+        &["events", "lib", "commands", "projectors", "effects"]
+    } else {
+        &["events", "lib"]
+    };
+    for subdir in MODULE_DIRS.iter().filter(|dir| wanted.contains(dir)) {
         let dir = root.join(subdir);
         if !dir.is_dir() {
             continue;
         }
         for path in star_files(&dir, findings) {
             let rel = rel_to_string(root, &path);
-            let role = match subdir {
-                "events" => Role::Events,
-                "lib" => Role::Lib,
-                "commands" => Role::Command {
-                    internal: rel.starts_with("commands/internal/"),
-                },
-                "projectors" => Role::Projector,
-                "effects" => Role::Effect,
-                _ => unreachable!("subdir list is fixed"),
+            let Some(role) = role_for(&rel) else {
+                continue;
             };
             files.push(parse_one(&path, rel, role, findings));
         }
@@ -294,7 +411,7 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
                 }
             }
         }
-        Role::Events | Role::Lib => None,
+        Role::Events | Role::Lib | Role::Test => None,
     };
 
     let mut file = ParsedFile {
@@ -323,7 +440,7 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
     let ast = match parse_module(&file.rel_path, src) {
         Ok(ast) => ast,
         Err(err) => {
-            findings.push(Finding::error(&file.rel_path, format!("{err}")));
+            findings.push(Finding::from_starlark_error(&file.rel_path, &err));
             return file;
         }
     };
@@ -331,21 +448,25 @@ fn parse_one(path: &Path, rel: String, role: Role, findings: &mut Vec<Finding>) 
     for load in ast.loads() {
         file.loaded_names
             .extend(load.symbols.iter().map(|(local, _)| local.to_string()));
+        let span = load.span.resolve_span();
         match normalize_load_path(load.module_id) {
             Ok(norm) if is_library_path(&norm) => file.deps.push(norm),
             Ok(_) => {
-                findings.push(Finding::error(
-                    &file.rel_path,
-                    format!(
-                        "load(\"{}\") is not allowed; a {} may only load from events/ or lib/",
-                        load.module_id,
-                        role.label()
-                    ),
-                ));
+                findings.push(
+                    Finding::error(
+                        &file.rel_path,
+                        format!(
+                            "load(\"{}\") is not allowed; a {} may only load from events/ or lib/",
+                            load.module_id,
+                            role.label()
+                        ),
+                    )
+                    .with_span(span),
+                );
                 file.has_illegal_deps = true;
             }
             Err(msg) => {
-                findings.push(Finding::error(&file.rel_path, msg));
+                findings.push(Finding::error(&file.rel_path, msg).with_span(span));
                 file.has_illegal_deps = true;
             }
         }
@@ -446,7 +567,7 @@ fn evaluate_one_library(
             }
             cache.insert(load_path, frozen);
         }
-        Err(err) => findings.push(Finding::error(&file.rel_path, format!("{err}"))),
+        Err(err) => findings.push(Finding::from_starlark_error(&file.rel_path, &err)),
     }
 }
 
@@ -586,7 +707,7 @@ fn evaluate_units(
         let frozen = match eval_frozen(ast, globals, Some(&loader), query_mode) {
             Ok(frozen) => frozen,
             Err(err) => {
-                findings.push(Finding::error(&rel, format!("{err}")));
+                findings.push(Finding::from_starlark_error(&rel, &err));
                 continue;
             }
         };
@@ -624,7 +745,7 @@ fn evaluate_units(
                 loaded,
                 rel_path: rel,
             }),
-            Role::Events | Role::Lib => unreachable!("filtered by module_kind"),
+            Role::Events | Role::Lib | Role::Test => unreachable!("filtered by module_kind"),
         }
     }
     (commands, projectors, effects)
@@ -703,14 +824,16 @@ impl FileLoader for LibraryLoader<'_> {
     }
 }
 
-fn is_library_path(path: &str) -> bool {
+/// Whether a normalised load path names a shared module. Every role may only
+/// load from `events/` or `lib/`, including those two themselves.
+pub fn is_library_path(path: &str) -> bool {
     path.starts_with("events/") || path.starts_with("lib/")
 }
 
 /// Normalise a `load()` path to a project-relative, forward-slash form matching
 /// the cache keys. Rejects absolute paths and `..` so imports cannot escape the
 /// project.
-fn normalize_load_path(raw: &str) -> Result<String, String> {
+pub fn normalize_load_path(raw: &str) -> Result<String, String> {
     let trimmed = raw.strip_prefix("./").unwrap_or(raw);
     if trimmed.is_empty() {
         return Err("load path is empty".to_owned());
@@ -759,6 +882,102 @@ pub(crate) fn rel_to_string(root: &Path, path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::{Role, role_for};
+
+    #[test]
+    fn each_module_directory_maps_to_its_role() {
+        assert_eq!(role_for("events/user.star"), Some(Role::Events));
+        assert_eq!(role_for("lib/validation.star"), Some(Role::Lib));
+        assert_eq!(role_for("projectors/users.star"), Some(Role::Projector));
+        assert_eq!(role_for("effects/send-welcome.star"), Some(Role::Effect));
+        assert_eq!(role_for("tests/register-user.star"), Some(Role::Test));
+    }
+
+    #[test]
+    fn only_the_internal_prefix_makes_a_command_internal() {
+        assert_eq!(
+            role_for("commands/register-user.star"),
+            Some(Role::Command { internal: false })
+        );
+        // Nesting is free; the internal marker is the literal prefix, not depth.
+        assert_eq!(
+            role_for("commands/billing/refund.star"),
+            Some(Role::Command { internal: false })
+        );
+        assert_eq!(
+            role_for("commands/internal/record-welcome.star"),
+            Some(Role::Command { internal: true })
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_convention_has_no_role() {
+        assert_eq!(role_for("kiln.toml"), None);
+        assert_eq!(role_for("src/main.star"), None);
+        assert_eq!(role_for("commands/notes.md"), None);
+        // A bare directory is not a module, and neither is a directory that merely
+        // starts with a module directory's name.
+        assert_eq!(role_for("commands"), None);
+        assert_eq!(role_for("commands/"), None);
+        assert_eq!(role_for("commandsx/a.star"), None);
+    }
+}
+
+#[cfg(test)]
+mod library_load_tests {
+    use std::path::Path;
+
+    use super::LoadedProject;
+
+    fn example(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(name)
+    }
+
+    /// The cheap load has to agree with the full one about the shared half, or a
+    /// caller that uses it (the language server) would resolve `load()`s and event
+    /// clauses differently from `kiln check`.
+    #[test]
+    fn loading_libraries_only_agrees_with_a_full_load() {
+        for name in ["users", "orders"] {
+            let root = example(name);
+            let full = LoadedProject::load(&root);
+            let libraries = LoadedProject::load_libraries(&root);
+
+            let mut full_events: Vec<&str> =
+                full.events.by_type.keys().map(String::as_str).collect();
+            let mut library_events: Vec<&str> = libraries
+                .events
+                .by_type
+                .keys()
+                .map(String::as_str)
+                .collect();
+            full_events.sort();
+            library_events.sort();
+            assert_eq!(full_events, library_events, "{name}: event registry");
+
+            assert_eq!(
+                full.library_paths, libraries.library_paths,
+                "{name}: library paths"
+            );
+            assert!(
+                !libraries.library_paths.is_empty(),
+                "{name}: expected some library modules"
+            );
+            assert!(!libraries.has_errors(), "{name}: {:?}", libraries.findings);
+
+            // The units are the whole difference.
+            assert!(libraries.commands.is_empty());
+            assert!(libraries.projectors.is_empty());
+            assert!(libraries.effects.is_empty());
+            assert!(!full.commands.is_empty(), "{name}: expected commands");
+        }
+    }
 }
 
 #[cfg(test)]

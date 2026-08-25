@@ -50,6 +50,20 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Run the Starlark language server over stdio, for editor integration.
+    ///
+    /// Takes no project directory: each open file is placed in its own project,
+    /// so one editor session can span several.
+    Lsp {
+        /// Accepted and ignored. Editors conventionally pass it, and stdio is the
+        /// only transport.
+        #[arg(long)]
+        stdio: bool,
+        /// Skip evaluating each file against its project, leaving parsing, load
+        /// rules and name resolution.
+        #[arg(long)]
+        no_project_checks: bool,
+    },
     /// Run the runtime and HTTP API from a project directory.
     Serve {
         /// The project directory.
@@ -104,6 +118,10 @@ pub fn run() -> ExitCode {
     match cli.command {
         Command::Check { dir } => check(&dir),
         Command::Fmt { dir, check } => run_fmt(&dir, check),
+        Command::Lsp {
+            stdio: _,
+            no_project_checks,
+        } => crate::lsp::run(!no_project_checks),
         Command::Serve {
             dir,
             addr,
@@ -319,7 +337,16 @@ fn run_fmt(dir: &Path, check_only: bool) -> ExitCode {
 pub(crate) fn collect_findings(project: &LoadedProject) -> Vec<Finding> {
     let mut findings = project.findings.clone();
     findings.extend(validate::check(project));
-    findings.sort_by(|left, right| left.location.cmp(&right.location));
+    findings.sort_by(|left, right| {
+        let position = |finding: &Finding| {
+            finding
+                .span
+                .map(|span| (span.begin.line, span.begin.column))
+        };
+        left.location
+            .cmp(&right.location)
+            .then_with(|| position(left).cmp(&position(right)))
+    });
     findings
 }
 
@@ -345,7 +372,12 @@ fn print_findings(findings: &[Finding]) {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
-        println!("{severity}: {}: {}", finding.location, finding.message);
+        // Spans are 0-based; editors and humans count from one.
+        let at = match finding.span {
+            Some(span) => format!(":{}:{}", span.begin.line + 1, span.begin.column + 1),
+            None => String::new(),
+        };
+        println!("{severity}: {}{at}: {}", finding.location, finding.message);
     }
 }
 

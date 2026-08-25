@@ -26,7 +26,7 @@
 use starlark::environment::{FrozenModule, Module};
 use starlark::values::OwnedFrozenValue;
 
-use crate::loader::{CommandUnit, EventRegistry, Finding, LoadedProject};
+use crate::loader::{EventRegistry, Finding, LoadedProject};
 use crate::starlark_builtins::{
     EventDef, EventSpec, FieldKind, InputSchema, ModuleDef, alloc_input,
     call_handler_with_query_ctx, parse_event_dispatch, parse_event_specs, thaw,
@@ -52,7 +52,12 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
     let mut findings = Vec::new();
     check_event_definitions(&project.events, &mut findings);
     for command in &project.commands {
-        check_command(command, &project.events, &mut findings);
+        findings.extend(check_module(
+            &command.loaded.def,
+            &command.loaded.module,
+            &command.rel_path,
+            &project.events,
+        ));
     }
     // Projectors and effects subscribe the same way, so they are checked together:
     // all projectors first, then all effects.
@@ -67,23 +72,45 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
                 .map(|unit| (&unit.loaded, unit.rel_path.as_str())),
         );
     for (loaded, rel) in subscribers {
-        if !matches!(
+        findings.extend(check_module(
             &loaded.def,
-            ModuleDef::Projector { .. } | ModuleDef::Effect { .. }
-        ) {
-            continue;
+            &loaded.module,
+            rel,
+            &project.events,
+        ));
+    }
+    findings
+}
+
+/// The semantic checks for one module, given its definition and its frozen form.
+/// [`check`] is this over every unit in a project; the language server runs it
+/// over the single module being edited, so the two cannot disagree about what a
+/// module's own clauses mean.
+///
+/// The cross-module checks ([`check_event_definitions`]) are not here: they are
+/// about the registry as a whole, not about any one file.
+pub fn check_module(
+    def: &ModuleDef,
+    module: &FrozenModule,
+    rel: &str,
+    events: &EventRegistry,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    match def {
+        ModuleDef::Command { input, .. } => {
+            check_command(input, module, rel, events, &mut findings)
         }
         // `sources` on the ModuleDef is `handle`'s keys, so checking the map covers
         // the subscription too; validating both would report each clause twice.
-        check_dispatch(
-            &loaded.module,
+        ModuleDef::Projector { .. } | ModuleDef::Effect { .. } => check_dispatch(
+            module,
             "handle",
             Context::Handle,
             None,
-            &project.events,
+            events,
             rel,
             &mut findings,
-        );
+        ),
     }
     findings
 }
@@ -146,17 +173,19 @@ fn looks_personal(field: &str) -> bool {
 /// `query` is evaluated once and the clauses it declares are reused for both, so a
 /// command with no `query` is checked for the one thing that is still wrong without
 /// it: a `fold` that can never run.
-fn check_command(command: &CommandUnit, events: &EventRegistry, findings: &mut Vec<Finding>) {
-    let ModuleDef::Command { input, .. } = &command.loaded.def else {
-        return;
-    };
-    let module = &command.loaded.module;
+fn check_command(
+    input: &InputSchema,
+    module: &FrozenModule,
+    rel: &str,
+    events: &EventRegistry,
+    findings: &mut Vec<Finding>,
+) {
     let query_fn = match module.get_option("query") {
         // A command with no invariants omits `query` entirely.
         Ok(None) => {
             if matches!(module.get_option("fold"), Ok(Some(_))) {
                 findings.push(Finding::warning(
-                    &command.rel_path,
+                    rel,
                     "command defines `fold` but no `query`, so there is no boundary to fold and handle() only ever sees `initial`; add a query(), or drop `fold`".to_owned(),
                 ));
             }
@@ -164,21 +193,18 @@ fn check_command(command: &CommandUnit, events: &EventRegistry, findings: &mut V
         }
         Ok(Some(func)) => func,
         Err(err) => {
-            findings.push(Finding::error(
-                &command.rel_path,
-                format!("reading query(): {err}"),
-            ));
+            findings.push(Finding::error(rel, format!("reading query(): {err}")));
             return;
         }
     };
     let specs = match evaluate_query(input, &query_fn) {
         Ok(specs) => {
-            validate_specs(&specs, events, &command.rel_path, Context::Query, findings);
+            validate_specs(&specs, events, rel, Context::Query, findings);
             Some(specs)
         }
         Err(err) => {
             findings.push(Finding::warning(
-                &command.rel_path,
+                rel,
                 format!("could not statically evaluate query() with placeholder input: {err:#}"),
             ));
             None
@@ -190,7 +216,7 @@ fn check_command(command: &CommandUnit, events: &EventRegistry, findings: &mut V
         Context::Fold,
         specs.as_deref(),
         events,
-        &command.rel_path,
+        rel,
         findings,
     );
 }

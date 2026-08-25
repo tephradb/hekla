@@ -8,6 +8,7 @@ pub mod envelope;
 pub mod fmt;
 pub mod hash;
 pub mod loader;
+pub mod lsp;
 pub mod opdb;
 pub mod openapi;
 pub mod projector;

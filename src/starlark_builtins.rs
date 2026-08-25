@@ -1038,17 +1038,25 @@ impl ModuleDef {
 pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     // --- field types -------------------------------------------------------
     //
-    // The scalar types reuse Starlark's builtin names (`str`, `int`, `bool`),
-    // shadowing the standard globals. One rule keeps both meanings reachable: a
-    // positional argument means Starlark's conversion, and no positional argument
-    // means a field declaration. That works because every stdlib conversion is
-    // positional-only and every field option (`indexed`, `subject`, `unique`,
-    // `max_length`) is named-only.
-    //
-    // The one thing this costs is the zero-value idiom: `int()` and `bool()` no
-    // longer produce `0` and `False`. Write the literals instead. (`str()` costs
-    // nothing at all, since the standard `str` requires its argument.)
+    // The scalar types shadow the standard globals; the overload rule is spelled
+    // out on each of `str`, `int` and `bool` so it reaches hover in an editor.
 
+    /// A text field, or Starlark's string conversion.
+    ///
+    /// Which one you get depends on the positional argument: `str(x)` converts
+    /// `x` to a string exactly as standard Starlark does, and `str()` with no
+    /// positional argument declares a text field, as in
+    /// `email = str(indexed = True)`. Every stdlib conversion is positional-only
+    /// and every field option is named-only, so the two meanings never collide.
+    ///
+    /// # Arguments
+    ///
+    /// * `a`: convert this value to a string. Omit it to declare a field.
+    /// * `max_length`: reject values longer than this.
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field, so
+    ///   erasing that subject shreds this value everywhere at once.
+    /// * `unique`: enforce uniqueness across the read model.
     fn str<'v>(
         #[starlark(require = pos)] a: Option<Value<'v>>,
         #[starlark(require = named)] max_length: Option<u32>,
@@ -1078,6 +1086,20 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         Ok(eval.heap().alloc(ft))
     }
 
+    /// A signed 64-bit integer field, or Starlark's integer conversion.
+    ///
+    /// `int(x)` converts (and accepts `base` for string input), exactly as
+    /// standard Starlark does; `int()` with no positional argument declares a
+    /// field. The one cost of that overload is the zero-value idiom: `int()` no
+    /// longer produces `0`, so write the literal.
+    ///
+    /// # Arguments
+    ///
+    /// * `a`: convert this value to an integer. Omit it to declare a field.
+    /// * `base`: the radix to parse a string argument in.
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field.
+    /// * `unique`: enforce uniqueness across the read model.
     fn int<'v>(
         #[starlark(require = pos)] a: Option<Value<'v>>,
         base: Option<Value<'v>>,
@@ -1114,7 +1136,14 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         Ok(eval.heap().alloc(ft))
     }
 
-    /// No standard global to shadow, so this one is a plain field type.
+    /// An unsigned 64-bit integer field. No standard global to shadow, so unlike
+    /// `int` this one is a plain field type with no conversion overload.
+    ///
+    /// # Arguments
+    ///
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field.
+    /// * `unique`: enforce uniqueness across the read model.
     fn uint(
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
@@ -1123,6 +1152,18 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         field_type(FieldKind::U64, indexed, subject, unique)
     }
 
+    /// A boolean field, or Starlark's truthiness conversion.
+    ///
+    /// `bool(x)` converts, exactly as standard Starlark does; `bool()` with no
+    /// positional argument declares a field. As with `int`, the zero-value idiom
+    /// is gone: `bool()` no longer produces `False`, so write the literal.
+    ///
+    /// # Arguments
+    ///
+    /// * `a`: convert this value to a boolean. Omit it to declare a field.
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field.
+    /// * `unique`: enforce uniqueness across the read model.
     fn bool<'v>(
         #[starlark(require = pos)] a: Option<Value<'v>>,
         #[starlark(require = named)] indexed: Option<bool>,
@@ -1145,6 +1186,14 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         Ok(eval.heap().alloc(ft))
     }
 
+    /// A UUID field. Stored and compared as its canonical string form, so it
+    /// round-trips through JSON payloads and tag values unchanged.
+    ///
+    /// # Arguments
+    ///
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field.
+    /// * `unique`: enforce uniqueness across the read model.
     fn uuid(
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
@@ -1153,6 +1202,16 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         field_type(FieldKind::Uuid, indexed, subject, unique)
     }
 
+    /// An ISO-8601 timestamp field, stored as text so it sorts lexicographically.
+    /// A command gets its value from `now()`, which is the request's pinned append
+    /// time rather than a live clock, so a command that writes one stays
+    /// deterministic.
+    ///
+    /// # Arguments
+    ///
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field.
+    /// * `unique`: enforce uniqueness across the read model.
     fn timestamp(
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
@@ -1161,6 +1220,15 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         field_type(FieldKind::Timestamp, indexed, subject, unique)
     }
 
+    /// A fixed-scale decimal field for monetary amounts, carried as a decimal
+    /// string so a value like `"10.50"` round-trips exactly. Never use a float
+    /// for money.
+    ///
+    /// # Arguments
+    ///
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field.
+    /// * `unique`: enforce uniqueness across the read model.
     fn money(
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
@@ -1169,6 +1237,14 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         field_type(FieldKind::Money, indexed, subject, unique)
     }
 
+    /// An arbitrary JSON field, for a nested structure that has no schema of its
+    /// own. Stored as text; the runtime does not look inside it.
+    ///
+    /// # Arguments
+    ///
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field.
+    /// * `unique`: enforce uniqueness across the read model.
     fn json(
         #[starlark(require = named)] indexed: Option<bool>,
         #[starlark(require = named)] subject: Option<String>,
@@ -1177,11 +1253,21 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
         field_type(FieldKind::Json, indexed, subject, unique)
     }
 
+    /// A field constrained to a fixed set of string variants, as in
+    /// `status = one_of(["pending", "shipped"])`.
+    ///
     /// Named `one_of` rather than `enum` because the overload rule the scalar
     /// types use does not reach it: `enum(["a", "b"])` and a variant list are both
     /// positional, so there would be nothing to tell them apart. (`enum` itself is
     /// free, being a starlark-rust extension rather than standard Starlark, and
     /// kiln builds standard globals.)
+    ///
+    /// # Arguments
+    ///
+    /// * `variants`: the permitted string values. At least one is required.
+    /// * `indexed`: make the field filterable in queries and read-model reads.
+    /// * `subject`: encrypt under the key scoped to the named sibling field.
+    /// * `unique`: enforce uniqueness across the read model.
     fn one_of(
         #[starlark(require = pos)] variants: UnpackList<String>,
         #[starlark(require = named)] indexed: Option<bool>,
@@ -1211,6 +1297,16 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
 
     // --- schema ------------------------------------------------------------
 
+    /// Declare a command's input, as in `input = schema(user_id = uuid(), email = str())`.
+    ///
+    /// Every field is a field type, and the host validates the request body
+    /// against it before `handle` runs, so a command never sees a malformed
+    /// input. Command input is plaintext at the boundary, so `subject` and
+    /// `unique` are rejected here: those are event and entity concerns.
+    ///
+    /// # Arguments
+    ///
+    /// * `fields`: one keyword argument per input field, each a field type.
     fn schema<'v>(
         #[starlark(kwargs)] fields: SmallMap<String, Value<'v>>,
     ) -> anyhow::Result<InputSchema> {
@@ -1236,6 +1332,13 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
 
     // --- entities ----------------------------------------------------------
 
+    /// A secondary index on a read-model table, as in
+    /// `index("by_email", ["email"])`. Pass it to `entity(indexes = [...])`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name`: the index name. Must be a valid SQL identifier.
+    /// * `columns`: the entity fields to index, in order. At least one.
     fn index(
         #[starlark(require = pos)] name: String,
         #[starlark(require = pos)] columns: UnpackList<String>,
@@ -1254,6 +1357,13 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
     /// pass `name` only to override that (e.g. to match a legacy table). The
     /// entity is included in its projector automatically; there is no list to
     /// keep in sync. Validation is deferred to load, once the name is known.
+    ///
+    /// # Arguments
+    ///
+    /// * `key`: the field that is the table's primary key.
+    /// * `fields`: a dict of column name to field type, including the key.
+    /// * `indexes`: secondary indexes, each an `index(...)`.
+    /// * `name`: override the table name, which otherwise comes from the binding.
     fn entity<'v>(
         #[starlark(require = named)] key: String,
         #[starlark(require = named)] fields: SmallMap<String, Value<'v>>,
@@ -1290,6 +1400,16 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
 
     /// Declare an event type. Every field is automatically indexed as a store tag
     /// unless it opts out with `indexed = False`; there is no `tags = [...]` list.
+    ///
+    /// The binding is callable, and that call is the one dispatch form: with
+    /// field values it constructs an event to emit, and in a `query`, `fold` key
+    /// or `handle` key it builds a clause matching those fields.
+    ///
+    /// # Arguments
+    ///
+    /// * `type`: the event type string, as stored in the log.
+    /// * `fields`: a dict of field name to field type. Names may not start with
+    ///   `_kiln_`, which the host reserves for its own tags.
     fn event<'v>(
         #[starlark(require = named)] r#type: String,
         #[starlark(require = named)] fields: SmallMap<String, Value<'v>>,
@@ -1332,6 +1452,17 @@ pub fn runtime_builtins(builder: &mut GlobalsBuilder) {
 
     // --- control flow ------------------------------------------------------
 
+    /// Refuse a command because the current state forbids it, as in
+    /// `reject("email_taken", "that email is already registered")`. Return it
+    /// from `handle` instead of events; nothing is appended.
+    ///
+    /// This is a business outcome, not an error: the input was well formed and
+    /// the decision was to say no. Use `invalid_input` for malformed input.
+    ///
+    /// # Arguments
+    ///
+    /// * `code`: a stable machine-readable code, for callers to branch on.
+    /// * `message`: a human-readable explanation.
     fn reject(
         #[starlark(require = pos)] code: String,
         #[starlark(require = pos)] message: String,
@@ -1751,6 +1882,12 @@ pub fn globals() -> Globals {
 /// the context, so `query` and `fold` (evaluated without one) cannot read a clock.
 #[starlark_module]
 pub(crate) fn command_builtins(builder: &mut GlobalsBuilder) {
+    /// The request's append time, as an RFC 3339 string.
+    ///
+    /// Pinned once per request rather than read from a live clock, so a command
+    /// that stamps a timestamp stays deterministic and replays identically. Only
+    /// available inside `handle`: `query` and `fold` are evaluated without a
+    /// request context and calling it there is an error.
     fn now(eval: &mut Evaluator) -> anyhow::Result<String> {
         eval.extra
             .and_then(|extra| extra.downcast_ref::<HandleCtx>())
@@ -1774,6 +1911,18 @@ pub fn command_globals() -> Globals {
 /// the presence of the context, so it errors anywhere but a projector `handle`.
 #[starlark_module]
 pub(crate) fn projector_builtins(builder: &mut GlobalsBuilder) {
+    /// Read one row from this projector's own read model by key, returning `None`
+    /// when there is no such row.
+    ///
+    /// Reads through the current batch's uncommitted writes, so a
+    /// read-modify-write within one batch sees its own earlier `put`. Subject
+    /// columns come back as opaque handles, so the row round-trips back through
+    /// `put` unchanged. Only available inside a projector's `handle`.
+    ///
+    /// # Arguments
+    ///
+    /// * `entity`: the entity value itself, as in `get(users, ...)`, not its name.
+    /// * `key`: the primary-key value to look up.
     fn get<'v>(
         #[starlark(require = pos)] entity: Value<'v>,
         #[starlark(require = pos)] key: String,
@@ -1899,10 +2048,21 @@ fn http_dispatch<'v>(
 /// projectors never see these globals, so purity stays structural.
 #[starlark_module]
 pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
+    /// The current time, as an RFC 3339 string.
+    ///
+    /// Journaled, so a replay after a crash returns the time the original
+    /// invocation saw rather than reading the clock again. Only available inside
+    /// an effect's `handle`.
     fn now(eval: &mut Evaluator) -> anyhow::Result<String> {
         effect_host(eval, "now()")?.now()
     }
 
+    /// Write a line to the runtime's log. Not journaled and not a side effect the
+    /// journal replays, so a message may appear twice across a crash.
+    ///
+    /// # Arguments
+    ///
+    /// * `message`: the line to log.
     fn log(
         #[starlark(require = pos)] message: String,
         eval: &mut Evaluator,
@@ -1932,6 +2092,17 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
         )
     }
 
+    /// Call a command, public or internal, and return `{status, body}`.
+    ///
+    /// Journaled, and passed a deterministic idempotency key derived from this
+    /// invocation, so a replay after a crash lands the domain fact exactly once
+    /// rather than appending it twice. This is how an effect writes back to the
+    /// log: effects never append events directly.
+    ///
+    /// # Arguments
+    ///
+    /// * `name`: the command's name, its file stem, as in `"record-welcome"`.
+    /// * `input`: a dict matching that command's `input` schema.
     fn invoke_command<'v>(
         #[starlark(require = pos)] name: String,
         #[starlark(require = pos)] input: Value<'v>,
@@ -1945,6 +2116,15 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
         Ok(alloc_fixed(eval.heap(), &result, &["status", "body"]))
     }
 
+    /// Read one row by key from another projector's read model, returning `None`
+    /// when there is no such row. Journaled, so a replay sees the same row the
+    /// original invocation did.
+    ///
+    /// # Arguments
+    ///
+    /// * `projector`: the projector's name, its file stem.
+    /// * `entity`: the entity (table) name within that projector.
+    /// * `key`: the primary-key value to look up.
     fn read<'v>(
         #[starlark(require = pos)] projector: String,
         #[starlark(require = pos)] entity: String,
@@ -1956,6 +2136,17 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
         Ok(eval.heap().alloc(result))
     }
 
+    /// Page through another projector's read model, returning
+    /// `{items, next_cursor}`. Journaled, so a replay sees the same page.
+    ///
+    /// # Arguments
+    ///
+    /// * `projector`: the projector's name, its file stem.
+    /// * `entity`: the entity (table) name within that projector.
+    /// * `field`: an indexed field to filter on. Must be given with `value`.
+    /// * `value`: the value `field` must equal.
+    /// * `cursor`: the `next_cursor` from a previous page. Omit for the first.
+    /// * `limit`: the maximum rows to return. Must not be negative.
     fn scan<'v>(
         #[starlark(require = pos)] projector: String,
         #[starlark(require = pos)] entity: String,
@@ -1988,6 +2179,8 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
 /// handler decides on.
 #[starlark_module]
 pub(crate) fn http_builtins(builder: &mut GlobalsBuilder) {
+    /// A journaled HTTP GET. Takes `url=` and optional `headers=`, and returns
+    /// `{status, body, headers}`.
     fn get<'v>(
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -1995,6 +2188,8 @@ pub(crate) fn http_builtins(builder: &mut GlobalsBuilder) {
         http_dispatch("GET", kwargs, eval)
     }
 
+    /// A journaled HTTP POST. Takes `url=`, optional `headers=` and optional
+    /// `body=` (any JSON value), and returns `{status, body, headers}`.
     fn post<'v>(
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -2002,6 +2197,8 @@ pub(crate) fn http_builtins(builder: &mut GlobalsBuilder) {
         http_dispatch("POST", kwargs, eval)
     }
 
+    /// A journaled HTTP PUT. Takes `url=`, optional `headers=` and optional
+    /// `body=` (any JSON value), and returns `{status, body, headers}`.
     fn put<'v>(
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -2009,6 +2206,8 @@ pub(crate) fn http_builtins(builder: &mut GlobalsBuilder) {
         http_dispatch("PUT", kwargs, eval)
     }
 
+    /// A journaled HTTP DELETE. Takes `url=` and optional `headers=`, and returns
+    /// `{status, body, headers}`.
     fn delete<'v>(
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -2016,6 +2215,8 @@ pub(crate) fn http_builtins(builder: &mut GlobalsBuilder) {
         http_dispatch("DELETE", kwargs, eval)
     }
 
+    /// A journaled HTTP PATCH. Takes `url=`, optional `headers=` and optional
+    /// `body=` (any JSON value), and returns `{status, body, headers}`.
     fn patch<'v>(
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -2879,7 +3080,79 @@ fn key_spec(key: Value<'_>) -> anyhow::Result<Option<EventSpec>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    /// Every kiln builtin, recursing into namespaces, paired with its doc summary.
+    /// Standard Starlark names are excluded: only the ones kiln adds or shadows are
+    /// this crate's to document.
+    fn kiln_documented_names(globals: &Globals) -> Vec<(String, Option<String>)> {
+        fn walk(
+            prefix: &str,
+            module: &starlark::docs::DocModule,
+            out: &mut Vec<(String, Option<String>)>,
+        ) {
+            for (name, item) in &module.members {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                match item {
+                    // A namespace root carries no docs of its own: starlark-rust
+                    // hardcodes `docs: None` when documenting one and offers no way
+                    // to attach a docstring, so only its members are ours to check.
+                    starlark::docs::DocItem::Module(inner) => walk(&path, inner, out),
+                    _ => out.push((path, item.get_doc_summary().map(str::to_owned))),
+                }
+            }
+        }
+
+        // A shadowed name (`str`, `int`, `bool`) is kiln's, so subtract by name only
+        // where kiln does not redefine it: the standard set is the baseline, and any
+        // name kiln rebinds carries kiln's docs by the time we see it here.
+        let standard: HashSet<String> = Globals::standard()
+            .names()
+            .map(|n| n.as_str().to_owned())
+            .collect();
+        let shadowed: HashSet<&str> = ["str", "int", "bool"].into_iter().collect();
+
+        let mut out = Vec::new();
+        walk("", &globals.documentation(), &mut out);
+        out.retain(|(name, _)| {
+            let root = name.split('.').next().unwrap();
+            shadowed.contains(root) || !standard.contains(root)
+        });
+        out
+    }
+
+    #[test]
+    fn every_kiln_builtin_has_a_doc_summary() {
+        // The docs are the hover text and the generated stubs the language server
+        // serves, so an undocumented builtin is a silently worse editor.
+        for (label, globals) in [
+            ("base", globals()),
+            ("command", command_globals()),
+            ("projector", projector_globals()),
+            ("effect", effect_globals()),
+        ] {
+            let documented = kiln_documented_names(&globals);
+            assert!(
+                !documented.is_empty(),
+                "{label} globals exposed no kiln builtins"
+            );
+            let missing: Vec<&str> = documented
+                .iter()
+                .filter(|(_, summary)| summary.as_deref().unwrap_or("").trim().is_empty())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{label} globals have undocumented builtins: {missing:?}"
+            );
+        }
+    }
 
     fn fields() -> Vec<(String, FieldMeta)> {
         vec![

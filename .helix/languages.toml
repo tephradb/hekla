@@ -1,0 +1,17 @@
+# Use kiln's own language server for this repository's `.star` files, in place of
+# Helix's default starpls (which serves Bazel's dialect, so every kiln builtin
+# reads as undefined and every `load()` resolves against the wrong root).
+#
+# Requires `kiln` on PATH: `cargo install --path .`, or point `command` at
+# `target/debug/kiln`.
+#
+# Formatting stays with buildifier from the global config: the server advertises
+# no formatting capability.
+
+[language-server.kiln]
+command = "kiln"
+args = ["lsp"]
+
+[[language]]
+name = "starlark"
+language-servers = ["kiln"]

@@ -489,7 +489,7 @@ fn expected_calls(value: Value<'_>) -> anyhow::Result<Vec<ExpectedCall>> {
 
 /// Globals for test files: the base builtins (so `reject`/`invalid_input` and
 /// event constructors work) plus `case(...)`.
-fn test_globals() -> Globals {
+pub(crate) fn test_globals() -> Globals {
     GlobalsBuilder::standard()
         .with(runtime_builtins)
         .with(test_builtins)
@@ -543,7 +543,9 @@ pub fn run(dir: &Path) -> ExitCode {
                 continue;
             }
         };
-        let module = match project.eval_against_libraries(&rel, src, &globals) {
+        // Test files call event definitions in `given`/`expect` to construct
+        // events, not to filter, so this is not query mode.
+        let module = match project.eval_against_libraries(&rel, src, &globals, false) {
             Ok(module) => module,
             Err(err) => {
                 eprintln!("error: {rel}: {err}");
@@ -582,7 +584,7 @@ pub fn run(dir: &Path) -> ExitCode {
 }
 
 /// Read the `cases` list off a frozen test module.
-fn read_cases(module: &FrozenModule) -> anyhow::Result<Vec<TestCase>> {
+pub(crate) fn read_cases(module: &FrozenModule) -> anyhow::Result<Vec<TestCase>> {
     let Some(owned) = module.get_option("cases")? else {
         anyhow::bail!("test file defines no `cases = [...]` list");
     };
