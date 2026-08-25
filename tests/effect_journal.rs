@@ -4,8 +4,8 @@
 //! These tests pin the replay machinery underneath: a retry (and a crash restart)
 //! must replay every completed journaled call instead of re-firing it, `now()` must
 //! hand back the same recorded instant on every attempt, two byte-identical calls
-//! must line up one-to-one through their disambiguators, and `read()`/`scan()` must
-//! journal what they saw (including a miss) so a replay is deterministic.
+//! must line up one-to-one through their disambiguators, and an edited script must
+//! replay an in-flight invocation against its new code.
 //!
 //! Assertions go through the observable seams: the HTTP stub's call log, the
 //! effect's health signals, and the operational DB's `effect_invocation` /
@@ -25,7 +25,7 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::{ALICE, BOB, Boot, Harness, MISSING, ctx, log_head, wait_position, wait_until};
+use support::{ALICE, BOB, Boot, Harness, ctx, log_head, wait_until};
 
 const EFFECT: &str = "notify";
 
@@ -100,7 +100,7 @@ fn project(effect: &str) -> TempDir {
 }
 
 /// The same, plus the `users` read model and the `activate-user` command, for the
-/// tests that exercise the journaled `read()` and `scan()` builtins.
+/// tests that need a second event type on the log.
 fn project_with_read_model(effect: &str) -> TempDir {
     support::write_project(&[
         ("events/user.star", USER_EVENTS),
@@ -225,7 +225,7 @@ fn invocation_status(data_dir: &Path, position: u64) -> Option<String> {
 const TWO_POSTS: &str = r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     http.post(url = "https://a.test/first", body = {"id": event.data.user_id})
     http.post(url = "https://a.test/second", body = {})
 
@@ -329,7 +329,7 @@ fn a_crashed_invocation_resumes_from_the_journal_and_runs_only_the_tail() {
 const NOW_THEN_POST: &str = r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     t = now()
     http.post(url = "https://a.test/at", body = {"t": t})
     http.post(url = "https://a.test/fail", body = {})
@@ -381,7 +381,7 @@ fn now_replays_the_recorded_timestamp_on_every_retry() {
 const IDENTICAL_TWICE: &str = r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     http.post(url = "https://a.test/twice", body = {"n": 1})
     http.post(url = "https://a.test/twice", body = {"n": 1})
     http.post(url = "https://a.test/fail", body = {})
@@ -434,66 +434,6 @@ fn identical_repeated_calls_journal_under_separate_disambiguators() {
     harness.shutdown();
 }
 
-// --- journaled read() and scan() -------------------------------------------
-
-const READ_AND_SCAN: &str = r#"
-load("events/user.star", "user_activated")
-
-def on_event(event):
-    row = read("users", "users", event.data.user_id)
-    page = scan("users", "users", field = "email", value = row["email"], limit = 10)
-    http.post(url = "https://a.test/sync", body = {
-        "name": row["name"],
-        "found": len(page.items),
-        "cursor": page.next_cursor,
-    })
-
-handle = {user_activated(): on_event}
-"#;
-
-#[test]
-fn an_effect_reads_and_scans_a_projector_and_journals_the_results() {
-    let dir = project_with_read_model(READ_AND_SCAN);
-    let data = tempfile::tempdir().unwrap();
-    let stub = Arc::new(StubHttpClient::ok());
-    let harness = boot(dir.path(), data.path(), stub.clone());
-
-    register(&harness.rt, ALICE);
-    // Let the read model catch up first: the effect reads it, and a miss would be
-    // journaled permanently (see a_journaled_read_miss_is_frozen_across_retries).
-    wait_position(&harness.rt, "users", 1);
-    activate(&harness.rt, ALICE); // user.activated at position 2
-
-    wait_until("the sync post", || stub.call_count() >= 1);
-    let body = post_body(&stub, "/sync");
-    assert_eq!(body["name"], "U", "read() returned the projected row");
-    assert_eq!(body["found"], 1, "scan() filtered on the indexed email");
-    assert_eq!(
-        body["cursor"],
-        Value::Null,
-        "a single-row page has no cursor"
-    );
-
-    wait_until("the invocation to complete", || {
-        harness.rt.effect(EFFECT).unwrap().position() >= 2
-    });
-    thread::sleep(Duration::from_millis(50));
-    assert_eq!(stub.call_count(), 1, "the invocation ran once");
-
-    let rows = journal_rows(data.path(), 2);
-    assert_eq!(
-        rows.len(),
-        3,
-        "read, scan and http are all journaled: {rows:?}"
-    );
-    assert_eq!(rows[0].2["email"], format!("{ALICE}@x"));
-    assert_eq!(rows[1].2["items"][0]["user_id"], ALICE);
-    assert_eq!(rows[1].2["next_cursor"], Value::Null);
-    assert_eq!(rows[2].2["status"], 200);
-
-    harness.shutdown();
-}
-
 // --- host-built wrappers read with a dot -----------------------------------
 
 /// Reads every field of the response struct and echoes what it saw, so the assertion
@@ -501,7 +441,7 @@ fn an_effect_reads_and_scans_a_projector_and_journals_the_results() {
 const RESPONSE_SHAPE: &str = r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     response = http.post(url = "https://a.test/first", body = {"x": 1})
     http.post(url = "https://a.test/echo", body = {
         "status": response.status,
@@ -548,7 +488,7 @@ fn a_non_json_response_body_reads_as_a_string() {
         r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     response = http.post(url = "https://a.test/first", body = {"x": 1})
     http.post(url = "https://a.test/echo", body = {"body": response.body})
 
@@ -588,7 +528,7 @@ fn an_invoke_command_outcome_reads_its_fields_with_a_dot() {
             r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     outcome = invoke_command("activate-user", {"user_id": event.data.user_id})
     http.post(url = "https://a.test/echo", body = {
         "status": outcome.status,
@@ -621,7 +561,7 @@ fn an_unknown_response_field_names_itself() {
         r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     response = http.post(url = "https://a.test/first", body = {"x": 1})
     log(str(response.stauts))
 
@@ -640,133 +580,12 @@ handle = {user_registered(): on_event}
     harness.shutdown();
 }
 
-/// Boot a project whose effect fires on registration and fails immediately, then
-/// assert the wedge message and that nothing was journaled.
-fn assert_wedges_with(effect: &str, needle: &str) {
-    let dir = project_with_read_model(effect);
-    let data = tempfile::tempdir().unwrap();
-    let stub = Arc::new(StubHttpClient::ok());
-    let harness = boot(dir.path(), data.path(), stub.clone());
-
-    register(&harness.rt, ALICE);
-    wait_for_failures(&harness, 1);
-
-    let error = harness.rt.effect(EFFECT).unwrap().last_error().unwrap();
-    assert!(error.contains(needle), "expected `{needle}` in `{error}`");
-    assert_eq!(
-        stub.call_count(),
-        0,
-        "the handler failed before its http call"
-    );
-    assert_eq!(log_head(&harness.rt), 1, "a wedged effect appends nothing");
-    assert!(
-        journal_rows(data.path(), 1).is_empty(),
-        "a failed call is never journaled, so a retry re-runs it"
-    );
-
-    harness.shutdown();
-}
-
-#[test]
-fn read_and_scan_reject_an_unknown_projector_and_an_unindexed_filter() {
-    assert_wedges_with(
-        r#"
-load("events/user.star", "user_registered")
-
-def on_event(event):
-    read("nope", "users", event.data.user_id)
-    http.post(url = "https://a.test/never", body = {})
-
-handle = {user_registered(): on_event}
-"#,
-        "no projector `nope`",
-    );
-
-    assert_wedges_with(
-        r#"
-load("events/user.star", "user_registered")
-
-def on_event(event):
-    scan("users", "users", field = "name", value = "U")
-    http.post(url = "https://a.test/never", body = {})
-
-handle = {user_registered(): on_event}
-"#,
-        "not indexed",
-    );
-}
-
-const READ_A_MISSING_ROW: &str = r#"
-load("events/user.star", "user_registered")
-
-def on_event(event):
-    row = read("users", "users", "99999999-9999-9999-9999-999999999999")
-    http.post(url = "https://a.test/seen", body = {"found": row != None})
-    http.post(url = "https://a.test/fail", body = {})
-
-handle = {user_registered(): on_event}
-"#;
-
-#[test]
-fn a_journaled_read_miss_is_frozen_across_retries() {
-    // A read of an absent row records `null`, and that null is what every later
-    // retry replays: the row can never be observed, even once the projector catches
-    // up. This is deliberate (replay determinism), and the only way out of the
-    // resulting wedge is an operator `request_skip`. Pinned here so a "fix" that
-    // re-queries on retry cannot land silently.
-    let dir = project_with_read_model(READ_A_MISSING_ROW);
-    let data = tempfile::tempdir().unwrap();
-    let stub = stub_failing_on("/fail");
-    let harness = boot(dir.path(), data.path(), stub.clone());
-
-    register(&harness.rt, ALICE); // position 1: the effect reads MISSING and misses
-    wait_for_failures(&harness, 1);
-
-    // The row the wedged invocation looked for now exists and is projected.
-    register(&harness.rt, MISSING);
-    wait_position(&harness.rt, "users", 2);
-    wait_for_failures(&harness, 4);
-
-    let retries = calls_ending(&stub, "/fail");
-    assert!(
-        retries >= 4,
-        "the handler re-ran to its failing tail {retries} times"
-    );
-    assert_eq!(
-        calls_ending(&stub, "/seen"),
-        1,
-        "the retries replay the recorded read, so this call never re-fires"
-    );
-    assert_eq!(
-        post_body(&stub, "/seen")["found"],
-        false,
-        "the handler saw the miss"
-    );
-
-    let rows = journal_rows(data.path(), 1);
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!(
-        rows[0].2,
-        Value::Null,
-        "the miss stays recorded as null even though the row now exists"
-    );
-
-    // An operator skip is the only escape from a permanently frozen miss.
-    harness.rt.effect(EFFECT).unwrap().request_skip(1);
-    wait_until("the skip to advance the effect", || {
-        let effect = harness.rt.effect(EFFECT).unwrap();
-        effect.consecutive_failures() == 0 && effect.position() >= 1
-    });
-
-    harness.shutdown();
-}
-
 // --- editing an effect under an in-flight invocation -----------------------
 
 const TWO_POSTS_V2: &str = r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     http.post(url = "https://a.test/first-v2", body = {"id": event.data.user_id})
     http.post(url = "https://a.test/second", body = {})
 
@@ -829,7 +648,7 @@ fn an_edited_effect_replays_an_in_flight_invocation_against_the_new_code() {
 const RUNAWAY: &str = r#"
 load("events/user.star", "user_registered")
 
-def on_event(event):
+def on_event(event, state):
     for i in range(100000000):
         pass
     http.post(url = "https://a.test/never", body = {})
@@ -884,11 +703,11 @@ const PER_TYPE_EFFECT: &str = r#"
 load("events/user.star", "user_registered")
 
 handle = {
-    user_registered(): lambda event: http.post(
+    user_registered(): lambda event, state: http.post(
         url = "https://a.test/welcome/" + event.data.user_id,
         body = {"email": event.data.email},
     ),
-    user_registered(name = "VIP"): lambda event: http.post(
+    user_registered(name = "VIP"): lambda event, state: http.post(
         url = "https://a.test/vip/" + event.data.user_id,
         body = {},
     ),
@@ -949,5 +768,128 @@ fn a_per_type_effect_handle_subscribes_to_exactly_its_arms() {
         "an unsubscribed type is never read"
     );
     assert_eq!(harness.rt.effect(EFFECT).unwrap().consecutive_failures(), 0);
+    harness.shutdown();
+}
+
+// --- the boundary is folded, never journaled -------------------------------
+
+/// Folds the registrations for this user and reports the count in the POST body, so
+/// the assertion below reads the state the handler actually saw.
+const FOLDING_EFFECT: &str = r#"
+load("events/user.star", "user_registered", "user_activated")
+
+def query(event):
+    return [user_activated(user_id = event.data.user_id)]
+
+initial = {"activations": 0}
+
+fold = {user_activated(): lambda state, event: {"activations": state["activations"] + 1}}
+
+def on_event(event, state):
+    http.post(
+        url = "https://a.test/seen",
+        body = {"activations": state["activations"]},
+    )
+
+handle = {user_registered(): on_event}
+"#;
+
+#[test]
+fn a_fold_reads_state_written_one_position_earlier_without_a_projector() {
+    // The case this whole design exists for. Under the old `read()` an effect at
+    // position N that needed state written at N-1 could observe the projector before
+    // it caught up, journal the miss as `null`, and then replay that null forever: a
+    // permanent wedge only an operator skip could clear. A fold cannot miss, because
+    // it reads the log itself, up to this event's own position.
+    let dir = project_with_read_model(FOLDING_EFFECT);
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::ok());
+    let harness = boot(dir.path(), data.path(), stub.clone());
+
+    // position 1: the activation the effect will fold. It is not subscribed to, so
+    // the effect never runs for it, exactly as a projector-written row would not be.
+    activate(&harness.rt, ALICE);
+    // position 2: the registration the effect does fire on, one position later.
+    register(&harness.rt, ALICE);
+    wait_until("the effect to post", || calls_ending(&stub, "/seen") == 1);
+
+    assert_eq!(
+        post_body(&stub, "/seen")["activations"],
+        1,
+        "the fold saw the event appended one position earlier"
+    );
+    assert_eq!(
+        harness.rt.effect(EFFECT).unwrap().consecutive_failures(),
+        0,
+        "no wedge: a fold cannot observe a state that has not caught up"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn a_fold_is_not_journaled_and_reproduces_itself_on_every_retry() {
+    // The fold is derived from the log prefix and the triggering position, so it needs
+    // no journal entry: recording it would buy nothing and would freeze a point-in-time
+    // answer. Only the POST is journaled, and every retry re-folds and agrees.
+    let dir = project_with_read_model(FOLDING_EFFECT);
+    let data = tempfile::tempdir().unwrap();
+    let stub = stub_failing_on("/seen");
+    let harness = boot(dir.path(), data.path(), stub.clone());
+
+    activate(&harness.rt, ALICE); // position 1
+    register(&harness.rt, ALICE); // position 2, the trigger
+    wait_for_failures(&harness, 3);
+
+    let rows = journal_rows(data.path(), 2);
+    assert!(
+        rows.is_empty(),
+        "a 5xx is absorbed before the journal, and the fold writes nothing: {rows:?}"
+    );
+    let bodies: Vec<Value> = stub
+        .calls()
+        .iter()
+        .filter(|call| call.url.ends_with("/seen"))
+        .map(|call| serde_json::from_slice(call.body.as_deref().unwrap()).unwrap())
+        .collect();
+    assert!(bodies.len() >= 3, "the invocation retried: {bodies:?}");
+    assert!(
+        bodies.iter().all(|body| body["activations"] == 1),
+        "every retry re-folds and gets the same answer: {bodies:?}"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn the_boundary_stops_at_the_triggering_position() {
+    // Folding to the log head instead would make the state depend on how far the log
+    // had run by the time the handler happened to execute, which is exactly the
+    // nondeterminism the design removes. Here the effect is deliberately kept behind:
+    // it wedges on position 2 while position 3 lands, and every retry must still see
+    // the log as it stood at position 2.
+    let dir = project_with_read_model(FOLDING_EFFECT);
+    let data = tempfile::tempdir().unwrap();
+    let stub = stub_failing_on("/seen");
+    let harness = boot(dir.path(), data.path(), stub.clone());
+
+    activate(&harness.rt, ALICE); // position 1
+    register(&harness.rt, ALICE); // position 2, the wedged trigger
+    wait_for_failures(&harness, 2);
+
+    // A second activation lands while the effect is stuck at position 2.
+    activate(&harness.rt, ALICE); // position 3
+    wait_up_to(Duration::from_secs(20), "further retries", || {
+        calls_ending(&stub, "/seen") >= 5
+    });
+
+    let bodies: Vec<Value> = stub
+        .calls()
+        .iter()
+        .filter(|call| call.url.ends_with("/seen"))
+        .map(|call| serde_json::from_slice(call.body.as_deref().unwrap()).unwrap())
+        .collect();
+    assert!(
+        bodies.iter().all(|body| body["activations"] == 1),
+        "the fold must not pick up position 3, which is past the trigger: {bodies:?}"
+    );
     harness.shutdown();
 }

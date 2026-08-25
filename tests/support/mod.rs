@@ -301,7 +301,7 @@ handle = {order_placed(): on_event}
 pub const NOTIFY_EFFECT: &str = r#"
 load("events/order.star", "order_placed")
 
-def on_event(event):
+def on_event(event, state):
     # reveal() is the explicit boundary: the effect decrypts the customer email to
     # send it. A projector could not; only an effect has reveal().
     email = reveal(event.data.email)

@@ -1237,7 +1237,7 @@ fn a_handle_filed_under_the_wrong_subject_id_is_rejected() {
 const SHRED_EFFECT: &str = r#"
 load("events/order.star", "order_placed")
 
-def shred(event):
+def shred(event, state):
     erase("customer_id", str(event.data.customer_id))
 
 # Constrained to one customer, so the assertion that erasure is scoped to the subject
@@ -1286,7 +1286,7 @@ fn an_effect_erases_a_subject_and_shreds_its_data() {
 const DOUBLE_SHRED_EFFECT: &str = r#"
 load("events/order.star", "order_placed")
 
-def shred(event):
+def shred(event, state):
     erase("customer_id", str(event.data.customer_id))
     erase("customer_id", str(event.data.customer_id))
 

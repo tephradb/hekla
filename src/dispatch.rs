@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 
 use starlark::ErrorKind;
-use starlark::environment::Module;
-use starlark::values::ValueError;
+use starlark::environment::{FrozenModule, Module};
+use starlark::values::{Value, ValueError};
 use tephra::{
     AppendCondition, AppendError, ConflictClause, Event, EventRef, EventType, Matches, Position,
     PositionRange, Query, QueryItem, Tag, Tags, WriteHandle,
@@ -195,65 +195,23 @@ pub fn run_command(
             None => None,
         };
 
-        let mut state = initial_state(frozen, &module)
+        let initial = initial_state(frozen, &module)
             .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?;
-        let mut after = Position::ZERO;
-        if let Some(query) = &boundary {
-            // Resolved and lowered once: the map is a module-level literal, so it
-            // cannot differ between events, and thawing per event would touch the temp
-            // heap's reference set for nothing.
-            let fold_owned = frozen.get_option("fold")?;
-            let fold = fold_owned
-                .as_ref()
-                .map(|owned| parse_event_dispatch(thaw(owned, &module)))
-                .transpose()
-                .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
-            let lowered = match &fold {
-                Some(fold) => lower_dispatch(fold, events, keystore)
-                    .map_err(|err| anyhow::anyhow!("`fold` {err}"))?,
-                None => Vec::new(),
-            };
-            let mut reads = store.read(query, Position::ZERO, None);
-            while let Some(item) = reads.next() {
-                let seq = item.map_err(|err| anyhow::anyhow!("read failed: {err}"))?;
-                // Advances for every event in the boundary, folded or not, so the
-                // append condition covers everything the query matched.
-                after = seq.position;
-                let Some(fold) = &fold else { continue };
-                // Matching before decoding: a map over a wide boundary pays nothing for
-                // the events no arm selects.
-                let selected: Vec<usize> = lowered
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, item)| arm_selects(item.as_ref(), seq.event))
-                    .map(|(index, _)| index)
-                    .collect();
-                if selected.is_empty() {
-                    continue;
-                }
-                let event_type = seq.event.event_type();
-                let (envelope, data) = envelope::decode(seq.event.data())
-                    .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-                let def = events.get(event_type);
-                let event = alloc_event(
-                    &module,
-                    envelope.event_id,
-                    &envelope.timestamp,
-                    event_type,
-                    &data,
-                    def,
-                );
-                // Every selecting arm runs, threading state through them in declaration
-                // order.
-                for index in selected {
-                    let arm = &fold.arms()[index];
-                    let what = fold.label("fold", arm.spec.as_ref());
-                    state = call_handler(&module, arm.func, &[state, event], MAX_TICKS)
-                        .map_err(|err| fold_error(&what, err))?;
-                    check_fold_result(state, &what)?;
-                }
-            }
-        }
+        let (state, after) = match &boundary {
+            Some(query) => fold_boundary(
+                &module,
+                &FoldInputs {
+                    frozen,
+                    store,
+                    query,
+                    events,
+                    keystore,
+                    upto: None,
+                },
+                initial,
+            )?,
+            None => (initial, Position::ZERO),
+        };
 
         // `handle` alone sees the pinned clock.
         let handle_fn = frozen
@@ -362,6 +320,110 @@ pub fn run_command(
             }
         }
     })
+}
+
+/// What [`fold_boundary`] needs besides the heap and the starting state, bundled so
+/// the call stays under the argument limit.
+pub(crate) struct FoldInputs<'a> {
+    pub frozen: &'a FrozenModule,
+    pub store: &'a WriteHandle,
+    pub query: &'a Query,
+    pub events: &'a EventDefs,
+    pub keystore: Option<&'a KeyStore>,
+    /// Inclusive upper bound on the positions folded. `None` folds the whole
+    /// boundary, which is what a command wants: its state is the log as of now.
+    /// `Some(n)` stops after position `n`, which is what an effect wants: folding
+    /// past its own position would make the state depend on how far the log had
+    /// run by the time the handler happened to execute.
+    pub upto: Option<u64>,
+}
+
+/// Fold a boundary into state, returning it alongside the last position the query
+/// matched.
+///
+/// Shared by commands and effects so the two cannot drift on the parts that are not
+/// obvious: arms are matched against the raw event *before* the envelope is decoded,
+/// and the dispatch map is thawed and lowered once rather than per event.
+///
+/// The returned position advances for every event in the boundary, folded or not, so
+/// a command's append condition covers everything the query matched rather than only
+/// what an arm consumed. An effect ignores it.
+pub(crate) fn fold_boundary<'v>(
+    module: &Module<'v>,
+    inputs: &FoldInputs<'_>,
+    initial: Value<'v>,
+) -> anyhow::Result<(Value<'v>, Position)> {
+    let FoldInputs {
+        frozen,
+        store,
+        query,
+        events,
+        keystore,
+        upto,
+    } = *inputs;
+
+    // Resolved and lowered once: the map is a module-level literal, so it cannot
+    // differ between events, and thawing per event would touch the temp heap's
+    // reference set for nothing.
+    let fold_owned = frozen.get_option("fold")?;
+    let fold = fold_owned
+        .as_ref()
+        .map(|owned| parse_event_dispatch(thaw(owned, module)))
+        .transpose()
+        .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
+    let lowered = match &fold {
+        Some(fold) => {
+            lower_dispatch(fold, events, keystore).map_err(|err| anyhow::anyhow!("`fold` {err}"))?
+        }
+        None => Vec::new(),
+    };
+
+    let mut state = initial;
+    let mut after = Position::ZERO;
+    let mut reads = store.read(query, Position::ZERO, None);
+    while let Some(item) = reads.next() {
+        let seq = item.map_err(|err| anyhow::anyhow!("read failed: {err}"))?;
+        // The store reads ascending up to the watermark pinned when the read was
+        // planned, and takes no upper bound, so the bound is a break.
+        if upto.is_some_and(|limit| seq.position.get() > limit) {
+            break;
+        }
+        after = seq.position;
+        let Some(fold) = &fold else { continue };
+        // Matching before decoding: a map over a wide boundary pays nothing for
+        // the events no arm selects.
+        let selected: Vec<usize> = lowered
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| arm_selects(item.as_ref(), seq.event))
+            .map(|(index, _)| index)
+            .collect();
+        if selected.is_empty() {
+            continue;
+        }
+        let event_type = seq.event.event_type();
+        let (envelope, data) = envelope::decode(seq.event.data())
+            .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
+        let def = events.get(event_type);
+        let event = alloc_event(
+            module,
+            envelope.event_id,
+            &envelope.timestamp,
+            event_type,
+            &data,
+            def,
+        );
+        // Every selecting arm runs, threading state through them in declaration
+        // order.
+        for index in selected {
+            let arm = &fold.arms()[index];
+            let what = fold.label("fold", arm.spec.as_ref());
+            state = call_handler(module, arm.func, &[state, event], MAX_TICKS)
+                .map_err(|err| fold_error(&what, err))?;
+            check_fold_result(state, &what)?;
+        }
+    }
+    Ok((state, after))
 }
 
 /// Prefix a fold failure with the entry that produced it, and spell out the one

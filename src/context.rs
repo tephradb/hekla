@@ -90,6 +90,11 @@ pub struct ProjectorCtx<'a> {
 /// Every method but [`log`](EffectHost::log) is journaled; `log` writes a trace
 /// line and may repeat on replay, which is why it returns nothing that could
 /// steer control flow.
+///
+/// Every method here is a genuine side effect or an unrepeatable observation, which
+/// is what earns it a journal entry. State is deliberately not among them: an effect
+/// reads state by folding its boundary off the log, which is derived from the
+/// triggering position and so reproduces itself on every attempt.
 pub trait EffectHost {
     /// Perform an HTTP request and return `{status, body, headers}`. A transport
     /// failure or a 5xx is an `Err` (the runtime retries it, so it never reaches
@@ -108,20 +113,6 @@ pub trait EffectHost {
         &self,
         name: &str,
         input: serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value>;
-
-    /// Read one row from a projector's read model by key (`null` when absent).
-    fn read(&self, projector: &str, entity: &str, key: &str) -> anyhow::Result<serde_json::Value>;
-
-    /// Scan a projector's read model with an optional single indexed filter and
-    /// cursor pagination, returning `{items, next_cursor}`.
-    fn scan(
-        &self,
-        projector: &str,
-        entity: &str,
-        filter: Option<(String, String)>,
-        cursor: Option<String>,
-        limit: Option<usize>,
     ) -> anyhow::Result<serde_json::Value>;
 
     /// The wall clock at first run, recorded so a replay agrees, RFC 3339.

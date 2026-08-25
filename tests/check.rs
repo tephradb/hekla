@@ -1149,7 +1149,7 @@ handle = {
         r#"
 load("events/t.star", "happened")
 
-def relay(event):
+def relay(event, state):
     response = http.post(url = "https://a.test/relay", body = {"note": event.data.note})
     if response.status < 400:
         invoke_command("emit", {"id": event.data.id, "note": "relayed"})
@@ -1878,7 +1878,7 @@ def handle(input, state):
             r#"
 load("events/t.star", "happened")
 
-def relay(event):
+def relay(event, state):
     invoke_command("emit", {"id": uuid5(event.id, "relay"), "note": event.data.note})
 
 handle = {happened(): relay}
@@ -1936,7 +1936,7 @@ happened = event(
                 r#"
 load("events/t.star", "happened")
 
-def shred(event):
+def shred(event, state):
     erase("who", str(event.data.who))
 
 handle = {happened(): shred}
@@ -1947,7 +1947,7 @@ handle = {happened(): shred}
                 r#"
 load("events/t.star", "happened")
 
-def shred(event):
+def shred(event, state):
     erase("who", str(event.data.who))
     log(reveal(event.data.secret))
 
@@ -2001,151 +2001,6 @@ cases = [
     );
 }
 
-/// A project whose effect reports back what its projector reads found, so a scenario
-/// can assert on them through `command_call`.
-fn rows_project(effect_body: &str, scenario: &str) -> TempDir {
-    write_project(&[
-        (
-            "events/t.star",
-            r#"
-happened = event(type = "t.happened", fields = {"id": uuid()})
-"#,
-        ),
-        (
-            "commands/noop.star",
-            r#"
-load("events/t.star", "happened")
-
-input = schema(seen = json())
-
-def handle(input, state):
-    return []
-"#,
-        ),
-        (
-            "projectors/dir.star",
-            r#"
-load("events/t.star", "happened")
-
-people = entity(
-    key = "id",
-    fields = {
-        "id": str(max_length = 64),
-        "who": uint(),
-        "email": str(subject = "who", max_length = 100),
-    },
-    indexes = [index("by_who", ["who"])],
-)
-
-# Rows come from the case's `rows`, never from an event.
-handle = {happened(): lambda event: []}
-"#,
-        ),
-        ("effects/probe.star", effect_body),
-        ("tests/scenario.star", scenario),
-    ])
-}
-
-fn probe(effect_body: &str, scenario: &str) -> ExitCode {
-    testing::run(rows_project(effect_body, scenario).path())
-}
-
-const GIVEN: &str = r#"
-load("events/t.star", "happened")
-
-cases = [case(effect = "probe", given = [happened(id = "11111111-1111-1111-1111-111111111111")],"#;
-
-/// `rows` seeds what an effect's `read` and `scan` find, and a subject column is
-/// written plaintext, stored encrypted and read back decrypted, exactly as live.
-#[test]
-fn rows_seed_an_effects_projector_reads() {
-    let effect = r#"
-load("events/t.star", "happened")
-
-def probe(event):
-    row = read("dir", "people", "p1")
-    page = scan("dir", "people", field = "who", value = "7")
-    invoke_command("noop", {"seen": [row["email"]] + [r["email"] for r in page.items]})
-
-handle = {happened(): probe}
-"#;
-    let scenario = format!(
-        r#"{GIVEN}
-    rows = {{"dir": {{"people": [
-        {{"id": "p1", "who": 7, "email": "a@b.c"}},
-        {{"id": "p2", "who": 7, "email": "d@e.f"}},
-        {{"id": "p3", "who": 9, "email": "x@y.z"}},
-    ]}}}},
-    expect = [command_call("noop", {{"seen": ["a@b.c", "a@b.c", "d@e.f"]}})],
-)]
-"#
-    );
-    assert_eq!(
-        format!("{:?}", probe(effect, &scenario)),
-        format!("{:?}", ExitCode::SUCCESS),
-        "read by key, an indexed scan, and decrypted subject columns"
-    );
-}
-
-/// A projector with no `rows` entry reads as empty, which is what a live effect sees
-/// before its projector has caught up. That is what makes a missing-row case
-/// expressible at all.
-#[test]
-fn an_undeclared_projector_reads_as_empty() {
-    let effect = r#"
-load("events/t.star", "happened")
-
-def probe(event):
-    row = read("dir", "people", "p1")
-    page = scan("dir", "people")
-    invoke_command("noop", {"seen": [row == None, len(page.items)]})
-
-handle = {happened(): probe}
-"#;
-    let scenario =
-        format!("{GIVEN}\n    expect = [command_call(\"noop\", {{\"seen\": [True, 0]}})],\n)]\n");
-    assert_eq!(
-        format!("{:?}", probe(effect, &scenario)),
-        format!("{:?}", ExitCode::SUCCESS),
-    );
-}
-
-/// The read path is the real one, so its rules hold in a case: a filter on a field
-/// that is neither the key nor a declared index is an error rather than a table scan.
-#[test]
-fn a_scan_in_a_case_still_refuses_an_unindexed_filter() {
-    let effect = r#"
-load("events/t.star", "happened")
-
-def probe(event):
-    scan("dir", "people", field = "email", value = "a@b.c")
-
-handle = {happened(): probe}
-"#;
-    let scenario = format!("{GIVEN}\n    expect = [],\n)]\n");
-    assert_eq!(
-        format!("{:?}", probe(effect, &scenario)),
-        format!("{:?}", ExitCode::FAILURE),
-    );
-}
-
-/// A projector named in `rows` that the project does not have is a typo worth
-/// naming, not rows that silently never get read.
-#[test]
-fn rows_naming_an_unknown_projector_fails_the_case() {
-    let effect = r#"
-load("events/t.star", "happened")
-
-handle = {happened(): lambda event: None}
-"#;
-    let scenario =
-        format!("{GIVEN}\n    rows = {{\"nope\": {{\"people\": []}}}},\n    expect = [],\n)]\n");
-    assert_eq!(
-        format!("{:?}", probe(effect, &scenario)),
-        format!("{:?}", ExitCode::FAILURE),
-    );
-}
-
 /// `event.timestamp` reaches every handler position, and `kiln test` pins it along
 /// with the clock, so a case can assert on a column built from it.
 #[test]
@@ -2182,7 +2037,7 @@ def handle(input, state):
             r#"
 load("events/t.star", "happened")
 
-def relay(event):
+def relay(event, state):
     invoke_command("emit", {"id": event.data.id, "at": event.timestamp})
 
 handle = {happened(): relay}
@@ -2217,4 +2072,205 @@ cases = [
         format!("{:?}", testing::run(project.path())),
         format!("{:?}", ExitCode::SUCCESS),
     );
+}
+
+// --- an effect's boundary --------------------------------------------------
+
+/// Events for the effect-boundary cases: `note` is `indexed = False`, so a clause
+/// filtering on it can never match.
+const BOUNDARY_EVENTS: &str = r#"
+placed = event(
+    type = "t.placed",
+    fields = {"id": uuid(), "shop": uint(), "note": str(indexed = False)},
+)
+other = event(type = "t.other", fields = {"id": uuid()})
+"#;
+
+/// A one-effect project with the given body, for the boundary validation cases.
+fn boundary_project(effect: &str) -> TempDir {
+    write_project(&[
+        ("events/t.star", BOUNDARY_EVENTS),
+        ("effects/probe.star", effect),
+    ])
+}
+
+#[test]
+fn an_effect_fold_without_a_query_warns() {
+    // The same shape a command is warned about: nothing folds, so `handle` only ever
+    // sees `initial`, and the author almost certainly meant to declare a boundary.
+    let project = LoadedProject::load(
+        boundary_project(
+            r#"
+load("events/t.star", "placed")
+
+initial = {"count": 0}
+
+fold = {placed(): lambda state, event: {"count": state["count"] + 1}}
+
+def probe(event, state):
+    log(str(state))
+
+handle = {placed(): probe}
+"#,
+        )
+        .path(),
+    );
+    let warns = warnings(&project);
+    assert!(
+        warns
+            .iter()
+            .any(|warn| warn.contains("`fold` but no `query`")),
+        "{warns:?}"
+    );
+}
+
+#[test]
+fn an_effect_query_without_a_fold_warns() {
+    // Effect-only: a command's bare `query` still guards its append, but an effect
+    // never appends, so a boundary with nothing folding it is read and discarded.
+    let project = LoadedProject::load(
+        boundary_project(
+            r#"
+load("events/t.star", "placed")
+
+def query(event):
+    return [placed(shop = event.data.shop)]
+
+def probe(event, state):
+    log(str(state))
+
+handle = {placed(): probe}
+"#,
+        )
+        .path(),
+    );
+    let warns = warnings(&project);
+    assert!(
+        warns
+            .iter()
+            .any(|warn| warn.contains("`query` but no `fold`")),
+        "{warns:?}"
+    );
+}
+
+#[test]
+fn an_effect_query_on_a_non_indexed_field_is_an_error() {
+    // The boundary is lowered into a real store query, so an un-tagged field would
+    // silently match nothing. Same rule and same message as a command's `query`.
+    assert_error(
+        &[
+            ("events/t.star", BOUNDARY_EVENTS),
+            (
+                "effects/probe.star",
+                r#"
+load("events/t.star", "placed")
+
+def query(event):
+    return [placed(note = event.data.note)]
+
+initial = {"count": 0}
+
+fold = {placed(): lambda state, event: state}
+
+def probe(event, state):
+    log(str(state))
+
+handle = {placed(): probe}
+"#,
+            ),
+        ],
+        "is not indexed",
+    );
+}
+
+#[test]
+fn an_effect_fold_arm_outside_the_boundary_warns_as_dead() {
+    let project = LoadedProject::load(
+        boundary_project(
+            r#"
+load("events/t.star", "placed", "other")
+
+def query(event):
+    return [placed(shop = event.data.shop)]
+
+initial = {"count": 0}
+
+fold = {
+    placed(): lambda state, event: state,
+    other(): lambda state, event: state,
+}
+
+def probe(event, state):
+    log(str(state))
+
+handle = {placed(): probe}
+"#,
+        )
+        .path(),
+    );
+    let warns = warnings(&project);
+    assert!(
+        warns
+            .iter()
+            .any(|warn| warn.contains("t.other") && warn.contains("never runs")),
+        "{warns:?}"
+    );
+}
+
+#[test]
+fn an_all_events_subscription_with_a_query_checks_clean() {
+    // `all_events()` names no type, so there is no shape to build a placeholder event
+    // from and `query` is left to the runtime. It must not fail spuriously here.
+    let project = LoadedProject::load(
+        boundary_project(
+            r#"
+load("events/t.star", "placed")
+
+def query(event):
+    return [placed()]
+
+initial = {"count": 0}
+
+fold = {placed(): lambda state, event: state}
+
+def probe(event, state):
+    log(str(state))
+
+handle = {all_events(): probe}
+"#,
+        )
+        .path(),
+    );
+    let errs = errors(&project);
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn read_and_scan_are_no_longer_effect_builtins() {
+    // Removed in favour of the boundary: an effect's state comes from folding the log,
+    // which cannot race a projector or freeze a miss into its journal.
+    for call in [
+        "read(\"p\", \"e\", event.data.id)",
+        "scan(\"p\", \"e\", field = \"shop\", value = \"1\")",
+    ] {
+        let dir = boundary_project(&format!(
+            r#"
+load("events/t.star", "placed")
+
+def probe(event, state):
+    log(str({call}))
+
+handle = {{placed(): probe}}
+"#
+        ));
+        let errs = errors(&LoadedProject::load(dir.path()));
+        // A load error, so `kiln check` catches it rather than leaving it to wedge an
+        // invocation at runtime.
+        let name = call.split('(').next().unwrap();
+        assert!(
+            errs.iter()
+                .any(|err| err.contains(&format!("Variable `{name}` not found"))),
+            "`{call}` should no longer resolve: {errs:?}"
+        );
+    }
 }

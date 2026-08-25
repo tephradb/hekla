@@ -35,9 +35,9 @@ Phase 2, so it is scoped honestly as "toolchain, no server" rather than a runnab
   evaluation and cycle detection) and an evaluated-module cache.
 - Event definitions in `events/`; the event-def constructor validates each payload against the field
   schema and derives tags; structured tag queries.
-- Effects evaluate against effect-scoped globals (`http.*`, `invoke_command`, `now`, `log`, `read`,
-  stubbed until Phase 4), so command and projector purity is structural: they never see a clock or
-  the network.
+- Effects evaluate against effect-scoped globals (`http.*`, `invoke_command`, `now`, `log`, stubbed
+  until Phase 4), so command and projector purity is structural: they never see a clock or the
+  network.
 - Deploy-time validation: `query` tag fields and projector/effect `source` types checked against the
   event registry, projector indexes against declared fields. Emit payloads are validated by the event
   constructor itself, at the point of emit.
@@ -129,8 +129,8 @@ crash mid-handler resumes by replaying journaled calls and running only the unjo
   failed invocation replays completed calls and fails at the same point without re-firing. The script
   hash is recorded on each invocation, and a restart warns when in-flight code changed under it.
 - Builtins: journaled `http.*`, `invoke_command` (public or internal, deterministic idempotency key plus
-  the target command's DCB boundary), `now()`, journaled `read(projector, entity, key)` plus a `scan`
-  filter/paginate, and `log()` (not journaled).
+  the target command's DCB boundary), `now()`, and `log()` (not journaled). A journaled
+  `read(projector, entity, key)` plus `scan` shipped here and was removed in Phase 13.
 - Retry split: the runtime absorbs transport errors and 5xx (they never reach the script) by wedging the
   invocation and retrying with capped backoff; a 2xx/3xx/4xx result reaches the script, so `status >= 400`
   is a real decide-what-to-do outcome. A handler error wedges the same way (retry forever, never skip).
@@ -154,6 +154,7 @@ Honest scope for this phase:
   at-least-once (a crash between a successful request and its journal write re-fires on replay).
 - `read()`/`scan()` are journaled, so a replayed effect sees point-in-time-stale data by design; at cold
   start an effect can also outrun a projector and journal an empty read that then replays empty forever.
+  *(Both closed by Phase 13, which removed the builtins in favour of a folded boundary.)*
 - One explicit skip endpoint; no automatic dead-lettering, and no per-event retry endpoint beyond
   fix-the-code-and-restart (which replays the running invocation). The script hash is recorded and
   mismatch-warned but not pinned.
@@ -434,7 +435,7 @@ triggering event.
 - **A `scan`-driven fan-out is not testable in `kiln test`.** *(Closed by Phase 11: `rows = {...}`
   seeds an effect's projector reads, so the per-row erase loop is now covered by a case.)*
 
-## Phase 11: an effect case can seed the projectors it reads (done)
+## Phase 11: an effect case can seed the projectors it reads (done, retired by Phase 13)
 
 `TestEffectHost` served `read` and `scan` as empty, so every effect that reads a projector was
 untestable in the language it ships for: the interesting branch never ran, and the case could only
@@ -467,6 +468,11 @@ plaintext an effect sees is the plaintext the real read path would hand it.
   the test host now both call `read_api::is_filterable` in the same order, but they are two call
   sites that must stay in step. A test asserts the unindexed-filter rejection so a drift shows up.
 
+**Retired by Phase 13.** `rows` was the right answer to "how does a case stub an effect's projector
+reads", and it stopped being needed because the question did: an effect's state now comes from
+folding the seeded log, so `given` is both the trigger and the state. The honest-scope note above
+about a snapshot with no relationship to `given` is what the fold removes.
+
 ## Phase 12: event.timestamp (done)
 
 A read model that wants a `created_at` column had nowhere to get one. The envelope has held the
@@ -495,6 +501,65 @@ the event was appended, `now()` for time that is genuinely domain data** (`expir
 - **No formatting or arithmetic on it.** It is an RFC 3339 string; a projector that wants a date
   bucket does its own string slicing, and a fold that wants a duration parses both ends by hand.
   Starlark has no date library and kiln adds none.
+
+## Phase 13: effects fold the log instead of reading projectors (done)
+
+An effect got state from `read(projector, entity, key)` and `scan(...)`, reaching another projector's
+read model by string name. That was the only cross-module coupling in kiln, and it was unsound in a
+way Phase 4's honest scope already recorded as the "cold-start empty read": an effect could outrun a
+projector, and because reads were journaled, the miss recorded `null` and **every retry replayed that
+null**. The row could never be observed, even once the projector caught up. The retry loop that
+looked like waiting was not waiting; it burned attempts at the 60s cap until an operator skipped the
+position by hand.
+
+Journaling exists to make *side effects* exactly-once. A read has no side effect. Phase 4 journaled
+it "for consistency with the rest of the model", and that consistency bought an unrecoverable failure
+mode.
+
+An effect now declares `query` / `initial` / `fold`, the same three globals as a command with the
+same meanings, and each `handle` arm takes `(event, state)`. `query` takes the triggering event where
+a command's takes `input`, because an effect's boundary is scoped by what it is reacting to. **The
+fold is bounded at the effect's own position, inclusive**, so `state` is a pure function of the log
+prefix and that position.
+
+That bound is the whole point. Reading a projector is nondeterministic: the answer depends on where
+another thread happens to be. Folding the log at your own position is deterministic. Same
+information, and every problem above dissolves at once: no race, no frozen miss, and no journal entry
+needed, because re-folding reproduces the answer exactly. The dispatch and effect paths share one
+`fold_boundary`, so the two cannot drift on the parts that are not obvious (match before decode,
+lower once outside the loop).
+
+`kiln test` got simpler rather than harder: `rows = {...}` is gone, because `given` is already the
+state. The boundary folds the same seeded log the case built.
+
+Two smaller consequences fell out. `check_state_shape` is now shared by commands and effects, so
+`initial` and `fold` fail identically in both. And an effect's `query` is validated against a
+placeholder event per subscribed type, mirroring the command path's placeholder input.
+
+**Honest scope:**
+
+- **The fold runs per invocation, from position zero.** The same cost model commands already pay per
+  request, but effects are sequential and single-lane, so it comes off throughput rather than off one
+  request's latency. No snapshotting and no state carried between invocations. Incremental folding is
+  the optimisation to reach for if this hurts; it is not here because it cannot be scoped by the
+  triggering event, so it would trade the throughput problem for a memory ceiling.
+- **`run_handle` still re-parses and re-lowers `handle` on every event**, where `run_command` hoists
+  it. Hoisting across events means restructuring the per-call `Module::with_temp_heap`. It is a
+  smaller cost than the boundary read this phase adds, so it is noted rather than fixed.
+- **`query` is not validated for an `all_events()` subscription**, because there is no event type to
+  build a placeholder from. That effect's `query` is checked at runtime only.
+- **A `query` that branches on the event's values is only validated along the placeholder's branch**,
+  inherited verbatim from the command path's documented blind spot.
+- **Large fan-outs must fit in memory.** A `scan` paged with a cursor; a fold does not. Scoping via
+  `query(event)` keeps this to one entity's worth at a time, but an effect that folds an unbounded
+  set has no backstop.
+- **Removing `read` is a load error, not a guided migration.** `read(...)` in an effect now fails
+  with starlark's own "Variable `read` not found". `kiln check` catches it, which is the important
+  part, but the message does not name `query`/`fold` as the replacement. Registering a stub that
+  errors with guidance would have deferred the failure from check time to runtime, which is worse.
+- **Settled reference data now costs a fold.** State that is genuinely old (an access token, a plan's
+  SKU) used to be an O(1) row read. If that proves too coarse, the successor is a log-query path that
+  returns a value without emitting, not the reinstatement of `read`.
 
 ## Deferred, with triggers
 
@@ -527,16 +592,13 @@ forward. Collected here so they are not lost in the prose of the phase that intr
   field only.
 - **Automatic dead-lettering** (Phase 4): the manual `POST /effects/{name}/skip/{position}` is the only
   escape hatch; a wedged effect is never advanced automatically.
-- **Cold-start empty read** (Phase 4): an effect can outrun a projector and journal an empty
-  `read()`/`scan()` that then replays empty forever; accepted, not yet guarded.
 - **Integers above `i64::MAX`** (Phase 3): both `i64` and `u64` land in a signed SQLite `INTEGER`, so
   a `u64` past `i64::MAX` is rejected at the write boundary rather than stored. Widening it needs a
   storage form that still orders correctly, since the read API's `ORDER BY` and `key > ?` cursor
   depend on numeric order; a bit-reinterpretation would round-trip but sort those rows below zero.
 
 Inherent design properties, listed for completeness (not future work): `invoke_command` is exactly-once
-only when the target is idempotent under replay, raw `http.*` is at-least-once, and `read()`/`scan()`
-are journaled (point-in-time-stale on replay).
+only when the target is idempotent under replay, and raw `http.*` is at-least-once.
 
 ## Design brainstorm: language and runtime ergonomics (unscheduled)
 

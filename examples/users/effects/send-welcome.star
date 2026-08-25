@@ -9,7 +9,7 @@
 
 load("events/user.star", "user_registered")
 
-def send_welcome(event):
+def send_welcome(event, state):
     response = http.post(
         url = "https://example.test/welcome",
         body = {"email": event.data.email},

@@ -35,7 +35,6 @@ use crate::loader::{CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::opdb::{InvocationState, OpDb};
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
-use crate::read_api;
 use crate::starlark_builtins::{EmittedEvent, EventDef, InputSchema, ModuleDef};
 
 /// Individual event segments before rolling to a new file. 256 MiB matches
@@ -186,7 +185,7 @@ impl Runtime {
             openapi_json,
         });
 
-        // Effects need `Arc<Runtime>` (for `invoke_command` and `read`), so they
+        // Effects need `Arc<Runtime>` (for `invoke_command` and the boundary fold), so they
         // spawn after the runtime is built; the runtime learns their handles for
         // `/status` here, once.
         let effect_runtime = effect::start_all(effect_units, &runtime, http, &project.config)?;
@@ -487,69 +486,6 @@ impl Runtime {
 
     pub(crate) fn sweep_effect_journal(&self, cutoff: &str, limit: usize) -> anyhow::Result<usize> {
         self.lock_opdb().sweep_effect_journal(cutoff, limit)
-    }
-
-    /// Read one row from a projector's read model, for the effect `read()` builtin.
-    /// Returns `null` when the row is absent.
-    pub(crate) fn read_projector(
-        &self,
-        projector: &str,
-        entity: &str,
-        key: &str,
-    ) -> anyhow::Result<Value> {
-        let shared = self
-            .projectors
-            .get(projector)
-            .ok_or_else(|| anyhow::anyhow!("read(): no projector `{projector}`"))?;
-        let entity_def = read_api::find_entity(&shared.entities, entity).ok_or_else(|| {
-            anyhow::anyhow!("read(): no entity `{entity}` in projector `{projector}`")
-        })?;
-        let (row, _position) =
-            read_api::get_one(&shared.db_path, entity_def, key, self.keystore.as_ref())?;
-        Ok(row.unwrap_or(Value::Null))
-    }
-
-    /// Scan a projector's read model, for the effect `scan()` builtin. Returns
-    /// `{items, next_cursor}`; an unindexed filter is an error.
-    pub(crate) fn scan_projector(
-        &self,
-        projector: &str,
-        entity: &str,
-        filter: Option<(String, String)>,
-        cursor: Option<String>,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Value> {
-        let shared = self
-            .projectors
-            .get(projector)
-            .ok_or_else(|| anyhow::anyhow!("scan(): no projector `{projector}`"))?;
-        let entity_def = read_api::find_entity(&shared.entities, entity).ok_or_else(|| {
-            anyhow::anyhow!("scan(): no entity `{entity}` in projector `{projector}`")
-        })?;
-        if let Some((field, _)) = &filter
-            && !read_api::is_filterable(entity_def, field)
-        {
-            anyhow::bail!("scan(): filter field `{field}` is not indexed on entity `{entity}`");
-        }
-        let after_key = match &cursor {
-            Some(raw) => Some(read_api::decode_cursor(raw)?),
-            None => None,
-        };
-        let limit = limit
-            .unwrap_or(read_api::DEFAULT_LIMIT)
-            .clamp(1, read_api::MAX_LIMIT);
-        let filter_ref = filter
-            .as_ref()
-            .map(|(field, value)| (field.as_str(), value.as_str()));
-        let page = read_api::scan(
-            &shared.db_path,
-            entity_def,
-            filter_ref,
-            after_key.as_deref(),
-            limit,
-            self.keystore.as_ref(),
-        )?;
-        Ok(json!({ "items": page.items, "next_cursor": page.next_cursor }))
     }
 
     /// The OpenAPI document, serialized once at startup.

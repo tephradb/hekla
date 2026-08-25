@@ -1719,19 +1719,22 @@ pub fn module_def_from_frozen(
                 sources,
             }
         }
-        ModuleKind::Effect => ModuleDef::Effect {
-            name,
-            sources: read_event_handler(module)?,
-        },
+        ModuleKind::Effect => {
+            check_state_shape(module)?;
+            ModuleDef::Effect {
+                name,
+                sources: read_event_handler(module)?,
+            }
+        }
     })
 }
 
-/// Check a command's `initial`, `fold` and `handle` shapes.
+/// Check the `initial` and `fold` shapes of a module that folds a boundary.
 ///
-/// `initial` is a plain value and never a function (see [`initial_state`]); `fold` is
-/// a clause-keyed map; `handle` decides from input and folded state rather than from
-/// one event, so per-clause dispatch belongs on `fold`, not on it.
-fn check_command_handlers(module: &FrozenModule) -> anyhow::Result<()> {
+/// Shared by commands and effects: both reach the same [`initial_state`] and the same
+/// fold loop, so a mistake in either has to fail identically. `initial` is a plain
+/// value and never a function (see [`initial_state`]); `fold` is a clause-keyed map.
+fn check_state_shape(module: &FrozenModule) -> anyhow::Result<()> {
     if let Some(owned) = module.get_option("initial")? {
         let val = owned.value();
         if val.get_type() == FUNCTION_TYPE {
@@ -1751,6 +1754,15 @@ fn check_command_handlers(module: &FrozenModule) -> anyhow::Result<()> {
     if let Some(owned) = module.get_option("fold")? {
         parse_event_dispatch(owned.value()).map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
     }
+    Ok(())
+}
+
+/// Check a command's `initial`, `fold` and `handle` shapes.
+///
+/// `handle` decides from input and folded state rather than from one event, so
+/// per-clause dispatch belongs on `fold`, not on it.
+fn check_command_handlers(module: &FrozenModule) -> anyhow::Result<()> {
+    check_state_shape(module)?;
     if let Some(owned) = module.get_option("handle")?
         && owned.value().get_type() != FUNCTION_TYPE
     {
@@ -1897,7 +1909,7 @@ pub fn call_handler_with_projector_ctx<'v>(
 }
 
 /// Call an effect's `handle` with an [`EffectCtx`] in scope, so the impure
-/// builtins (`http.*`, `invoke_command`, `read`, `now`, `log`) resolve and journal
+/// builtins (`http.*`, `invoke_command`, `now`, `log`) resolve and journal
 /// through the host. Used only for an effect's `handle`.
 pub fn call_handler_with_effect_ctx<'v>(
     module: &Module<'v>,
@@ -2189,61 +2201,6 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
         let host = effect_host(eval, "invoke_command()")?;
         let result = host.invoke_command(&name, input_json)?;
         Ok(alloc_fixed(eval.heap(), &result, &["status", "body"]))
-    }
-
-    /// Read one row by key from another projector's read model, returning `None`
-    /// when there is no such row. Journaled, so a replay sees the same row the
-    /// original invocation did.
-    ///
-    /// # Arguments
-    ///
-    /// * `projector`: the projector's name, its file stem.
-    /// * `entity`: the entity (table) name within that projector.
-    /// * `key`: the primary-key value to look up.
-    fn read<'v>(
-        #[starlark(require = pos)] projector: String,
-        #[starlark(require = pos)] entity: String,
-        #[starlark(require = pos)] key: String,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<Value<'v>> {
-        let host = effect_host(eval, "read()")?;
-        let result = host.read(&projector, &entity, &key)?;
-        Ok(eval.heap().alloc(result))
-    }
-
-    /// Page through another projector's read model, returning
-    /// `{items, next_cursor}`. Journaled, so a replay sees the same page.
-    ///
-    /// # Arguments
-    ///
-    /// * `projector`: the projector's name, its file stem.
-    /// * `entity`: the entity (table) name within that projector.
-    /// * `field`: an indexed field to filter on. Must be given with `value`.
-    /// * `value`: the value `field` must equal.
-    /// * `cursor`: the `next_cursor` from a previous page. Omit for the first.
-    /// * `limit`: the maximum rows to return. Must not be negative.
-    fn scan<'v>(
-        #[starlark(require = pos)] projector: String,
-        #[starlark(require = pos)] entity: String,
-        #[starlark(require = named)] field: Option<String>,
-        #[starlark(require = named)] value: Option<String>,
-        #[starlark(require = named)] cursor: Option<String>,
-        #[starlark(require = named)] limit: Option<i32>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<Value<'v>> {
-        let filter = match (field, value) {
-            (Some(field), Some(value)) => Some((field, value)),
-            (None, None) => None,
-            _ => anyhow::bail!("scan() `field` and `value` must be given together"),
-        };
-        // A negative limit would clamp to a one-row page, silently truncating the scan.
-        let limit = match limit {
-            Some(n) if n < 0 => anyhow::bail!("scan() limit must not be negative"),
-            other => other.map(|n| n as usize),
-        };
-        let host = effect_host(eval, "scan()")?;
-        let result = host.scan(&projector, &entity, filter, cursor, limit)?;
-        Ok(alloc_fixed(eval.heap(), &result, &["items", "next_cursor"]))
     }
 }
 
@@ -3576,19 +3533,6 @@ def bad_patch():
                     .expect_err("a non-dict row must not reach the subject-column check");
                 assert!(err.to_string().contains("must be a dict"), "{name}: {err}");
             }
-        });
-    }
-
-    #[test]
-    fn scan_rejects_a_negative_limit() {
-        let src = "def f():\n    return scan(\"p\", \"e\", limit = -1)\n";
-        let ast = parse_module("t.star", src.to_owned()).unwrap();
-        let frozen = eval_frozen(ast, &effect_globals(), None, false).unwrap();
-        Module::with_temp_heap(|module| {
-            let func = frozen.get_option("f").unwrap().unwrap();
-            let err = call_handler(&module, thaw(&func, &module), &[], 1_000_000)
-                .expect_err("a negative limit must not be coerced to a one-row page");
-            assert!(err.to_string().contains("negative"), "{err}");
         });
     }
 

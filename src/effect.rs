@@ -3,7 +3,7 @@
 //! One dedicated thread per effect subscribes to its `handle` keys and processes
 //! matching events strictly in order, one invocation per event. An invocation
 //! runs the effect's straight-line `handle`, whose impure builtins (`http.*`,
-//! `invoke_command`, `read`, `scan`, `now`) are journaled: each call records its
+//! `invoke_command`, `now`) are journaled: each call records its
 //! result in the operational DB, so a crash mid-handler resumes by replaying the
 //! journaled calls and running only the unjournaled tail live. `log` is not
 //! journaled.
@@ -38,19 +38,21 @@ use std::time::Duration;
 use anyhow::Context;
 use serde_json::{Value, json};
 use starlark::environment::Module;
-use tephra::{Event, Position, WaitOutcome};
+use tephra::{Event, Position, WaitOutcome, WriteHandle};
 use ureq::Agent;
 use ureq::typestate::{WithBody, WithoutBody};
 
 use crate::config::Config;
 use crate::context::{CommandContext, EffectCtx, EffectHost};
+use crate::crypto::KeyStore;
 use crate::dispatch::{self, EventDefs, arm_selects, lower_dispatch};
 use crate::envelope::{self, Envelope};
 use crate::loader::EffectUnit;
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
 use crate::runtime::{self, Runtime};
 use crate::starlark_builtins::{
-    LoadedModule, ModuleDef, alloc_event, call_handler_with_effect_ctx, parse_event_dispatch, thaw,
+    LoadedModule, ModuleDef, alloc_event, call_handler_with_effect_ctx,
+    call_handler_with_query_ctx, initial_state, parse_event_dispatch, parse_event_specs, thaw,
 };
 
 /// Per-handler instruction budget. Bounds a runaway script at dispatch time.
@@ -247,7 +249,7 @@ impl Sweeper {
 }
 
 /// Start one thread per effect plus the retention sweeper. The threads hold
-/// `Arc<Runtime>` (for `invoke_command` and `read`); the runtime does not hold the
+/// `Arc<Runtime>` (for `invoke_command` and the boundary fold); the runtime does not hold the
 /// returned [`EffectRuntime`], so nothing cycles.
 pub fn start_all(
     effects: Vec<Arc<EffectUnit>>,
@@ -520,40 +522,60 @@ fn try_invocation(
         disambiguators: RefCell::new(HashMap::new()),
         terminal: Cell::new(false),
     };
-    run_handle(
-        loaded,
-        runtime.events_map(),
+    let inv = Invocation {
+        events: runtime.events_map(),
+        store: runtime.store(),
+        keystore: runtime.keystore(),
+        position,
         event,
         env,
         event_type,
         data,
-        &host,
-    )
-    .map_err(|err| InvocationFailure {
+    };
+    run_handle(loaded, &inv, &host).map_err(|err| InvocationFailure {
         message: format!("{err:#}"),
         terminal: host.terminal.get(),
     })
 }
 
+/// One event to route through an effect, and everything the boundary needs to fold
+/// state for it. Bundled so [`run_handle`] stays under the argument limit.
+pub(crate) struct Invocation<'a> {
+    pub events: &'a EventDefs,
+    pub store: &'a WriteHandle,
+    pub keystore: Option<&'a KeyStore>,
+    /// The triggering event's position, and so the inclusive upper bound on the
+    /// fold. This is what makes the state deterministic: it is a function of the
+    /// log prefix and this position, not of how far the log had run by the time
+    /// the handler executed.
+    pub position: u64,
+    pub event: &'a Event,
+    pub env: &'a Envelope,
+    pub event_type: &'a str,
+    pub data: &'a Value,
+}
+
 /// Route one event through an effect's `handle` and run every arm whose clause selects
-/// it, in declaration order.
+/// it, in declaration order, each against the state its boundary folds.
 ///
 /// This is the dispatch half only. The durable half (journal, retry, completion) stays
 /// in [`try_invocation`], which is why the host arrives as a trait object: anything
 /// that can serve the impure builtins can drive a handler, including `kiln test`.
+///
+/// The fold is deliberately **not** journaled. It is derived from the log prefix and
+/// the triggering position, so every attempt and every replay reproduces it exactly;
+/// recording it would buy nothing and would freeze a point-in-time answer the way a
+/// journaled read once did.
 pub(crate) fn run_handle(
     loaded: &LoadedModule,
-    events: &EventDefs,
-    event: &Event,
-    env: &Envelope,
-    event_type: &str,
-    data: &Value,
+    inv: &Invocation<'_>,
     host: &dyn EffectHost,
 ) -> anyhow::Result<()> {
+    let events = inv.events;
     Module::with_temp_heap(|module| {
         let ctx = EffectCtx { host };
-        let handle_owned = loaded
-            .module
+        let frozen = &loaded.module;
+        let handle_owned = frozen
             .get_option("handle")?
             .ok_or_else(|| anyhow::anyhow!("effect has no handle map"))?;
         let handle = parse_event_dispatch(thaw(&handle_owned, &module))
@@ -565,34 +587,70 @@ pub(crate) fn run_handle(
         let selected: Vec<usize> = lowered
             .iter()
             .enumerate()
-            .filter(|(_, item)| arm_selects(item.as_ref(), event.as_ref()))
+            .filter(|(_, item)| arm_selects(item.as_ref(), inv.event.as_ref()))
             .map(|(index, _)| index)
             .collect();
         // No arm selects this event, so the effect has decided it needs no side
         // effect. The invocation still completes, so the cursor advances past it.
+        // Checked before the boundary, so an unselected event pays for no fold.
         if selected.is_empty() {
             return Ok(());
         }
         let value = alloc_event(
             &module,
-            env.event_id,
-            &env.timestamp,
-            event_type,
-            data,
-            events.get(event_type),
+            inv.env.event_id,
+            &inv.env.timestamp,
+            inv.event_type,
+            inv.data,
+            events.get(inv.event_type),
         );
+
+        // The boundary is scoped by the triggering event, so `query` takes it where a
+        // command's takes `input`.
+        let boundary = match frozen.get_option("query")? {
+            Some(func) => {
+                let result =
+                    call_handler_with_query_ctx(&module, thaw(&func, &module), &[value], MAX_TICKS)
+                        .map_err(|err| anyhow::anyhow!("query() failed: {err}"))?;
+                let specs =
+                    parse_event_specs(result).map_err(|err| anyhow::anyhow!("query() {err}"))?;
+                Some(dispatch::to_query(&specs, events, inv.keystore)?)
+            }
+            None => None,
+        };
+        let initial = initial_state(frozen, &module)
+            .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?;
+        let state = match &boundary {
+            Some(query) => {
+                dispatch::fold_boundary(
+                    &module,
+                    &dispatch::FoldInputs {
+                        frozen,
+                        store: inv.store,
+                        query,
+                        events,
+                        keystore: inv.keystore,
+                        upto: Some(inv.position),
+                    },
+                    initial,
+                )?
+                .0
+            }
+            None => initial,
+        };
+
         // Every selecting arm runs in declaration order, so a replay journals and
-        // replays the same call sequence.
+        // replays the same call sequence. Each sees the same state: the fold is of
+        // the log, not of what an earlier arm did.
         for index in selected {
             let arm = &handle.arms()[index];
-            call_handler_with_effect_ctx(&module, arm.func, &[value], MAX_TICKS, &ctx).map_err(
-                |err| {
+            call_handler_with_effect_ctx(&module, arm.func, &[value, state], MAX_TICKS, &ctx)
+                .map_err(|err| {
                     anyhow::anyhow!(
                         "{} failed: {err}",
                         handle.label("handle", arm.spec.as_ref())
                     )
-                },
-            )?;
+                })?;
         }
         Ok(())
     })
@@ -783,45 +841,6 @@ impl EffectHost for EffectHostImpl<'_> {
                 self.runtime
                     .execute_from_effect(name, input, &ctx, Some(&idempotency_key))?;
             Ok(json!({ "status": result.status, "body": result.body }))
-        })
-        .map_err(flatten_chain)
-    }
-
-    fn read(&self, projector: &str, entity: &str, key: &str) -> anyhow::Result<Value> {
-        let hash = call_hash(
-            "read",
-            &json!({ "projector": projector, "entity": entity, "key": key }),
-        );
-        self.journaled(&hash, |_| {
-            self.runtime.read_projector(projector, entity, key)
-        })
-        .map_err(flatten_chain)
-    }
-
-    fn scan(
-        &self,
-        projector: &str,
-        entity: &str,
-        filter: Option<(String, String)>,
-        cursor: Option<String>,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Value> {
-        let filter_json = filter
-            .as_ref()
-            .map(|(field, value)| json!({ "field": field, "value": value }));
-        let hash = call_hash(
-            "scan",
-            &json!({
-                "projector": projector,
-                "entity": entity,
-                "filter": filter_json,
-                "cursor": cursor,
-                "limit": limit,
-            }),
-        );
-        self.journaled(&hash, |_| {
-            self.runtime
-                .scan_projector(projector, entity, filter, cursor, limit)
         })
         .map_err(flatten_chain)
     }

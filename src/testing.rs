@@ -13,7 +13,8 @@
 //!   asserted as the plaintext a `GET /read/...` would return.
 //! - an **effect** runs its `handle` over each seeded event its keys select, served by
 //!   a [`TestEffectHost`] that stubs the responses the case declares and records the
-//!   calls made. `expect` is that call sequence.
+//!   calls made. `expect` is that call sequence. Its boundary folds the same seeded
+//!   log, so `given` is the state as well as the trigger.
 //!
 //! What a case does *not* cover is the machinery around a handler: batching,
 //! checkpoints, retry, the journal and replay. Those are the runtime's, and they are
@@ -23,7 +24,7 @@
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -50,8 +51,8 @@ use crate::projector::project_to_head;
 use crate::read_api;
 use crate::read_model::ReadModel;
 use crate::starlark_builtins::{
-    ConstructedEvent, EmittedEvent, EntityDef, EntityOpKind, InvalidInput, ModuleDef, Rejection,
-    check_registered_definition, events_from_value, runtime_builtins, scalar_to_string,
+    ConstructedEvent, EmittedEvent, InvalidInput, ModuleDef, Rejection,
+    check_registered_definition, events_from_value, runtime_builtins,
 };
 
 /// Throwaway per-case stores stay small, but the segment must still clear the
@@ -82,14 +83,11 @@ enum Target {
     Command { name: String, input: String },
     /// Project `given` into a fresh read model and read the rows back.
     Projector { name: String },
-    /// Run the effect's `handle` over `given`, serving `responds` to its HTTP calls
-    /// and `rows` to its projector reads.
+    /// Run the effect's `handle` over `given`, serving `responds` to its HTTP calls.
+    /// State comes from `given` too: the effect's boundary folds the same seeded log.
     Effect {
         name: String,
         responds: Vec<ResponseStub>,
-        /// Projector name to entity name to its rows, as the JSON wire form (a
-        /// `serde_json::Value` is not `Allocative`). Empty when the case declares none.
-        rows: String,
     },
 }
 
@@ -249,11 +247,9 @@ pub(crate) fn test_builtins(builder: &mut GlobalsBuilder) {
     /// - `projector`: `given` is projected into a fresh read model, and `expect` is a
     ///   dict of entity name to the rows the read API should return.
     /// - `effect`: `handle` runs over each `given` event, `responds` serves its HTTP
-    ///   calls in order, `rows` is what its `read`/`scan` of other projectors find,
-    ///   and `expect` is the list of `http_call(...)`, `command_call(...)` and
-    ///   `erase_call(...)` it should have made. `rows` is keyed projector, then
-    ///   entity: `rows = {"shops": {"shops": [{...}]}}`. Write subject columns as
-    ///   plaintext; the harness stores them encrypted and the read decrypts, as live.
+    ///   calls in order, and `expect` is the list of `http_call(...)`,
+    ///   `command_call(...)` and `erase_call(...)` it should have made. An effect's
+    ///   state needs nothing extra: its boundary folds the same seeded `given`.
     // One argument per authored keyword: all named, all optional bar `expect`, so
     // grouping them into a struct would move the surface rather than shrink it.
     #[allow(clippy::too_many_arguments)]
@@ -264,7 +260,6 @@ pub(crate) fn test_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] effect: Option<String>,
         #[starlark(require = named)] input: Option<Value<'v>>,
         #[starlark(require = named)] responds: Option<UnpackList<Value<'v>>>,
-        #[starlark(require = named)] rows: Option<Value<'v>>,
         #[starlark(require = named)] given: Option<UnpackList<Value<'v>>>,
         #[starlark(require = named)] name: Option<String>,
     ) -> anyhow::Result<TestCase> {
@@ -284,7 +279,7 @@ pub(crate) fn test_builtins(builder: &mut GlobalsBuilder) {
             }
             None => Vec::new(),
         };
-        let target = parse_target(command, projector, effect, input, responds, rows)?;
+        let target = parse_target(command, projector, effect, input, responds)?;
         let expect = parse_expectation(expect, &target)?;
         Ok(TestCase {
             name,
@@ -402,7 +397,6 @@ fn parse_target(
     effect: Option<String>,
     input: Option<Value<'_>>,
     responds: Option<UnpackList<Value<'_>>>,
-    rows: Option<Value<'_>>,
 ) -> anyhow::Result<Target> {
     let named: Vec<&str> = [
         command.as_ref().map(|_| "command"),
@@ -427,9 +421,6 @@ fn parse_target(
     }
     if responds.is_some() && kind != "effect" {
         anyhow::bail!("`responds` stubs an effect's http calls, so a {kind} case takes none");
-    }
-    if rows.is_some() && kind != "effect" {
-        anyhow::bail!("`rows` stubs an effect's projector reads, so a {kind} case takes none");
     }
     match (command, projector, effect) {
         (Some(name), _, _) => {
@@ -463,51 +454,10 @@ fn parse_target(
                 })
                 .transpose()?
                 .unwrap_or_default();
-            Ok(Target::Effect {
-                name,
-                responds,
-                rows: parse_rows(rows)?,
-            })
+            Ok(Target::Effect { name, responds })
         }
         _ => unreachable!("exactly one target was checked above"),
     }
-}
-
-/// Read the `rows = {...}` argument of an effect case: projector name to entity name
-/// to the rows that projector's read model holds.
-///
-/// Shape-checked here rather than at execution so a typo names the case that has it,
-/// and the two levels are checked separately: `{"plans": [...]}` (a list where an
-/// entity dict belongs) is the likely mistake and gets its own message.
-fn parse_rows(rows: Option<Value<'_>>) -> anyhow::Result<String> {
-    let Some(rows) = rows else {
-        return Ok(String::new());
-    };
-    let json = rows
-        .to_json_value()
-        .map_err(|err| anyhow::anyhow!("`rows` must be JSON-serialisable: {err}"))?;
-    let outer = json.as_object().ok_or_else(|| {
-        anyhow::anyhow!(
-            "`rows` must be a dict of projector name to its entities, got {}",
-            rows.get_type()
-        )
-    })?;
-    for (projector, entities) in outer {
-        let entities = entities.as_object().ok_or_else(|| {
-            anyhow::anyhow!(
-                "rows[`{projector}`] must be a dict of entity name to its rows, as in `{{\"{projector}\": {{\"my_entity\": [...]}}}}`"
-            )
-        })?;
-        for (entity, list) in entities {
-            let list = list.as_array().ok_or_else(|| {
-                anyhow::anyhow!("rows[`{projector}`][`{entity}`] must be a list of rows")
-            })?;
-            if let Some(bad) = list.iter().find(|row| !row.is_object()) {
-                anyhow::bail!("rows[`{projector}`][`{entity}`] must hold dicts, got {bad}");
-            }
-        }
-    }
-    Ok(json.to_string())
 }
 
 /// Read `expect` in the shape the case's target calls for.
@@ -787,19 +737,13 @@ fn execute_case(project: &LoadedProject, case: &TestCase) -> anyhow::Result<Outc
                 .ok_or_else(|| anyhow::anyhow!("no projector named `{name}`"))?;
             run_projector_case(&seeded, projector, events).map(Outcome::Rows)
         }
-        Target::Effect {
-            name,
-            responds,
-            rows,
-        } => {
+        Target::Effect { name, responds } => {
             let effect = project
                 .effects
                 .iter()
                 .find(|unit| unit.loaded.def.name() == name)
                 .ok_or_else(|| anyhow::anyhow!("no effect named `{name}`"))?;
-            let dir = tempfile::tempdir().context("creating temp read models")?;
-            let models = seed_models(project, dir.path(), rows, &seeded.keystore)?;
-            run_effect_case(&seeded, effect, events, responds, &models).map(Outcome::Calls)
+            run_effect_case(&seeded, effect, events, responds).map(Outcome::Calls)
         }
     };
     seeded.coordinator.shutdown();
@@ -868,142 +812,18 @@ fn run_projector_case(
     Ok(out)
 }
 
-/// Build one temp read model per projector in the project, seeded with whatever the
-/// case declared in `rows`.
-///
-/// Every projector gets a model, not only the declared ones, so an undeclared
-/// projector reads as empty (what a live effect sees before its projector has caught
-/// up) while a projector name the case got wrong still fails by name.
-fn seed_models(
-    project: &LoadedProject,
-    dir: &Path,
-    rows: &str,
-    keystore: &KeyStore,
-) -> anyhow::Result<Vec<SeededModel>> {
-    let declared: serde_json::Map<String, serde_json::Value> = if rows.is_empty() {
-        serde_json::Map::new()
-    } else {
-        serde_json::from_str(rows).context("parsing the case rows")?
-    };
-    let mut models = Vec::with_capacity(project.projectors.len());
-    for unit in &project.projectors {
-        let ModuleDef::Projector { name, entities, .. } = &unit.loaded.def else {
-            continue;
-        };
-        let path = dir.join(format!("{name}.db"));
-        let model = ReadModel::open(&path, entities)
-            .with_context(|| format!("opening a temp read model for `{name}`"))?;
-        if let Some(by_entity) = declared.get(name).and_then(serde_json::Value::as_object) {
-            for (entity_name, list) in by_entity {
-                let def = read_api::find_entity(entities, entity_name).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "rows[`{name}`]: no entity `{entity_name}` in projector `{name}`"
-                    )
-                })?;
-                for row in list.as_array().into_iter().flatten() {
-                    let stored = encrypt_row(def, row, keystore)
-                        .with_context(|| format!("rows[`{name}`][`{entity_name}`]"))?;
-                    model
-                        .apply_one(def, EntityOpKind::Put(stored.to_string()))
-                        .with_context(|| format!("seeding rows[`{name}`][`{entity_name}`]"))?;
-                }
-            }
-        }
-        drop(model);
-        models.push(SeededModel {
-            projector: name.clone(),
-            path,
-            entities: entities.clone(),
-        });
-    }
-    for projector in declared.keys() {
-        if !models.iter().any(|model| &model.projector == projector) {
-            anyhow::bail!("rows names `{projector}`, which is not a projector in this project");
-        }
-    }
-    Ok(models)
-}
-
-/// Encrypt a declared row's subject columns, so a seeded row is stored the way a
-/// projector would have stored it and the read path decrypts it back.
-///
-/// A case writes plaintext, which is the whole point: the ciphertext is an artefact
-/// of storage and never appears in a scenario.
-fn encrypt_row(
-    entity: &EntityDef,
-    row: &serde_json::Value,
-    keystore: &KeyStore,
-) -> anyhow::Result<serde_json::Value> {
-    let mut out = row
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("a row must be a dict"))?
-        .clone();
-    for (field, meta) in &entity.fields {
-        let Some(subject_field) = &meta.subject else {
-            continue;
-        };
-        let Some(value) = out.get(field).filter(|value| !value.is_null()) else {
-            continue;
-        };
-        let plaintext = scalar_to_string(value)
-            .ok_or_else(|| anyhow::anyhow!("subject field `{field}` must be a scalar"))?;
-        let subject_value = out.get(subject_field).and_then(scalar_to_string).ok_or_else(|| {
-            anyhow::anyhow!(
-                "row sets `{field}`, which is scoped to `{subject_field}`, but gives no `{subject_field}`"
-            )
-        })?;
-        let ciphertext =
-            keystore.encrypt_subject(subject_field, &subject_value, field, &plaintext)?;
-        out.insert(field.clone(), serde_json::Value::String(ciphertext));
-    }
-    Ok(serde_json::Value::Object(out))
-}
-
 /// Serves an effect's impure builtins from a case's declarations and records every
 /// external call it makes.
 ///
 /// There is no journal: a case runs a handler once, so there is nothing to replay.
-/// `read` and `scan` go through the real [`read_api`] against read models built from
-/// the case's `rows`, so key lookup, index validation, ordering, cursor paging and
-/// subject decryption behave exactly as they do live; a projector the case does not
-/// declare rows for is an empty model, the same answer a live effect gets for a row
-/// its projector has not built yet.
+/// The host serves only the genuinely impure builtins; state reaches the handler
+/// through its boundary, folded off the same seeded log the case built from `given`.
 struct TestEffectHost<'a> {
     keystore: &'a KeyStore,
     responds: &'a [ResponseStub],
     /// Advanced per HTTP call, so `responds` is consumed in the order made.
     served: Cell<usize>,
     calls: RefCell<Vec<MadeCall>>,
-    /// One entry per projector in the project: its temp read model and entities.
-    models: &'a [SeededModel],
-}
-
-/// A projector's read model as a case declared it.
-struct SeededModel {
-    projector: String,
-    path: PathBuf,
-    entities: Vec<EntityDef>,
-}
-
-impl TestEffectHost<'_> {
-    /// Resolve `(projector, entity)` the way the runtime does, so a name a case got
-    /// wrong fails with the message the live builtin would give.
-    fn entity(
-        &self,
-        what: &str,
-        projector: &str,
-        entity: &str,
-    ) -> anyhow::Result<(&Path, &EntityDef)> {
-        let model = self
-            .models
-            .iter()
-            .find(|model| model.projector == projector)
-            .ok_or_else(|| anyhow::anyhow!("{what}: no projector `{projector}`"))?;
-        let def = read_api::find_entity(&model.entities, entity).ok_or_else(|| {
-            anyhow::anyhow!("{what}: no entity `{entity}` in projector `{projector}`")
-        })?;
-        Ok((&model.path, def))
-    }
 }
 
 impl EffectHost for TestEffectHost<'_> {
@@ -1061,47 +881,6 @@ impl EffectHost for TestEffectHost<'_> {
         Ok(serde_json::json!({ "status": 200, "body": serde_json::Value::Null }))
     }
 
-    fn read(&self, projector: &str, entity: &str, key: &str) -> anyhow::Result<serde_json::Value> {
-        let (path, def) = self.entity("read()", projector, entity)?;
-        let (row, _position) = read_api::get_one(path, def, key, Some(self.keystore))?;
-        Ok(row.unwrap_or(serde_json::Value::Null))
-    }
-
-    fn scan(
-        &self,
-        projector: &str,
-        entity: &str,
-        filter: Option<(String, String)>,
-        cursor: Option<String>,
-        limit: Option<usize>,
-    ) -> anyhow::Result<serde_json::Value> {
-        let (path, def) = self.entity("scan()", projector, entity)?;
-        // The same check the runtime makes, so a case fails on the filter it would
-        // fail on live rather than quietly scanning the table.
-        if let Some((field, _)) = &filter
-            && !read_api::is_filterable(def, field)
-        {
-            anyhow::bail!("scan(): filter field `{field}` is not indexed on entity `{entity}`");
-        }
-        let after = cursor
-            .map(|raw| read_api::decode_cursor(&raw))
-            .transpose()?;
-        let filter = filter
-            .as_ref()
-            .map(|(field, value)| (field.as_str(), value.as_str()));
-        let page = read_api::scan(
-            path,
-            def,
-            filter,
-            after.as_deref(),
-            limit
-                .unwrap_or(read_api::DEFAULT_LIMIT)
-                .min(read_api::MAX_LIMIT),
-            Some(self.keystore),
-        )?;
-        Ok(serde_json::json!({ "items": page.items, "next_cursor": page.next_cursor }))
-    }
-
     fn now(&self) -> anyhow::Result<String> {
         Ok(TEST_NOW.to_owned())
     }
@@ -1141,36 +920,42 @@ impl EffectHost for TestEffectHost<'_> {
 ///
 /// Events are read back out of the store rather than replayed from `given`, so an arm
 /// matches against the same lowered `QueryItem` and the same encrypted tags the live
-/// subscription would see.
+/// subscription would see. That same store is what an effect's boundary folds, so
+/// `given` is both the trigger and the state with nothing further to declare.
 fn run_effect_case(
     seeded: &Seeded,
     effect: &EffectUnit,
     events: &EventDefs,
     responds: &[ResponseStub],
-    models: &[SeededModel],
 ) -> anyhow::Result<Vec<MadeCall>> {
     let host = TestEffectHost {
         keystore: &seeded.keystore,
         responds,
         served: Cell::new(0),
         calls: RefCell::new(Vec::new()),
-        models,
     };
+    let mut positions = Vec::new();
     let mut reads = seeded.store.read(&Query::All, Position::ZERO, None);
     while let Some(item) = reads.next() {
         let seq = item.map_err(|err| anyhow::anyhow!("reading seeded events: {err}"))?;
-        let (envelope, data) = envelope::decode(seq.event.data())
+        positions.push((seq.position.get(), seq.event.to_owned()));
+    }
+    // Collected first: the fold opens its own read of the same store, and holding the
+    // outer lending iterator across it would borrow the store twice.
+    for (position, event) in &positions {
+        let (envelope, data) = envelope::decode(event.data())
             .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-        let event = seq.event.to_owned();
-        effect::run_handle(
-            &effect.loaded,
+        let inv = effect::Invocation {
             events,
-            &event,
-            &envelope,
-            event.event_type(),
-            &data,
-            &host,
-        )?;
+            store: &seeded.store,
+            keystore: Some(&seeded.keystore),
+            position: *position,
+            event,
+            env: &envelope,
+            event_type: event.event_type(),
+            data: &data,
+        };
+        effect::run_handle(&effect.loaded, &inv, &host)?;
     }
     Ok(host.calls.into_inner())
 }

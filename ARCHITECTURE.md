@@ -147,16 +147,15 @@ else is a dict read by subscript.
 Dot: `input` and `event.data`, built from a declared field schema (`input.email`,
 `event.data.email`), where a field the schema does not declare is a shape error and one the payload
 omits reads as `None`. `event.id` sits beside them, so an event that declares its own `id` field
-keeps it at `event.data.id`. Also the three fixed-shape wrappers an effect gets back: `http.*` returns
-`{status, body, headers}`, `invoke_command` returns `{status, body}`, and `scan` returns
-`{items, next_cursor}`.
+keeps it at `event.data.id`. Also the two fixed-shape wrappers an effect gets back: `http.*` returns
+`{status, body, headers}` and `invoke_command` returns `{status, body}`.
 
-Subscript: values a handler builds itself, a command's folded `state` and a `put()` row, because
-there is no declared shape to check them against. Also the *contents* of the wrappers above, which
-the host cannot promise a shape for: a response `body` is parsed JSON when the bytes parse and a
-string otherwise, `headers` is keyed by arbitrary header names, and `items` is a list of rows.
+Subscript: values a handler builds itself, a folded `state` (in a command or an effect) and a
+`put()` row, because there is no declared shape to check them against. Also the *contents* of the
+wrappers above, which the host cannot promise a shape for: a response `body` is parsed JSON when the
+bytes parse and a string otherwise, and `headers` is keyed by arbitrary header names.
 
-A read-model row from `get()` or `read()` stays a dict for a second reason: `put()` takes a dict, so
+A read-model row from `get()` stays a dict for a second reason: `put()` takes a dict, so
 read-modify-write has to round-trip without a conversion in between.
 
 **Envelope**: the tephra payload is a JSON envelope wrapping `data` with an `event_id`,
@@ -442,13 +441,24 @@ belonging to a permanently wedged or removed effect, are kept past the window un
 over them.
 
 **Builtins (v1)**: journaled `http.{get,post,...}`; `invoke_command(name, input)` targeting a public
-or internal command; `now()`; `log()`; `reveal()` and `erase()` (section 15); and a journaled
-`read(projector, entity, key)` plus filter/scan variant, so effects query read models instead of keeping a local database. There is no
-effect-local SQLite: durable state is the journal plus events written through commands. Whether
-`read()` is journaled is a deliberate tradeoff. Journaling it (the chosen default) gives full replay
-determinism, so a replayed effect makes the same decisions it originally made, at the cost of seeing
-point-in-time-stale data. Not journaling it would give fresh data at replay time but let replay
-diverge from the original run. kiln journals `read()` for consistency with the rest of the model.
+or internal command; `now()`; `log()`; `reveal()` and `erase()` (section 15). Every one is a real
+side effect or an unrepeatable observation, which is what earns it a journal entry. There is no
+effect-local SQLite and no way to read a projector.
+
+**State**: an effect declares `query` / `initial` / `fold` exactly as a command does, with `query`
+taking the triggering event where a command's takes `input`, and each `handle` arm receiving
+`(event, state)`. The fold is bounded at the effect's own position, inclusive, so `state` is a pure
+function of the log prefix and that position.
+
+That bound is the whole design. Because the state is derived rather than observed, it cannot race a
+projector, it is identical on every attempt and every replay, and it needs no journal entry: there
+is nothing to record that re-folding would not reproduce. An earlier design gave effects a journaled
+`read(projector, entity, key)`, which forced a choice between replay determinism and fresh data and
+resolved it badly: a read that missed because a projector was behind journaled `null`, and every
+retry then replayed that null, so a transient lag became a permanent wedge only an operator skip
+could clear. Folding the log has no such failure mode. Its cost is that a wide boundary is re-folded
+per invocation, and effects are sequential, so that comes off throughput; a boundary keyed on an
+entity id is as important here as it is for a command.
 
 **Writing outcomes**: effects do not append events; they `invoke_command`, and that invoke is a
 journaled, idempotent side effect, so durable domain facts (tracking numbers, external ids) land

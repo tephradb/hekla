@@ -288,7 +288,7 @@ fn goto_definition_on_a_builtin_reaches_a_generated_stub() {
         ("events/order.star", ORDER_EVENTS),
         (
             "effects/notify.star",
-            "load(\"events/order.star\", \"order_placed\")\n\ndef on_placed(event):\n    http.post(url = \"https://example.test\")\n\nhandle = {order_placed(): on_placed}\n",
+            "load(\"events/order.star\", \"order_placed\")\n\ndef on_placed(event, state):\n    http.post(url = \"https://example.test\")\n\nhandle = {order_placed(): on_placed}\n",
         ),
     ]);
     let mut lsp = Lsp::start(dir.path());

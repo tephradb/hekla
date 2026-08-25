@@ -25,15 +25,19 @@
 
 use starlark::environment::{FrozenModule, Module};
 use starlark::values::OwnedFrozenValue;
+use uuid::Uuid;
 
 use crate::loader::{EventRegistry, Finding, LoadedProject};
 use crate::starlark_builtins::{
-    EventDef, EventSpec, FieldKind, InputSchema, ModuleDef, alloc_input,
+    EventDef, EventSpec, FieldKind, InputSchema, ModuleDef, alloc_event, alloc_input,
     call_handler_with_query_ctx, parse_event_dispatch, parse_event_specs, thaw,
 };
 
 /// Instruction budget for evaluating a `query` during the check.
 const MAX_TICKS: u64 = 10_000_000;
+/// The `event.timestamp` a placeholder event carries, matching what `kiln test` pins
+/// so an author sees one fixed clock across the check and their scenarios.
+const STUB_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 /// Field-name substrings that suggest personal data. A field whose name contains one
 /// of these but declares no `subject` is warned about, because a value appended
@@ -102,7 +106,7 @@ pub fn check_module(
         }
         // `sources` on the ModuleDef is `handle`'s keys, so checking the map covers
         // the subscription too; validating both would report each clause twice.
-        ModuleDef::Projector { .. } | ModuleDef::Effect { .. } => check_dispatch(
+        ModuleDef::Projector { .. } => check_dispatch(
             module,
             "handle",
             Context::Handle,
@@ -111,6 +115,18 @@ pub fn check_module(
             rel,
             &mut findings,
         ),
+        ModuleDef::Effect { sources, .. } => {
+            check_dispatch(
+                module,
+                "handle",
+                Context::Handle,
+                None,
+                events,
+                rel,
+                &mut findings,
+            );
+            check_effect_boundary(sources, module, rel, events, &mut findings);
+        }
     }
     findings
 }
@@ -221,6 +237,79 @@ fn check_command(
     );
 }
 
+/// Check an effect's boundary and its fold dispatch, the mirror of [`check_command`].
+///
+/// The difference is where the placeholder comes from. A command's `query` takes
+/// `input`, so there is one schema to stub; an effect's takes the triggering event,
+/// and its `handle` keys may name several types, so `query` is evaluated once per
+/// subscribed type and the clauses are unioned. A type whose evaluation fails is a
+/// warning for the same reason it is on a command: the placeholder may be the problem.
+fn check_effect_boundary(
+    sources: &[EventSpec],
+    module: &FrozenModule,
+    rel: &str,
+    events: &EventRegistry,
+    findings: &mut Vec<Finding>,
+) {
+    let query_fn = match module.get_option("query") {
+        Ok(None) => {
+            if matches!(module.get_option("fold"), Ok(Some(_))) {
+                findings.push(Finding::warning(
+                    rel,
+                    "effect defines `fold` but no `query`, so there is no boundary to fold and handle() only ever sees `initial`; add a query(), or drop `fold`".to_owned(),
+                ));
+            }
+            return;
+        }
+        Ok(Some(func)) => func,
+        Err(err) => {
+            findings.push(Finding::error(rel, format!("reading query(): {err}")));
+            return;
+        }
+    };
+    // Unlike a command, whose `query` still guards the append, an effect never
+    // appends. A boundary with nothing folding it is read and discarded.
+    if !matches!(module.get_option("fold"), Ok(Some(_))) {
+        findings.push(Finding::warning(
+            rel,
+            "effect defines `query` but no `fold`, so the boundary is read and discarded and handle() only ever sees `initial`; add a fold, or drop `query`".to_owned(),
+        ));
+    }
+
+    let mut declared: Vec<EventSpec> = Vec::new();
+    for source in sources {
+        // `all_events()` names no type, so there is no shape to build a placeholder
+        // from; that effect's `query` is checked at runtime only.
+        let EventSpec::Filter { event_type, .. } = source else {
+            continue;
+        };
+        let Some(def) = events.by_type.get(event_type) else {
+            continue; // Already reported by the `handle` pass.
+        };
+        match evaluate_effect_query(def, &query_fn) {
+            Ok(specs) => {
+                validate_specs(&specs, events, rel, Context::Query, findings);
+                declared.extend(specs);
+            }
+            Err(err) => findings.push(Finding::warning(
+                rel,
+                format!(
+                    "could not statically evaluate query() with a placeholder `{event_type}`: {err:#}"
+                ),
+            )),
+        }
+    }
+    check_dispatch(
+        module,
+        "fold",
+        Context::Fold,
+        Some(&declared),
+        events,
+        rel,
+        findings,
+    );
+}
+
 /// Validate a dispatch map's keys, and for a command cross-check them against the
 /// boundary.
 ///
@@ -316,6 +405,33 @@ fn evaluate_query(
         let input = alloc_input(&module, schema, &stub)?;
         let func = thaw(query_fn, &module);
         let result = call_handler_with_query_ctx(&module, func, &[input], MAX_TICKS)
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        parse_event_specs(result)
+    })
+}
+
+/// Evaluate an effect's `query` against a placeholder event of one subscribed type.
+///
+/// The same three calls the effect runtime makes, which is what keeps the check and
+/// the runtime from disagreeing about what a clause means. The placeholder is built
+/// from the event's own declared fields, so a `query` reading `event.data.shop_id`
+/// resolves; a subject field arrives as a handle here exactly as it does live.
+fn evaluate_effect_query(
+    def: &EventDef,
+    query_fn: &OwnedFrozenValue,
+) -> anyhow::Result<Vec<EventSpec>> {
+    Module::with_temp_heap(|module| {
+        let stub = stub_event_payload(def);
+        let event = alloc_event(
+            &module,
+            Uuid::nil(),
+            STUB_TIMESTAMP,
+            &def.event_type,
+            &stub,
+            Some(def),
+        );
+        let func = thaw(query_fn, &module);
+        let result = call_handler_with_query_ctx(&module, func, &[event], MAX_TICKS)
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         parse_event_specs(result)
     })
@@ -489,6 +605,15 @@ fn stub_payload(schema: &InputSchema) -> serde_json::Value {
     let mut obj = serde_json::Map::with_capacity(schema.fields.len());
     for (name, kind) in &schema.fields {
         obj.insert(name.clone(), stub_value(kind));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// The event-shaped counterpart of [`stub_payload`], for an effect's `query`.
+fn stub_event_payload(def: &EventDef) -> serde_json::Value {
+    let mut obj = serde_json::Map::with_capacity(def.fields.len());
+    for (name, meta) in &def.fields {
+        obj.insert(name.clone(), stub_value(&meta.kind));
     }
     serde_json::Value::Object(obj)
 }
