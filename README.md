@@ -1,4 +1,4 @@
-# hekla
+# 🌋 hekla
 
 A single-app event-sourcing runtime you write in Starlark, over the Dynamic Consistency Boundary.
 
