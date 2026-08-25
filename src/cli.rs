@@ -2,7 +2,7 @@
 //!
 //! `check` (thorough static analysis) and `fmt` (whitespace normalisation) are
 //! toolchain commands; `serve` runs the command runtime and HTTP API, and `test`
-//! runs the command scenarios under `tests/`. `rotate` and `erase` are the
+//! runs the scenarios under `tests/`. `rotate` and `erase` are the
 //! operational key commands: rewrapping subject keys under a new master, and
 //! irreversibly deleting one subject's key.
 
@@ -77,7 +77,7 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Run the command scenarios under `tests/`.
+    /// Run the scenarios under `tests/`, covering commands, projectors and effects.
     Test {
         /// The project directory.
         #[arg(default_value = ".")]
