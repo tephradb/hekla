@@ -1884,7 +1884,11 @@ fn http_dispatch<'v>(
     let (url, headers, body) = parse_http_args(method, kwargs)?;
     let host = effect_host(eval, &format!("http.{}()", method.to_ascii_lowercase()))?;
     let result = host.http(method, &url, headers, body)?;
-    Ok(eval.heap().alloc(result))
+    Ok(alloc_fixed(
+        eval.heap(),
+        &result,
+        &["status", "body", "headers"],
+    ))
 }
 
 /// Builtins available only to effects: the impure, journaled capabilities. Each
@@ -1938,7 +1942,7 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
         })?;
         let host = effect_host(eval, "invoke_command()")?;
         let result = host.invoke_command(&name, input_json)?;
-        Ok(eval.heap().alloc(result))
+        Ok(alloc_fixed(eval.heap(), &result, &["status", "body"]))
     }
 
     fn read<'v>(
@@ -1973,7 +1977,7 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
         };
         let host = effect_host(eval, "scan()")?;
         let result = host.scan(&projector, &entity, filter, cursor, limit)?;
-        Ok(eval.heap().alloc(result))
+        Ok(alloc_fixed(eval.heap(), &result, &["items", "next_cursor"]))
     }
 }
 
@@ -2102,6 +2106,31 @@ pub fn alloc_input<'v>(
         fields.push((name.as_str(), value));
     }
     Ok(module.heap().alloc(AllocStruct(fields)))
+}
+
+/// Wrap a host-built result whose shape is fixed (an HTTP response, a command outcome,
+/// a scan page) as a struct, so it reads with a dot like `input` and `event.data`.
+///
+/// The keys are written at the call site rather than read off the value, so a field the
+/// host omitted still reads as `None` instead of vanishing, the way an absent optional
+/// does on `input`. Nested values stay as they come: a response body is a dict or a
+/// string depending on what parsed, and a scan's `items` is a list of row dicts.
+///
+/// A read-model row is deliberately *not* wrapped, here or in `get()`: `put()` takes a
+/// dict, so `get()` then `put()` has to round-trip without a conversion in between.
+fn alloc_fixed<'v>(heap: Heap<'v>, result: &serde_json::Value, keys: &[&'static str]) -> Value<'v> {
+    let empty = serde_json::Map::new();
+    let obj = result.as_object().unwrap_or(&empty);
+    let fields: Vec<(&str, Value<'v>)> = keys
+        .iter()
+        .map(|key| {
+            let value = obj
+                .get(*key)
+                .map_or_else(Value::new_none, |value| heap.alloc(value.clone()));
+            (*key, value)
+        })
+        .collect();
+    heap.alloc(AllocStruct(fields))
 }
 
 /// Build the `event` struct passed to `fold` and to a projector/effect `handle`:

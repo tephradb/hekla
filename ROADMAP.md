@@ -310,6 +310,13 @@ one spelling for one meaning is worth more than the convenience of either altern
   is caught at check time. The guardrails differ by position because the lowering does: a `fold` key
   is lowered with the command's keystore like `query`, a `handle` key with none, so only the first
   can filter a subject-scoped field.
+- **The dot now covers every fixed-shape host value.** Phase 7 gave `event.data` dot access on the
+  rule that a host-built value with a declared shape earns it, but left three wrappers behind as
+  dicts: `http.*`'s `{status, body, headers}`, `invoke_command`'s `{status, body}`, and `scan`'s
+  `{items, next_cursor}`. All three are structs now. Their *contents* stay subscripted, which is the
+  same rule rather than an exception: a response `body` is parsed JSON or a string depending on what
+  arrived, `headers` is keyed by arbitrary names, and `items` is a list of rows. A read-model row
+  stays a dict for the reason Phase 7 recorded, that `put()` takes one.
 - **`kiln check` says each thing once.** With the keys doubling as the subscription, an unregistered
   type used to be reported twice, once by the clause validation and once by the dispatch check. The
   dispatch check now keeps only what is genuinely its own: a key built by calling `event(...)` inline,

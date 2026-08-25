@@ -92,7 +92,7 @@ forgotten from the tag list was unqueryable forever (and adding it later missed 
 
 The scalar types deliberately reuse Starlark's builtin names, shadowing the standard `str`, `int`
 and `bool` globals. One rule keeps both meanings reachable: **a positional argument means Starlark's
-conversion, and no positional argument means a field declaration.** So `str(response["status"])`
+conversion, and no positional argument means a field declaration.** So `str(response.status)`
 converts and `str(max_length = 200)` declares. This works because every standard conversion is
 positional-only while every field option (`indexed`, `subject`, `unique`, `max_length`) is
 named-only, and passing both at once is an error rather than a silent drop. The cost is one idiom:
@@ -140,11 +140,22 @@ to a loaded definition by a second name is the same definition and keeps working
 check runs at load time, so a module-scope redeclaration outside `events/` is a `kiln check` error
 rather than a runtime one.
 
-**Payload access**: `input` and `event.data` are host-built from a declared field schema and read with
-dot access (`input.email`, `event.data.email`); a field the schema does not declare is a shape error,
-and one the payload omits reads as `None`. Values a handler builds itself, a command's folded `state`
-and a `put()` row, stay dicts read by subscript, because there is no declared shape to check them
-against.
+**Payload access**: a host-built value with a fixed shape is read with **dot access**, and everything
+else is a dict read by subscript.
+
+Dot: `input` and `event.data`, built from a declared field schema (`input.email`,
+`event.data.email`), where a field the schema does not declare is a shape error and one the payload
+omits reads as `None`. Also the three fixed-shape wrappers an effect gets back: `http.*` returns
+`{status, body, headers}`, `invoke_command` returns `{status, body}`, and `scan` returns
+`{items, next_cursor}`.
+
+Subscript: values a handler builds itself, a command's folded `state` and a `put()` row, because
+there is no declared shape to check them against. Also the *contents* of the wrappers above, which
+the host cannot promise a shape for: a response `body` is parsed JSON when the bytes parse and a
+string otherwise, `headers` is keyed by arbitrary header names, and `items` is a list of rows.
+
+A read-model row from `get()` or `read()` stays a dict for a second reason: `put()` takes a dict, so
+read-modify-write has to round-trip without a conversion in between.
 
 **Envelope**: the tephra payload is a JSON envelope wrapping `data` with `correlation_id`,
 `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The host stamps these

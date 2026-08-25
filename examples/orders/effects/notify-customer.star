@@ -11,7 +11,7 @@ def notify(event):
         url = "https://mail.example/confirm",
         body = {"to": email, "order_id": event.data.order_id},
     )
-    if response["status"] >= 400:
-        log("confirmation rejected with status " + str(response["status"]))
+    if response.status >= 400:
+        log("confirmation rejected with status " + str(response.status))
 
 handle = {order_placed(): notify}

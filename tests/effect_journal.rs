@@ -444,8 +444,8 @@ def on_event(event):
     page = scan("users", "users", field = "email", value = row["email"], limit = 10)
     http.post(url = "https://a.test/sync", body = {
         "name": row["name"],
-        "found": len(page["items"]),
-        "cursor": page["next_cursor"],
+        "found": len(page.items),
+        "cursor": page.next_cursor,
     })
 
 handle = {user_activated(): on_event}
@@ -491,6 +491,152 @@ fn an_effect_reads_and_scans_a_projector_and_journals_the_results() {
     assert_eq!(rows[1].2["next_cursor"], Value::Null);
     assert_eq!(rows[2].2["status"], 200);
 
+    harness.shutdown();
+}
+
+// --- host-built wrappers read with a dot -----------------------------------
+
+/// Reads every field of the response struct and echoes what it saw, so the assertion
+/// below pins the shape rather than just that a dot parsed.
+const RESPONSE_SHAPE: &str = r#"
+load("events/user.star", "user_registered")
+
+def on_event(event):
+    response = http.post(url = "https://a.test/first", body = {"x": 1})
+    http.post(url = "https://a.test/echo", body = {
+        "status": response.status,
+        "ok": response.body["ok"],
+        "kind": response.headers["content-type"][0],
+    })
+
+handle = {user_registered(): on_event}
+"#;
+
+/// `{status, body, headers}` is host-built with a fixed shape, so it reads with a dot
+/// like `input` and `event.data`. `body` and `headers` stay subscripted inside: a body
+/// is whatever parsed, and a header name is not an attribute.
+#[test]
+fn an_http_response_reads_its_fixed_fields_with_a_dot() {
+    let dir = project(RESPONSE_SHAPE);
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::new(|_n, _req| {
+        Ok(HttpResponse {
+            status: 201,
+            body: br#"{"ok": true}"#.to_vec(),
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+        })
+    }));
+    let harness = boot(dir.path(), data.path(), stub.clone());
+
+    register(&harness.rt, ALICE);
+    wait_up_to(Duration::from_secs(30), "the echo call", || {
+        calls_ending(&stub, "/echo") == 1
+    });
+
+    let echoed = post_body(&stub, "/echo");
+    assert_eq!(echoed["status"], 201);
+    assert_eq!(echoed["ok"], true);
+    assert_eq!(echoed["kind"], "application/json");
+    harness.shutdown();
+}
+
+/// A body that is not JSON reads back as a string, so the struct field is a union and
+/// the dot does not imply a declared type the way an event field's does.
+#[test]
+fn a_non_json_response_body_reads_as_a_string() {
+    let dir = project(
+        r#"
+load("events/user.star", "user_registered")
+
+def on_event(event):
+    response = http.post(url = "https://a.test/first", body = {"x": 1})
+    http.post(url = "https://a.test/echo", body = {"body": response.body})
+
+handle = {user_registered(): on_event}
+"#,
+    );
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::new(|_n, _req| {
+        Ok(HttpResponse {
+            status: 200,
+            body: b"not json".to_vec(),
+            headers: Vec::new(),
+        })
+    }));
+    let harness = boot(dir.path(), data.path(), stub.clone());
+
+    register(&harness.rt, ALICE);
+    wait_up_to(Duration::from_secs(30), "the echo call", || {
+        calls_ending(&stub, "/echo") == 1
+    });
+    assert_eq!(post_body(&stub, "/echo")["body"], "not json");
+    harness.shutdown();
+}
+
+/// A field the struct does not carry is an attribute error naming it, which a dict
+/// `invoke_command` returns `{status, body}`, the third host-built wrapper with a fixed
+/// shape, so it reads with a dot too. Its `body` stays subscripted: that is the
+/// command's own response payload, with no shape the host can promise.
+#[test]
+fn an_invoke_command_outcome_reads_its_fields_with_a_dot() {
+    let dir = support::write_project(&[
+        ("events/user.star", USER_EVENTS),
+        ("commands/register-user.star", REGISTER_USER),
+        ("commands/activate-user.star", ACTIVATE_USER),
+        (
+            "effects/notify.star",
+            r#"
+load("events/user.star", "user_registered")
+
+def on_event(event):
+    outcome = invoke_command("activate-user", {"user_id": event.data.user_id})
+    http.post(url = "https://a.test/echo", body = {
+        "status": outcome.status,
+        "type": outcome.body["events"][0]["type"],
+    })
+
+handle = {user_registered(): on_event}
+"#,
+        ),
+    ]);
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::ok());
+    let harness = boot(dir.path(), data.path(), stub.clone());
+
+    register(&harness.rt, ALICE);
+    wait_up_to(Duration::from_secs(30), "the echo call", || {
+        calls_ending(&stub, "/echo") == 1
+    });
+
+    let echoed = post_body(&stub, "/echo");
+    assert_eq!(echoed["status"], 200);
+    assert_eq!(echoed["type"], "user.activated");
+    harness.shutdown();
+}
+
+/// subscript could not do as precisely: the misspelling is the message.
+#[test]
+fn an_unknown_response_field_names_itself() {
+    let dir = project(
+        r#"
+load("events/user.star", "user_registered")
+
+def on_event(event):
+    response = http.post(url = "https://a.test/first", body = {"x": 1})
+    log(str(response.stauts))
+
+handle = {user_registered(): on_event}
+"#,
+    );
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::ok());
+    let harness = boot(dir.path(), data.path(), stub.clone());
+
+    register(&harness.rt, ALICE);
+    wait_for_failures(&harness, 1);
+
+    let error = harness.rt.effect(EFFECT).unwrap().last_error().unwrap();
+    assert!(error.contains("stauts"), "{error}");
     harness.shutdown();
 }
 

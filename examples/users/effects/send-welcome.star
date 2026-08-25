@@ -14,8 +14,8 @@ def send_welcome(event):
         url = "https://example.test/welcome",
         body = {"email": event.data.email},
     )
-    if response["status"] >= 400:
-        log("welcome email rejected with status " + str(response["status"]))
+    if response.status >= 400:
+        log("welcome email rejected with status " + str(response.status))
         return
     invoke_command("record-welcome", {"user_id": event.data.user_id})
 
