@@ -626,9 +626,9 @@ toolchain, no compile cache, parse-and-freeze in milliseconds.
 
 ## 13. Non-goals
 
-**Deferred** (see the roadmap, each with a trigger): encryption and crypto-shredding; metrics and
-Prometheus; partition-key parallel effect lanes; an upload API with versioning, pinning, and
-retention; hot reload; a fold library; a workspace crate split.
+**Deferred** (see the roadmap, each with a trigger): metrics and Prometheus; partition-key parallel
+effect lanes; an upload API with versioning, pinning, and retention, plus hot reload; a fold
+library; a workspace crate split.
 
 **Permanent commitments** (not deferrals, and not to be reopened): Starlark is the only authoring
 surface. There is no Rust, TypeScript, or WASM SDK path now or later. This is deliberate: a single

@@ -571,7 +571,6 @@ warranted.
   script hash for this.
 - **Partition-key parallel effect lanes**: when a single effect's throughput on slow APIs hurts. The
   checkpoint format (watermark plus completed-set) already supports it.
-- **Encryption and crypto-shredding**: when PII-at-rest requirements land.
 - **Metrics and Prometheus**: when there is something to operate at scale.
 - **Fold library** (`event_counter`, `latest_event`, `toggle`): only after roughly fifteen real
   commands exist, and only if it compiles down to the existing `query` / `fold` shape rather than
