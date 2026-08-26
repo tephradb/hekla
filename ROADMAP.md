@@ -749,6 +749,162 @@ is the price of the freeze on the cheapest possible command, about 0.6 us per at
   builds a fresh `OwnedHeap` every call and pools nothing. A wrong premise, a plausible-sounding
   conclusion, and a silent-wrong-commit left in the tree behind it.
 
+## Phase 16: a fold's live heap is bounded, not linear in the boundary (done)
+
+A wider DCB benchmark (1M events, 1000 courses, 32 concurrent, hekla against tephra, umadb and Axon
+Server) put hekla first uncontended (3815 ops/s against tephra's 3081, on the round trips it saves by
+folding in-process) and last but one contended (145 against 537). The harness reports mean read
+amplification, so per-event throughput can be computed rather than guessed: tephra folds 3.40M
+events/s at skew 0 and 3.23M at skew 0.99, flat on the same corpus and the same queries, while hekla
+goes 4.21M to 0.87M. Per-event cost rising 4.85x when mean depth rises 5.45x is a slope, and no fixed
+per-event cost can produce a slope, so the constants were not the explanation.
+
+What is proportional to depth is the live heap. From starlark's own source, in `possible_gc`: "For
+the moment we only GC when executing a statement at the root of the module". The instruction that
+calls it is emitted only at module top level, and a fold loop calls `eval_function` repeatedly
+without ever reaching one, so **nothing a fold allocates is released until its heap is dropped**:
+every event struct, every string, and every superseded state from `dict(state, ...)` survives to the
+end of the boundary. A fold over 24k events with 4 KB payloads holds ~100 MB live, and 8 of those at
+once hold most of a gigabyte. tephra's client decodes an event, applies it, and drops it, at O(1)
+live for any depth.
+
+So a fold is no longer one pass over one heap. It runs in chunks: fold until the scratch heap has
+grown `HEKLA_FOLD_HEAP_BUDGET` bytes (1 MiB by default), freeze the state out, drop the heap with
+everything the chunk allocated, thaw the state into the next one. The seam is sound for the reason
+the retry carry already was, a left fold over an append-only log, and the read is planned once before
+the first chunk so the whole fold still runs against a single pinned watermark and reports one
+position for the append condition. Freezing between chunks is cheap because a freeze copies only what
+the state reaches, which is the state, not the boundary.
+
+Two constants came out with it, both free:
+
+- **`envelope::decode` no longer goes through `#[serde(flatten)]`.** On the deserialize side flatten
+  buffers the whole event into an intermediate map and deserialises a second time out of it, and
+  every store read pays it: both fold paths, plus projectors, effects, `hekla verify` and
+  `hekla test`. A hand-written `MapAccess` visitor does one pass. Unknown keys are still skipped
+  rather than rejected, which forward compatibility depends on.
+- **`alloc_event` borrows its field names.** It cloned a `String` per declared field per event while
+  the envelope fields beside it already used `&str`.
+
+Measured on this machine (20 cores), boundary folded through a rejecting command so nothing appends,
+best of 7 solo and best of 5 for the concurrent batch. `us/event` is wall time over boundary depth,
+so the concurrent column is latency under pressure, not throughput:
+
+400-byte payloads, 16 concurrent:
+
+| depth | solo before | solo after | x16 before | x16 after |
+|---|---|---|---|---|
+| 1,000 | 1.261 | 1.143 | 3.312 | 3.097 |
+| 6,000 | 1.284 | 1.141 | 3.092 | 2.395 |
+| 24,000 | 1.312 | 1.179 | 3.230 | 2.446 |
+
+4 KB payloads, 8 concurrent, where retention bites harder:
+
+| depth | solo before | solo after | x8 before | x8 after |
+|---|---|---|---|---|
+| 1,000 | 2.411 | 2.094 | 5.659 | 4.431 |
+| 6,000 | 2.631 | 2.221 | 5.614 | 3.663 |
+| 12,000 | 3.038 | 2.214 | 5.969 | 3.536 |
+
+Per-event cost is now flat in depth: 26% drift across a 12x depth range becomes 6%, and 4% becomes
+3% at the smaller payload. Under concurrency the deep boundaries gain 22% to 38%.
+
+The retry backoff was also uncapped, `thread::sleep(1 << attempt)` milliseconds with no jitter, which
+is why the benchmark measured `HEKLA_MAX_ATTEMPTS=10` as *worse* than 5: the last wait alone is about
+a second, held on a request thread and its blocking slot, with 32 lockstep clients waiting through
+it. It is now full jitter over a capped exponential, uniform in `[0, min(2^attempt, 16 ms)]`. The
+jitter is the load-bearing half: requests that conflict are by definition synchronised, so an
+undithered backoff sleeps them identically and lines them up to collide again.
+
+**Confirmed on the benchmark**, three samples at the shipped `HEKLA_MAX_ATTEMPTS=5`, same corpus,
+seed and machine:
+
+| skew 0.99 | before | after |
+|---|---|---|
+| sustained at 250 ms | 145 / 145 / 702 | 757 / 830 / 830 |
+| sustained at 500 ms | 150 / 150 / 739 | 977 / 830 / 830 |
+| p99 at 25 ops/s (the cold deep fold) | 62-121 ms | 51.3 / 52.3 / 52.6 ms |
+| events folded/sec | 0.87 M | 4.99 M |
+
+Against 4.21 M events/sec at skew 0, the contended cell is now at parity: **the depth penalty is
+gone**, which is what the retention hypothesis predicted and the sharpest confirmation this harness
+can give. hekla now leads tephra at every deadline it reaches (830 against 537 at 250 ms) and returns
+zero 409s, absorbing every conflict inside its five attempts. The oracle re-folded 1.1 M events per
+cell at every prefix: no violations.
+
+**Honest scope:**
+
+- **The 5.5x median is mostly variance, not mean.** Before, two of three runs tipped into congestive
+  collapse at the same ramp step and were trapped near 150 while the third reached 739; after, all
+  three take an almost identical path (156 ops/s at 54.3 / 54.7 / 54.8 ms). Best case against best
+  case the gain is about 12%, in line with the local probe. What the fix removed is the *coupling*:
+  boundary depth is heavy-tailed here (p50 1757 events, p99 30031), so with memory linear in depth,
+  whether 32 concurrent requests happened to land on deep boundaries together decided whether the run
+  collapsed. A bounded heap decouples them, so the good outcome stops being a coin flip. Both readings
+  are true and the distinction matters for where to look next: service time improved by tens of
+  percent, and throughput improved 5.5x because the system had been sitting on a cliff edge.
+- **The local probe under-reproduced the effect by about 15x, on the same machine.** It measured mean
+  latency at a fixed depth; the benchmark measures p99 over a heavy-tailed depth distribution in an
+  open-loop ramp near saturation. Right hardware, wrong statistic, and it nearly argued this change
+  out of the tree. A probe has to reproduce the *metric*, not just the workload.
+- **The two changes are still confounded.** The chunked fold and the jittered backoff shipped
+  together. At `attempts=5` the old backoff could sleep at most 1+2+4+8 = 15 ms in total across a
+  request, which cannot account for 150 to 830, so the fold work is almost certainly the driver; the
+  backoff's own effect was measured at `attempts=10`, where the old code's last wait alone was about a
+  second. An `attempts=1` run separates them outright, since hekla's backoff never fires there.
+- **The 50 ms deadline is still unreachable**, and it is the one place tephra still wins outright. One
+  cold fold of the deepest boundary costs about 52 ms at 25 ops/s, where nothing is contending, so no
+  rate can get under it. That is roughly 1.7 us per event over a 30k-event boundary, and lowering it
+  is now a constants problem rather than a scaling one.
+- **`/status` now reports `folds`**, as `events_folded` and `chunk_seams` since boot. The first is
+  read amplification, the number the benchmark had to proxy from tephra because
+  `events_returned_p99` is zero in every hekla sample; divided by commands run it is the mean
+  boundary depth a deployment is paying for. The second exists because chunking is otherwise
+  unobservable: a chunked fold and a single-pass fold produce the same state by construction, so
+  without a seam count nothing distinguishes "the budget worked" from "the budget was never reached",
+  and the test that guards the seam would pass either way. A verify-mode re-fold is deliberately not
+  counted, being the check's cost rather than the request's.
+- **Verify compares with starlark equality, which has two false-positive cases.** A state holding a
+  NaN, or a value whose type does not implement `equals` (a constructed event), is not equal to
+  itself, so a deterministic fold producing either is reported as nondeterministic: a failed command
+  or a wedged effect. Comparing rendered forms instead would close both and open something worse,
+  since several types render lossily (a `CipherHandle` prints as `<encrypted:field>` with the
+  ciphertext dropped), so two states differing only in a subject-encrypted value would look
+  identical and verify would call a real divergence reproducible. A checker that can say "fine" when
+  it is not is worse than no checker, so the false positive stands.
+- **The chunk seam is invisible from outside.** Folding in chunks and folding in one pass give the
+  same state by construction, so no black-box test distinguishes them. The test that guards it seeds
+  600 padded events, which crosses the default budget five times, and asserts the count *and* the
+  first and last ids the fold saw, so a carry dropped at a seam shows up as a wrong id rather than
+  only a wrong total.
+- **The budget is bytes as bumpalo reports them**, which is chunk capacity rather than bytes used,
+  and it over-reports by up to a doubling. So a 1 MiB budget holds more like 500 KB of live data.
+  Conservative in the right direction, and worth knowing before anyone tunes it.
+- **Chunking is not free in memory, and tuning the budget down makes it worse.** Thawing the carry
+  references the previous chunk's frozen heap and freezing keeps referenced heaps alive, so the
+  per-chunk states form a chain released only when the fold ends. A code review caught the first cut
+  claiming a flat bound it does not have. Two guards now hold it: a floor under the knob (a review
+  measurement had a 4 KiB budget costing 76 MB peak where 64 KiB cost 34 MB, since a chunk per event
+  pays every seam and saves nothing), and a rule that a chunk must be at least eight times the state
+  it carries, so the chain can never exceed an eighth of the unchunked footprint. Verified after the
+  fix: a 4 KiB budget now behaves exactly like the default rather than degenerating.
+- **A fold that mutates the state a previous arm call built now fails once the boundary chunks.**
+  Contract-breaking already (`AUTHORING.md` has always said to return the new state) and already
+  broken on any retry since Phase 15, but the failure is depth-dependent, which is a bad way to find
+  out. Documented with the fix alongside it, and pinned by a test that asserts both halves: it
+  succeeds shallow and fails deep. An effect's `handle` likewise receives a frozen state now, which
+  makes it agree with a command's.
+- **`event.data` is still materialised in full.** The benchmark's events carry a `_pad` of 100 to 400
+  bytes plus `eventId`, `title` and `name`, and no fold arm reads any of them, yet every one is
+  parsed and allocated per event. That is the largest remaining constant on that workload, and with
+  the scaling problem solved it is now the thing standing between hekla and the 50 ms deadline.
+  Making it lazy means a hekla-owned value type with `get_attr`, which changes documented author
+  surface (`type()`, `dir()`, unknown-field errors, and serialising `event.data` whole).
+- **Caching folded state across requests is still the only thing that changes the asymptote**, and it
+  is still the wrong thing to ship for a benchmark: it would drive read amplification to zero and
+  stop the comparison being a comparison. If built, it belongs off by default and disclosed, the way
+  the harness already treats umadb's page cache.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

@@ -14,6 +14,9 @@
 //! unwraps it, so handlers only ever see the payload.
 
 use std::collections::HashMap;
+use std::env;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use starlark::ErrorKind;
 use starlark::environment::{FrozenModule, Module};
@@ -31,9 +34,13 @@ use crate::hash;
 use crate::starlark_builtins::{
     EmittedEvent, EventDef, EventDispatch, EventSpec, HandleOutcome, LoadedModule, ModuleDef,
     alloc_event, alloc_input, call_handler, call_handler_with_ctx, call_handler_with_query_ctx,
-    check_fold_result, initial_state, parse_event_dispatch, parse_event_specs, parse_handle_result,
-    scalar_to_string, thaw, validate_command_input,
+    check_fold_result, dispatch_arm_functions, initial_state, parse_event_dispatch,
+    parse_event_specs, parse_handle_result, scalar_to_string, thaw, validate_command_input,
 };
+
+/// The module slot a chunk's folded state is exported through, so it survives the
+/// freeze that ends the chunk.
+const STATE_SLOT: &str = "state";
 
 /// The reserved tag-key prefix for the global uniqueness tag of a `unique` field:
 /// `_hekla_uniq_<field>`. Host-stamped, so it lives in the reserved namespace a user
@@ -234,8 +241,6 @@ pub fn run_command(
             None => None,
         };
 
-        let initial = initial_state(frozen, &module)
-            .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?;
         let plan = FoldPlan::build(frozen, &module, events, keystore)?;
 
         // `handle` alone sees the pinned clock.
@@ -276,7 +281,13 @@ pub fn run_command(
                     folded = Some((frozen_state, after));
                     (state, after)
                 }
-                None => (initial, Position::ZERO),
+                // Resolved only here: a boundaried command's state comes from the fold,
+                // which builds its own `initial` in the heap each chunk folds in.
+                None => (
+                    initial_state(frozen, &module)
+                        .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?,
+                    Position::ZERO,
+                ),
             };
 
             let decision = call_handler_with_ctx(
@@ -310,14 +321,134 @@ pub fn run_command(
     })
 }
 
-/// The module slot the folded state is exported through, so it survives the freeze.
-const STATE_SLOT: &str = "state";
+/// How much a single fold chunk may allocate before it is closed off and its heap
+/// released. Overridable through `HEKLA_FOLD_HEAP_BUDGET`, in bytes.
+const DEFAULT_FOLD_HEAP_BUDGET: usize = 1 << 20;
 
-/// Fold one attempt's boundary in a scratch heap and hand back the state frozen,
-/// alongside the last position it covers.
+/// The floor under `HEKLA_FOLD_HEAP_BUDGET`. A budget small enough to close a chunk
+/// every event or two is strictly worse than not chunking: each seam costs a freeze and
+/// leaves the previous chunk's state retained (see [`fold_chunks`]), so tuning the knob
+/// down to save memory spends more of it.
+const MIN_FOLD_HEAP_BUDGET: usize = 64 << 10;
+
+/// How much larger a chunk must be than the state it carries. The chain of retained
+/// per-chunk states is the price of chunking, and this is what bounds it: at `N`, the
+/// retained chain can never exceed `1/N` of what folding the whole boundary in one heap
+/// would have held, whatever the state's size or the boundary's depth.
+const FOLD_CHUNK_STATE_RATIO: usize = 8;
+
+/// The ceiling on `HEKLA_FOLD_HEAP_BUDGET`. A budget no fold ever reaches is a fold
+/// that never chunks, which is the depth-linear live heap the chunking exists to
+/// remove, so the knob cannot switch the mechanism off by being set high.
+const MAX_FOLD_HEAP_BUDGET: usize = 64 << 20;
+
+/// The effective per-chunk heap budget, read once.
 ///
-/// The scratch module is what makes the retry carry safe, and it earns its allocation
-/// twice over:
+/// Out-of-range values are clamped to the nearest bound and unparseable ones fall back
+/// to the default, both with a warning: a budget silently 32x what the operator asked
+/// for is how a deployment-config typo stays invisible.
+///
+/// A memory knob rather than caller policy, so it lives here rather than on
+/// [`FoldInputs`]: every fold in the process wants the same ceiling, and the number
+/// that matters is the aggregate live heap across concurrent folds.
+fn fold_heap_budget() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let Some(raw) = env::var("HEKLA_FOLD_HEAP_BUDGET").ok() else {
+            return DEFAULT_FOLD_HEAP_BUDGET;
+        };
+        let Ok(asked) = raw.trim().parse::<usize>() else {
+            tracing::warn!(
+                "HEKLA_FOLD_HEAP_BUDGET is not a byte count: {raw:?}; using {DEFAULT_FOLD_HEAP_BUDGET}"
+            );
+            return DEFAULT_FOLD_HEAP_BUDGET;
+        };
+        let clamped = asked.clamp(MIN_FOLD_HEAP_BUDGET, MAX_FOLD_HEAP_BUDGET);
+        if clamped != asked {
+            tracing::warn!("HEKLA_FOLD_HEAP_BUDGET {asked} is out of range; using {clamped}");
+        }
+        clamped
+    })
+}
+
+/// How many events this process has folded, and how many chunk seams it has crossed
+/// doing it.
+///
+/// Read amplification is the diagnostic number for a DCB workload and a command API
+/// cannot expose it per request, so it is counted per process instead. The seam count
+/// is what makes the chunking observable at all: folding in chunks and folding in one
+/// pass give the same state by construction, so without it nothing distinguishes a
+/// chunked fold from a fold whose budget was never reached.
+static EVENTS_FOLDED: AtomicU64 = AtomicU64::new(0);
+static CHUNK_SEAMS: AtomicU64 = AtomicU64::new(0);
+
+/// What one fold cost, before it is folded into the process totals. Kept separate so a
+/// verify-mode re-fold, which is the check's cost rather than the request's, can be
+/// left out of them.
+#[derive(Default)]
+struct FoldWork {
+    events: u64,
+    seams: u64,
+}
+
+/// Events folded and chunk seams crossed since the process started. Reported by
+/// `/status` as `folds`.
+pub fn fold_counters() -> (u64, u64) {
+    (
+        EVENTS_FOLDED.load(Ordering::Relaxed),
+        CHUNK_SEAMS.load(Ordering::Relaxed),
+    )
+}
+
+/// Fold a boundary in bounded-memory chunks and hand back the state frozen, alongside
+/// the last position it covers.
+///
+/// Under [`FoldInputs::verify`] the fold runs twice and the two states are compared. A
+/// disagreement is returned as an error rather than a typed violation, because there is
+/// no safe way to continue from it: the caller's decision would be built on a state
+/// that does not reproduce. The command path surfaces it as a failed request; the
+/// effect path wedges the invocation, which is the quarantine.
+fn fold_frozen(
+    base: Option<&OwnedFrozenValue>,
+    inputs: &FoldInputs<'_>,
+) -> anyhow::Result<(OwnedFrozenValue, Position)> {
+    let (state, after, work) = fold_chunks(base, inputs)?;
+    EVENTS_FOLDED.fetch_add(work.events, Ordering::Relaxed);
+    CHUNK_SEAMS.fetch_add(work.seams, Ordering::Relaxed);
+    if !inputs.verify {
+        return Ok((state, after));
+    }
+    // The second fold is bounded at where the first one ended, which is what makes
+    // this a determinism check rather than a race. A command folds with `upto: None`,
+    // and each read pins the watermark as of its own call, so an unbounded re-fold
+    // would absorb any append that landed in between and report a concurrent write as
+    // nondeterminism, turning ordinary DCB contention into a 500.
+    let bounded = FoldInputs {
+        upto: Some(after.get()),
+        ..*inputs
+    };
+    // The re-fold's work is deliberately not counted: it is the check's cost, not the
+    // request's, and counting it would report twice the read amplification a verified
+    // deployment actually has.
+    let (again, after_again, _) = fold_chunks(base, &bounded)?;
+    if let Some((first, second)) = frozen_states_differ(&state, &again)? {
+        anyhow::bail!(
+            "the same boundary folded to two different states at position {after}: {first} then {second}"
+        );
+    }
+    if after != after_again {
+        anyhow::bail!(
+            "the same boundary ended at two different positions: {after} then {after_again}"
+        );
+    }
+    Ok((state, after))
+}
+
+/// Fold the boundary a chunk at a time, each chunk in a scratch heap of its own, and
+/// return the final state frozen.
+///
+/// Two properties come out of the freeze between chunks, and the second is why the
+/// chunking exists at all:
 ///
 /// - **`handle` cannot mutate what the next attempt folds onto.** A frozen state fails
 ///   an assignment with `Immutable`, which is already what happens when the boundary
@@ -325,28 +456,197 @@ const STATE_SLOT: &str = "state";
 ///   rather than inventing one. Without it a `handle` that wrote into `state` would
 ///   corrupt every later attempt and commit past the boundary it exists to protect,
 ///   silently and with a 200.
-/// - **The attempt's allocations are freed when it ends.** A fold over a deep boundary
-///   allocates an event per matched position and starlark only collects at module
-///   top-level statements, which a handler call is not, so holding one heap across the
-///   whole retry sequence would pin every attempt's events through every backoff. The
-///   freeze copies out only what the state reaches; the rest dies with the scratch
-///   heap.
-fn fold_frozen(
+/// - **The events a chunk allocates die with it.** Starlark collects only when
+///   executing a statement at the root of a module, which a fold loop never does, so
+///   nothing a fold allocates is released until its heap is dropped: every event
+///   struct, every string, and every superseded state from `dict(state, ...)` survives
+///   to the end. One heap for the whole boundary therefore costs memory linear in its
+///   depth, and per-event cost stops being flat once that working set outgrows the
+///   cache. Freezing every [`fold_heap_budget`] bytes copies out only what the state
+///   reaches and drops the rest.
+///
+/// It is *not* true that a fold of any depth holds a constant amount live. Thawing the
+/// carry adds a reference to the previous chunk's frozen heap, and freezing keeps every
+/// referenced heap alive, so the per-chunk states form a chain that is only released
+/// when the whole fold ends. What bounds it is [`FOLD_CHUNK_STATE_RATIO`]: a chunk must
+/// be at least that many times the size of the state it carries, so the chain can never
+/// exceed `1/ratio` of what folding in one heap would have held. A fold whose state is
+/// a handful of scalars chunks at the configured budget; one accumulating a large dict
+/// chunks less often, which is the right trade, since that is exactly the fold whose
+/// per-chunk copy is expensive.
+///
+/// Sound for the same reason the retry carry is: a left fold over an append-only log,
+/// where folding `[0, a]` and then `(a, b]` gives the state folding `[0, b]` would.
+/// The read is planned once, before the first chunk, so the whole fold still runs
+/// against a single pinned watermark and reports one `after` for the append condition.
+fn fold_chunks(
     base: Option<&OwnedFrozenValue>,
     inputs: &FoldInputs<'_>,
-) -> anyhow::Result<(OwnedFrozenValue, Position)> {
+) -> anyhow::Result<(OwnedFrozenValue, Position, FoldWork)> {
+    // Destructured exhaustively so a new field on `FoldInputs` has to be considered
+    // here rather than silently ignored by the fold.
+    let FoldInputs {
+        frozen,
+        store,
+        query,
+        plan,
+        events,
+        resume_after,
+        upto,
+        verify: _,
+    } = *inputs;
+
+    // Resolved once rather than per chunk: the owned frozen value is heap-independent,
+    // and only the thaw into each chunk's heap has to be repeated.
+    let fold_owned = frozen.get_option("fold")?;
+    let mut reads = store.read(query, resume_after, None);
+    let mut carry = base.cloned();
+    // Starts at the resume point, not at zero, so a fold that matches nothing new
+    // still reports the position its state already covers.
+    let mut after = resume_after;
+    let mut budget = fold_heap_budget();
+    let mut work = FoldWork::default();
+    loop {
+        // The chunk body is inline because tephra exports neither `Reads` nor its
+        // lending item type, so the iterator cannot be named in a helper's signature.
+        let (state, at, folded, more) = Module::with_temp_heap(|scratch| -> anyhow::Result<_> {
+            let mut state = match &carry {
+                Some(value) => thaw(value, &scratch),
+                None => initial_state(frozen, &scratch)
+                    .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?,
+            };
+            // The map is a module-level literal and its clauses were lowered once by
+            // the plan, so a chunk lifts only the arm functions into its heap. Going
+            // through `parse_event_dispatch` here would clone an `EventSpec` per arm
+            // per chunk and discard every one.
+            let arms = fold_owned
+                .as_ref()
+                .map(|owned| dispatch_arm_functions(thaw(owned, &scratch)));
+            // The plan indexes the arms, so a plan built from a different module than
+            // the one being folded would index out of bounds inside `fold_event`.
+            // Nothing in the types pairs them, so it is checked rather than assumed.
+            if let Some(arms) = &arms
+                && arms.len() != plan.lowered.len()
+            {
+                anyhow::bail!("the fold plan does not match the module's fold");
+            }
+
+            // Measured against what the carried state cost to thaw, so the budget
+            // bounds what this chunk adds rather than what it inherited.
+            let baseline = scratch.heap().allocated_bytes();
+            let mut at = after;
+            let mut folded = 0u64;
+            let mut more = false;
+            let mut selected: Vec<usize> = Vec::new();
+            while let Some(item) = reads.next() {
+                let seq = item.map_err(|err| anyhow::anyhow!("read failed: {err}"))?;
+                // The store reads ascending up to the watermark pinned when the read
+                // was planned, and takes no upper bound, so the bound is a break.
+                if upto.is_some_and(|limit| seq.position.get() > limit) {
+                    break;
+                }
+                at = seq.position;
+                let Some(arms) = &arms else { continue };
+                // Matching before decoding: a map over a wide boundary pays nothing
+                // for the events no arm selects. The buffer is reused across events so
+                // a boundary of any depth costs one allocation.
+                selected.clear();
+                selected.extend(
+                    plan.lowered
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| arm_selects(item.as_ref(), seq.event))
+                        .map(|(index, _)| index),
+                );
+                if selected.is_empty() {
+                    continue;
+                }
+                state = fold_event(&scratch, arms, plan, events, &selected, seq.event, state)?;
+                folded += 1;
+                // Checked after folding, so a chunk always makes progress and a single
+                // event larger than the budget cannot spin.
+                if scratch.heap().allocated_bytes() - baseline >= budget {
+                    more = true;
+                    break;
+                }
+            }
+
+            scratch.set(STATE_SLOT, state);
+            let frozen = scratch
+                .freeze()
+                .map_err(|err| anyhow::Error::from(err).context("freezing the folded state"))?;
+            Ok((frozen.get(STATE_SLOT)?, at, folded, more))
+        })?;
+        after = at;
+        work.events += folded;
+        // A chunk that folded nothing produces a state equal to the one it carried, so
+        // keeping the old one drops a link from the retained chain for free. This is
+        // the boundary that ended exactly on a budget trip.
+        if folded > 0 || carry.is_none() {
+            // The next chunk must be large enough to dwarf what it will carry, or the
+            // chain of retained states costs more than the events ever did.
+            budget = budget.max(state.owner().allocated_bytes() * FOLD_CHUNK_STATE_RATIO);
+            carry = Some(state);
+        }
+        if !more {
+            break;
+        }
+        work.seams += 1;
+    }
+    Ok((
+        carry.expect("the chunk loop always runs at least once"),
+        after,
+        work,
+    ))
+}
+
+/// Decode one selected event and thread the state through every arm that selected it,
+/// in declaration order.
+fn fold_event<'v>(
+    module: &Module<'v>,
+    arms: &[Value<'v>],
+    plan: &FoldPlan,
+    events: &EventDefs,
+    selected: &[usize],
+    event: EventRef<'_>,
+    mut state: Value<'v>,
+) -> anyhow::Result<Value<'v>> {
+    let event_type = event.event_type();
+    let (envelope, data) =
+        envelope::decode(event.data()).map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
+    let value = alloc_event(
+        module,
+        envelope.event_id,
+        &envelope.timestamp,
+        event_type,
+        &data,
+        events.get(event_type),
+    );
+    for &index in selected {
+        let what = &plan.labels[index];
+        state = call_handler(module, arms[index], &[state, value], MAX_TICKS)
+            .map_err(|err| fold_error(what, err))?;
+        check_fold_result(state, what)?;
+    }
+    Ok(state)
+}
+
+/// Compare two folded states, rendering both when they disagree.
+///
+/// They live in separate frozen heaps, so the comparison needs a module to thaw them
+/// into. Rendering only on disagreement keeps the happy path free of a `to_json_value`
+/// per fold.
+fn frozen_states_differ(
+    first: &OwnedFrozenValue,
+    second: &OwnedFrozenValue,
+) -> anyhow::Result<Option<(String, String)>> {
     Module::with_temp_heap(|scratch| {
-        let start = match base {
-            Some(value) => thaw(value, &scratch),
-            None => initial_state(inputs.frozen, &scratch)
-                .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?,
-        };
-        let (state, after) = fold_boundary(&scratch, inputs, start)?;
-        scratch.set(STATE_SLOT, state);
-        let frozen = scratch
-            .freeze()
-            .map_err(|err| anyhow::Error::from(err).context("freezing the folded state"))?;
-        Ok((frozen.get(STATE_SLOT)?, after))
+        let first = thaw(first, &scratch);
+        let second = thaw(second, &scratch);
+        if values_agree(first, second)? {
+            return Ok(None);
+        }
+        Ok(Some((render_state(first), render_state(second))))
     })
 }
 
@@ -491,7 +791,7 @@ impl FoldPlan {
             .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
         let lowered = lower_dispatch(&fold, events, keystore)
             .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
-        let labels = fold
+        let labels: Vec<String> = fold
             .arms()
             .iter()
             .map(|arm| fold.label("fold", arm.spec.as_ref()))
@@ -528,49 +828,24 @@ pub(crate) struct FoldInputs<'a> {
     pub verify: bool,
 }
 
-/// Fold a boundary into state, returning it alongside the last position the query
-/// matched.
+/// Fold a boundary into state in the caller's heap, returning it alongside the last
+/// position the query matched.
 ///
-/// Shared by commands and effects so the two cannot drift on the parts that are not
-/// obvious: arms are matched against the raw event *before* the envelope is decoded,
-/// and the dispatch map is thawed and lowered once rather than per event.
+/// The effect path's entry point. Shared with commands through [`fold_frozen`] so the
+/// two cannot drift on the parts that are not obvious: arms are matched against the
+/// raw event *before* the envelope is decoded, the dispatch map is lowered once rather
+/// than per event, and the live heap is bounded rather than linear in the boundary's
+/// depth.
 ///
 /// The returned position advances for every event in the boundary, folded or not, so
 /// a command's append condition covers everything the query matched rather than only
 /// what an arm consumed. An effect ignores it.
-///
-/// Under [`FoldInputs::verify`] the fold runs twice and the two states are compared.
-/// A disagreement is returned as an error rather than a typed violation, because
-/// there is no safe way to continue from it: the caller's decision would be built on
-/// a state that does not reproduce. The command path surfaces it as a failed
-/// request; the effect path wedges the invocation, which is the quarantine.
 pub(crate) fn fold_boundary<'v>(
     module: &Module<'v>,
     inputs: &FoldInputs<'_>,
-    initial: Value<'v>,
 ) -> anyhow::Result<(Value<'v>, Position)> {
-    let (state, after) = fold_once(module, inputs, initial)?;
-    if !inputs.verify {
-        return Ok((state, after));
-    }
-    // The second fold is bounded at where the first one ended, which is what makes
-    // this a determinism check rather than a race. A command folds with `upto: None`,
-    // and each read pins the watermark as of its own call, so an unbounded re-fold
-    // would absorb any append that landed in between and report a concurrent write as
-    // nondeterminism, turning ordinary DCB contention into a 500.
-    let bounded = FoldInputs {
-        upto: Some(after.get()),
-        ..*inputs
-    };
-    let (again, after_again) = fold_once(module, &bounded, initial)?;
-    if !values_agree(state, again)? || after != after_again {
-        anyhow::bail!(
-            "the same boundary folded to two different states at position {after}: {} then {}",
-            render_state(state),
-            render_state(again)
-        );
-    }
-    Ok((state, after))
+    let (state, after) = fold_frozen(None, inputs)?;
+    Ok((thaw(&state, module), after))
 }
 
 /// Compare two folded states structurally.
@@ -579,6 +854,18 @@ pub(crate) fn fold_boundary<'v>(
 /// non-`None` value, so a fold may legitimately return a set, or a float that is NaN
 /// or infinite, none of which survive `to_json_value`. Comparing through JSON would
 /// make verify mode reject state the runtime otherwise allows.
+///
+/// Starlark equality has two gaps, and this errs toward reporting a disagreement that
+/// is not one rather than missing one that is. A NaN in the state is not equal to
+/// itself, and a value whose type does not implement `equals` (a constructed event) is
+/// never equal to itself either, so a deterministic fold producing either is reported
+/// as nondeterministic: a failed command, or a wedged effect. That is the survivable
+/// direction. Comparing rendered forms instead would close both gaps and open a worse
+/// one, because several of this crate's types render lossily: a `CipherHandle` prints
+/// as `<encrypted:field>` with the ciphertext dropped, so two states differing in a
+/// subject-encrypted value would render identically and verify would call a real
+/// divergence reproducible. A checker that can say "fine" when it is not is worse than
+/// no checker.
 fn values_agree<'v>(first: Value<'v>, second: Value<'v>) -> anyhow::Result<bool> {
     first
         .equals(second)
@@ -592,102 +879,6 @@ fn render_state(value: Value<'_>) -> String {
         Ok(json) => json.to_string(),
         Err(_) => format!("{value:?}"),
     }
-}
-
-/// Fold a boundary into state, returning it alongside the last position the query
-/// matched.
-///
-/// Shared by commands and effects so the two cannot drift on the parts that are not
-/// obvious: arms are matched against the raw event *before* the envelope is decoded,
-/// and the dispatch map is thawed and lowered once rather than per event.
-///
-/// The returned position advances for every event in the boundary, folded or not, so
-/// a command's append condition covers everything the query matched rather than only
-/// what an arm consumed. An effect ignores it.
-fn fold_once<'v>(
-    module: &Module<'v>,
-    inputs: &FoldInputs<'_>,
-    initial: Value<'v>,
-) -> anyhow::Result<(Value<'v>, Position)> {
-    let FoldInputs {
-        frozen,
-        store,
-        query,
-        plan,
-        events,
-        resume_after,
-        upto,
-        verify: _,
-    } = *inputs;
-
-    // The map is a module-level literal, so only the arm functions have to be lifted
-    // into this heap; the clauses they are matched on were lowered once by the plan.
-    let fold_owned = frozen.get_option("fold")?;
-    let fold = fold_owned
-        .as_ref()
-        .map(|owned| parse_event_dispatch(thaw(owned, module)))
-        .transpose()
-        .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
-    if let Some(fold) = &fold
-        && fold.arms().len() != plan.lowered.len()
-    {
-        anyhow::bail!("the fold plan does not match the module's fold");
-    }
-    let lowered = &plan.lowered;
-    let labels = &plan.labels;
-
-    let mut state = initial;
-    // Starts at the resume point, not at zero, so a fold that matches nothing new
-    // still reports the position its state already covers.
-    let mut after = resume_after;
-    let mut selected: Vec<usize> = Vec::new();
-    let mut reads = store.read(query, resume_after, None);
-    while let Some(item) = reads.next() {
-        let seq = item.map_err(|err| anyhow::anyhow!("read failed: {err}"))?;
-        // The store reads ascending up to the watermark pinned when the read was
-        // planned, and takes no upper bound, so the bound is a break.
-        if upto.is_some_and(|limit| seq.position.get() > limit) {
-            break;
-        }
-        after = seq.position;
-        let Some(fold) = &fold else { continue };
-        // Matching before decoding: a map over a wide boundary pays nothing for
-        // the events no arm selects. The buffer is reused across events so a
-        // boundary of any depth costs one allocation.
-        selected.clear();
-        selected.extend(
-            lowered
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| arm_selects(item.as_ref(), seq.event))
-                .map(|(index, _)| index),
-        );
-        if selected.is_empty() {
-            continue;
-        }
-        let event_type = seq.event.event_type();
-        let (envelope, data) = envelope::decode(seq.event.data())
-            .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-        let def = events.get(event_type);
-        let event = alloc_event(
-            module,
-            envelope.event_id,
-            &envelope.timestamp,
-            event_type,
-            &data,
-            def,
-        );
-        // Every selecting arm runs, threading state through them in declaration
-        // order.
-        for &index in &selected {
-            let arm = &fold.arms()[index];
-            let what = &labels[index];
-            state = call_handler(module, arm.func, &[state, event], MAX_TICKS)
-                .map_err(|err| fold_error(what, err))?;
-            check_fold_result(state, what)?;
-        }
-    }
-    Ok((state, after))
 }
 
 /// Prefix a fold failure with the entry that produced it, and spell out the one
@@ -719,6 +910,20 @@ fn handle_error(err: starlark::Error) -> anyhow::Error {
         )
     } else {
         anyhow::anyhow!("handle() failed: {err}")
+    }
+}
+
+/// The same treatment for an effect's `handle`, whose state is also frozen (it comes
+/// out of a chunked fold). Shared with `effect.rs` so the two paths cannot drift into
+/// reporting the same mistake differently: a bare `Immutable` names a line but not the
+/// rule, and an effect that hits it wedges until someone works out why.
+pub(crate) fn effect_handle_error(what: &str, err: starlark::Error) -> anyhow::Error {
+    if mutated_immutable(&err) {
+        anyhow::anyhow!(
+            "{what} failed: {err}; the folded state is read-only, because it is derived from the log rather than stored; a write to it would be discarded, so decide from `state` and act through the effect builtins"
+        )
+    } else {
+        anyhow::anyhow!("{what} failed: {err}")
     }
 }
 

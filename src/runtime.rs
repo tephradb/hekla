@@ -11,8 +11,11 @@
 //! original `(status, body)` from those events on a replay. It is synchronous
 //! (Starlark and tephra appends are), so the server calls it on a blocking thread.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -51,16 +54,21 @@ const SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 /// brings its own fixed retry policy, and two nested budgets measure neither.
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
-/// The ceiling on `HEKLA_MAX_ATTEMPTS`. The backoff is `1 << attempt` milliseconds,
-/// so this bounds the worst-case wait at about 16 seconds and keeps the shift inside
-/// `u64`.
+/// The ceiling on `HEKLA_MAX_ATTEMPTS`. Each attempt re-folds and re-decides, so this
+/// bounds how much work one request can spend losing races; the wait itself is bounded
+/// separately by [`BACKOFF_CAP_MS`].
 const MAX_ATTEMPTS_CAP: u32 = 15;
+
+/// The ceiling on one retry's wait. The sleep blocks a request thread and its blocking
+/// slot, so an uncapped doubling makes a deep retry budget *worse* than a shallow one:
+/// at 10 attempts the last wait alone would be about a second, and the clients that
+/// conflicted are all waiting through it.
+const BACKOFF_CAP_MS: u64 = 16;
 
 /// The effective retry budget, read once from `HEKLA_MAX_ATTEMPTS`. Values below 1
 /// and unparseable ones fall back to the default rather than disabling the append,
-/// and the whole thing is capped: the backoff doubles per attempt, so attempt 25 is
-/// already a nine-hour sleep holding a request thread and its blocking slot, and 64
-/// overflows the shift outright.
+/// and the whole thing is capped, because every attempt is another fold of the
+/// boundary and another decision.
 fn max_attempts() -> u32 {
     static ATTEMPTS: OnceLock<u32> = OnceLock::new();
     *ATTEMPTS.get_or_init(|| {
@@ -70,6 +78,63 @@ fn max_attempts() -> u32 {
             .filter(|attempts| *attempts >= 1)
             .unwrap_or(DEFAULT_MAX_ATTEMPTS)
             .min(MAX_ATTEMPTS_CAP)
+    })
+}
+
+/// How long to wait before the retry after `attempt`: full jitter over a capped
+/// exponential, uniform in `[0, min(2^attempt ms, BACKOFF_CAP_MS)]`.
+///
+/// The jitter is the load-bearing half. Requests that conflict are by definition in
+/// lockstep, so an undithered backoff sleeps them for the same duration and lines them
+/// up to conflict again on the same boundary; spreading them over the window is what
+/// lets one through per round. `roll` is the caller's random draw, so the schedule
+/// stays a pure function and is testable without sleeping.
+fn backoff_delay(attempt: u32, roll: u64) -> Duration {
+    // Clamped before the shift, not after: `checked_shl` guards only the shift width,
+    // so it returns `Some` of a wrapped product for every attempt from 22 to 63, and
+    // `1000 << 61` is exactly 0. Clamping first keeps the exponential exact over the
+    // range that can reach the cap and saturating past it.
+    let exponential_ms = 1u64 << attempt.min(BACKOFF_CAP_MS.ilog2() + 1);
+    Duration::from_micros(roll % (exponential_ms.min(BACKOFF_CAP_MS) * 1_000 + 1))
+}
+
+/// A per-thread random draw for [`backoff_delay`]. xorshift64 rather than a real RNG:
+/// this decorrelates retries and guards nothing, so the bar is "cheap and not the same
+/// on every thread". Seeded once per thread from the OS, since threads that wake
+/// together must not draw the same sequence.
+fn jitter_roll() -> u64 {
+    thread_local! {
+        static STATE: Cell<u64> = const { Cell::new(0) };
+    }
+    STATE.with(|state| {
+        let mut seed = state.get();
+        if seed == 0 {
+            let mut bytes = [0u8; 8];
+            // A failure here must not fail the request, but it must not collapse the
+            // seed either: `bytes` stays zero, so without mixing in this thread's own
+            // slot address every thread would draw the identical sequence, which is
+            // precisely the lockstep the jitter exists to break.
+            let _ = getrandom::fill(&mut bytes);
+            // The slot address alone is not enough: thread-local blocks come from one
+            // contiguous allocation, so addresses across a pool differ in a few middle
+            // bits, and one xorshift round then a reduction modulo the window leaves
+            // the first draws correlated. A per-thread counter run through a splitmix
+            // finaliser separates them regardless of layout.
+            static THREADS: AtomicU64 = AtomicU64::new(0);
+            let mut mix = THREADS.fetch_add(1, AtomicOrdering::Relaxed)
+                ^ (ptr::from_ref(state) as u64)
+                ^ u64::from_ne_bytes(bytes);
+            mix ^= mix >> 30;
+            mix = mix.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mix ^= mix >> 27;
+            mix = mix.wrapping_mul(0x94d0_49bb_1331_11eb);
+            seed = (mix ^ (mix >> 31)) | 1;
+        }
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        state.set(seed);
+        seed
     })
 }
 
@@ -361,7 +426,7 @@ impl Runtime {
     }
 
     /// Run the decision cycle, retrying on a DCB conflict so the decision model is
-    /// rebuilt against the new tail, with a small exponential backoff so a hot
+    /// rebuilt against the new tail, with a capped jittered backoff so a hot
     /// boundary does not hammer the single writer. The retry loop itself lives in
     /// `dispatch`, which folds only what landed since the last attempt; this decides
     /// the budget and the wait. When a keyed request already committed (a crash or a
@@ -386,7 +451,7 @@ impl Runtime {
 
         let retry = dispatch::Retry {
             max_attempts: max_attempts(),
-            backoff: &|attempt| thread::sleep(Duration::from_millis(1u64 << attempt)),
+            backoff: &|attempt| thread::sleep(backoff_delay(attempt, jitter_roll())),
         };
         match dispatch::run_command(
             &self.store,
@@ -489,6 +554,15 @@ impl Runtime {
             })
             .collect();
 
+        // Read amplification is the diagnostic number for a DCB workload, and a command
+        // API cannot report it per request: the caller sees a decision, not the events
+        // behind it. Counted per process instead, so `events / commands` is the mean
+        // boundary depth this deployment is actually paying for. `chunk_seams` is what
+        // makes the chunked fold observable at all, since chunking is invisible in the
+        // result. Both are process-wide rather than per runtime; one process holds one
+        // data directory, so that is the same thing here.
+        let (events_folded, chunk_seams) = dispatch::fold_counters();
+
         json!({
             "log_head": head,
             "uptime_seconds": self.started.elapsed().as_secs(),
@@ -497,6 +571,7 @@ impl Runtime {
             "projectors": projectors,
             "effects": effects,
             "events": self.events.len(),
+            "folds": { "events_folded": events_folded, "chunk_seams": chunk_seams },
         })
     }
 
@@ -793,5 +868,74 @@ pub fn resolve_data_dir(project_dir: &Path, data_dir: Option<&Path>) -> PathBuf 
     match data_dir {
         Some(dir) => dir.to_path_buf(),
         None => project_dir.join("data"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// The property that matters is the ceiling, not the distribution: whatever the
+    /// draw, a single wait can never grow past the cap, which is what made
+    /// `HEKLA_MAX_ATTEMPTS=10` worse than 5 before it existed.
+    #[test]
+    fn backoff_is_capped_however_large_the_attempt() {
+        let cap = Duration::from_millis(BACKOFF_CAP_MS);
+        // Every attempt, not just the reachable ones. The window from 22 upwards is
+        // where a `checked_shl` wraps to a *small* product instead of saturating, so
+        // the wait silently collapses toward zero rather than holding at the cap.
+        for attempt in 0..64 {
+            for roll in [0, 1, u64::MAX / 2, u64::MAX] {
+                let delay = backoff_delay(attempt, roll);
+                assert!(delay <= cap, "attempt {attempt} roll {roll}: {delay:?}");
+            }
+        }
+        assert!(backoff_delay(u32::MAX, u64::MAX) <= cap);
+    }
+
+    /// The cap must be a ceiling the schedule actually reaches, not one it collapses
+    /// past: at a high attempt the largest draw should wait the full cap.
+    #[test]
+    fn backoff_saturates_at_the_cap_rather_than_wrapping() {
+        let cap = Duration::from_millis(BACKOFF_CAP_MS);
+        for attempt in [8, 15, 22, 40, 63] {
+            assert_eq!(
+                backoff_delay(attempt, BACKOFF_CAP_MS * 1_000),
+                cap,
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    /// Early attempts stay under the exponential, so the cap does not turn the first
+    /// retry into a 16 ms wait.
+    #[test]
+    fn backoff_follows_the_exponential_below_the_cap() {
+        for attempt in 0..4 {
+            let ceiling = Duration::from_millis(1 << attempt);
+            for roll in [0, 7, u64::MAX] {
+                assert!(
+                    backoff_delay(attempt, roll) <= ceiling,
+                    "attempt {attempt} roll {roll}"
+                );
+            }
+        }
+        assert_eq!(backoff_delay(0, 0), Duration::ZERO);
+    }
+
+    /// Full jitter means the draw actually moves the wait. Without this, two clients
+    /// that conflict sleep identically and collide again.
+    #[test]
+    fn backoff_spreads_across_the_window() {
+        let waits: Vec<Duration> = (0..64).map(|roll| backoff_delay(8, roll * 977)).collect();
+        let distinct = waits.iter().collect::<HashSet<_>>();
+        assert!(distinct.len() > 8, "{waits:?}");
+    }
+
+    #[test]
+    fn jitter_rolls_differ_within_a_thread() {
+        let rolls = [jitter_roll(), jitter_roll(), jitter_roll()];
+        assert!(rolls[0] != rolls[1] || rolls[1] != rolls[2], "{rolls:?}");
     }
 }

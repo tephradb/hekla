@@ -341,3 +341,66 @@ handle = {placed(owner = 1, secret = "s"): probe}
         "a handle key must not filter an encrypted field: {findings:?}"
     );
 }
+
+/// The folded state an effect's `handle` receives is frozen, exactly as a command's is.
+///
+/// It became frozen when the fold started chunking (a chunk freezes its state and drops
+/// its heap), and the two paths agreeing matters more than which way they agree: `state`
+/// is derived from the log, so writing into it changes nothing durable and the write is
+/// silently lost. Failing loudly is the honest outcome, and pinning it here keeps the
+/// command and effect contracts from drifting apart again.
+#[test]
+fn an_effect_handle_cannot_mutate_the_folded_state() {
+    // `run` yields only an exit code, so a bare "it failed" would also be satisfied by
+    // a typo, a `query` error, or a renamed field. The control is the same effect with
+    // the mutation removed and the expectation adjusted: it must pass. Only the one
+    // line differs, so a failure of the first with a pass of the second isolates the
+    // write to `state` as the cause.
+    let effect = |mutate: bool| {
+        format!(
+            r#"
+load("events/t.star", "placed")
+
+def query(event):
+    return [placed(shop = event.data.shop)]
+
+initial = {{"count": 0}}
+
+fold = {{placed(): lambda state, event: {{"count": state["count"] + 1}}}}
+
+def probe(event, state):
+{}
+    invoke_command("record", {{"id": event.data.id, "shop": state["count"]}})
+
+handle = {{placed(): probe}}
+"#,
+            if mutate {
+                "    state[\"count\"] = 99"
+            } else {
+                "    pass"
+            }
+        )
+    };
+    let scenario = |shop: u32| {
+        format!(
+            r#"
+load("events/t.star", "placed")
+
+cases = [
+    case(
+        name = "the arm reads the folded state",
+        effect = "probe",
+        given = [placed(id = "{A}", shop = 1)],
+        expect = [command_call("record", {{"id": "{A}", "shop": {shop}}})],
+    ),
+]
+"#
+        )
+    };
+    assert_eq!(
+        run(&effect(false), &scenario(1)),
+        ok(),
+        "the control must pass, or the mutating case proves nothing"
+    );
+    assert_eq!(run(&effect(true), &scenario(99)), failed());
+}

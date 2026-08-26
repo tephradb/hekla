@@ -2415,7 +2415,9 @@ pub fn alloc_event<'v>(
                     Some(value) => heap.alloc(value),
                     None => Value::new_none(),
                 };
-                pairs.push((name.clone(), value));
+                // Borrowed from the definition rather than cloned: the definition
+                // outlives the call, and this runs once per field per folded event.
+                pairs.push((name.as_str(), value));
             }
             pairs
         }
@@ -2423,7 +2425,7 @@ pub fn alloc_event<'v>(
         // payload as it was stored.
         None => obj
             .iter()
-            .map(|(key, value)| (key.clone(), heap.alloc(value)))
+            .map(|(key, value)| (key.as_str(), heap.alloc(value)))
             .collect(),
     };
     // Formatted into a stack buffer rather than through `to_string`: this runs once
@@ -3065,6 +3067,23 @@ impl<'v> EventDispatch<'v> {
 ///
 /// Errors read as predicates so callers can prefix them with the global's name, the
 /// way [`parse_event_specs`] is consumed.
+/// Just the arm functions of a dispatch dict, in declaration order.
+///
+/// What a fold needs once its clauses are lowered: the arm `Value`s are bound to the
+/// heap they were thawed into, so they have to be re-read per chunk, while the specs
+/// are already in the [`FoldPlan`](crate::dispatch::FoldPlan). Going through
+/// [`parse_event_dispatch`] there would clone an `EventSpec` per arm per chunk to
+/// throw every one of them away.
+///
+/// Shape errors are not re-reported here: the module was validated at load and the
+/// plan parsed the same dict, so anything malformed has already been rejected.
+pub fn dispatch_arm_functions<'v>(val: Value<'v>) -> Vec<Value<'v>> {
+    let Some(dict) = DictRef::from_value(val) else {
+        return Vec::new();
+    };
+    dict.values().collect()
+}
+
 pub fn parse_event_dispatch<'v>(val: Value<'v>) -> anyhow::Result<EventDispatch<'v>> {
     if val.get_type() == FUNCTION_TYPE {
         anyhow::bail!(

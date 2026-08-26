@@ -694,8 +694,6 @@ pub(crate) fn run_handle(
             }
             None => None,
         };
-        let initial = initial_state(frozen, &module)
-            .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?;
         let state = match &boundary {
             Some(query) => {
                 let plan = dispatch::FoldPlan::build(frozen, &module, events, inv.keystore)?;
@@ -711,11 +709,13 @@ pub(crate) fn run_handle(
                         upto: Some(inv.position),
                         verify: inv.verify,
                     },
-                    initial,
                 )?
                 .0
             }
-            None => initial,
+            // Resolved only here: a boundaried effect's state comes from the fold,
+            // which builds its own `initial` in the heap it folds in.
+            None => initial_state(frozen, &module)
+                .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?,
         };
 
         // Every selecting arm runs in declaration order, so a replay journals and
@@ -725,10 +725,7 @@ pub(crate) fn run_handle(
             let arm = &handle.arms()[index];
             call_handler_with_effect_ctx(&module, arm.func, &[value, state], MAX_TICKS, &ctx)
                 .map_err(|err| {
-                    anyhow::anyhow!(
-                        "{} failed: {err}",
-                        handle.label("handle", arm.spec.as_ref())
-                    )
+                    dispatch::effect_handle_error(&handle.label("handle", arm.spec.as_ref()), err)
                 })?;
         }
         Ok(())

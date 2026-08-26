@@ -293,13 +293,32 @@ keystore lookup and a deterministic encryption each when a field is subject-scop
 request. The runtime still owns the *policy*: how many attempts, and how long to wait between them.
 
 **The carried state is frozen, so `handle` cannot mutate what the next attempt folds onto.** Each
-attempt folds in a scratch heap and freezes the result, which pays for itself twice: an assignment
-into `state` inside `handle` fails with `Immutable` and a message naming the reason, exactly as it
-already did when the boundary was empty and `state` was the frozen `initial`; and the events the
-attempt allocated die with the scratch heap rather than being pinned for the life of the request
-(starlark collects only at module top-level statements, which a handler call is not). Without the
-freeze a mutating `handle` would corrupt every later attempt and commit straight past the boundary,
-silently and with a 200.
+attempt folds in a scratch heap and freezes the result: an assignment into `state` inside `handle`
+fails with `Immutable` and a message naming the reason, exactly as it already did when the boundary
+was empty and `state` was the frozen `initial`. Without the freeze a mutating `handle` would corrupt
+every later attempt and commit straight past the boundary, silently and with a 200.
+
+**A fold's live heap does not grow with the boundary's depth, so per-event cost stays flat.**
+Starlark collects only when executing a statement at the root of a module, and a fold loop never
+executes one, so *nothing a fold allocates is released until its heap is dropped*: every event
+struct, every string, and every superseded state from `dict(state, ...)` survives to the end. One
+heap for the whole boundary therefore costs memory linear in its depth, and once that working set
+outgrows the cache the cost per event stops being flat, which turns a linear fold into a
+quadratic-looking one. So a fold is not one pass over one heap: it runs in chunks, freezing the
+state and dropping the scratch heap every `HEKLA_FOLD_HEAP_BUDGET` bytes (1 MiB by default), then
+thawing that state into the next chunk. The events die with each chunk. The seam is sound for the
+same reason the retry carry is, and the read is planned once before the first chunk, so the whole
+fold still runs against a single pinned watermark and reports one position for the append condition.
+
+The per-chunk states are not free, and it is worth being exact rather than claiming a flat bound.
+Thawing the carry adds a reference to the previous chunk's frozen heap, and freezing keeps every
+referenced heap alive, so the states form a chain released only when the fold ends. What bounds it is
+a ratio rather than a constant: a chunk must be at least eight times the size of the state it
+carries, so the chain can never exceed an eighth of what folding the whole boundary in one heap would
+have held. A fold over a few scalars chunks at the configured budget; one accumulating a large dict
+chunks less often, which is the right trade, since that is exactly the fold whose per-chunk copy is
+expensive. Tuning the budget *down* to save memory therefore backfires, and it has a floor for that
+reason.
 
 **Built-in idempotency key** is distinct from id-based dedupe. It exists for commands where nothing
 in the input distinguishes intent (approving a claim twice with identical input could be one retry

@@ -338,7 +338,30 @@ arm gets for mutating rather than returning. The reason is the retry: a conflict
 folding what landed since onto the state the previous attempt already built, rather than re-reading
 the boundary from the start, so a mutation would decide the *next* attempt instead of being discarded
 with this one. There was never anything to gain from it: `handle` returns its decision, and the state
-is thrown away with the request.
+is thrown away with the request. The same holds for an effect's `handle`, whose state is folded from
+the log: writing into it changes nothing durable, so it fails rather than being silently lost.
+
+**A fold arm must return the new state even when it is mutating a value it built itself.** Returning
+a fresh value on the first event and then writing into that value on later events looks like it
+works, and on a shallow boundary it does. It is still wrong, and it fails in two places: on any
+retry, and on any boundary deep enough that the fold chunks (hekla freezes the accumulated state
+every megabyte or so, to keep a deep fold's memory flat). The failure is therefore *depth-dependent*,
+which is a bad thing to discover in production, so write the arm the way the contract says:
+
+```starlark
+# Wrong: works until the boundary grows, then fails with `Immutable`.
+def tally(state, event):
+    if state == None:
+        return {"seen": 1}
+    state["seen"] = state["seen"] + 1
+    return state
+
+# Right: a new value every time.
+initial = {"seen": 0}
+
+def tally(state, event):
+    return dict(state, seen = state["seen"] + 1)
+```
 
 ### Determinism and ids
 
