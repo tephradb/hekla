@@ -1272,6 +1272,33 @@ cases = [
     );
 }
 
+/// A case cannot stub a status the runtime absorbs, because no handler ever sees
+/// one. Left unguarded, a case could assert a 429 branch that the live runtime
+/// makes unreachable, which is worse than no test at all.
+#[test]
+fn a_case_cannot_stub_a_status_the_runtime_retries_itself() {
+    for status in [408, 425, 429, 500, 503] {
+        assert_scenario(
+            &format!(
+                r#"
+load("events/t.star", "happened")
+
+cases = [
+    case(
+        effect = "relay",
+        given = [happened(id = "{ID}", note = "hi")],
+        responds = [http_response(status = {status})],
+        expect = [http_call(url = "https://a.test/relay")],
+    ),
+]
+"#
+            ),
+            ExitCode::FAILURE,
+            "a case must not be able to stub a retryable status",
+        );
+    }
+}
+
 /// Order is part of the assertion, not just membership: an effect's call sequence is
 /// what a replay has to reproduce.
 #[test]

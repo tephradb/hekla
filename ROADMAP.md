@@ -141,6 +141,7 @@ crash mid-handler resumes by replaying journaled calls and running only the unjo
 - Retry split: the runtime absorbs transport errors and 5xx (they never reach the script) by wedging the
   invocation and retrying with capped backoff; a 2xx/3xx/4xx result reaches the script, so `status >= 400`
   is a real decide-what-to-do outcome. A handler error wedges the same way (retry forever, never skip).
+  Phase 18 widened the absorbed set to every retryable status.
 - Graceful-shutdown draining (effects first, then projectors, then the writer), with a bounded join so a
   wedged effect cannot hang shutdown. `/status` reports each effect's position, lag, consecutive-failure
   count, and last error, so a wedge reads as broken rather than merely slow.
@@ -997,6 +998,64 @@ enables `serde_json/preserve_order`, which would flip `serde_json::Map` to inser
 whole test build. `effect.rs`'s journaled call hash is a hash of canonical JSON and depends on
 `serde_json::Value` sorting object keys, so that feature would have made tests exercise a different
 hash than production.
+
+## Phase 18: the retry split covers every status that clears on its own (done)
+
+The runtime absorbed transport errors and 5xx and handed everything else to the script, on the
+stated invariant that "a result that reaches Starlark is always terminal". **429 was the
+counterexample**, and 408 and 425 with it: the canonical retryable status arrived in the handler as
+an ordinary result.
+
+The gap was not that authors had to handle it. It was that they **could not**. Every response that
+reaches a handler is journaled, and the wedge retry deliberately never clears the journal, so the
+obvious handler:
+
+```python
+res = http.post(url = url, body = payload)
+if res.status == 429:
+    fail("rate limited")
+```
+
+wedges the invocation and then replays the recorded 429 from the op-DB on every attempt, forever.
+The request is never re-sent. Retention does not reclaim it either, since the sweeper only touches
+terminal invocations. The only exit is an operator skip, which abandons the work. A
+reasonable-looking handler turned a routine rate limit into permanent data loss needing a human.
+The alternative available to an author, a bounded loop inside one handler run, does re-fire (the
+disambiguator makes each repeat a distinct journal entry) but there is no `sleep` builtin, so it is
+a hot loop against a rate limiter bounded only by the tick budget.
+
+What shipped:
+
+- `effect::is_retryable_status`: 408, 425 and 429 join every 5xx, checked before the journal write.
+  That ordering is the whole mechanism. Bailing before `journal_put` is what leaves the next attempt
+  free to re-send instead of replaying the refusal.
+- `Retry-After` is honored, as a floor under the wedge backoff rather than in place of it:
+  `retry_delay = max(backoff(attempt), min(retry_after, 5min))`. Honoring it alone would let a
+  limiter repeating `Retry-After: 1` pin an effect at one attempt a second forever; capping it at
+  `BACKOFF_CAP` instead would defeat the point, since a limiter naming a 300s window is naming
+  something longer than any backoff we would pick. The hint rides out of the host on a
+  `Cell<Option<Duration>>` next to `terminal`, for the same reason: the starlark boundary flattens a
+  host error down to its message, so a value the driver needs cannot travel inside one.
+- Only the delta-seconds form of the header is parsed. The HTTP-date form would mean taking on a
+  date parser and turning the peer's clock into a duration against ours; it reads as absent, and the
+  backoff stands unchanged.
+- `hekla test`'s `http_response()` guard moved onto the same predicate. It already refused a 5xx
+  ("the runtime retries it, so a handler never sees one") and would otherwise have let a case assert
+  behaviour on a 429 that the runtime now makes unreachable.
+
+Two judgment calls worth recording:
+
+- **A rate limit is a wedge, and reads as one.** `consecutive_failures` and `last_error` move for a
+  429 exactly as for a 5xx, so an alarm on those will fire on ordinary rate limiting. That is
+  accurate rather than unfortunate: the invocation genuinely is not progressing. It differs from
+  other wedges only in clearing itself, which no separate counter would have conveyed better than
+  the counter returning to zero does.
+- **The ceiling on `Retry-After` is a defence, not a policy.** Five minutes is far longer than any
+  backoff the runtime chooses and far shorter than the day a stray or hostile header could ask for.
+
+The `Retry-After` test asserts wall-clock: a 1s window against a 200ms first backoff. It was checked
+against a build with the honoring removed, where the retry landed at 223ms, so it discriminates
+rather than passing on timing slack.
 
 ## Deferred, with triggers
 

@@ -4,9 +4,9 @@
 //! the invocation runs once, restarting the runtime replays the journal without
 //! re-firing a completed invocation, and a 5xx wedges the effect (visible in the
 //! health signals) until an explicit operator skip advances it. They also pin the
-//! runtime's split between what reaches the script (a 4xx) and what it absorbs as
-//! a wedge (a transport error), and that draining a wedged effect leaves its
-//! invocation to replay rather than losing it.
+//! runtime's split between what reaches the script (a plain 4xx) and what it
+//! absorbs as a wedge (a transport error, and every retryable status), and that
+//! draining a wedged effect leaves its invocation to replay rather than losing it.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hekla::context::CommandContext;
-use hekla::effect::{HttpClient, StubHttpClient};
+use hekla::effect::{HttpClient, HttpResponse, StubHttpClient};
 use hekla::runtime::Runtime;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -331,4 +331,86 @@ fn a_4xx_reaches_the_handler_and_completes_the_invocation() {
     assert_eq!(journal.len(), 1, "one journaled call: the http.post");
     let recorded: serde_json::Value = serde_json::from_str(&journal[0]).unwrap();
     assert_eq!(recorded["status"], 404, "the 4xx response is journaled");
+}
+
+/// Every response is journaled, so a status the handler could not have recovered
+/// from would be baked into the invocation: raising on it would replay the recorded
+/// refusal on every attempt and wedge forever without re-sending. That is why 429
+/// (and 408, and 425) are absorbed like a 5xx rather than handed to the script.
+#[test]
+fn a_429_is_retried_by_the_runtime_and_never_reaches_the_handler() {
+    let data = tempfile::tempdir().unwrap();
+    // Rate limited twice, then through.
+    let stub = Arc::new(StubHttpClient::new(|index, _| {
+        Ok(HttpResponse {
+            status: if index < 2 { 429 } else { 200 },
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+        })
+    }));
+    let booted = boot(data.path(), stub.clone());
+
+    register(&booted.rt, ALICE); // user.registered at position 1
+    wait_until("the effect to get past the rate limit", || {
+        log_head(&booted.rt) >= 2
+    });
+
+    assert_eq!(
+        stub.call_count(),
+        3,
+        "the runtime really re-sent the request rather than replaying the 429"
+    );
+    let effect = booted.rt.effect(EFFECT).unwrap();
+    assert_eq!(
+        effect.terminal_skips(),
+        0,
+        "a rate limit abandons no work: it is a wedge that clears itself"
+    );
+    wait_until("the wedge to clear", || {
+        booted.rt.effect(EFFECT).unwrap().consecutive_failures() == 0
+    });
+
+    booted.shutdown();
+
+    let db = open_op_db(data.path());
+    assert_eq!(invocation_status(&db, 1).as_deref(), Some("terminal"));
+    let statuses: Vec<serde_json::Value> = journal_results(&db, 1)
+        .iter()
+        .map(|result| serde_json::from_str::<serde_json::Value>(result).unwrap()["status"].clone())
+        .collect();
+    assert!(
+        !statuses.iter().any(|status| status == 429),
+        "a retryable status must never be journaled, or the retry would replay it: {statuses:?}"
+    );
+}
+
+/// A limiter that names its window gets that window waited out. Without this the
+/// runtime would come back on its own first backoff (200ms) and spend the whole
+/// window being refused.
+#[test]
+fn a_retry_after_holds_the_next_attempt_for_the_window_the_server_named() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::new(|index, _| {
+        Ok(HttpResponse {
+            status: if index == 0 { 429 } else { 200 },
+            headers: vec![("retry-after".to_owned(), "1".to_owned())],
+            body: b"{}".to_vec(),
+        })
+    }));
+    let booted = boot(data.path(), stub.clone());
+
+    let started = Instant::now();
+    register(&booted.rt, ALICE); // user.registered at position 1
+    wait_until("the effect to get past the rate limit", || {
+        log_head(&booted.rt) >= 2
+    });
+    let elapsed = started.elapsed();
+
+    assert_eq!(stub.call_count(), 2, "one refusal, then the retry");
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "the retry landed after {elapsed:?}, so the 1s the server asked for was ignored"
+    );
+
+    booted.shutdown();
 }

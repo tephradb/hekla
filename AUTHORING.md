@@ -561,13 +561,28 @@ twice.
 
 ### The retry split
 
-**The runtime absorbs transport errors and 5xx with backoff, and those never reach your script.** A
-result that reaches Starlark is therefore always terminal, so `status >= 400` in a handler is a
-real, decide-what-to-do failure rather than something every effect re-implements.
+**The runtime absorbs transport errors and every retryable status with backoff, and those never
+reach your script.** A retryable status is **408, 425, 429, or any 5xx**: each names a condition
+that clears on its own, with the same request. A result that does reach Starlark is therefore
+always terminal, so `status >= 400` in a handler is a real, decide-what-to-do failure rather than
+something every effect re-implements.
 
-Transport errors, 5xx, and a raised handler all **wedge** the invocation: the runtime retries the
-whole invocation with capped exponential backoff, forever, replaying journaled calls each attempt,
-and never skipping. `/status` reports each effect's consecutive-failure count and last error. The
+That split is not a convenience, it is the only place the decision can live. **Every response that
+reaches your handler is journaled.** A handler that raised on a 429 would replay the recorded 429 on
+every retry: the request would never be re-sent, and the invocation would wedge until an operator
+skipped it and dropped the work. Re-sending a call is something only the runtime can do, because
+only the runtime decides what goes into the journal.
+
+A `Retry-After` on a retryable response is honored: the next attempt waits at least the window the
+server named, up to a five-minute ceiling. It raises the backoff and never lowers it, so a limiter
+answering `Retry-After: 1` forever still gets exponentially rarer attempts rather than one a second.
+Only the delta-seconds form is read; the HTTP-date form reads as absent.
+
+Transport errors, retryable statuses, and a raised handler all **wedge** the invocation: the runtime
+retries the whole invocation with capped exponential backoff, forever, replaying journaled calls
+each attempt, and never skipping. `/status` reports each effect's consecutive-failure count and last
+error, so ordinary rate limiting surfaces there like any other wedge. That is what it is (the
+invocation is not progressing), and unlike most wedges it clears itself once the window opens. The
 only way past a genuinely unprocessable event is fixing the code and restarting, or an explicit
 operator `POST /effects/{name}/skip/{position}`.
 
@@ -704,7 +719,9 @@ stem. `given` is a list of events, constructed from the event definitions. `name
 | `effect` | `responds` (a list of `http_response(...)`) | the ordered list of `http_call(...)`, `command_call(...)` and `erase_call(...)` the handler should have made |
 
 - `http_response(status = , body = , headers = )` stubs a reply. `responds` serves them to the
-  handler's `http.*` calls in the order it makes them. Running past the end is a case failure.
+  handler's `http.*` calls in the order it makes them. Running past the end is a case failure. The
+  status has to be one a handler can actually see: the runtime retries 408, 425, 429 and every 5xx
+  itself, so a case declaring one would describe a path that cannot happen.
 - `http_call(url = , method = , body = )` is an expected request. **Only the arguments you give are
   compared**, so a case need not restate headers it does not care about.
 - `command_call(name, input)` is an expected `invoke_command`.

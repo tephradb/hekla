@@ -97,8 +97,9 @@ pub struct ProjectorCtx<'a> {
 /// triggering position and so reproduces itself on every attempt.
 pub trait EffectHost {
     /// Perform an HTTP request and return `{status, body, headers}`. A transport
-    /// failure or a 5xx is an `Err` (the runtime retries it, so it never reaches
-    /// the script); a 2xx/3xx/4xx response is a value the handler decides on.
+    /// failure or a retryable status (408, 425, 429, any 5xx) is an `Err`, because
+    /// the runtime retries those and they never reach the script; every other
+    /// response is a value the handler decides on.
     fn http(
         &self,
         method: &str,

@@ -2206,9 +2206,9 @@ pub(crate) fn effect_builtins(builder: &mut GlobalsBuilder) {
 
 /// The `http.*` namespace for effects: journaled HTTP calls. Each takes `url=`,
 /// optional `headers=` (a dict), and (for the body-bearing verbs) `body=` (any
-/// JSON), and returns `{status, body, headers}`. Transport failures and 5xx never
-/// reach here (the runtime retries them); a `status >= 400` is a real result the
-/// handler decides on.
+/// JSON), and returns `{status, body, headers}`. Transport failures and retryable
+/// statuses (408, 425, 429, any 5xx) never reach here, because the runtime retries
+/// them; a `status >= 400` that does is a real result the handler decides on.
 #[starlark_module]
 pub(crate) fn http_builtins(builder: &mut GlobalsBuilder) {
     /// A journaled HTTP GET. Takes `url=` and optional `headers=`, and returns

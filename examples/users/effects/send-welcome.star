@@ -3,9 +3,10 @@
 # journaled `http.post` whose result the handler inspects, `log()`, and
 # `invoke_command`, which lands the internal command exactly once across replays.
 #
-# The runtime absorbs transport errors and 5xx (they never reach here), so a
-# `status >= 400` is a real 4xx to decide on. A crash after the POST but before
-# the journal write replays the POST; the `invoke_command` is exactly-once.
+# The runtime absorbs transport errors and every retryable status (408, 425, 429
+# and any 5xx), so they never reach here and a `status >= 400` that does is a real
+# rejection to decide on. A crash after the POST but before the journal write
+# replays the POST; the `invoke_command` is exactly-once.
 
 load("events/user.star", "user_registered")
 

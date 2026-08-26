@@ -516,11 +516,18 @@ was already cancelled, the order already fulfilled), the runtime records the rej
 journal and completes the invocation. Treating rejection as retryable would loop forever on
 legitimately-stale completions.
 
-**Retry split**: the runtime absorbs transport errors and 5xx with backoff, and those never reach
-the script. A result that reaches Starlark is therefore always terminal, so `status >= 400` in a
-handler is a real, decide-what-to-do failure rather than something every effect re-implements.
+**Retry split**: the runtime absorbs transport errors and every retryable status (408, 425, 429 and
+any 5xx) with backoff, and those never reach the script. A result that reaches Starlark is therefore
+always terminal, so `status >= 400` in a handler is a real, decide-what-to-do failure rather than
+something every effect re-implements. The split has to fall there rather than in the script, because
+every response that reaches a handler is journaled: an effect that raised on a 429 would replay the
+recorded 429 on every retry, never re-send, and wedge until an operator skipped it and dropped the
+work. A `Retry-After` on a retryable response raises that attempt's backoff (delta-seconds only,
+capped at five minutes) so a limiter's own window is waited out rather than hammered; it never
+lowers the backoff, so a limiter repeating `Retry-After: 1` still gets exponentially rarer attempts.
 
-**Wedging and the skip hatch**: transport errors, 5xx, and a raised handler all wedge the invocation.
+**Wedging and the skip hatch**: transport errors, retryable statuses, and a raised handler all wedge
+the invocation.
 The runtime retries the whole invocation with capped exponential backoff, forever, replaying journaled
 calls each attempt so completed side effects never re-fire, and never skipping. Because a wedge is not
 the same as ordinary lag, the status endpoint reports each effect's consecutive-failure count and last

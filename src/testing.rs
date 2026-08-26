@@ -296,11 +296,12 @@ pub(crate) fn test_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] body: Option<Value<'_>>,
         #[starlark(require = named)] headers: Option<Value<'_>>,
     ) -> anyhow::Result<ResponseStub> {
-        // The runtime absorbs 5xx and retries, so one never reaches a handler. A case
-        // that declared one would be describing a path that cannot happen.
-        if !(100..500).contains(&status) {
+        // The runtime absorbs every retryable status and retries it itself, so none
+        // reaches a handler. A case that declared one would be describing a path
+        // that cannot happen.
+        if !(100..600).contains(&status) || effect::is_retryable_status(status as u16) {
             anyhow::bail!(
-                "http_response() status must be between 100 and 499; the runtime retries a 5xx, so a handler never sees one"
+                "http_response() status must be one a handler can actually see; the runtime retries 408, 425, 429 and every 5xx itself, so none of those ever reaches one"
             );
         }
         let body = match body {

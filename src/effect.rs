@@ -22,11 +22,18 @@
 //! at-least-once (a crash between a successful request and its journal write
 //! re-fires on replay).
 //!
-//! A handler error (a script bug, or a transport error / 5xx the runtime refuses
-//! to surface) wedges the invocation: it retries forever with capped backoff,
-//! never skipping, surfacing as a distinct failure count and last error in
-//! `/status`. The only escape past a genuinely unprocessable event is an explicit
-//! operator skip.
+//! A handler error (a script bug, or a transport error / retryable status the
+//! runtime refuses to surface) wedges the invocation: it retries forever with
+//! capped backoff, never skipping, surfacing as a distinct failure count and last
+//! error in `/status`. The only escape past a genuinely unprocessable event is an
+//! explicit operator skip.
+//!
+//! A *retryable* status is 408, 425, 429 or any 5xx: each names a condition that
+//! clears on its own, with the same request. Keeping 429 out of the script is not
+//! a convenience. A response that reaches Starlark is journaled, so an effect that
+//! raised on one would replay the recorded 429 on every attempt and wedge forever
+//! without ever re-sending. A `Retry-After` on such a response raises that
+//! attempt's backoff, so a rate limiter's own window is waited out, not hammered.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -65,6 +72,11 @@ const IDLE_POLL: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// The base wedge retry backoff, doubled each attempt up to [`BACKOFF_CAP`].
 const BACKOFF_BASE: Duration = Duration::from_millis(200);
+/// The ceiling on a `Retry-After` a server asked for. The header is honored past
+/// [`BACKOFF_CAP`], because a rate limiter legitimately names a window longer than
+/// any backoff we would pick for ourselves, but not without bound: this stops a
+/// stray or hostile value from parking an effect for a day.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(300);
 /// How long a graceful shutdown waits for effects to drain before abandoning a
 /// stuck one (its invocation stays `running` and replays next start).
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -555,12 +567,14 @@ fn run_invocation(
             }
             Err(failure) => {
                 shared.record_failure(&failure.message);
+                let delay = retry_delay(attempt, failure.retry_after);
                 tracing::error!(
-                    "effect `{effect}` invocation at position {position} failed (attempt {}): {}",
+                    "effect `{effect}` invocation at position {position} failed (attempt {}), \
+                     retrying in {delay:?}: {}",
                     attempt + 1,
                     failure.message
                 );
-                if sleep_watching(shared, Some(position), backoff(attempt)) {
+                if sleep_watching(shared, Some(position), delay) {
                     return Ok(Progress::Interrupted);
                 }
                 attempt = attempt.saturating_add(1);
@@ -591,6 +605,7 @@ fn try_invocation(
         position,
         disambiguators: RefCell::new(HashMap::new()),
         terminal: Cell::new(false),
+        retry_after: Cell::new(None),
         mode: HostMode::Live,
         trace: RefCell::new(Vec::new()),
         sealed_miss: RefCell::new(None),
@@ -609,6 +624,7 @@ fn try_invocation(
     run_handle(loaded, &inv, &host).map_err(|err| InvocationFailure {
         message: format!("{err:#}"),
         terminal: host.terminal.get(),
+        retry_after: host.retry_after.get(),
     })
 }
 
@@ -732,11 +748,13 @@ pub(crate) fn run_handle(
     })
 }
 
-/// A failed invocation attempt: its message, and whether the failure is terminal (no
-/// retry can succeed, e.g. a `reveal()` of an erased subject) rather than a wedge.
+/// A failed invocation attempt: its message, whether the failure is terminal (no
+/// retry can succeed, e.g. a `reveal()` of an erased subject) rather than a wedge,
+/// and how long the peer asked us to wait before the next attempt.
 struct InvocationFailure {
     message: String,
     terminal: bool,
+    retry_after: Option<Duration>,
 }
 
 /// The wedge backoff for `attempt`, doubling from [`BACKOFF_BASE`] up to
@@ -745,6 +763,46 @@ fn backoff(attempt: u32) -> Duration {
     BACKOFF_BASE
         .saturating_mul(1u32 << attempt.min(10))
         .min(BACKOFF_CAP)
+}
+
+/// Whether an HTTP status means "send this same request again", in which case the
+/// runtime absorbs it into the wedge rather than handing it to the script.
+///
+/// 408 (request timeout), 425 (too early) and 429 (too many requests) join every
+/// 5xx: each names a condition that clears on its own, with the request unchanged.
+/// 429 especially cannot be left to the script, because a response that reaches
+/// Starlark is journaled: an effect that raised on one would replay the recorded
+/// 429 on every retry and wedge forever without re-sending, leaving an operator
+/// skip (which abandons the work) as the only way out.
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429) || status >= 500
+}
+
+/// The `Retry-After` a retryable response asked for, if it named one in seconds.
+///
+/// The header's other legal form is an HTTP-date (RFC 9110 10.2.3). Honoring that
+/// would mean taking on a date parser and turning the peer's clock into a duration
+/// against ours, so a date reads as absent and the wedge backoff applies unchanged.
+fn retry_after_hint(headers: &[(String, String)]) -> Option<Duration> {
+    let value = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.trim())?;
+    // Rejects a date, a negative, and anything else non-numeric, all as "absent".
+    value.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// How long to wait before the next attempt: never sooner than the wedge backoff,
+/// and never sooner than a `Retry-After` asked for.
+///
+/// Taking the larger of the two rather than the header alone is what matters on a
+/// limiter that keeps answering `Retry-After: 1`. Obeying that literally would
+/// retry once a second forever, so the backoff still grows underneath it.
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    match retry_after {
+        Some(after) => backoff(attempt).max(after.min(RETRY_AFTER_CAP)),
+        None => backoff(attempt),
+    }
 }
 
 /// Honor a pending operator skip by completing the wedged invocation. The request
@@ -797,6 +855,10 @@ struct EffectHostImpl<'a> {
     /// data is gone, no retry recovers it), so the driver completes rather than
     /// wedges the invocation.
     terminal: Cell<bool>,
+    /// The `Retry-After` a retryable HTTP status named, for the driver's backoff. A
+    /// `Cell` for the same reason as `terminal`: it has to reach the driver past the
+    /// starlark boundary, which flattens a host error down to its message.
+    retry_after: Cell<Option<Duration>>,
     /// Whether a journal miss may perform the call. [`HostMode::Sealed`] is what
     /// makes the replay check safe to run: it cannot fire the side effect it is
     /// checking for.
@@ -931,9 +993,12 @@ impl EffectHost for EffectHostImpl<'_> {
                 .http
                 .send(&request)
                 .with_context(|| format!("http {method} {url}"))?;
-            // 5xx never reaches the script: surface it as a retryable error so the
-            // wedge absorbs it.
-            if response.status >= 500 {
+            // A retryable status never reaches the script: surface it as a retryable
+            // error so the wedge absorbs it, keeping any `Retry-After` for the
+            // driver. Bailing here is before the journal write, which is exactly what
+            // lets the next attempt re-send instead of replaying the refusal.
+            if is_retryable_status(response.status) {
+                self.retry_after.set(retry_after_hint(&response.headers));
                 anyhow::bail!("http {method} {url} returned {}", response.status);
             }
             Ok(http_response_to_json(response))
@@ -1338,6 +1403,7 @@ pub(crate) fn verify_replay(
         position,
         disambiguators: RefCell::new(HashMap::new()),
         terminal: Cell::new(false),
+        retry_after: Cell::new(None),
         mode: HostMode::Sealed,
         trace: RefCell::new(Vec::new()),
         sealed_miss: RefCell::new(None),
@@ -1526,6 +1592,61 @@ mod tests {
         assert_eq!(backoff(0), BACKOFF_BASE);
         assert_eq!(backoff(1), BACKOFF_BASE * 2);
         assert_eq!(backoff(100), BACKOFF_CAP);
+    }
+
+    /// The split between what the runtime absorbs and what the script decides on.
+    /// Every status here is one an effect author could plausibly branch on, so the
+    /// list is spelled out rather than left to the `matches!`.
+    #[test]
+    fn retryable_statuses_are_the_ones_that_clear_on_their_own() {
+        for status in [408, 425, 429, 500, 502, 503, 504, 599] {
+            assert!(is_retryable_status(status), "{status} must be absorbed");
+        }
+        for status in [200, 201, 204, 301, 400, 401, 403, 404, 409, 410, 418, 422] {
+            assert!(
+                !is_retryable_status(status),
+                "{status} is a real result the handler decides on"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_is_read_only_in_its_delta_seconds_form() {
+        let header =
+            |value: &str| retry_after_hint(&[("Retry-After".to_owned(), value.to_owned())]);
+        assert_eq!(header("30"), Some(Duration::from_secs(30)));
+        assert_eq!(header("  30 "), Some(Duration::from_secs(30)));
+        assert_eq!(header("0"), Some(Duration::ZERO));
+        // The header's other legal form. Unparsed on purpose, so it reads as absent
+        // and the wedge backoff stands rather than the effect stalling on a guess.
+        assert_eq!(header("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(header("-5"), None);
+        assert_eq!(header("soon"), None);
+        assert_eq!(header(""), None);
+        // A transport need not normalise the name, and the stub client does not.
+        assert_eq!(
+            retry_after_hint(&[("retry-after".to_owned(), "7".to_owned())]),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(retry_after_hint(&[]), None);
+    }
+
+    #[test]
+    fn retry_after_raises_the_backoff_and_never_lowers_it() {
+        assert_eq!(retry_delay(0, None), backoff(0), "nothing was asked for");
+        // A window longer than our own backoff is honored, past `BACKOFF_CAP`.
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(120))),
+            Duration::from_secs(120)
+        );
+        // A limiter answering `Retry-After: 1` forever must not pin the effect to one
+        // attempt a second: the backoff keeps growing underneath the header.
+        assert_eq!(retry_delay(100, Some(Duration::from_secs(1))), BACKOFF_CAP);
+        // And a stray or hostile value cannot park the effect for a day.
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(86_400))),
+            RETRY_AFTER_CAP
+        );
     }
 
     #[test]
