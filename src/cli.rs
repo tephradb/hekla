@@ -76,12 +76,33 @@ enum Command {
         /// `<dir>/data`.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Run the continuous invariant checks: every fold is checked for
+        /// determinism, and every completed effect invocation is replayed against a
+        /// sealed journal. A component that breaks an invariant is quarantined.
+        #[arg(long)]
+        verify: bool,
     },
     /// Run the scenarios under `tests/`, covering commands, projectors and effects.
     Test {
         /// The project directory.
         #[arg(default_value = ".")]
         dir: PathBuf,
+    },
+    /// Check the invariants the design rests on against a data directory: that a
+    /// projector rebuilt from position 0 matches the live one, and that every
+    /// recorded effect invocation still replays without performing anything.
+    ///
+    /// Takes the data-directory lock, so it refuses to run against a directory a
+    /// server has open. Verify a copy of the directory, which checks the backup at
+    /// the same time.
+    Verify {
+        /// The project directory.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// The data directory (event store and operational DB). Defaults to
+        /// `<dir>/data`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
     /// Rewrap every subject key under the primary master key (`HEKLA_MASTER_KEY`),
     /// unwrapping with the previous keys (`HEKLA_MASTER_KEY_PREVIOUS`) as needed. Run
@@ -126,8 +147,10 @@ pub fn run() -> ExitCode {
             dir,
             addr,
             data_dir,
-        } => serve(&dir, addr.as_deref(), data_dir.as_deref()),
+            verify,
+        } => serve(&dir, addr.as_deref(), data_dir.as_deref(), verify),
         Command::Test { dir } => testing::run(&dir),
+        Command::Verify { dir, data_dir } => verify(&dir, data_dir.as_deref()),
         Command::Rotate { dir, data_dir } => rotate(&dir, data_dir.as_deref()),
         Command::Erase {
             subject_field,
@@ -247,16 +270,65 @@ fn check(dir: &Path) -> ExitCode {
     }
 }
 
-fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>) -> ExitCode {
+/// `hekla verify`: the offline invariant sweep over a data directory.
+///
+/// Exits non-zero on any violation, so it drops straight into CI or a nightly job.
+/// It reports what it checked even when clean, because a sweep that found nothing
+/// because it covered nothing must not read like a passing one.
+fn verify(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
     init_tracing();
 
     let project = LoadedProject::load(dir);
     let (errors, _) = report_findings(&project);
     if errors > 0 {
+        eprintln!("refusing to verify: the project has {errors} error(s)");
+        return ExitCode::FAILURE;
+    }
+    let data = runtime::resolve_data_dir(dir, data_dir);
+    if !data.exists() {
+        eprintln!("error: no data directory at {}", data.display());
+        return ExitCode::FAILURE;
+    }
+    let master = match crypto::master_keys_from_env() {
+        Ok(master) => master,
+        Err(err) => {
+            eprintln!("error: reading the master key: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match crate::verify::sweep(&project, &data, master) {
+        Ok(report) => {
+            println!("{report}");
+            if report.is_clean() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) -> ExitCode {
+    init_tracing();
+
+    let mut project = LoadedProject::load(dir);
+    let (errors, _) = report_findings(&project);
+    if errors > 0 {
         eprintln!("refusing to serve: the project has {errors} error(s)");
         return ExitCode::FAILURE;
     }
-
+    // The flag turns the checks on without editing `hekla.toml`; the file can turn
+    // them on permanently. Neither can turn the other off, so `--verify` on a
+    // project that already enables them is a no-op rather than a surprise.
+    if verify {
+        project.config.verify.enabled = true;
+    }
+    if project.config.verify.enabled {
+        tracing::info!("verify mode on: folds and effect replays are checked as they run");
+    }
     let addr: SocketAddr = match addr.unwrap_or(DEFAULT_ADDR).parse() {
         Ok(addr) => addr,
         Err(err) => {

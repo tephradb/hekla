@@ -34,6 +34,7 @@ use crate::starlark_builtins::{
     EntityDef, EventSpec, LoadedModule, ModuleDef, alloc_event, call_handler_with_projector_ctx,
     parse_entity_ops, parse_event_dispatch, thaw,
 };
+use crate::verify::Violation;
 
 /// Per-handler instruction budget, matching the command dispatch bound.
 const MAX_TICKS: u64 = 10_000_000;
@@ -59,6 +60,10 @@ pub enum Readiness {
     /// The definition changed and auto-rebuild is off, so nothing will resolve it
     /// but an operator-triggered replay.
     Stale,
+    /// A verify-mode check found a broken invariant. The model keeps serving what it
+    /// has, but the projector stops advancing: whatever it would apply next is built
+    /// on state already known to be wrong. Only an operator clears this.
+    Quarantined,
     /// A rebuild was attempted and failed, leaving the model at the shape it had.
     /// Like [`Readiness::Stale`] it needs an operator, but the cause is an error
     /// rather than a setting, so [`ProjectorShared::last_error`] names it.
@@ -71,6 +76,7 @@ impl Readiness {
             1 => Readiness::Rebuilding,
             2 => Readiness::Stale,
             3 => Readiness::Failed,
+            4 => Readiness::Quarantined,
             _ => Readiness::Ready,
         }
     }
@@ -81,6 +87,7 @@ impl Readiness {
             Readiness::Rebuilding => 1,
             Readiness::Stale => 2,
             Readiness::Failed => 3,
+            Readiness::Quarantined => 4,
         }
     }
 
@@ -91,6 +98,7 @@ impl Readiness {
             Readiness::Rebuilding => "rebuilding",
             Readiness::Stale => "stale",
             Readiness::Failed => "rebuild_failed",
+            Readiness::Quarantined => "quarantined",
         }
     }
 
@@ -193,6 +201,47 @@ impl ProjectorShared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
         self.failed.store(false, Ordering::Relaxed);
+    }
+
+    /// Publish a checkpoint reached by tailing, refusing to move backwards.
+    ///
+    /// A regression means one of two things, and neither is recoverable by carrying
+    /// on: the model is about to re-absorb events it already applied, or the gap
+    /// between the two positions will never be applied at all. Returns the violation
+    /// rather than storing it, so the caller quarantines instead.
+    ///
+    /// Only for the tailing path. A rebuild *replaces* the model, so its checkpoint
+    /// is authoritative even when it lands behind (a bounded rebuild stops where it
+    /// was told to); it publishes through [`ProjectorShared::reset_position`].
+    fn advance_position(&self, to: u64) -> Result<(), Violation> {
+        let from = self.position.load(Ordering::Acquire);
+        if to < from {
+            return Err(Violation::CheckpointRegression {
+                component: format!("projector `{}`", self.name),
+                from,
+                to,
+            });
+        }
+        self.position.store(to, Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish the checkpoint of a freshly rebuilt model, which replaces whatever the
+    /// projector had. Not guarded against moving backwards: the rebuilt model *is*
+    /// the state now, so a lower checkpoint is the truth rather than a violation.
+    fn reset_position(&self, to: u64) {
+        self.position.store(to, Ordering::Release);
+    }
+
+    /// Stop advancing after a broken invariant, leaving the model readable.
+    ///
+    /// Deliberately not `record_failure` alone: a failed projector is one that hit
+    /// an error and may recover, while a quarantined one is serving state a check
+    /// says is wrong, and no amount of retrying fixes that.
+    fn quarantine(&self, violation: &Violation) {
+        tracing::error!("projector `{}` quarantined: {violation}", self.name);
+        self.record_failure(&violation.to_string());
+        self.set_readiness(Readiness::Quarantined);
     }
 }
 
@@ -447,9 +496,9 @@ fn run_inner(
             .map_err(|err| anyhow::anyhow!("reading events: {err}"))?;
         if !batch.is_empty() {
             apply_batch(&model, frozen, &by_id, &batch, sub.position(), events)?;
-            shared
-                .position
-                .store(sub.position().get(), Ordering::Release);
+            if let Err(violation) = shared.advance_position(sub.position().get()) {
+                shared.quarantine(&violation);
+            }
             continue;
         }
 
@@ -461,7 +510,9 @@ fn run_inner(
         let watermark = sub.position();
         if watermark.get() > shared.position() {
             model.advance_checkpoint(watermark)?;
-            shared.position.store(watermark.get(), Ordering::Release);
+            if let Err(violation) = shared.advance_position(watermark.get()) {
+                shared.quarantine(&violation);
+            }
         }
 
         // Stop only here, so a pending shutdown still drains to head.
@@ -518,26 +569,32 @@ fn rebuild_or_degrade(
     if reconcile_plan(&reopened, definition, false)? != Reconcile::Stale {
         shared.set_readiness(Readiness::Ready);
     }
-    shared
-        .position
-        .store(reopened.read_checkpoint()?.get(), Ordering::Release);
+    shared.reset_position(reopened.read_checkpoint()?.get());
     Ok(reopened)
 }
 
-/// Project every event up to the current head into `model`, committing in batches
-/// and advancing the checkpoint. Does not tail live events. Used by replay and by
-/// tests; the live loop drives batches itself so it can also wait and shut down.
-pub fn project_to_head(
+/// Project every event up to `upto` (or the current head when `None`) into `model`,
+/// committing in batches and advancing the checkpoint. Does not tail live events.
+/// Used by replay, by the rebuild check, and by tests; the live loop drives batches
+/// itself so it can also wait and shut down.
+///
+/// The checkpoint ends at the subscription's watermark, not at the last *matching*
+/// event, which is what the live loop's caught-up branch does too. Leaving it at the
+/// last match would make a rebuilt model's checkpoint read as behind the live one
+/// whenever the log ends in events the query does not select, including the case
+/// where it selects nothing at all.
+pub fn project_to(
     store: &WriteHandle,
     unit: &LoadedModule,
     model: &ReadModel,
     events: &EventDefs,
+    upto: Option<Position>,
 ) -> anyhow::Result<usize> {
     let ModuleDef::Projector {
         entities, sources, ..
     } = &unit.def
     else {
-        anyhow::bail!("project_to_head called on a non-projector module");
+        anyhow::bail!("project_to called on a non-projector module");
     };
     let query = dispatch::to_query(sources, events, None)?;
     let by_id = by_id_map(entities);
@@ -550,10 +607,54 @@ pub fn project_to_head(
         if batch.is_empty() {
             break;
         }
+        // Bounded runs stop at the first event past the bound rather than applying a
+        // partial batch, so the model lands on a position the caller named.
+        let batch: Vec<_> = match upto {
+            Some(limit) => batch
+                .iter()
+                .take_while(|(position, _)| *position <= limit)
+                .map(|(position, event)| (*position, event.clone()))
+                .collect(),
+            None => batch.to_vec(),
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let reached = batch
+            .last()
+            .map(|(position, _)| *position)
+            .unwrap_or(Position::ZERO);
+        let checkpoint = match upto {
+            Some(limit) if sub.position() > limit => reached,
+            _ => sub.position(),
+        };
         seen += batch.len();
-        apply_batch(model, &unit.module, &by_id, &batch, sub.position(), events)?;
+        apply_batch(model, &unit.module, &by_id, &batch, checkpoint, events)?;
+        if upto.is_some_and(|limit| checkpoint >= limit) {
+            return Ok(seen);
+        }
+    }
+    // Caught up. Publish the watermark so a selective projector's rebuilt checkpoint
+    // tracks head rather than stalling at its last matching event, matching what the
+    // live loop does when its poll comes back empty.
+    let watermark = match upto {
+        Some(limit) => sub.position().min(limit),
+        None => sub.position(),
+    };
+    if watermark > model.read_checkpoint()? {
+        model.advance_checkpoint(watermark)?;
     }
     Ok(seen)
+}
+
+/// [`project_to`] with no upper bound: project everything to the current head.
+pub fn project_to_head(
+    store: &WriteHandle,
+    unit: &LoadedModule,
+    model: &ReadModel,
+    events: &EventDefs,
+) -> anyhow::Result<usize> {
+    project_to(store, unit, model, events, None)
 }
 
 /// Apply one batch of events and advance the checkpoint, in one transaction. Every
@@ -667,9 +768,7 @@ fn rebuild(
     remove_sidecars(db_path)?;
 
     let reopened = ReadModel::open(db_path, &shared.entities)?;
-    shared
-        .position
-        .store(reopened.read_checkpoint()?.get(), Ordering::Release);
+    shared.reset_position(reopened.read_checkpoint()?.get());
     tracing::info!("projector `{}` replayed {count} events", shared.name);
     Ok(reopened)
 }

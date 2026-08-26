@@ -74,7 +74,36 @@ HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
 
 `check` is thorough on purpose: it resolves the load graph, verifies every clause filters on a field
 its event declares and indexes, and warns about a personal-looking field with no `subject`. Also
-`hekla fmt`, `hekla lsp` for editors, and `hekla erase` / `hekla rotate` for key management.
+`hekla fmt`, `hekla lsp` for editors, `hekla erase` / `hekla rotate` for key management, and
+`hekla verify` for the invariant sweep below.
+
+## Checking the invariants
+
+The event log is append-only, so the bugs worth hunting are the ones you cannot undo: an event that
+should never have been appended, an effect that fired twice, a read model that quietly disagrees with
+its own history. `hekla verify` checks the properties those rest on, against whatever state a
+deployment actually reached rather than against cases someone thought to write down.
+
+```sh
+# Verify a stopped instance, or a snapshot of one. A plain `cp -r` of a directory a
+# server has open is not crash-consistent (SQLite WAL, a segment mid-append), so the
+# sweep could report divergence the copy caused, the worst possible false positive
+# for a tool whose whole value is being believed.
+cargo run -- verify . --data-dir data   # non-zero exit on any violation, for CI or a nightly job
+```
+
+It checks that every projector rebuilt from position 0 matches the live one row for row, and that
+every recorded effect invocation still replays without performing anything. The replay runs against
+a *sealed* host that can only read the journal and can never send, so verifying an invocation is
+structurally incapable of repeating it.
+
+`serve --verify` runs the per-operation half continuously: every fold is checked for determinism, and
+every completed invocation is replayed as it finishes. A component that breaks an invariant is
+quarantined (it stops advancing, its reads return 503, and `/status` names what broke) while the rest
+of the runtime keeps serving. Turn it on permanently with `[verify] enabled = true` in `hekla.toml`.
+
+One process at a time: a runtime takes an exclusive lock on its data directory, because tephra does
+not lock the segment directory itself.
 
 ## Learn more
 

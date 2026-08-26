@@ -54,6 +54,7 @@ use crate::starlark_builtins::{
     LoadedModule, ModuleDef, alloc_event, call_handler_with_effect_ctx,
     call_handler_with_query_ctx, initial_state, parse_event_dispatch, parse_event_specs, thaw,
 };
+use crate::verify::Violation;
 
 /// Per-handler instruction budget. Bounds a runaway script at dispatch time.
 const MAX_TICKS: u64 = 10_000_000;
@@ -89,6 +90,11 @@ pub struct EffectShared {
     /// The position an operator asked to skip, or `0` for none (no event sits at
     /// position 0).
     skip_position: AtomicU64,
+    /// Set when a verify-mode check found a broken invariant. The driver stops
+    /// rather than retries: a divergence is not a transient failure, and every
+    /// later position would be processed on the strength of an assumption that has
+    /// just been shown false.
+    quarantined: AtomicBool,
 }
 
 impl EffectShared {
@@ -155,6 +161,32 @@ impl EffectShared {
             .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
+    /// Whether a verify-mode check stopped this effect. Unlike a wedge, nothing
+    /// clears this on its own.
+    pub fn quarantined(&self) -> bool {
+        self.quarantined.load(Ordering::Relaxed)
+    }
+
+    /// Re-apply a quarantine recorded by an earlier process, so `/status` reports it
+    /// the same way whether or not the server has restarted since.
+    fn restore_quarantine(&self, position: u64, reason: &str) {
+        self.quarantined.store(true, Ordering::Relaxed);
+        self.position.store(position, Ordering::Relaxed);
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(reason.to_owned());
+    }
+
+    /// Stop the effect after a broken invariant, recording what broke.
+    fn quarantine(&self, violation: &Violation) {
+        tracing::error!("effect `{}` quarantined: {violation}", self.name);
+        self.quarantined.store(true, Ordering::Relaxed);
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(violation.to_string());
+    }
     /// Record a terminal skip: count it and keep its message, without touching the wedge
     /// counter (the position is abandoned, not stuck). Pair with `clear_failures` so any
     /// wedge state from earlier retries of the same position is reset.
@@ -298,6 +330,7 @@ fn spawn(
         terminal_skips: AtomicU64::new(0),
         last_terminal_error: Mutex::new(None),
         skip_position: AtomicU64::new(0),
+        quarantined: AtomicBool::new(false),
     });
     let task_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
@@ -360,6 +393,16 @@ fn run_inner(
     // Sources filter on plaintext fields only (check-time rejects encrypted source
     // constraints), so no key store is needed to lower them.
     let query = dispatch::to_query(sources, runtime.events_map(), None)?;
+    // A recorded quarantine outlives the process that found it. Refusing to start is
+    // the point: an effect stopped for a broken invariant must not resume because
+    // someone restarted the server, which is the ordinary reaction to a stuck effect.
+    if let Some((position, reason)) = runtime.effect_quarantine(name)? {
+        shared.restore_quarantine(position, &reason);
+        tracing::error!(
+            "effect `{name}` stays quarantined from position {position} across this restart: {reason}"
+        );
+        return Ok(());
+    }
     let resume = runtime.effect_resume_after(name)?;
     let mut sub = runtime.store().subscribe(query, Position::new(resume));
     loop {
@@ -462,8 +505,35 @@ fn run_invocation(
             http,
         ) {
             Ok(()) => {
+                // Complete first, then check. The live run has already performed and
+                // journaled its side effects, so this position's work is genuinely
+                // done; leaving the row `running` so the check could report on it
+                // would make the next boot re-enter the handler in `Live` mode and
+                // perform for real the very call the sealed replay refused. The
+                // detection would become the double-fire it exists to prevent.
                 runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
                 shared.clear_failures();
+                if runtime.verify() {
+                    let violations = verify_replay(
+                        effect,
+                        position,
+                        &env,
+                        event,
+                        &event_type,
+                        &data,
+                        loaded,
+                        runtime,
+                    );
+                    if let Some(violation) = violations.first() {
+                        // Durable, so the restart a wedged effect invites does not
+                        // silently clear it. The watermark is deliberately left where
+                        // it is: this position is terminal, but nothing past it should
+                        // be processed until an operator has looked.
+                        runtime.quarantine_effect(effect, position, &violation.to_string())?;
+                        shared.quarantine(violation);
+                        return Ok(Progress::Interrupted);
+                    }
+                }
                 return Ok(Progress::Advanced);
             }
             // A terminal failure (an erased subject a `reveal()` needed) cannot be
@@ -521,6 +591,9 @@ fn try_invocation(
         position,
         disambiguators: RefCell::new(HashMap::new()),
         terminal: Cell::new(false),
+        mode: HostMode::Live,
+        trace: RefCell::new(Vec::new()),
+        sealed_miss: RefCell::new(None),
     };
     let inv = Invocation {
         events: runtime.events_map(),
@@ -531,6 +604,7 @@ fn try_invocation(
         env,
         event_type,
         data,
+        verify: runtime.verify(),
     };
     run_handle(loaded, &inv, &host).map_err(|err| InvocationFailure {
         message: format!("{err:#}"),
@@ -553,6 +627,8 @@ pub(crate) struct Invocation<'a> {
     pub env: &'a Envelope,
     pub event_type: &'a str,
     pub data: &'a Value,
+    /// Whether the boundary fold is checked for determinism on this run.
+    pub verify: bool,
 }
 
 /// Route one event through an effect's `handle` and run every arm whose clause selects
@@ -631,6 +707,7 @@ pub(crate) fn run_handle(
                         events,
                         keystore: inv.keystore,
                         upto: Some(inv.position),
+                        verify: inv.verify,
                     },
                     initial,
                 )?
@@ -721,6 +798,33 @@ struct EffectHostImpl<'a> {
     /// data is gone, no retry recovers it), so the driver completes rather than
     /// wedges the invocation.
     terminal: Cell<bool>,
+    /// Whether a journal miss may perform the call. [`HostMode::Sealed`] is what
+    /// makes the replay check safe to run: it cannot fire the side effect it is
+    /// checking for.
+    mode: HostMode,
+    /// Every journaled call this run reached, in order. The replay check compares
+    /// it against what the journal holds, which is how a handler that changed the
+    /// *order* of its calls gets caught: the journal is keyed by call content, so
+    /// a reordered run still hits every entry and would otherwise look faithful.
+    trace: RefCell<Vec<CallKey>>,
+    /// The first call a sealed run found no journal entry for. Held separately from
+    /// the error it raises so the caller can report which call diverged rather than
+    /// parsing a message.
+    sealed_miss: RefCell<Option<CallKey>>,
+}
+
+/// The identity of one journaled call within an invocation: its content hash and
+/// which repeat of that content it is.
+pub(crate) type CallKey = (String, u64);
+
+/// Whether a host may perform side effects, or only replay recorded ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostMode {
+    /// A journal miss performs the call and records it. The live path.
+    Live,
+    /// A journal miss is a violation: nothing is performed, and the run stops.
+    /// Used by the replay check, so verifying an invocation can never repeat it.
+    Sealed,
 }
 
 impl EffectHostImpl<'_> {
@@ -733,11 +837,21 @@ impl EffectHostImpl<'_> {
         F: FnOnce(u64) -> anyhow::Result<Value>,
     {
         let disambiguator = self.next_disambiguator(call_hash);
+        self.trace
+            .borrow_mut()
+            .push((call_hash.to_owned(), disambiguator));
         if let Some(recorded) =
             self.runtime
                 .journal_get(&self.effect, self.position, call_hash, disambiguator)?
         {
             return serde_json::from_str(&recorded).context("decoding a journaled call result");
+        }
+        // A sealed run stops here rather than performing anything. The miss *is* the
+        // finding: the handler reached a call the recorded run did not make, which
+        // on a real retry is the double-fire this check exists to detect.
+        if self.mode == HostMode::Sealed {
+            *self.sealed_miss.borrow_mut() = Some((call_hash.to_owned(), disambiguator));
+            anyhow::bail!("sealed replay reached a call with no journal entry");
         }
         let result = run(disambiguator)?;
         let encoded = serde_json::to_string(&result).context("encoding a call result")?;
@@ -857,17 +971,27 @@ impl EffectHost for EffectHostImpl<'_> {
     }
 
     fn log(&self, message: &str) {
+        // A sealed run is a verification pass over work that already happened, so
+        // repeating its log lines would double every effect's trace output for no
+        // information. The journaled calls are what the check reads.
+        if self.mode == HostMode::Sealed {
+            return;
+        }
         tracing::info!("effect `{}` @ {}: {message}", self.effect, self.position);
     }
 
     fn erase(&self, subject_field: &str, subject_value: &str) -> anyhow::Result<bool> {
         // Auditable like `reveal`, and for a stronger reason: this one is the
-        // irreversible half of the pair.
-        tracing::info!(
-            "effect `{}` @ {}: erase {subject_field}={subject_value}",
-            self.effect,
-            self.position
-        );
+        // irreversible half of the pair. Which is exactly why a sealed run stays
+        // silent: it performs nothing, and an audit line for an erasure that did not
+        // happen is worse than no line at all.
+        if self.mode == HostMode::Live {
+            tracing::info!(
+                "effect `{}` @ {}: erase {subject_field}={subject_value}",
+                self.effect,
+                self.position
+            );
+        }
         let hash = call_hash(
             "erase",
             &json!({ "subject_field": subject_field, "subject_value": subject_value }),
@@ -888,12 +1012,16 @@ impl EffectHost for EffectHostImpl<'_> {
         field: &str,
         ciphertext: &str,
     ) -> anyhow::Result<String> {
-        // Auditable: every crossing of the decrypt boundary is traced.
-        tracing::debug!(
-            "effect `{}` @ {}: reveal {subject_field}={subject_value} field={field}",
-            self.effect,
-            self.position
-        );
+        // Auditable: every crossing of the decrypt boundary is traced, for a live
+        // run. A sealed replay re-runs `reveal` (it is not journaled) but performs
+        // nothing outward, so tracing it would double the audit trail.
+        if self.mode == HostMode::Live {
+            tracing::debug!(
+                "effect `{}` @ {}: reveal {subject_field}={subject_value} field={field}",
+                self.effect,
+                self.position
+            );
+        }
         let keystore = self.runtime.keystore().ok_or_else(|| {
             anyhow::anyhow!("reveal() needs a master key, but none is configured")
         })?;
@@ -1165,6 +1293,137 @@ impl HttpClient for StubHttpClient {
     }
 }
 
+// --- the replay check ------------------------------------------------------
+
+/// An [`HttpClient`] that cannot send. A sealed host never reaches its transport,
+/// because a journal miss stops the run before the call is performed; this makes
+/// that unreachability explicit rather than relying on a stub that would quietly
+/// succeed if the invariant ever broke.
+struct SealedHttp;
+
+impl HttpClient for SealedHttp {
+    fn send(&self, _request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+        anyhow::bail!("a sealed replay tried to send an HTTP request")
+    }
+}
+
+/// Re-run a recorded invocation against a sealed host and report every way it fails
+/// to reproduce itself.
+///
+/// Safe against a live system by construction: the sealed host performs nothing, so
+/// the worst outcome is a report. `reveal` is re-run because it is not journaled,
+/// but it decrypts and returns without reaching anything outward.
+///
+/// Two shapes of divergence are caught, and the second is the one nothing else
+/// detects: a call the journal has no entry for, and a journal entry the handler no
+/// longer makes. Because the journal is keyed by call content rather than by
+/// sequence, a handler that merely *reorders* its calls still hits every entry, so
+/// comparing the visited set against the recorded set is what surfaces it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_replay(
+    effect: &str,
+    position: u64,
+    env: &Envelope,
+    event: &Event,
+    event_type: &str,
+    data: &Value,
+    loaded: &LoadedModule,
+    runtime: &Arc<Runtime>,
+) -> Vec<Violation> {
+    let sealed_http = SealedHttp;
+    let host = EffectHostImpl {
+        runtime,
+        http: &sealed_http,
+        env: env.clone(),
+        effect: effect.to_owned(),
+        position,
+        disambiguators: RefCell::new(HashMap::new()),
+        terminal: Cell::new(false),
+        mode: HostMode::Sealed,
+        trace: RefCell::new(Vec::new()),
+        sealed_miss: RefCell::new(None),
+    };
+    let inv = Invocation {
+        events: runtime.events_map(),
+        store: runtime.store(),
+        keystore: runtime.keystore(),
+        position,
+        event,
+        env,
+        event_type,
+        data,
+        // The replay check is already a second run; folding twice inside it would
+        // re-check determinism the live run already checked.
+        verify: false,
+    };
+
+    let divergence = |detail: String| Violation::ReplayDivergence {
+        effect: effect.to_owned(),
+        position,
+        detail,
+    };
+
+    let outcome = run_handle(loaded, &inv, &host);
+    let visited = host.trace.borrow().clone();
+
+    if let Err(err) = outcome {
+        // A terminal failure is the documented cost of the `erase last` rule, not a
+        // divergence: the replay re-runs the unjournaled `reveal` against a key the
+        // invocation itself deleted, exactly as the live retry path already does.
+        // Reporting it would quarantine every effect written the recommended way.
+        if host.terminal.get() {
+            tracing::debug!(
+                "effect `{effect}` at {position} is not replayable by design (it erased a \
+                 subject it revealed); skipping the replay check"
+            );
+            return Vec::new();
+        }
+        let miss = host.sealed_miss.borrow().clone();
+        return vec![match miss {
+            Some((hash, disambiguator)) => divergence(format!(
+                "it reached a call with no journal entry (call {hash}, repeat {disambiguator}); \
+                 a real retry would have performed it a second time"
+            )),
+            // No miss recorded and not terminal, so the handler itself failed on a
+            // path the first run got through. That is a genuine surprise.
+            None => divergence(format!("it failed part-way through: {err:#}")),
+        }];
+    }
+
+    let recorded = match runtime.journal_keys(effect, position) {
+        Ok(recorded) => recorded,
+        Err(err) => {
+            return vec![divergence(format!(
+                "its journal could not be read: {err:#}"
+            ))];
+        }
+    };
+
+    // Ordered comparison. A subset test would be blind to exactly the case the
+    // content-keyed journal cannot see on its own: `(call_hash, disambiguator)` pairs
+    // are unique within an invocation, and a sealed run can never visit a key the
+    // journal lacks (that path returned above), so equal-as-sets is guaranteed and
+    // only the sequence carries new information.
+    if visited != recorded {
+        return vec![divergence(format!(
+            "it made a different sequence of calls than the journal records \
+             (journal {}, replay {})",
+            render_keys(&recorded),
+            render_keys(&visited)
+        ))];
+    }
+    Vec::new()
+}
+
+/// Render a call sequence compactly: each hash is truncated, since the full digest
+/// adds length without helping anyone reading the message.
+fn render_keys(keys: &[CallKey]) -> String {
+    let rendered: Vec<String> = keys
+        .iter()
+        .map(|(hash, disambiguator)| format!("{}#{disambiguator}", &hash[..8.min(hash.len())]))
+        .collect();
+    format!("[{}]", rendered.join(", "))
+}
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -1181,6 +1440,7 @@ mod tests {
             terminal_skips: AtomicU64::new(0),
             last_terminal_error: Mutex::new(None),
             skip_position: AtomicU64::new(0),
+            quarantined: AtomicBool::new(false),
         }
     }
 

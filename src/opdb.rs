@@ -17,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// The current schema version, tracked in SQLite's `user_version`. Bump it and
 /// add a migration arm when the schema changes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// How many rows a single sweep statement deletes, so a retention sweep never
 /// holds the connection across a long scan. The sweeper loops until a call
@@ -199,6 +199,89 @@ impl OpDb {
             )
             .context("recording effect journal entry")?;
         Ok(())
+    }
+
+    /// Record a verify-mode quarantine, so a restart honours it instead of resuming
+    /// the effect as though nothing had been found.
+    pub fn quarantine_effect(
+        &self,
+        effect: &str,
+        position: u64,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO effect_quarantine (effect, position, reason) \
+                 VALUES (?1, ?2, ?3)",
+                params![effect, position as i64, reason],
+            )
+            .context("recording an effect quarantine")?;
+        Ok(())
+    }
+
+    /// The recorded quarantine for an effect, if it has one.
+    pub fn effect_quarantine(&self, effect: &str) -> anyhow::Result<Option<(u64, String)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT position, reason FROM effect_quarantine WHERE effect = ?1",
+                params![effect],
+                |row| {
+                    let position: i64 = row.get(0)?;
+                    let reason: String = row.get(1)?;
+                    Ok((position as u64, reason))
+                },
+            )
+            .optional()
+            .context("reading an effect quarantine")?;
+        Ok(row)
+    }
+
+    /// Every journaled call recorded for one invocation, in the order it was made.
+    ///
+    /// The replay check needs the recorded set, not the results: a faithful replay
+    /// reaches exactly these calls, so a journal entry the handler no longer makes
+    /// is as much a divergence as a call with no entry.
+    pub fn journal_keys(&self, effect: &str, position: u64) -> anyhow::Result<Vec<(String, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT call_hash, disambiguator FROM effect_journal \
+                 WHERE effect = ?1 AND position = ?2 ORDER BY rowid",
+            )
+            .context("preparing the effect journal key query")?;
+        let rows = stmt
+            .query_map(params![effect, position as i64], |row| {
+                let hash: String = row.get(0)?;
+                let disambiguator: i64 = row.get(1)?;
+                Ok((hash, disambiguator as u64))
+            })
+            .context("querying effect journal keys")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting effect journal keys")
+    }
+
+    /// Every invocation recorded for `effect` that reached a terminal state, with
+    /// the script hash it ran under. The replay check sweeps these; the hash is what
+    /// lets it skip invocations whose module has since been edited, which diverge
+    /// legitimately rather than in error.
+    pub fn terminal_invocations(&self, effect: &str) -> anyhow::Result<Vec<(u64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT position, script_hash FROM effect_invocation \
+                 WHERE effect = ?1 AND status = 'terminal' ORDER BY position",
+            )
+            .context("preparing the terminal invocation query")?;
+        let rows = stmt
+            .query_map(params![effect], |row| {
+                let position: i64 = row.get(0)?;
+                let hash: String = row.get(1)?;
+                Ok((position as u64, hash))
+            })
+            .context("querying terminal invocations")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting terminal invocations")
     }
 
     /// The effect's durable resume point: the watermark it has processed every
@@ -466,6 +549,7 @@ impl OpDb {
                 0 => tx.execute_batch(SCHEMA_V1).context("applying schema v1")?,
                 1 => tx.execute_batch(SCHEMA_V2).context("applying schema v2")?,
                 2 => tx.execute_batch(SCHEMA_V3).context("applying schema v3")?,
+                3 => tx.execute_batch(SCHEMA_V4).context("applying schema v4")?,
                 other => anyhow::bail!("no migration from schema version {other}"),
             }
             version += 1;
@@ -564,6 +648,17 @@ CREATE TABLE subject_key (
 CREATE INDEX subject_key_by_master ON subject_key (master_key_id);
 ";
 
+const SCHEMA_V4: &str = "
+-- A verify-mode quarantine. Durable because the whole point is that it does not
+-- clear on its own: an in-memory flag would be wiped by the restart that a wedged
+-- effect invites, and the effect would resume as if nothing had been found.
+CREATE TABLE effect_quarantine (
+    effect   TEXT    NOT NULL PRIMARY KEY,
+    position INTEGER NOT NULL,  -- where the invariant broke
+    reason   TEXT    NOT NULL,
+    at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+";
 #[cfg(test)]
 mod tests {
     use super::*;

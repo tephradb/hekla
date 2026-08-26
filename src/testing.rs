@@ -770,6 +770,7 @@ fn run_command_case(
             &ctx,
             TEST_NOW,
             None,
+            true,
         )?,
         Err(err) => CommandOutcome::InvalidInput {
             message: format!("{err}"),
@@ -954,6 +955,9 @@ fn run_effect_case(
             env: &envelope,
             event_type: event.event_type(),
             data: &data,
+            // A scenario is cheap and is exactly where a nondeterministic fold should
+            // surface first, so `hekla test` always checks.
+            verify: true,
         };
         effect::run_handle(&effect.loaded, &inv, &host)?;
     }

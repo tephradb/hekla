@@ -26,6 +26,7 @@ pub struct Config {
     pub effects: Effects,
     pub retention: Retention,
     pub projectors: Projectors,
+    pub verify: Verify,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -54,6 +55,16 @@ pub struct Projectors {
     pub auto_rebuild: bool,
 }
 
+/// The continuous invariant checks. Off by default, and `serve --verify` turns them
+/// on without editing the file: they are not free (a second fold per command, a
+/// second handler run per invocation), so running them is a decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Verify {
+    /// Check every fold and every completed effect invocation as it happens,
+    /// quarantining the component that breaks an invariant.
+    pub enabled: bool,
+}
 impl Default for Projectors {
     fn default() -> Projectors {
         Projectors { auto_rebuild: true }

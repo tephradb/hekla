@@ -71,8 +71,13 @@ project/
   under a file watcher is how the mechanism everything depends on gets subtly wrong. Restart is
   instant and correct. Graceful shutdown drains effects first (section 7).
 - **Configuration (`hekla.toml`)**: a small project-level file for operational knobs that are not
-  code: the effect blocking-pool size and the retention window for effect journals. Defaults are
-  sensible, so a project runs with no config.
+  code: the effect blocking-pool size, the retention window for effect journals, and whether the
+  continuous invariant checks run. Defaults are sensible, so a project runs with no config.
+- **One process per data directory.** A runtime takes an exclusive lock on its data directory for
+  its lifetime, because tephra locks nothing itself and two writers on one segment set corrupt the
+  log. The lock is an open `BEGIN EXCLUSIVE` on a dedicated SQLite file, so it needs no dependency
+  and is released by process death however it arrives. It is also what keeps `hekla verify` off a
+  directory a server is using (see section 11.2).
 
 ## 4. Events and schema
 
@@ -568,7 +573,7 @@ consistent copy is not required for them.
   rejection or invalid input; a **projector** produces the rows the read API reads back (subject
   columns decrypted, as `GET /read/...` would return them); an **effect** produces the ordered
   sequence of `http_call(...)`, `command_call(...)` and `erase_call(...)` it made, with `responds`
-  stubbing the HTTP replies and `rows` seeding the projectors it reads.
+  stubbing the HTTP replies (its state comes from folding the seeded `given` log, section 7).
   Pure functions with declared inputs make the harness small, and it is what earns trust in an
   untyped language. Everything a handler can observe is pinned so a case is reproducible: the clock,
   the master key, each `given` event's `event.id` (counting from
@@ -576,6 +581,7 @@ consistent copy is not required for them.
   `event.timestamp`, which is the same fixed clock. A case tests
   the author's logic, not the runtime around it: batching, checkpoints, retry, the journal and
   replay are covered elsewhere.
+- `hekla verify <dir>`: the runtime invariant sweep over a data directory. Section 11.2.
 - `hekla fmt`: starlark-rust ships a formatter, and indentation is syntactically meaningful.
 - `hekla lsp`: the language server, over stdio. Section 11.1.
 
@@ -616,6 +622,50 @@ one session can span several (this repository's `examples/` holds two).
   `configs.hekla` entry for `lspconfig` with `filetypes = { "starlark" }`.
 - **VS Code / Zed**: any generic LSP bridge extension, with the command `hekla lsp` for `.star` files.
 
+
+### 11.2 Invariant checks
+
+`hekla check` is static analysis; this is its runtime counterpart. The log is append-only, so the
+faults worth spending verification on are the ones nothing can undo: an event that should never have
+been appended, an effect that fired twice. A wrong read model, by contrast, is a rebuild. The checks
+follow that asymmetry.
+
+Four invariants. Three are reported as a `verify::Violation`; fold determinism is not,
+because there is no safe way to continue from it.
+
+- **Rebuild equivalence**: a projector rebuilt from position 0 matches the live one row for row.
+  Compared exactly rather than approximately, because subject encryption is deterministic AES-SIV and
+  a projector stores the event's ciphertext verbatim. The rebuild is **bounded at the live model's
+  own checkpoint**: building to head instead would compare a shadow that absorbed the whole log
+  against a projector that was merely lagging when the server stopped, and report the gap as
+  corruption.
+- **Replay equivalence**: a recorded invocation re-run from its journal reaches the same calls, in
+  the same order, and performs none of them. It runs against a **sealed** host, which serves journal
+  hits and turns a journal miss into a violation rather than a call. That is load-bearing rather than
+  tidy: the divergence being hunted is exactly the case where a naive replay would fire a real side
+  effect, so the check must be incapable of causing it. The sequence is compared as an ordered list,
+  which is the part the content-keyed journal cannot see for itself.
+- **Fold determinism**: the same boundary at the same position folds to the same state. Section 7's
+  claim that state can be derived rather than stored rests entirely on this. The second fold is
+  bounded at the position the first one reached, so a concurrent append reads as ordinary DCB
+  contention rather than as nondeterminism.
+- **Checkpoint monotonicity**: no position reached by *tailing* moves backwards. A rebuild replaces
+  the model, so it publishes its checkpoint without that guard: a bounded rebuild legitimately lands
+  behind, and treating that as a violation stopped the projector while leaving it readable.
+
+Two entry points over one set of checks. `hekla verify <dir>` sweeps offline and exits non-zero on a
+violation, for CI or a nightly job; it takes the data-directory lock, so the documented shape is to
+verify a copy of the directory, which exercises the backup at the same time. `serve --verify` (or
+`[verify] enabled` in `hekla.toml`) runs the per-operation half continuously. `hekla test` always
+checks folds: a scenario is cheap, and it is where a nondeterministic fold should surface first.
+
+A violation **quarantines the component**: it stops advancing, `/status` names what broke, and the
+rest of the runtime keeps serving. A quarantined projector's reads return 503 rather than its rows,
+because what a failed check calls into question is precisely the rows and the position, and a
+read-your-writes wait against a position that moved backwards would resolve on a lie.
+
+Rebuild equivalence is offline only: it costs a full log replay, and against a live projector the
+shadow model would race the one it is comparing to.
 ## 12. Why Starlark (determinism and purity)
 
 umari pins the wall clock and zeroes the monotonic clock to make commands deterministic, and polices
@@ -640,7 +690,9 @@ the durable-effect journal sound. Multi-language authoring is permanently out of
 hekla is a single crate. The dependency direction is documented and enforced by discipline,
 revisited only when a seam proves real (embeddability, or compile times that actually hurt):
 `starlark_builtins` and `schema` depend on nothing internal; `dispatch` depends on those; `runtime`
-(projectors, effects, journal, storage) depends on `dispatch`; `api` and `cli` sit on top.
+(projectors, effects, journal, storage) depends on `dispatch`; `verify` sits above the runtime,
+reaching into the projector and effect paths it checks; `api` and `cli` sit on top. `lock` depends on
+nothing internal.
 
 ## 15. Subject-scoped encryption and erasure
 

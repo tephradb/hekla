@@ -10,22 +10,29 @@ the language.
 The current single-crate code is the baseline:
 
 - `src/starlark_builtins.rs`: field types (`str`, `int`, `uint`, `bool`, `uuid`, `timestamp`,
-  `money`, `json`, `one_of`, `optional`), `schema()` for command input, `entity()` for implicitly
-  collected read-model tables with `key`, fields, and `index(...)`, `event()` for typed event
-  definitions with tagged fields, `events()` / `all_events()` with list OR-ing, `put` / `patch` /
-  `delete`, `reject`, `load_script(filename, src, kind)` deriving the module name from the file stem,
-  plus dispatch helpers (`alloc_input`, `alloc_event`, fold and handle plumbing, `parse_event_specs`,
-  `parse_tags`).
-- `src/dispatch.rs`: `run_command` (allocate input, boundary from `query`, fold, `handle`, append
-  guarded by `AppendCondition`) and `run_projector` (read `source`, `handle` per event, apply ops).
-- `src/read_model.rs`: `ReadModel` over bundled rusqlite, typed column binding both ways, DDL
-  generated from `EntityDef`.
-- `src/main.rs`: a throwaway demo wiring one command and one projector against a temp tephra store.
-
-Everything below layers the decided design on top of this.
-
-## Phase 1: project shape, shared events, validation (done)
-
+- **Rebuild equivalence** builds a shadow model with `project_to` and compares `ReadModel::rows` per
+  entity, as a merge join over the two key-ordered row sets. The comparison is exact rather than
+  approximate because subject encryption is deterministic AES-SIV and a projector stores the event's
+  ciphertext verbatim, so a rebuild copies bytes. The shadow is bounded at the live model's own
+  checkpoint: an unbounded rebuild would report every event a lagging projector had not reached as
+  corruption.
+- **Replay equivalence** re-runs a completed invocation against a **sealed** host: a journal hit
+  replays, a journal miss records a violation and returns, and nothing is ever performed. That
+  property is the design, not an optimisation. The divergence being hunted is precisely the case
+  where a naive replay would fire a real side effect, so the check must be structurally incapable of
+  causing it. The visited call sequence is compared against the journal's as an ordered list, which
+  is the shape nothing else could catch: the journal is keyed by call *content*, so a handler that
+  merely reordered its calls hits every entry and a set comparison would call it faithful.
+  The invocation is completed *before* the check runs, so a violation cannot leave a `running` row
+  for the next boot to re-enter live, and the quarantine is recorded durably so a restart honours it.
+- **Fold determinism** folds twice and compares, with the second fold bounded at the position the
+  first reached (an unbounded re-fold would read a concurrent append as nondeterminism). States are
+  compared with Starlark equality rather than through JSON, since `check_fold_result` admits values
+  that `to_json_value` cannot represent. It is an error rather than a typed violation because there
+  is no safe way to continue: a command fails the request, an effect wedges.
+- **Checkpoint monotonicity** routes every position reached by *tailing* through one helper that
+  refuses to go backwards. A rebuild publishes through a separate, unguarded path: it replaces the
+  model, so its checkpoint is authoritative even when it lands behind.
 Toolchain only. This phase lands the loader, validation, and CLI checks, but nothing serves until
 Phase 2, so it is scoped honestly as "toolchain, no server" rather than a runnable milestone.
 
@@ -560,6 +567,95 @@ placeholder event per subscribed type, mirroring the command path's placeholder 
 - **Settled reference data now costs a fold.** State that is genuinely old (an access token, a plan's
   SKU) used to be an O(1) row read. If that proves too coarse, the successor is a log-query path that
   returns a value without emitting, not the reinstatement of `read`.
+
+## Phase 14: the invariant harness and verify mode (done)
+
+The suite covered cases someone thought of. The properties the design rests on were asserted only by
+example, which is the wrong shape for a system whose worst bugs are the ones you cannot undo: a
+wrong event is permanent, a double-fired effect is money already spent, while a wrong read model is
+only a rebuild. So the verification budget belongs on the append and effect paths, and it belongs in
+checks that run against whatever state a deployment actually reached.
+
+`src/verify.rs` holds the checks; two entry points wrap them. `hekla verify` sweeps a data directory
+offline (CI, or a nightly job over a copy of the backup); `serve --verify` runs the per-operation
+half continuously, and `[verify] enabled` in `hekla.toml` makes that permanent. `hekla test` always
+checks folds, since a scenario is cheap and is where a nondeterministic fold should surface first.
+
+- **Rebuild equivalence** builds a shadow model with `project_to` and compares `ReadModel::rows` per
+  entity, as a merge join over the two key-ordered row sets. The comparison is exact rather than
+  approximate because subject encryption is deterministic AES-SIV and a projector stores the event's
+  ciphertext verbatim, so a rebuild copies bytes. The shadow is bounded at the live model's own
+  checkpoint: an unbounded rebuild would report every event a lagging projector had not reached as
+  corruption.
+- **Replay equivalence** re-runs a completed invocation against a **sealed** host: a journal hit
+  replays, a journal miss records a violation and returns, and nothing is ever performed. That
+  property is the design, not an optimisation. The divergence being hunted is precisely the case
+  where a naive replay would fire a real side effect, so the check must be structurally incapable of
+  causing it. The visited call sequence is compared against the journal's as an ordered list, which
+  is the shape nothing else could catch: the journal is keyed by call *content*, so a handler that
+  merely reordered its calls hits every entry and a set comparison would call it faithful.
+  The invocation is completed *before* the check runs, so a violation cannot leave a `running` row
+  for the next boot to re-enter live, and the quarantine is recorded durably so a restart honours it.
+- **Fold determinism** folds twice and compares, with the second fold bounded at the position the
+  first reached (an unbounded re-fold would read a concurrent append as nondeterminism). States are
+  compared with Starlark equality rather than through JSON, since `check_fold_result` admits values
+  that `to_json_value` cannot represent. It is an error rather than a typed violation because there
+  is no safe way to continue: a command fails the request, an effect wedges.
+- **Checkpoint monotonicity** routes every position reached by *tailing* through one helper that
+  refuses to go backwards. A rebuild publishes through a separate, unguarded path: it replaces the
+  model, so its checkpoint is authoritative even when it lands behind.
+
+A violation quarantines the component: it stops advancing, `/status` names what broke, and the rest
+of the runtime keeps serving. A quarantined projector's reads return 503 rather than its rows, since
+what a failed check calls into question is exactly the rows and the position.
+
+**A data-directory lock came with it**, and closes a hole that predates this phase: tephra locks
+nothing, so two `hekla serve` processes on one data directory would have corrupted the log with
+nothing to stop them. `Runtime::open` now takes an exclusive lock (an open `BEGIN EXCLUSIVE` on a
+dedicated SQLite file, so it needs no dependency and dies with the process however it dies), which is
+also what keeps `verify` off a directory a server is using.
+
+**Honest scope:**
+
+- **Rebuild equivalence is offline only.** It costs a full log replay, and against a live projector
+  the shadow would race the model it is comparing to: the bound it needs (`project_to` now takes
+  one) would be moving while the comparison runs.
+- **A terminal `reveal`-after-`erase` is exempt, not checked.** The `erase last` rule the authoring
+  guide recommends produces an invocation that deliberately cannot replay. Found by testing rather
+  than by design: the first cut reported it, which would have quarantined every effect written the
+  recommended way.
+- **Fold determinism is positive-only end to end.** Starlark's purity means a genuinely
+  nondeterministic fold cannot be written from the language, so the planted-violation test for it is
+  a unit test of the comparator rather than a scenario.
+- **`hekla verify` needs the log open for writes.** tephra exposes no read-only handle (`ReadHandle`
+  is reachable only through a `WriteCoordinator`), which is why the sweep takes the lock and why
+  verifying a copy is the documented shape rather than a suggestion.
+- **The replay sweep only covers what the journal still holds.** Retention reclaims completed
+  invocations, and an edited effect's recorded runs are skipped by script hash, so the sweep audits a
+  rolling recent window rather than all history. Both are counted and reported separately from the
+  checked ones, so a sweep cannot read as thorough when it was not.
+- **A code review after the fact found seven correctness bugs in the first cut**, all of them in the
+  checking machinery rather than in what it checks, and all now covered by tests that fail without
+  their fix. Worth recording because they share a shape: a checker is code too, and its failure mode
+  is confident wrongness. The two that mattered most inverted the feature's purpose. Treating a
+  rebuilt projector's checkpoint as a regression stopped the projector while `readiness` still read
+  `ready`, so the read API kept serving a model rebuilt from nothing and read-your-writes resolved
+  against it, which is exactly the lie the check exists to prevent. And quarantining *before*
+  completing the invocation left its row `running`, so the next boot re-entered the handler in live
+  mode and performed for real the call the sealed replay had refused: detection turning into the
+  double-fire. The rest were narrower: an unbounded rebuild reporting a merely-lagging projector as
+  corrupt, a missing master-key guard reporting a healthy directory as diverged, an unbounded second
+  fold turning DCB contention into a 500, audit lines emitted for erasures that did not happen, and a
+  subset comparison that could not see the call reordering three documents claimed it caught.
+- **A live replay divergence cannot be provoked from Starlark**, which is a good property and an
+  awkward one. The language is pure and every impure call is journaled, so a healthy handler's replay
+  always agrees with its first run. The continuous check is therefore exercised by planting state
+  (deleting a journal row, recording a quarantine) rather than by writing a misbehaving effect. The
+  same purity is why fold determinism has no end-to-end negative test.
+- **Boundary safety is still unchecked.** "At most one of a set of concurrent commands appends" is a
+  linearizability property, so it needs the deterministic simulator rather than an in-process
+  assertion. It is the headline invariant for that work, and this phase exists partly to give it an
+  oracle.
 
 ## Deferred, with triggers
 

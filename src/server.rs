@@ -414,6 +414,17 @@ fn not_servable(projector: &str, readiness: Readiness) -> Option<Response> {
             ),
             false,
         ),
+        // Served as unavailable rather than stale-but-readable. A quarantined
+        // projector failed an invariant check, so its rows and its position are
+        // exactly what cannot be vouched for, and a read-your-writes wait against a
+        // position that moved backwards would resolve on a lie.
+        Readiness::Quarantined => (
+            "quarantined",
+            format!(
+                "projector `{projector}` failed an invariant check and stopped advancing; see its `last_error` in /status"
+            ),
+            false,
+        ),
     };
     let mut response = json_response(503, read_error(code, &message));
     if retry {

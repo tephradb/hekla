@@ -12,11 +12,11 @@
 //! (Starlark and tephra appends are), so the server calls it on a blocking thread.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{env, fs};
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -32,6 +32,7 @@ use crate::crypto::{KeyStore, MasterKeys};
 use crate::dispatch::{self, CommandOutcome, EventDefs};
 use crate::effect::{self, EffectRuntime, EffectShared, HttpClient};
 use crate::loader::{CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
+use crate::lock::DataDirLock;
 use crate::opdb::{InvocationState, OpDb};
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
@@ -43,7 +44,34 @@ const SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 
 /// How many times a command re-runs its whole decision cycle on a DCB conflict
 /// before the runtime gives up and returns a concurrency conflict.
-const MAX_ATTEMPTS: u32 = 5;
+///
+/// In-runtime retry is the right default for an application: a hot boundary is
+/// usually a transient loser, and answering 409 for something a re-read would settle
+/// pushes work onto every client. It is overridable because a benchmark harness
+/// brings its own fixed retry policy, and two nested budgets measure neither.
+const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+
+/// The ceiling on `HEKLA_MAX_ATTEMPTS`. The backoff is `1 << attempt` milliseconds,
+/// so this bounds the worst-case wait at about 16 seconds and keeps the shift inside
+/// `u64`.
+const MAX_ATTEMPTS_CAP: u32 = 15;
+
+/// The effective retry budget, read once from `HEKLA_MAX_ATTEMPTS`. Values below 1
+/// and unparseable ones fall back to the default rather than disabling the append,
+/// and the whole thing is capped: the backoff doubles per attempt, so attempt 25 is
+/// already a nine-hour sleep holding a request thread and its blocking slot, and 64
+/// overflows the shift outright.
+fn max_attempts() -> u32 {
+    static ATTEMPTS: OnceLock<u32> = OnceLock::new();
+    *ATTEMPTS.get_or_init(|| {
+        env::var("HEKLA_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .filter(|attempts| *attempts >= 1)
+            .unwrap_or(DEFAULT_MAX_ATTEMPTS)
+            .min(MAX_ATTEMPTS_CAP)
+    })
+}
 
 /// The final HTTP outcome of a command execution: the status and the response body.
 pub struct ExecResult {
@@ -67,6 +95,14 @@ pub struct Runtime {
     /// The effect handles, for `/status` and the skip endpoint. Set once, right
     /// after the effect threads spawn (they need `Arc<Runtime>` first).
     effects: OnceLock<Vec<Arc<EffectShared>>>,
+    /// The exclusive claim on the data directory, held for as long as the runtime
+    /// is open. tephra does not lock its segment directory, so without this a
+    /// second process on one directory would corrupt the log rather than refuse to
+    /// start. Never read: it exists for its `Drop`.
+    _lock: DataDirLock,
+    /// Whether the continuous invariant checks run. Set from `[verify] enabled` in
+    /// `hekla.toml`, which `serve --verify` turns on without editing the file.
+    verify: bool,
     /// The OpenAPI document serialized once at startup: the public command set is
     /// fixed for the process lifetime, so `/openapi.json` serves this verbatim.
     openapi_json: String,
@@ -86,6 +122,10 @@ impl Runtime {
         http: Arc<dyn HttpClient>,
         master: Option<MasterKeys>,
     ) -> anyhow::Result<(Arc<Runtime>, WriteCoordinator, ProjectorSet, EffectRuntime)> {
+        // Taken before anything opens the log. tephra does not lock its segment
+        // directory, so a second process here would corrupt it rather than fail.
+        fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+        let lock = DataDirLock::acquire(data_dir)?;
         let events_dir = data_dir.join("events");
         fs::create_dir_all(&events_dir)
             .with_context(|| format!("creating {}", events_dir.display()))?;
@@ -115,6 +155,7 @@ impl Runtime {
         let projector_units: Vec<Arc<ProjectorUnit>> =
             project.projectors.into_iter().map(Arc::new).collect();
         let auto_rebuild = project.config.projectors.auto_rebuild;
+        let verify = project.config.verify.enabled;
         for unit in &projector_units {
             opdb.upsert_module_metadata(
                 unit.loaded.def.name(),
@@ -183,6 +224,8 @@ impl Runtime {
             projectors,
             effects: OnceLock::new(),
             openapi_json,
+            _lock: lock,
+            verify,
         });
 
         // Effects need `Arc<Runtime>` (for `invoke_command` and the boundary fold), so they
@@ -192,6 +235,69 @@ impl Runtime {
         let _ = runtime.effects.set(effect_runtime.shared_handles());
 
         Ok((runtime, coordinator, projector_set, effect_runtime))
+    }
+
+    /// Open the store and operational DB without starting a single thread.
+    ///
+    /// `hekla verify` audits recorded state, so it must not advance it: the full
+    /// [`Runtime::open`] starts projectors applying batches and effects performing
+    /// side effects, which for an audit is exactly the wrong thing. Nothing here
+    /// spawns, and the returned runtime has no projector or effect handles, so a
+    /// `/status` built from it would be empty.
+    ///
+    /// It still needs the log open for writes, because tephra exposes no read-only
+    /// handle: `ReadHandle` is reachable only through a `WriteCoordinator`. That is
+    /// why the caller holds the data-directory lock, and why verifying a live
+    /// directory is refused rather than merely discouraged.
+    pub fn open_quiescent(
+        project: &LoadedProject,
+        data_dir: &Path,
+        master: Option<MasterKeys>,
+    ) -> anyhow::Result<(Arc<Runtime>, WriteCoordinator)> {
+        let lock = DataDirLock::acquire(data_dir)?;
+        let events_dir = data_dir.join("events");
+        let set = SegmentSet::open(&events_dir, SegmentConfig::new(SEGMENT_SIZE))
+            .with_context(|| format!("opening event store at {}", events_dir.display()))?;
+        let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default())
+            .context("starting the write coordinator")?;
+
+        let events = Arc::new(project.events.by_type.clone());
+        // The same guard `open` applies. Without it a sweep of a subject-using project
+        // with no master key runs every check against a keystore-less runtime, where
+        // `reveal` fails before the host can mark the failure terminal, so the replay
+        // check reports a divergence for every invocation. A healthy directory would
+        // exit non-zero naming corruption that is not there.
+        let uses_subjects = events
+            .values()
+            .any(|def| def.fields.iter().any(|(_, meta)| meta.subject.is_some()));
+        if uses_subjects && master.is_none() {
+            anyhow::bail!(
+                "this project uses subject-scoped encryption (a field with subject = \"...\"), so HEKLA_MASTER_KEY must be set to verify it"
+            );
+        }
+        let opdb = Arc::new(Mutex::new(OpDb::open(&data_dir.join("hekla.db"))?));
+        let keystore = master.map(|master| KeyStore::new(opdb.clone(), master));
+        if let Some(keystore) = &keystore {
+            keystore.verify_masters_present()?;
+        }
+
+        let runtime = Arc::new(Runtime {
+            commands: HashMap::new(),
+            store,
+            opdb,
+            events: events.clone(),
+            keystore,
+            started: Instant::now(),
+            projectors: HashMap::new(),
+            effects: OnceLock::new(),
+            openapi_json: String::new(),
+            _lock: lock,
+            // The checks call what they need directly; leaving this off keeps a
+            // sealed replay from folding twice for a determinism check the live run
+            // already made.
+            verify: false,
+        });
+        Ok((runtime, coordinator))
     }
 
     /// Execute a command by name over the public surface. Resolves public commands
@@ -276,7 +382,8 @@ impl Runtime {
             });
         }
 
-        for attempt in 0..MAX_ATTEMPTS {
+        let max_attempts = max_attempts();
+        for attempt in 0..max_attempts {
             match dispatch::run_command(
                 &self.store,
                 &command.loaded,
@@ -286,9 +393,10 @@ impl Runtime {
                 ctx,
                 now,
                 idem_tag,
+                self.verify,
             )? {
                 CommandOutcome::Conflict => {
-                    if attempt + 1 < MAX_ATTEMPTS {
+                    if attempt + 1 < max_attempts {
                         thread::sleep(Duration::from_millis(1u64 << attempt));
                     }
                 }
@@ -385,6 +493,7 @@ impl Runtime {
                     "lag": head.saturating_sub(position),
                     "consecutive_failures": handle.consecutive_failures(),
                     "last_error": handle.last_error(),
+                    "quarantined": handle.quarantined(),
                     "terminal_skips": handle.terminal_skips(),
                     "last_terminal_error": handle.last_terminal_error(),
                 })
@@ -394,6 +503,7 @@ impl Runtime {
         json!({
             "log_head": head,
             "uptime_seconds": self.started.elapsed().as_secs(),
+            "verify": self.verify,
             "commands": { "public": public, "internal": internal },
             "projectors": projectors,
             "effects": effects,
@@ -461,6 +571,35 @@ impl Runtime {
             .journal_get(effect, position, call_hash, disambiguator)
     }
 
+    /// Record a durable verify-mode quarantine for an effect.
+    pub(crate) fn quarantine_effect(
+        &self,
+        effect: &str,
+        position: u64,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        self.lock_opdb().quarantine_effect(effect, position, reason)
+    }
+
+    /// The recorded quarantine for an effect, if any.
+    pub(crate) fn effect_quarantine(&self, effect: &str) -> anyhow::Result<Option<(u64, String)>> {
+        self.lock_opdb().effect_quarantine(effect)
+    }
+
+    /// The journaled calls recorded for one invocation, for the replay check.
+    pub(crate) fn journal_keys(
+        &self,
+        effect: &str,
+        position: u64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        self.lock_opdb().journal_keys(effect, position)
+    }
+
+    /// Every terminal invocation recorded for an effect, with its script hash.
+    pub(crate) fn terminal_invocations(&self, effect: &str) -> anyhow::Result<Vec<(u64, String)>> {
+        self.lock_opdb().terminal_invocations(effect)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn journal_put(
         &self,
@@ -502,6 +641,11 @@ impl Runtime {
     /// The full event-definition map, for lowering an effect's subscription to a query.
     pub fn events_map(&self) -> &EventDefs {
         &self.events
+    }
+
+    /// Whether the continuous invariant checks are on for this process.
+    pub fn verify(&self) -> bool {
+        self.verify
     }
 
     /// The subject-key store, if a master key is configured. The read API decrypts

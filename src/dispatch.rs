@@ -168,6 +168,7 @@ pub fn run_command(
     ctx: &CommandContext,
     now: &str,
     idem_tag: Option<&str>,
+    verify: bool,
 ) -> anyhow::Result<CommandOutcome> {
     let ModuleDef::Command { input: schema, .. } = &loaded.def else {
         anyhow::bail!("run_command called on a non-command module");
@@ -207,6 +208,7 @@ pub fn run_command(
                     events,
                     keystore,
                     upto: None,
+                    verify,
                 },
                 initial,
             )?,
@@ -336,6 +338,11 @@ pub(crate) struct FoldInputs<'a> {
     /// past its own position would make the state depend on how far the log had
     /// run by the time the handler happened to execute.
     pub upto: Option<u64>,
+    /// Fold twice and compare, for verify mode. The boundary is a pure function of
+    /// the log prefix and `upto`, so two folds that disagree mean the state an
+    /// effect derives is not reproducible, which is the assumption the whole
+    /// fold-instead-of-store design rests on.
+    pub verify: bool,
 }
 
 /// Fold a boundary into state, returning it alongside the last position the query
@@ -348,7 +355,73 @@ pub(crate) struct FoldInputs<'a> {
 /// The returned position advances for every event in the boundary, folded or not, so
 /// a command's append condition covers everything the query matched rather than only
 /// what an arm consumed. An effect ignores it.
+///
+/// Under [`FoldInputs::verify`] the fold runs twice and the two states are compared.
+/// A disagreement is returned as an error rather than a typed violation, because
+/// there is no safe way to continue from it: the caller's decision would be built on
+/// a state that does not reproduce. The command path surfaces it as a failed
+/// request; the effect path wedges the invocation, which is the quarantine.
 pub(crate) fn fold_boundary<'v>(
+    module: &Module<'v>,
+    inputs: &FoldInputs<'_>,
+    initial: Value<'v>,
+) -> anyhow::Result<(Value<'v>, Position)> {
+    let (state, after) = fold_once(module, inputs, initial)?;
+    if !inputs.verify {
+        return Ok((state, after));
+    }
+    // The second fold is bounded at where the first one ended, which is what makes
+    // this a determinism check rather than a race. A command folds with `upto: None`,
+    // and each read pins the watermark as of its own call, so an unbounded re-fold
+    // would absorb any append that landed in between and report a concurrent write as
+    // nondeterminism, turning ordinary DCB contention into a 500.
+    let bounded = FoldInputs {
+        upto: Some(after.get()),
+        ..*inputs
+    };
+    let (again, after_again) = fold_once(module, &bounded, initial)?;
+    if !values_agree(state, again)? || after != after_again {
+        anyhow::bail!(
+            "the same boundary folded to two different states at position {after}: {} then {}",
+            render_state(state),
+            render_state(again)
+        );
+    }
+    Ok((state, after))
+}
+
+/// Compare two folded states structurally.
+///
+/// Starlark equality rather than a JSON round-trip: `check_fold_result` accepts any
+/// non-`None` value, so a fold may legitimately return a set, or a float that is NaN
+/// or infinite, none of which survive `to_json_value`. Comparing through JSON would
+/// make verify mode reject state the runtime otherwise allows.
+fn values_agree<'v>(first: Value<'v>, second: Value<'v>) -> anyhow::Result<bool> {
+    first
+        .equals(second)
+        .map_err(|err| anyhow::anyhow!("comparing folded states: {err}"))
+}
+
+/// Render a folded state for an error message, falling back to its debug form when it
+/// is not JSON-representable.
+fn render_state(value: Value<'_>) -> String {
+    match value.to_json_value() {
+        Ok(json) => json.to_string(),
+        Err(_) => format!("{value:?}"),
+    }
+}
+
+/// Fold a boundary into state, returning it alongside the last position the query
+/// matched.
+///
+/// Shared by commands and effects so the two cannot drift on the parts that are not
+/// obvious: arms are matched against the raw event *before* the envelope is decoded,
+/// and the dispatch map is thawed and lowered once rather than per event.
+///
+/// The returned position advances for every event in the boundary, folded or not, so
+/// a command's append condition covers everything the query matched rather than only
+/// what an arm consumed. An effect ignores it.
+fn fold_once<'v>(
     module: &Module<'v>,
     inputs: &FoldInputs<'_>,
     initial: Value<'v>,
@@ -360,6 +433,7 @@ pub(crate) fn fold_boundary<'v>(
         events,
         keystore,
         upto,
+        verify: _,
     } = *inputs;
 
     // Resolved and lowered once: the map is a module-level literal, so it cannot
