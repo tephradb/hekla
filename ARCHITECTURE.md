@@ -598,6 +598,22 @@ consistent copy is not required for them.
 - An admin-only, read-only SQL endpoint behind a flag, off in production, for debugging.
 - Direct SQLite file access is not a supported surface. The table layout stays private behind the
   generated read API.
+- `GET /openapi.json` and a Scalar reference over it at `GET /docs`. The document is generated from
+  the loaded project rather than maintained by hand, and covers every route above: one concrete path
+  per public command, two per projector entity (with the key typed from the key column and one query
+  parameter per filterable field), and the operator endpoints. Internal commands are absent because
+  they are not routed.
+
+  Everything is generated through one function pair, `openapi::Surface::from_project` and
+  `openapi::build`, which the runtime calls at startup and `hekla openapi` calls without opening a
+  data directory. Two generators would be two things to keep true; one means the served document and
+  a spec committed from the CLI cannot disagree, and a test asserts they are the same value.
+
+  Event schemas are the one part of the document that is not a request or response body. An event's
+  fields never reach the wire (a command's 200 reports each emitted event as its type and its
+  plaintext tags), so `components/schemas/event.*` documents what the log holds and says so in its
+  own description. The declared event set does become load-bearing in one place, as the `enum` of
+  `EmittedEvent.type`.
 
 ## 11. CLI and dev loop
 

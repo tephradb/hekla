@@ -905,6 +905,99 @@ cell at every prefix: no violations.
   stop the comparison being a comparison. If built, it belongs off by default and disclosed, the way
   the harness already treats umadb's page cache.
 
+## Phase 17: the generated OpenAPI describes the whole surface (done)
+
+The generator covered one of the router's nine routes. It emitted `paths` and nothing else: no
+`tags`, no `components`, and responses whose only content was a `description` string. In the Scalar
+reference at `/docs` that rendered as a flat list of `execute the ... command` with no request or
+response shapes attached.
+
+Three gaps, closed together because they share one generator:
+
+- **The read API had no spec at all.** `GET /read/{projector}/{entity}` and its by-key sibling are
+  public surface whose path params, query params, response shapes and 400/404/503 codes existed only
+  in `server.rs` and in `AUTHORING.md` prose. Everything needed to generate them was already in
+  `EntityDef`.
+- **No response or error schemas.** The command 200 body and the two error envelopes (commands carry
+  correlation ids, read and operator endpoints do not) are shared by every path and were documented
+  nowhere, so nothing could be generated from the document.
+- **No grouping and no domain vocabulary.** No tags, and the event and entity schemas the system is
+  built around never appeared.
+
+What shipped:
+
+- `openapi::Surface`, a borrowed view of a `LoadedProject`, plus `openapi::build` over it. The
+  runtime builds the document from this before it takes the project apart, and `hekla openapi <dir>`
+  builds it from the same two calls with no data directory, no lock and no master key. One code path
+  rather than two, and a test asserts the CLI dump and the served document are the same value.
+- Paths for every route: one per public command (plus the `Idempotency-Key` and `X-Correlation-Id`
+  headers), two per projector entity, and the operator endpoints, whose `name` params carry an
+  `enum` of the project's own projector and effect names.
+- Tags in render order: `commands`, one `read: <projector>` per projector, then `operations`.
+- `components/schemas`: `ErrorDetail`, `Error`, `CommandError`, `CommandAccepted`, `EmittedEvent`,
+  `Status`, `ProjectorStatus`, `EffectStatus`, plus one schema per declared event and per entity,
+  with each field's policy as prose and as `x-hekla-*`.
+- `read_api::filterable_fields`, with `is_filterable` and `EntityDef::validate`'s reserved-param gate
+  both reimplemented on top of it. Three open-coded copies of "the key plus each index's leading
+  column" became one, which matters because that load-time gate is the only thing stopping the
+  generator from emitting a duplicate query parameter: widening filterability without it would let
+  an entity whose index leads on a column named `limit` load, and shadow the page-size control.
+- `server::route_table`, one list that `app()` folds into a `Router` and `server::routes()` projects
+  the paths out of. The drift test reads `routes()`, so a route the process serves and a route the
+  document is checked against are the same list by construction, rather than two lists and an
+  instruction to keep them in step.
+
+Eight details worth recording, because each is a place the obvious generated answer would have been
+wrong. The last five came out of code review, and two of those were shipping broken output:
+
+- **An entity's `required` is not simply "non-optional".** A subject-encrypted column whose key was
+  erased is removed from the row rather than nulled, so declaring it required would describe a body
+  the server does not always send.
+- **`indexed` and `unique` are event-field policy and mean nothing on a read-model column**, which
+  defaults to `indexed: true` regardless. Emitting them there produced a column annotated
+  `x-hekla-indexed: true` next to a description saying it was not filterable. Entity columns carry
+  `x-hekla-filterable` instead, derived from the key and the declared indexes.
+- **Every documented filter parameter is guaranteed plaintext**, so the generator needs no
+  ciphertext caveat. A filter arrives as plaintext and a subject column holds ciphertext, so such a
+  filter could only ever match nothing, and `EntityDef::validate` already rejects both possible
+  routes to one at load: a subject-encrypted key, and a subject-encrypted column in any index. The
+  generator's first draft carried a warning for a case the loader makes unreachable.
+- **A field annotation appends to the kind's description, it does not replace it.** `field_schema`
+  is the only place that states `money` is a decimal string and that `uint` spans 0 to 2^64-1 (no
+  numeric `maximum` can carry that ceiling without misleading the many tools that parse bounds as
+  f64). Assigning the per-field note over it left every `money` column indistinguishable from any
+  other string, on every field of every event and entity.
+- **An optional command input admits an explicit null, not just absence.** `check_value` returns
+  early for a null on a nullable kind, so `{"note": null}` is a 200. Omission from `required` says
+  only that the key may be missing, so the type has to be widened too, and a `one_of`'s `enum` needs
+  null as well or it rejects what its own `type` now permits. Verified against a running server.
+- **`limit` and `timeout_ms` are clamped, not rejected, so neither declares a `maximum`.** The
+  handlers do `clamp` and `min`, and a bound would make a validating client refuse `limit=1000`
+  locally rather than receive the page of 500 the server would return.
+- **`LoadedProject::load` succeeds at finding nothing.** A root that does not exist yields zero
+  findings, so `hekla openapi /typo` exited 0 and printed a valid document containing only the six
+  operator paths, which exist whatever the project declares. Harmless for `check` (which says
+  "checked 0 module(s)" and moves on) and disqualifying for a command whose output gets committed:
+  a CI regeneration step run from the wrong working directory would replace a real spec with that
+  stub and pass. It now refuses a non-directory, and a directory that declares no modules at all.
+- **Component keys need the same structural uniqueness as operation ids.** An event type is an
+  unvalidated author string, so `event(type = "order placed")` and `event(type = "order_placed")`
+  both sanitise to `event.order_placed` and the second `insert` silently replaced the first, leaving
+  one schema describing the wrong event's fields while `EmittedEvent.type` listed both. Keys are now
+  assigned up front by `ComponentNames`, before anything emits a `$ref`, seeded with the fixed names
+  so an event type cannot displace `Error`. The first draft argued from the character set that this
+  could not happen; the argument held for module names and not for event types.
+
+Deliberately not done: narrowing `EmittedEvent.type` per command (a `handle` returns arbitrary
+Starlark, so the emit set is not statically knowable), and vendoring Scalar, which `/docs` still
+loads from a CDN.
+
+The `oas3` dev-dependency is pinned `default-features = false`: its default `preserve-order` feature
+enables `serde_json/preserve_order`, which would flip `serde_json::Map` to insertion order across the
+whole test build. `effect.rs`'s journaled call hash is a hash of canonical JSON and depends on
+`serde_json::Value` sorting object keys, so that feature would have made tests exercise a different
+hash than production.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
@@ -921,6 +1014,8 @@ warranted.
   becoming a second execution path.
 - **Workspace crate split**: when hekla must be embeddable as a library, or when compile times
   actually hurt.
+- **Vendoring Scalar for `/docs`**: when hekla has to run somewhere with no outbound network. The
+  page loads the reference UI from a CDN today; `/openapi.json` itself needs nothing.
 
 ### Carried-forward gaps from earlier phases
 

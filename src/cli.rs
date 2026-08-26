@@ -116,6 +116,19 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Print the generated OpenAPI 3.1 document for a project to stdout.
+    ///
+    /// Reads the project only: no data directory, no lock, and no master key, so it
+    /// runs anywhere `hekla check` does. The document is the same one a running
+    /// server serves at `/openapi.json`, pretty-printed here so a committed
+    /// `openapi.json` diffs by line and an unintended API change shows up in CI.
+    ///
+    /// Findings go to stderr, so `hekla openapi . > openapi.json` writes only JSON.
+    Openapi {
+        /// The project directory.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
     /// Erase a subject: delete its encryption key, making every value scoped to it
     /// unreadable and unmatchable across the log and every read model at once. This
     /// is irreversible.
@@ -152,12 +165,62 @@ pub fn run() -> ExitCode {
         Command::Test { dir } => testing::run(&dir),
         Command::Verify { dir, data_dir } => verify(&dir, data_dir.as_deref()),
         Command::Rotate { dir, data_dir } => rotate(&dir, data_dir.as_deref()),
+        Command::Openapi { dir } => openapi(&dir),
         Command::Erase {
             subject_field,
             subject_value,
             dir,
             data_dir,
         } => erase(&subject_field, &subject_value, &dir, data_dir.as_deref()),
+    }
+}
+
+/// Print the generated OpenAPI document for a project.
+///
+/// The only subcommand that writes its findings to stderr: stdout is the document,
+/// and `hekla openapi . > openapi.json` has to produce a file `jq` will parse.
+fn openapi(dir: &Path) -> ExitCode {
+    // `LoadedProject::load` reports no findings for a root that does not exist or holds
+    // no modules: it discovers nothing and succeeds at it. Every other subcommand can
+    // afford that (`check` says "checked 0 module(s)" and moves on), but this one's
+    // output gets committed, so a typo'd path or a run from the wrong working directory
+    // would overwrite a real spec with a six-path stub and exit 0.
+    if !dir.is_dir() {
+        eprintln!("error: `{}` is not a directory", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let project = LoadedProject::load(dir);
+    let findings = collect_findings(&project);
+    for finding in &findings {
+        eprintln!("{}", render_finding(finding));
+    }
+    let errors = count_errors(&findings);
+    if errors > 0 {
+        eprintln!("refusing to generate: the project has {errors} error(s)");
+        return ExitCode::FAILURE;
+    }
+    if project.commands.is_empty()
+        && project.projectors.is_empty()
+        && project.effects.is_empty()
+        && project.events.by_type.is_empty()
+    {
+        eprintln!(
+            "error: `{}` declares no commands, projectors, effects or events, so there is \
+             nothing to describe; is this a hekla project directory?",
+            dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let document = crate::openapi::build(&crate::openapi::Surface::from_project(&project));
+    match serde_json::to_string_pretty(&document) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: serializing the document: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -426,11 +489,18 @@ pub(crate) fn collect_findings(project: &LoadedProject) -> Vec<Finding> {
 fn report_findings(project: &LoadedProject) -> (usize, usize) {
     let findings = collect_findings(project);
     print_findings(&findings);
-    let errors = findings
+    let errors = count_errors(&findings);
+    (errors, findings.len() - errors)
+}
+
+/// How many findings are errors, which is what every load-and-refuse path branches on.
+/// Shared with `openapi`, which reports to stderr instead and so cannot use
+/// [`report_findings`] wholesale.
+fn count_errors(findings: &[Finding]) -> usize {
+    findings
         .iter()
         .filter(|finding| finding.severity == Severity::Error)
-        .count();
-    (errors, findings.len() - errors)
+        .count()
 }
 
 fn init_tracing() {
@@ -440,17 +510,23 @@ fn init_tracing() {
 
 fn print_findings(findings: &[Finding]) {
     for finding in findings {
-        let severity = match finding.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-        };
-        // Spans are 0-based; editors and humans count from one.
-        let at = match finding.span {
-            Some(span) => format!(":{}:{}", span.begin.line + 1, span.begin.column + 1),
-            None => String::new(),
-        };
-        println!("{severity}: {}{at}: {}", finding.location, finding.message);
+        println!("{}", render_finding(finding));
     }
+}
+
+/// One finding as a line. Shared with `hekla openapi`, which writes the same lines to
+/// stderr so its stdout stays parseable JSON.
+fn render_finding(finding: &Finding) -> String {
+    let severity = match finding.severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+    };
+    // Spans are 0-based; editors and humans count from one.
+    let at = match finding.span {
+        Some(span) => format!(":{}:{}", span.begin.line + 1, span.begin.column + 1),
+        None => String::new(),
+    };
+    format!("{severity}: {}{at}: {}", finding.location, finding.message)
 }
 
 #[cfg(test)]

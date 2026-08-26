@@ -351,7 +351,7 @@ fn row_to_json(entity: &EntityDef, row: &Row) -> anyhow::Result<serde_json::Valu
     Ok(serde_json::Value::Object(obj))
 }
 
-fn key_kind(entity: &EntityDef) -> &FieldKind {
+pub(crate) fn key_kind(entity: &EntityDef) -> &FieldKind {
     entity
         .fields
         .iter()

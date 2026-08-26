@@ -39,7 +39,7 @@ use crate::lock::DataDirLock;
 use crate::opdb::{InvocationState, OpDb};
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
-use crate::starlark_builtins::{EmittedEvent, EventDef, InputSchema, ModuleDef};
+use crate::starlark_builtins::{EmittedEvent, EventDef};
 
 /// Individual event segments before rolling to a new file. 256 MiB matches
 /// tephra's own default sizing.
@@ -202,6 +202,11 @@ impl Runtime {
         let opdb = OpDb::open(&data_dir.join("hekla.db"))?;
         let now = now_rfc3339();
 
+        // Generated before the project is taken apart below: `Surface` borrows the whole
+        // of it, and `hekla openapi` goes through the same two calls, so the served
+        // document and the dumped one cannot disagree.
+        let openapi_json = openapi::build(&openapi::Surface::from_project(&project)).to_string();
+
         let mut commands = HashMap::new();
         for unit in project.commands {
             opdb.upsert_module_metadata(
@@ -267,8 +272,6 @@ impl Runtime {
                 &now,
             )?;
         }
-
-        let openapi_json = openapi::build(&public_command_schemas(&commands)).to_string();
 
         let opdb = Arc::new(Mutex::new(opdb));
         let keystore = master.map(|master| KeyStore::new(opdb.clone(), master));
@@ -741,24 +744,6 @@ pub(crate) fn rfc3339_days_ago(days: u32) -> String {
         .checked_sub(TimeDuration::days(i64::from(days)))
         .and_then(|cutoff| cutoff.format(&Rfc3339).ok())
         .unwrap_or_else(|| "0000-01-01T00:00:00Z".to_owned())
-}
-
-/// The public (HTTP-routed) commands and their declared input schemas, sorted by
-/// name, for OpenAPI generation.
-fn public_command_schemas(
-    commands: &HashMap<String, Arc<CommandUnit>>,
-) -> Vec<(&str, &InputSchema)> {
-    let mut out = Vec::new();
-    for unit in commands.values() {
-        if unit.internal {
-            continue;
-        }
-        if let ModuleDef::Command { name, input } = &unit.loaded.def {
-            out.push((name.as_str(), input));
-        }
-    }
-    out.sort_by_key(|(name, _)| *name);
-    out
 }
 
 /// The 409 body for a request whose consistency boundary kept changing until the

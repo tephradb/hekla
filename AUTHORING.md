@@ -846,8 +846,17 @@ A field the schema does not declare is a shape error; one the payload omits read
 - `GET /status` gives per-module positions and lag, plus each effect's consecutive-failure count and
   last error, so a wedge is distinguishable from ordinary lag.
 - `GET /health` is a liveness check, with none of `/status`'s per-module detail.
-- `GET /openapi.json` and `GET /docs` are generated from your command input schemas and entity
-  schemas.
+- `GET /openapi.json` and `GET /docs` (a Scalar reference over it) are generated from your project,
+  and describe every endpoint above. Commands get their real request body from your `input` schema.
+  Each projector entity gets two paths, with the key typed from its key column and one query
+  parameter per field you can actually filter on. The operator endpoints list your projector and
+  effect names. Responses carry real schemas, so a client generator has something to work with.
+
+  `components/schemas` also holds a schema per declared event and per entity. The entity schemas are
+  read responses; the **event schemas are documentation of the log, not wire shapes**. An event's
+  fields never appear in an HTTP response, so `event.*` is there to describe the vocabulary your
+  commands append and your projectors and effects subscribe to. The one place the event set is
+  load-bearing is `EmittedEvent.type`, the enum a command's 200 reports.
 - Opening the SQLite files directly is not a supported surface. The table layout is private.
 
 ## 14. CLI and config
@@ -858,6 +867,7 @@ A field the schema does not declare is a shape error; one the payload omits read
 | `hekla fmt <dir>` (`--check`) | Format `.star` files. Indentation is syntactically meaningful. |
 | `hekla test <dir>` | Run the scenarios under `tests/`. |
 | `hekla serve <dir>` (`--addr`, `--data-dir`) | Run the runtime and HTTP API. |
+| `hekla openapi <dir>` | Print the generated OpenAPI 3.1 document to stdout. Reads the project only (no data directory, no master key), so a committed `openapi.json` can be diffed in CI. Findings go to stderr, so redirecting stdout gives you pure JSON. |
 | `hekla lsp` | Language server over stdio, for editor integration. |
 | `hekla erase <field> <value> <dir>` | Delete a subject's key. Irreversible. |
 | `hekla rotate <dir>` | Rewrap every subject key under the current `HEKLA_MASTER_KEY`. |

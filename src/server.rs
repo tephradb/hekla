@@ -20,7 +20,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tephra::WriteCoordinator;
@@ -65,19 +65,53 @@ pub async fn serve(
     Ok(())
 }
 
+/// Every path template [`app`] registers, named once and used from the table below.
+/// axum exposes no route table of its own, so [`routes`] is what the OpenAPI drift
+/// test reads to check that every served path is described.
+pub const COMMAND_ROUTE: &str = "/commands/{name}";
+pub const READ_ONE_ROUTE: &str = "/read/{projector}/{entity}/{key}";
+pub const READ_SCAN_ROUTE: &str = "/read/{projector}/{entity}";
+pub const REPLAY_ROUTE: &str = "/projectors/{name}/replay";
+pub const SKIP_ROUTE: &str = "/effects/{name}/skip/{position}";
+pub const STATUS_ROUTE: &str = "/status";
+pub const HEALTH_ROUTE: &str = "/health";
+pub const OPENAPI_ROUTE: &str = "/openapi.json";
+pub const DOCS_ROUTE: &str = "/docs";
+
+/// Every route, as one table.
+///
+/// [`app`] folds this into a `Router` and [`routes`] projects out the paths, so a route
+/// this process serves and a route the generated OpenAPI is checked against are the
+/// same list by construction. A second hand-maintained copy would catch a typo but not
+/// the failure that matters: adding a route and forgetting to declare it, leaving a
+/// public endpoint with no spec and a drift test that still passes.
+fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
+    vec![
+        (COMMAND_ROUTE, post(execute)),
+        (READ_ONE_ROUTE, get(read_one)),
+        (READ_SCAN_ROUTE, get(read_scan)),
+        (REPLAY_ROUTE, post(replay)),
+        (SKIP_ROUTE, post(skip)),
+        (STATUS_ROUTE, get(status)),
+        (HEALTH_ROUTE, get(health)),
+        (OPENAPI_ROUTE, get(openapi_doc)),
+        (DOCS_ROUTE, get(docs)),
+    ]
+}
+
+/// Every path template [`app`] registers, derived from the same table it registers.
+pub fn routes() -> Vec<&'static str> {
+    route_table().into_iter().map(|(path, _)| path).collect()
+}
+
 /// The HTTP application over an already-built runtime, for in-process testing
 /// (drive it with `tower::ServiceExt::oneshot`).
 pub fn app(shared: Shared) -> Router {
-    Router::new()
-        .route("/commands/{name}", post(execute))
-        .route("/read/{projector}/{entity}/{key}", get(read_one))
-        .route("/read/{projector}/{entity}", get(read_scan))
-        .route("/projectors/{name}/replay", post(replay))
-        .route("/effects/{name}/skip/{position}", post(skip))
-        .route("/status", get(status))
-        .route("/health", get(health))
-        .route("/openapi.json", get(openapi_doc))
-        .route("/docs", get(docs))
+    route_table()
+        .into_iter()
+        .fold(Router::new(), |router, (path, handler)| {
+            router.route(path, handler)
+        })
         .with_state(shared)
 }
 
@@ -452,10 +486,10 @@ fn task_panicked(err: tokio::task::JoinError) -> Response {
 /// How often the read-your-writes wait re-checks the projector's position.
 const READ_WAIT_TICK: Duration = Duration::from_millis(10);
 /// The wait budget when a read passes `after` without a `timeout_ms`.
-const READ_WAIT_DEFAULT: Duration = Duration::from_millis(5_000);
+pub(crate) const READ_WAIT_DEFAULT: Duration = Duration::from_millis(5_000);
 /// The ceiling on a client-supplied `timeout_ms`, so one read cannot pin a request
 /// for longer than this.
-const READ_WAIT_MAX: Duration = Duration::from_millis(30_000);
+pub(crate) const READ_WAIT_MAX: Duration = Duration::from_millis(30_000);
 
 /// A read-your-writes wait parsed off the query string: block until the projector
 /// reaches `after`, giving up after `timeout`.

@@ -6,6 +6,7 @@
 //! response's `position` is consistent with its data. Filters are restricted to
 //! declared indexes, and pagination is by an opaque key cursor, never an offset.
 
+use std::iter;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -44,17 +45,34 @@ pub fn find_entity<'a>(entities: &'a [EntityDef], name: &str) -> Option<&'a Enti
     entities.iter().find(|entity| entity.name == name)
 }
 
+/// Every field a scan may filter on, in declaration order: the primary key, then the
+/// leftmost column of each declared index.
+///
+/// The single source of truth for both the 400 the scan handler returns and the query
+/// parameters the OpenAPI generator documents, so the two cannot drift apart.
+///
+/// May repeat a name, when two indexes lead with the same column or one leads with the
+/// key. A caller that turns each into something name-addressed (an OpenAPI query
+/// parameter) has to deduplicate; a caller asking a membership question does not, and
+/// leaving it lazy keeps [`is_filterable`] allocation-free on the read path.
+pub fn filterable_fields(entity: &EntityDef) -> impl Iterator<Item = &str> {
+    iter::once(entity.key.as_str()).chain(
+        entity
+            .indexes
+            .iter()
+            .filter_map(|index| index.columns.first())
+            .map(String::as_str),
+    )
+}
+
 /// Whether `field` can be filtered on: the primary key, or the leftmost column of
 /// some declared index. Anything else would be a table scan, which the read API
 /// refuses; the caller returns a 400 telling the author to declare the index.
+///
+/// Shares [`filterable_fields`] so the runtime's 400 and the parameters the OpenAPI
+/// generator documents cannot drift apart.
 pub fn is_filterable(entity: &EntityDef, field: &str) -> bool {
-    if field == entity.key {
-        return true;
-    }
-    entity
-        .indexes
-        .iter()
-        .any(|index| index.columns.first().map(String::as_str) == Some(field))
+    filterable_fields(entity).any(|name| name == field)
 }
 
 /// Validate that a filter value parses as its column's declared type, so a

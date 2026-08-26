@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::context::{EffectCtx, EffectHost, HandleCtx, ProjectorCtx, QueryCtx};
 use crate::dispatch::{EventDefs, RESERVED_TAG_PREFIX};
-use crate::read_api::RESERVED_QUERY_PARAMS;
+use crate::read_api::{self, RESERVED_QUERY_PARAMS};
 use crate::read_model::quote_ident;
 
 // ---------------------------------------------------------------------------
@@ -535,14 +535,14 @@ impl EntityDef {
         // A read filter targets the key or an index-leading column, so a field named
         // like a reserved read query param could never be filtered. Reject at load
         // rather than surprising the author with a silent no-op at request time.
-        let mut filterable = vec![self.key.as_str()];
-        filterable.extend(
-            self.indexes
-                .iter()
-                .filter_map(|ix| ix.columns.first())
-                .map(String::as_str),
-        );
-        for field in filterable {
+        //
+        // Derived from `filterable_fields` rather than open-coded, because this gate is
+        // the only thing stopping the OpenAPI generator from emitting a duplicate query
+        // parameter. Widen filterability there (to any prefix of a composite index, say)
+        // and an entity whose index leads on a column named `limit` would start loading
+        // while `scan_params` emitted a second `limit` parameter, shadowing the page-size
+        // control with an invalid document.
+        for field in read_api::filterable_fields(self) {
             if RESERVED_QUERY_PARAMS.contains(&field) {
                 anyhow::bail!(
                     "entity `{}`: filterable field `{}` collides with a reserved read query param (one of: {})",
