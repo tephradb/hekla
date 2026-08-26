@@ -250,11 +250,12 @@ only writer.
 
   Build the new state with `dict(state, taken = True)`, or `dict(state, **{key: value})` when the key
   is computed. `initial` is a frozen module global, so a fold that assigns into `state` fails on the
-  first event it sees; once an arm has returned a dict it built, mutating that one is its own
-  business. There is no way to freeze intermediate state (starlark-rust does not expose a freezer
-  mid-evaluation) and no way to lint a handler body (it does not expose the AST), so the contract is
-  carried by the first-event failure, the `must return the updated state` error on a `None` return,
-  and this paragraph.
+  first event it sees; once an arm has returned a dict it built, mutating that one *between arms* is
+  its own business, because the value is discarded at the end of the fold either way. What the fold
+  hands out is frozen before `handle` sees it. starlark-rust exposes no freezer mid-evaluation
+  (`Freezer::new` is crate-private and freezing rewrites the source heap), so freezing an arm's
+  intermediate result is not available; the contract between arms is carried by the first-event
+  failure, the `must return the updated state` error on a `None` return, and this paragraph.
 - `handle(input, state)` decides and returns one of three terminal outcomes. It is always a single
   function: it decides from input and folded state rather than from one event, so per-type dispatch
   belongs on `fold`.
@@ -280,7 +281,25 @@ no extra layer. Starlark mints no ids and has no randomness. Host-minted ids wou
 per retry, creating two entities from one intent.
 
 **Append and DCB**: emitted events are appended under an `AppendCondition` over the boundary. A
-concurrent write inside the boundary fails the append, and the caller retries.
+concurrent write inside the boundary fails the append, and the attempt is retried in place.
+
+**A retry costs the delta, not the boundary.** Each attempt keeps the state it folded and the last
+position that state covers; the next one reads strictly after that position and folds what landed
+onto the state it already has, rather than replaying the boundary from zero. The fold is a left fold
+over an append-only log, so folding `[0, a]` and then `(a, b]` gives the state folding `[0, b]`
+would. The attempt loop lives in `dispatch` rather than in the runtime so the work that does not vary
+between attempts (the input struct, the boundary, the lowered `fold` plan, whose clauses cost a
+keystore lookup and a deterministic encryption each when a field is subject-scoped) is done once per
+request. The runtime still owns the *policy*: how many attempts, and how long to wait between them.
+
+**The carried state is frozen, so `handle` cannot mutate what the next attempt folds onto.** Each
+attempt folds in a scratch heap and freezes the result, which pays for itself twice: an assignment
+into `state` inside `handle` fails with `Immutable` and a message naming the reason, exactly as it
+already did when the boundary was empty and `state` was the frozen `initial`; and the events the
+attempt allocated die with the scratch heap rather than being pinned for the life of the request
+(starlark collects only at module top-level statements, which a handler call is not). Without the
+freeze a mutating `handle` would corrupt every later attempt and commit straight past the boundary,
+silently and with a 200.
 
 **Built-in idempotency key** is distinct from id-based dedupe. It exists for commands where nothing
 in the input distinguishes intent (approving a claim twice with identical input could be one retry

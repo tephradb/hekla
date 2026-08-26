@@ -1041,3 +1041,149 @@ fn a_fold_reads_a_stable_event_id() {
     );
     harness.shutdown();
 }
+
+// --- the incremental re-fold across a conflict -----------------------------
+
+/// A counted resource: the boundary is one room's whole seating history, so every
+/// concurrent take collides on it.
+const SEAT_EVENTS: &str = r#"
+taken = event(type = "t.taken", fields = {"id": uuid(), "room": str(max_length = 20)})
+"#;
+
+/// Capacity two. The interesting property is what a loser does on its retry: the
+/// winner's event is inside the boundary it already folded up to, so a retry that
+/// folded nothing new would decide on a stale count and conflict again until the
+/// budget ran out, while a retry that folds the delta sees the seat go and rejects.
+const TAKE_SEAT: &str = r#"
+load("events/t.star", "taken")
+
+input = schema(id = uuid(), room = str())
+
+def query(input):
+    return taken(room = input.room)
+
+initial = 0
+
+fold = {taken(): lambda state, event: state + 1}
+
+def handle(input, state):
+    if state >= 2:
+        return reject("full", "no seats left")
+    return taken(id = input.id, room = input.room)
+"#;
+
+/// Note what this can and cannot catch. Folding the delta and re-folding the whole
+/// boundary reach the same state by construction, so nothing observable separates
+/// them and this passes against either. What it holds is that the carry is *correct*:
+/// folding the delta onto `initial` rather than onto the carried state commits five
+/// seats against a capacity of two.
+#[test]
+fn a_retry_decides_on_the_events_that_beat_it() {
+    let project = write_project(&[
+        ("events/t.star", SEAT_EVENTS),
+        ("commands/take.star", TAKE_SEAT),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    let outcomes: Vec<(u16, Value)> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let rt = &harness.rt;
+                scope.spawn(move || {
+                    let result = rt
+                        .execute(
+                            "take",
+                            json!({ "id": Uuid::new_v4(), "room": "r1" }),
+                            &ctx(),
+                            None,
+                        )
+                        .unwrap();
+                    (result.status, result.body)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let committed = outcomes.iter().filter(|(status, _)| *status == 200).count();
+    assert_eq!(
+        committed, 2,
+        "the boundary admits exactly the capacity: {outcomes:?}"
+    );
+    for (status, body) in &outcomes {
+        if *status == 200 {
+            continue;
+        }
+        assert_eq!(
+            *status, 422,
+            "a loser rejects on the state its retry folded rather than exhausting the \
+             retry budget on a stale one: {body:?}"
+        );
+        assert_eq!(body["error"]["code"], "full", "{body:?}");
+    }
+    assert_eq!(
+        log_head(&harness.rt),
+        2,
+        "no attempt appended past the capacity"
+    );
+    harness.shutdown();
+}
+
+/// Capacity three, and a `handle` that writes into the state it was handed. The
+/// mutation must be refused rather than carried: with the state carried across
+/// attempts, a `handle` that reset the count would let every racer commit, blowing
+/// the capacity the boundary exists to hold and answering 200 to all of them.
+const MUTATING_HANDLE: &str = r#"
+load("events/t.star", "taken")
+
+input = schema(id = uuid(), room = str())
+
+def query(input):
+    return taken(room = input.room)
+
+initial = {"n": 0}
+
+fold = {taken(): lambda state, event: dict(state, n = state["n"] + 1)}
+
+def handle(input, state):
+    if state["n"] >= 3:
+        return reject("full", "no seats left")
+    if state["n"] > 0:
+        state["n"] = 0
+    return taken(id = input.id, room = input.room)
+"#;
+
+#[test]
+fn a_handle_that_mutates_the_folded_state_is_refused() {
+    let project = write_project(&[
+        ("events/t.star", SEAT_EVENTS),
+        ("commands/take.star", MUTATING_HANDLE),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    // The first take folds an empty boundary, so `state` is the frozen `initial` and
+    // the mutation is skipped: this is the call that gets a seat on the log.
+    let first = harness
+        .rt
+        .execute("take", json!({ "id": ALICE, "room": "r1" }), &ctx(), None)
+        .unwrap();
+    assert_eq!(first.status, 200, "{:?}", first.body);
+
+    // Now the boundary has an event, so the fold builds real state and the mutation
+    // runs. It must fail loudly at the assignment.
+    let err = exec_err(&harness.rt, "take", json!({ "id": BOB, "room": "r1" }));
+    assert!(
+        err.contains("Immutable"),
+        "the folded state is read-only in handle: {err}"
+    );
+    assert!(
+        err.contains("a retry folds onto it"),
+        "the error says why, not just what: {err}"
+    );
+    assert_eq!(
+        log_head(&harness.rt),
+        1,
+        "the refused attempt appended nothing"
+    );
+    harness.shutdown();
+}

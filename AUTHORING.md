@@ -333,6 +333,13 @@ per-clause dispatch belongs on `fold`. Returns exactly one of:
 A DCB concurrency conflict that survives retries is a 409, kept distinct from 422 so the status
 alone tells a client whether a retry can help.
 
+**`state` is read-only in `handle`.** Assigning into it fails with `Immutable`, the same error a fold
+arm gets for mutating rather than returning. The reason is the retry: a conflict is retried by
+folding what landed since onto the state the previous attempt already built, rather than re-reading
+the boundary from the start, so a mutation would decide the *next* attempt instead of being discarded
+with this one. There was never anything to gain from it: `handle` returns its decision, and the state
+is thrown away with the request.
+
 ### Determinism and ids
 
 - `query` and `fold` are pure and clock-free. `now()` is available **only in `handle`**, pinned once
@@ -893,7 +900,7 @@ Not caught:
   Put it in `fold` only if `handle` needs to know about it.** They are different questions.
 - **In an effect, `query` asks only "what state do I need".** There is no append to guard, so the two
   questions collapse into one and a `query` with no `fold` is always a mistake.
-- **A fold arm returns the new state.** Never mutate `state`.
+- **A fold arm returns the new state.** Never mutate `state`, in a fold arm or in `handle`.
 - **A projector arm returns a list of ops**, possibly empty.
 - **An effect arm's return value is ignored.** Its contract is the calls it makes.
 - **An effect gets state by folding the log, never by reading a projector.** That is why a fold

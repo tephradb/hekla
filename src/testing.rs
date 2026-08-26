@@ -771,6 +771,7 @@ fn run_command_case(
             TEST_NOW,
             None,
             true,
+            &dispatch::Retry::once(),
         )?,
         Err(err) => CommandOutcome::InvalidInput {
             message: format!("{err}"),

@@ -7,17 +7,17 @@
 //! write inside the boundary makes the append fail rather than silently violate an
 //! invariant.
 //!
-//! One call is one attempt. A DCB conflict returns [`CommandOutcome::Conflict`]
-//! rather than an error, so the runtime can rebuild the decision model by
-//! re-running the whole cycle. The events a command emits are wrapped in a
-//! host-stamped [`envelope`] at the append seam, and every read unwraps it, so
-//! handlers only ever see the payload.
+//! A DCB conflict is retried in place, per the caller's [`Retry`] policy, by folding
+//! what landed since onto the state the previous attempt already built; only an
+//! exhausted budget returns [`CommandOutcome::Conflict`]. The events a command emits
+//! are wrapped in a host-stamped [`envelope`] at the append seam, and every read
+//! unwraps it, so handlers only ever see the payload.
 
 use std::collections::HashMap;
 
 use starlark::ErrorKind;
 use starlark::environment::{FrozenModule, Module};
-use starlark::values::{Value, ValueError};
+use starlark::values::{OwnedFrozenValue, Value, ValueError};
 use tephra::{
     AppendCondition, AppendError, ConflictClause, Event, EventRef, EventType, Matches, Position,
     PositionRange, Query, QueryItem, Tag, Tags, WriteHandle,
@@ -133,8 +133,8 @@ pub enum CommandOutcome {
 
 /// Host-side validation of a command's raw input against its declared schema.
 /// A malformed body is the equivalent of `invalid_input(...)` and never reaches a
-/// handler. The runtime validates once before the retry loop, so [`run_command`]
-/// (re-run per attempt) can assume an already-validated body.
+/// handler. The runtime validates once before dispatch, so [`run_command`] can assume
+/// an already-validated body on every attempt it makes.
 pub fn validate_input(loaded: &LoadedModule, input: &serde_json::Value) -> anyhow::Result<()> {
     let ModuleDef::Command { input: schema, .. } = &loaded.def else {
         anyhow::bail!("validate_input called on a non-command module");
@@ -142,11 +142,48 @@ pub fn validate_input(loaded: &LoadedModule, input: &serde_json::Value) -> anyho
     validate_command_input(schema, input)
 }
 
-/// Run one command attempt against the store: read the boundary, fold, handle,
-/// append. The caller validates input once via [`validate_input`] before the retry
-/// loop, so this per-attempt cycle assumes a well-formed body. `now` is the
-/// request's pinned append time, visible to `handle` through `now()` and stamped
-/// into each event's envelope.
+/// How a DCB conflict is retried: how many attempts, and what to do between them.
+///
+/// The policy belongs to the caller (the runtime picks the budget and the backoff)
+/// but the loop belongs here, so the work that does not vary between attempts (the
+/// input struct, the boundary, the lowered `fold` plan) is done once per request
+/// rather than once per attempt.
+pub struct Retry<'a> {
+    /// Total attempts including the first. Below 1, nothing runs and the command
+    /// reports a conflict.
+    pub max_attempts: u32,
+    /// Called before each retry with the zero-based number of the attempt that just
+    /// conflicted.
+    pub backoff: &'a dyn Fn(u32),
+}
+
+impl Retry<'_> {
+    /// One attempt and no backoff: a conflict is reported rather than retried. What
+    /// `hekla test` wants, where the log is seeded and nothing else is writing.
+    pub fn once() -> Retry<'static> {
+        Retry {
+            max_attempts: 1,
+            backoff: &|_| {},
+        }
+    }
+}
+
+/// Run the command's decision cycle against the store: read the boundary, fold,
+/// handle, append, retrying per `retry` on a DCB conflict. The caller validates input
+/// once via [`validate_input`] first, so this cycle assumes a well-formed body. `now`
+/// is the request's pinned append time, visible to `handle` through `now()` and
+/// stamped into each event's envelope, and it does not move across attempts.
+///
+/// `query`, `initial` and `handle` are resolved once: the input is invariant and all
+/// three are pure, so a retry repeats only the fold and the append. The fold itself is
+/// incremental. Each attempt keeps the state it folded and the last position that
+/// state covers, and the next one resumes strictly after that position, folding what
+/// landed in between onto the state it already has. A conflict on a boundary tens of
+/// thousands of events deep therefore costs the handful of events that caused it
+/// rather than the whole boundary again.
+///
+/// The carried state is frozen, so `handle` cannot mutate what the next attempt folds
+/// onto; see [`fold_frozen`] for why that is enforced rather than documented.
 ///
 /// When `idem_tag` is set, exactly-once is enforced atomically at the append: every
 /// emitted event carries the tag and the append condition's existence clause
@@ -169,6 +206,7 @@ pub fn run_command(
     now: &str,
     idem_tag: Option<&str>,
     verify: bool,
+    retry: &Retry<'_>,
 ) -> anyhow::Result<CommandOutcome> {
     let ModuleDef::Command { input: schema, .. } = &loaded.def else {
         anyhow::bail!("run_command called on a non-command module");
@@ -198,140 +236,285 @@ pub fn run_command(
 
         let initial = initial_state(frozen, &module)
             .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?;
-        let (state, after) = match &boundary {
-            Some(query) => fold_boundary(
-                &module,
-                &FoldInputs {
-                    frozen,
-                    store,
-                    query,
-                    events,
-                    keystore,
-                    upto: None,
-                    verify,
-                },
-                initial,
-            )?,
-            None => (initial, Position::ZERO),
-        };
+        let plan = FoldPlan::build(frozen, &module, events, keystore)?;
 
         // `handle` alone sees the pinned clock.
         let handle_fn = frozen
             .get_option("handle")?
             .ok_or_else(|| anyhow::anyhow!("command has no handle() function"))?;
+        let handle_value = thaw(&handle_fn, &module);
         let handle_ctx = HandleCtx {
             now: now.to_owned(),
         };
-        let decision = call_handler_with_ctx(
-            &module,
-            thaw(&handle_fn, &module),
-            &[input_value, state],
-            MAX_TICKS,
-            &handle_ctx,
-        )
-        .map_err(|err| anyhow::anyhow!("handle() failed: {err}"))?;
 
-        match parse_handle_result(decision, events)? {
-            HandleOutcome::Reject(rejection) => {
-                if let Some(recovered) =
-                    recover_if_committed(store, events, boundary.as_ref(), idem_tag)?
-                {
-                    return Ok(CommandOutcome::AlreadyCommitted(recovered));
-                }
-                Ok(CommandOutcome::Rejected {
-                    code: rejection.code,
-                    message: rejection.message,
-                })
+        // What an attempt hands the next one: the state it folded, frozen, and the
+        // last position that state covers. `None` on the first attempt, which folds
+        // from the start of the boundary onto `initial`.
+        let mut folded: Option<(OwnedFrozenValue, Position)> = None;
+
+        for attempt in 0..retry.max_attempts {
+            if attempt > 0 {
+                (retry.backoff)(attempt - 1);
             }
-            HandleOutcome::InvalidInput(invalid) => Ok(CommandOutcome::InvalidInput {
-                message: invalid.message,
-            }),
-            HandleOutcome::Emit(emitted) => {
-                if emitted.is_empty() {
-                    if let Some(recovered) =
-                        recover_if_committed(store, events, boundary.as_ref(), idem_tag)?
-                    {
-                        return Ok(CommandOutcome::AlreadyCommitted(recovered));
-                    }
-                    return Ok(CommandOutcome::Committed {
-                        events: emitted,
-                        positions: None,
-                    });
+            let (state, after) = match &boundary {
+                Some(query) => {
+                    let resume_after = folded.as_ref().map_or(Position::ZERO, |(_, at)| *at);
+                    let (frozen_state, after) = fold_frozen(
+                        folded.as_ref().map(|(state, _)| state),
+                        &FoldInputs {
+                            frozen,
+                            store,
+                            query,
+                            plan: &plan,
+                            events,
+                            resume_after,
+                            upto: None,
+                            verify,
+                        },
+                    )?;
+                    let state = thaw(&frozen_state, &module);
+                    folded = Some((frozen_state, after));
+                    (state, after)
                 }
-                let packed = emitted
-                    .iter()
-                    .map(|event| {
-                        build_event(
-                            event,
-                            events.get(&event.event_type),
-                            keystore,
-                            ctx,
-                            now,
-                            idem_tag,
-                            Uuid::new_v4(),
-                        )
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                let condition = build_condition(boundary, after, idem_tag)?;
-                match store.append(packed, condition) {
-                    Ok(positions) => Ok(CommandOutcome::Committed {
-                        events: emitted,
-                        positions: Some(positions),
-                    }),
-                    // The existence clause fired: this request already committed (a
-                    // crash replay or a concurrent duplicate), caught atomically at the
-                    // append with no TOCTOU. Recover its original outcome.
-                    Err(AppendError::Conflict {
-                        clause: ConflictClause::Existence,
-                        ..
-                    }) => {
-                        let tag = idem_tag.expect("the existence clause is only set when keyed");
-                        match find_committed_outcome(store, events, tag)? {
-                            Some(recovered) => Ok(CommandOutcome::AlreadyCommitted(recovered)),
-                            None => Err(anyhow::anyhow!(
-                                "idempotency existence guard fired but no committed outcome was found"
-                            )),
-                        }
-                    }
-                    // A concurrent write inside the boundary: rebuild state on a fresh
-                    // read and retry.
-                    Err(AppendError::Conflict {
-                        clause: ConflictClause::Boundary,
-                        ..
-                    }) => Ok(CommandOutcome::Conflict),
-                    // The coordinator is draining: the request never landed, and a
-                    // retry against a fresh process can succeed, so surface it as a
-                    // retryable 503 rather than an opaque 500.
-                    Err(AppendError::Shutdown) => Ok(CommandOutcome::Unavailable {
-                        message: "the write coordinator is shutting down; retry".to_owned(),
-                    }),
-                    // A handler emitted a batch too large to ever store: an author
-                    // bug, distinct from the integrity and I/O failures below.
-                    Err(err @ AppendError::TooLarge { .. }) => Err(anyhow::anyhow!(
-                        "command emitted an oversized event batch: {err}"
-                    )),
-                    // An event already on the log failed to decode during the
-                    // condition scan: an integrity failure, not a normal outcome.
-                    Err(err @ AppendError::Corrupt(_)) => Err(anyhow::anyhow!(
-                        "append aborted on a corrupt event in the boundary: {err}"
-                    )),
-                    // Empty (guarded above) and AfterBeyondTip (a position hekla
-                    // never hands out) are host bugs; Log is a durable write failure.
-                    Err(err) => Err(anyhow::anyhow!("append failed: {err}")),
-                }
+                None => (initial, Position::ZERO),
+            };
+
+            let decision = call_handler_with_ctx(
+                &module,
+                handle_value,
+                &[input_value, state],
+                MAX_TICKS,
+                &handle_ctx,
+            )
+            .map_err(handle_error)?;
+
+            let outcome = attempt_outcome(
+                store,
+                events,
+                keystore,
+                ctx,
+                now,
+                idem_tag,
+                boundary.as_ref(),
+                after,
+                decision,
+            )?;
+            match outcome {
+                // A concurrent write inside the boundary: fold what landed and
+                // decide again.
+                CommandOutcome::Conflict => continue,
+                settled => return Ok(settled),
             }
         }
+        Ok(CommandOutcome::Conflict)
     })
+}
+
+/// The module slot the folded state is exported through, so it survives the freeze.
+const STATE_SLOT: &str = "state";
+
+/// Fold one attempt's boundary in a scratch heap and hand back the state frozen,
+/// alongside the last position it covers.
+///
+/// The scratch module is what makes the retry carry safe, and it earns its allocation
+/// twice over:
+///
+/// - **`handle` cannot mutate what the next attempt folds onto.** A frozen state fails
+///   an assignment with `Immutable`, which is already what happens when the boundary
+///   is empty and `state` is the frozen `initial`, so this makes the rule uniform
+///   rather than inventing one. Without it a `handle` that wrote into `state` would
+///   corrupt every later attempt and commit past the boundary it exists to protect,
+///   silently and with a 200.
+/// - **The attempt's allocations are freed when it ends.** A fold over a deep boundary
+///   allocates an event per matched position and starlark only collects at module
+///   top-level statements, which a handler call is not, so holding one heap across the
+///   whole retry sequence would pin every attempt's events through every backoff. The
+///   freeze copies out only what the state reaches; the rest dies with the scratch
+///   heap.
+fn fold_frozen(
+    base: Option<&OwnedFrozenValue>,
+    inputs: &FoldInputs<'_>,
+) -> anyhow::Result<(OwnedFrozenValue, Position)> {
+    Module::with_temp_heap(|scratch| {
+        let start = match base {
+            Some(value) => thaw(value, &scratch),
+            None => initial_state(inputs.frozen, &scratch)
+                .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?,
+        };
+        let (state, after) = fold_boundary(&scratch, inputs, start)?;
+        scratch.set(STATE_SLOT, state);
+        let frozen = scratch
+            .freeze()
+            .map_err(|err| anyhow::Error::from(err).context("freezing the folded state"))?;
+        Ok((frozen.get(STATE_SLOT)?, after))
+    })
+}
+
+/// Turn one attempt's `handle` decision into its outcome: reject and invalid-input
+/// pass straight through, and an emit is packed, guarded by the boundary and
+/// appended.
+///
+/// Split out of [`run_command`] so the attempt loop there reads as fold, decide,
+/// settle rather than burying the append in a nest of match arms.
+#[allow(clippy::too_many_arguments)]
+fn attempt_outcome(
+    store: &WriteHandle,
+    events: &EventDefs,
+    keystore: Option<&KeyStore>,
+    ctx: &CommandContext,
+    now: &str,
+    idem_tag: Option<&str>,
+    boundary: Option<&Query>,
+    after: Position,
+    decision: Value<'_>,
+) -> anyhow::Result<CommandOutcome> {
+    match parse_handle_result(decision, events)? {
+        HandleOutcome::Reject(rejection) => {
+            if let Some(recovered) = recover_if_committed(store, events, boundary, idem_tag)? {
+                return Ok(CommandOutcome::AlreadyCommitted(recovered));
+            }
+            Ok(CommandOutcome::Rejected {
+                code: rejection.code,
+                message: rejection.message,
+            })
+        }
+        HandleOutcome::InvalidInput(invalid) => Ok(CommandOutcome::InvalidInput {
+            message: invalid.message,
+        }),
+        HandleOutcome::Emit(emitted) => {
+            if emitted.is_empty() {
+                if let Some(recovered) = recover_if_committed(store, events, boundary, idem_tag)? {
+                    return Ok(CommandOutcome::AlreadyCommitted(recovered));
+                }
+                return Ok(CommandOutcome::Committed {
+                    events: emitted,
+                    positions: None,
+                });
+            }
+            let packed = emitted
+                .iter()
+                .map(|event| {
+                    build_event(
+                        event,
+                        events.get(&event.event_type),
+                        keystore,
+                        ctx,
+                        now,
+                        idem_tag,
+                        Uuid::new_v4(),
+                    )
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let condition = build_condition(boundary, after, idem_tag)?;
+            match store.append(packed, condition) {
+                Ok(positions) => Ok(CommandOutcome::Committed {
+                    events: emitted,
+                    positions: Some(positions),
+                }),
+                // The existence clause fired: this request already committed (a
+                // crash replay or a concurrent duplicate), caught atomically at the
+                // append with no TOCTOU. Recover its original outcome.
+                Err(AppendError::Conflict {
+                    clause: ConflictClause::Existence,
+                    ..
+                }) => {
+                    let tag = idem_tag.expect("the existence clause is only set when keyed");
+                    match find_committed_outcome(store, events, tag)? {
+                        Some(recovered) => Ok(CommandOutcome::AlreadyCommitted(recovered)),
+                        None => Err(anyhow::anyhow!(
+                            "idempotency existence guard fired but no committed outcome was found"
+                        )),
+                    }
+                }
+                // A concurrent write inside the boundary: rebuild state on a fresh
+                // read and retry.
+                Err(AppendError::Conflict {
+                    clause: ConflictClause::Boundary,
+                    ..
+                }) => Ok(CommandOutcome::Conflict),
+                // The coordinator is draining: the request never landed, and a
+                // retry against a fresh process can succeed, so surface it as a
+                // retryable 503 rather than an opaque 500.
+                Err(AppendError::Shutdown) => Ok(CommandOutcome::Unavailable {
+                    message: "the write coordinator is shutting down; retry".to_owned(),
+                }),
+                // A handler emitted a batch too large to ever store: an author
+                // bug, distinct from the integrity and I/O failures below.
+                Err(err @ AppendError::TooLarge { .. }) => Err(anyhow::anyhow!(
+                    "command emitted an oversized event batch: {err}"
+                )),
+                // An event already on the log failed to decode during the
+                // condition scan: an integrity failure, not a normal outcome.
+                Err(err @ AppendError::Corrupt(_)) => Err(anyhow::anyhow!(
+                    "append aborted on a corrupt event in the boundary: {err}"
+                )),
+                // Empty (guarded above) and AfterBeyondTip (a position hekla
+                // never hands out) are host bugs; Log is a durable write failure.
+                Err(err) => Err(anyhow::anyhow!("append failed: {err}")),
+            }
+        }
+    }
 }
 
 /// What [`fold_boundary`] needs besides the heap and the starting state, bundled so
 /// the call stays under the argument limit.
+///
+/// Everything about a `fold` that does not vary between attempts: each arm's lowered
+/// query clause and its error label.
+///
+/// Lowering is the expensive half. A clause over a subject-scoped field costs a
+/// keystore lookup and a deterministic encryption per arm, so doing it per attempt
+/// would put crypto on the hot contention path for nothing: the map is a module-level
+/// literal and the events and keys it lowers against are fixed for the request.
+pub(crate) struct FoldPlan {
+    lowered: Vec<Option<QueryItem>>,
+    labels: Vec<String>,
+}
+
+impl FoldPlan {
+    /// Resolve, thaw and lower a module's `fold` once. `module` is only borrowed for
+    /// the thaw; nothing in the plan outlives it, so the caller is free to fold in a
+    /// different heap.
+    pub(crate) fn build(
+        frozen: &FrozenModule,
+        module: &Module<'_>,
+        events: &EventDefs,
+        keystore: Option<&KeyStore>,
+    ) -> anyhow::Result<FoldPlan> {
+        let Some(owned) = frozen.get_option("fold")? else {
+            return Ok(FoldPlan {
+                lowered: Vec::new(),
+                labels: Vec::new(),
+            });
+        };
+        let fold = parse_event_dispatch(thaw(&owned, module))
+            .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
+        let lowered = lower_dispatch(&fold, events, keystore)
+            .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
+        let labels = fold
+            .arms()
+            .iter()
+            .map(|arm| fold.label("fold", arm.spec.as_ref()))
+            .collect();
+        Ok(FoldPlan { lowered, labels })
+    }
+}
+
 pub(crate) struct FoldInputs<'a> {
     pub frozen: &'a FrozenModule,
     pub store: &'a WriteHandle,
     pub query: &'a Query,
+    pub plan: &'a FoldPlan,
     pub events: &'a EventDefs,
-    pub keystore: Option<&'a KeyStore>,
+    /// Exclusive lower bound on the positions read: the fold resumes strictly after
+    /// this position, onto the state it is handed rather than onto `initial`.
+    /// [`Position::ZERO`] folds the whole boundary.
+    ///
+    /// A command's retry sets it to the last position its previous attempt folded, so
+    /// a DCB conflict costs the delta instead of the boundary again. That is sound
+    /// because the fold is a left fold over an append-only log: folding `[0, a]` and
+    /// then `(a, b]` gives the state folding `[0, b]` would.
+    pub resume_after: Position,
     /// Inclusive upper bound on the positions folded. `None` folds the whole
     /// boundary, which is what a command wants: its state is the log as of now.
     /// `Some(n)` stops after position `n`, which is what an effect wants: folding
@@ -430,31 +613,35 @@ fn fold_once<'v>(
         frozen,
         store,
         query,
+        plan,
         events,
-        keystore,
+        resume_after,
         upto,
         verify: _,
     } = *inputs;
 
-    // Resolved and lowered once: the map is a module-level literal, so it cannot
-    // differ between events, and thawing per event would touch the temp heap's
-    // reference set for nothing.
+    // The map is a module-level literal, so only the arm functions have to be lifted
+    // into this heap; the clauses they are matched on were lowered once by the plan.
     let fold_owned = frozen.get_option("fold")?;
     let fold = fold_owned
         .as_ref()
         .map(|owned| parse_event_dispatch(thaw(owned, module)))
         .transpose()
         .map_err(|err| anyhow::anyhow!("`fold` {err}"))?;
-    let lowered = match &fold {
-        Some(fold) => {
-            lower_dispatch(fold, events, keystore).map_err(|err| anyhow::anyhow!("`fold` {err}"))?
-        }
-        None => Vec::new(),
-    };
+    if let Some(fold) = &fold
+        && fold.arms().len() != plan.lowered.len()
+    {
+        anyhow::bail!("the fold plan does not match the module's fold");
+    }
+    let lowered = &plan.lowered;
+    let labels = &plan.labels;
 
     let mut state = initial;
-    let mut after = Position::ZERO;
-    let mut reads = store.read(query, Position::ZERO, None);
+    // Starts at the resume point, not at zero, so a fold that matches nothing new
+    // still reports the position its state already covers.
+    let mut after = resume_after;
+    let mut selected: Vec<usize> = Vec::new();
+    let mut reads = store.read(query, resume_after, None);
     while let Some(item) = reads.next() {
         let seq = item.map_err(|err| anyhow::anyhow!("read failed: {err}"))?;
         // The store reads ascending up to the watermark pinned when the read was
@@ -465,13 +652,16 @@ fn fold_once<'v>(
         after = seq.position;
         let Some(fold) = &fold else { continue };
         // Matching before decoding: a map over a wide boundary pays nothing for
-        // the events no arm selects.
-        let selected: Vec<usize> = lowered
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| arm_selects(item.as_ref(), seq.event))
-            .map(|(index, _)| index)
-            .collect();
+        // the events no arm selects. The buffer is reused across events so a
+        // boundary of any depth costs one allocation.
+        selected.clear();
+        selected.extend(
+            lowered
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| arm_selects(item.as_ref(), seq.event))
+                .map(|(index, _)| index),
+        );
         if selected.is_empty() {
             continue;
         }
@@ -489,12 +679,12 @@ fn fold_once<'v>(
         );
         // Every selecting arm runs, threading state through them in declaration
         // order.
-        for index in selected {
+        for &index in &selected {
             let arm = &fold.arms()[index];
-            let what = fold.label("fold", arm.spec.as_ref());
+            let what = &labels[index];
             state = call_handler(module, arm.func, &[state, event], MAX_TICKS)
-                .map_err(|err| fold_error(&what, err))?;
-            check_fold_result(state, &what)?;
+                .map_err(|err| fold_error(what, err))?;
+            check_fold_result(state, what)?;
         }
     }
     Ok((state, after))
@@ -507,17 +697,37 @@ fn fold_once<'v>(
 /// `Immutable`. That is exactly the mistake the return-new-state contract exists to
 /// prevent, so it is worth naming rather than leaving to the source span.
 fn fold_error(what: &str, err: starlark::Error) -> anyhow::Error {
-    let immutable = matches!(
-        starlark_cause(&err).and_then(|cause| cause.downcast_ref::<ValueError>()),
-        Some(ValueError::CannotMutateImmutableValue)
-    );
-    if immutable {
+    if mutated_immutable(&err) {
         anyhow::anyhow!(
             "{what} failed: {err}; fold returns the new state (e.g. `return dict(state, taken = True)`) rather than mutating the one it was handed"
         )
     } else {
         anyhow::anyhow!("{what} failed: {err}")
     }
+}
+
+/// The same treatment for `handle`, whose own `Immutable` is the folded state.
+///
+/// Worth naming rather than leaving to the source span, because the reason it is
+/// frozen is not local to the handler: a DCB retry folds what landed since onto the
+/// state the previous attempt built, so a mutation here would decide the next attempt
+/// rather than dying with this one.
+fn handle_error(err: starlark::Error) -> anyhow::Error {
+    if mutated_immutable(&err) {
+        anyhow::anyhow!(
+            "handle() failed: {err}; the folded state is read-only, because a retry folds onto it rather than rebuilding it; decide from `state` and return the decision"
+        )
+    } else {
+        anyhow::anyhow!("handle() failed: {err}")
+    }
+}
+
+/// Whether a starlark error is the rejection of a write to a frozen value.
+fn mutated_immutable(err: &starlark::Error) -> bool {
+    matches!(
+        starlark_cause(err).and_then(|cause| cause.downcast_ref::<ValueError>()),
+        Some(ValueError::CannotMutateImmutableValue)
+    )
 }
 
 /// The `anyhow` error a starlark error carries, whatever kind it is filed under.
@@ -799,7 +1009,7 @@ fn lower_event(
 /// duplicate that committed anywhere is caught even when the boundary's `after` has
 /// advanced past it. A boundaryless keyed command is the pure-existence case.
 fn build_condition(
-    boundary: Option<Query>,
+    boundary: Option<&Query>,
     after: Position,
     idem_tag: Option<&str>,
 ) -> anyhow::Result<Option<AppendCondition>> {
@@ -807,7 +1017,9 @@ fn build_condition(
         Some(tag) => Some(Query::item(idem_item(tag)?)),
         None => None,
     };
-    match (boundary, existence) {
+    // Cloned rather than moved: the boundary is derived once per request and every
+    // attempt guards against the same one.
+    match (boundary.cloned(), existence) {
         (None, None) => Ok(None),
         (None, Some(exists)) => Ok(Some(AppendCondition::exists_only(exists))),
         (Some(query), None) => Ok(Some(AppendCondition::new(query).after(after))),

@@ -2332,7 +2332,7 @@ pub fn alloc_input<'v>(
     let mut fields: Vec<(&str, Value<'v>)> = Vec::with_capacity(schema.fields.len());
     for (name, kind) in &schema.fields {
         let value = match obj.get(name) {
-            Some(value) => module.heap().alloc(value.clone()),
+            Some(value) => module.heap().alloc(value),
             None if kind.is_nullable() => Value::new_none(),
             None => anyhow::bail!("input is missing declared field `{name}`"),
         };
@@ -2359,7 +2359,7 @@ fn alloc_fixed<'v>(heap: Heap<'v>, result: &serde_json::Value, keys: &[&'static 
         .map(|key| {
             let value = obj
                 .get(*key)
-                .map_or_else(Value::new_none, |value| heap.alloc(value.clone()));
+                .map_or_else(Value::new_none, |value| heap.alloc(value));
             (*key, value)
         })
         .collect();
@@ -2412,7 +2412,7 @@ pub fn alloc_event<'v>(
                     Some(value) if has_subject => {
                         wrap_subject_value(heap, &def.fields, obj, name, value)
                     }
-                    Some(value) => heap.alloc(value.clone()),
+                    Some(value) => heap.alloc(value),
                     None => Value::new_none(),
                 };
                 pairs.push((name.clone(), value));
@@ -2423,11 +2423,18 @@ pub fn alloc_event<'v>(
         // payload as it was stored.
         None => obj
             .iter()
-            .map(|(key, value)| (key.clone(), heap.alloc(value.clone())))
+            .map(|(key, value)| (key.clone(), heap.alloc(value)))
             .collect(),
     };
+    // Formatted into a stack buffer rather than through `to_string`: this runs once
+    // per folded event, and a deep boundary is exactly where a per-event `String`
+    // allocation shows up.
+    let mut id_buf = Uuid::encode_buffer();
     let fields: Vec<(&str, Value<'v>)> = vec![
-        ("id", heap.alloc(event_id.to_string())),
+        (
+            "id",
+            heap.alloc(&*event_id.hyphenated().encode_lower(&mut id_buf)),
+        ),
         ("timestamp", heap.alloc(timestamp)),
         ("type", heap.alloc(event_type)),
         ("data", heap.alloc(AllocStruct(pairs))),
@@ -2480,7 +2487,7 @@ pub(crate) fn wrap_subject_value<'v>(
         .find(|(n, _)| n == name)
         .and_then(|(_, meta)| meta.subject.as_ref());
     let (Some(subject_field), Some(ciphertext)) = (subject_field, value.as_str()) else {
-        return heap.alloc(value.clone());
+        return heap.alloc(value);
     };
     let subject_value = obj
         .get(subject_field)

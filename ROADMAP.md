@@ -657,6 +657,98 @@ also what keeps `verify` off a directory a server is using.
   assertion. It is the headline invariant for that work, and this phase exists partly to give it an
   oracle.
 
+## Phase 15: a conflict costs the delta, not the boundary (done)
+
+A DCB benchmark against a deliberately hot boundary (one course, ~30k events deep, 32 concurrent
+subscribers) put hekla about 4x behind a plain tephra client under contention, while it was ~20%
+ahead uncontended. Both numbers came from the same fact and neither was about storage, since hekla
+embeds the same tephra: uncontended, hekla folds in-process where the client ships the whole boundary
+over a socket, and it wins; contended, hekla re-read and re-folded the entire boundary on every
+retry where the client applied only the delta, and it lost that back several times over.
+
+The fold is a left fold over an append-only log, so folding `[0, a]` and then `(a, b]` is the state
+folding `[0, b]` would give. A retry never needed to start over.
+
+`run_command` now owns the attempt loop, and each attempt keeps the state it folded and the last
+position that state covers; the next one reads strictly after that position and folds what landed
+onto the state it already has. The loop lives in `dispatch` rather than the runtime so the work that
+is invariant across attempts happens once per request: the input struct, the boundary, and the
+lowered `fold` plan, whose clauses cost a keystore lookup and a deterministic encryption *each* when
+a field is subject-scoped. The retry *policy* stays with the caller as a `Retry { max_attempts,
+backoff }`, so the timing decision is still the runtime's and `hekla test` can ask for a single
+attempt.
+
+**Each attempt folds in a scratch heap and freezes the result**, which is what makes the carry safe
+rather than merely fast:
+
+- **`handle` cannot mutate what the next attempt folds onto.** This is not a style rule. Measured on
+  a capacity-three boundary with six racers and a `handle` that reset the count: before the freeze,
+  all six committed and the log ran to seven events, every caller getting a 200. The DCB boundary
+  exists to make exactly that impossible, and the incremental carry had quietly handed a handler the
+  ability to defeat it. Frozen, the assignment fails with `Immutable` at the offending line and a
+  message saying why, which is what already happened when the boundary was empty and `state` was the
+  frozen `initial`. The freeze makes the rule uniform instead of conditional on how much history
+  there was.
+- **An attempt's allocations die with it.** A fold over a deep boundary allocates a Starlark event
+  per matched position, and starlark collects only at module top-level statements, which a handler
+  call is not. One heap across the whole retry sequence would have pinned every attempt's events
+  through every backoff sleep; the freeze copies out only what the state reaches and drops the rest.
+
+The same measurement exposed three per-event allocations in the fold loop: the arm's error label was
+`format!`ed eagerly, the list of selecting arms allocated a `Vec` per event, and `event.id` went
+through `Uuid::to_string`. Alongside those, every JSON field of every event was deep-cloned before
+allocation, because `heap.alloc(value.clone())` satisfies a trait `heap.alloc(value)` satisfies just
+as well. The labels are built once per fold, the arm buffer is reused, the id formats into a stack
+buffer, and the clones are gone.
+
+Measured on a 20k-deep boundary with padded events, same machine, three runs each:
+
+| | before | after |
+|---|---|---|
+| one command, no contention (warm) | 37.8-38.8 ms | 33.4-34.3 ms |
+| 4 concurrent | 146-190 ms, 4/4 committed | 52-59 ms, 4/4 committed |
+| 16 concurrent | 315-325 ms, **7/16 committed** | 86-101 ms, **10-16/16 committed** |
+| shallow boundary, no append (per request) | 2.2-2.5 us | 2.9 us |
+
+The committed counts matter more than the times: under 16-way contention the old path burned its
+retry budget re-folding and answered 409 to nine of sixteen callers. That count is timing-dependent
+(one boundary, one winner per round, a five-attempt budget), which is why it is a range. The last row
+is the price of the freeze on the cheapest possible command, about 0.6 us per attempt, against a
+~2 ms fsync on any command that actually appends; on the deep fold it is about 2 ms in 32.
+
+**Honest scope:**
+
+- **The incremental fold cannot be observed from outside.** Folding the delta and re-folding from
+  zero are the same state by construction, so no black-box test can tell them apart, and the
+  contention test here passes against the pre-change implementation too. What it guards is that the
+  carry stays *correct*: folding the delta onto `initial` instead of onto the carried state makes it
+  commit five seats against a capacity of two. Named for the property it holds, not the optimisation
+  it accompanies.
+- **The mutation guard is a runtime error, not a `hekla check` rule.** It fires on the first request
+  that reaches the assignment with a non-empty boundary, which a `hekla test` scenario will do.
+  `AstModule::statement()` is public, so a static rule rejecting an assignment into `state` inside
+  `handle` is buildable and would move this to deploy time; the loader currently consumes the AST
+  during evaluation, so it would need to hold onto it.
+- **The first fold is untouched.** A boundary 30k events deep still costs 30k Starlark calls on the
+  first attempt, and that, not the retries, is what puts a floor under the contended latency. The fix
+  for *that* is caching folded state across requests, keyed by boundary. The freeze this phase added
+  is most of what such a cache needs (a shareable immutable state), but the invalidation story is not
+  written. Worth doing when a real workload has a boundary that deep.
+- **The backoff policy is unchanged**, deliberately: measuring an incremental fold and a new retry
+  cadence at once would attribute neither. tephra distinguishes a durable conflict from a
+  conservative same-batch rejection (`ConflictSite`), and hekla treats both identically; now that a
+  retry is cheap, retrying a durable conflict immediately and backing off only for the advisory one
+  is the obvious next experiment.
+- **`event.data` is still materialised in full.** Every declared field of a folded event becomes a
+  Starlark value whether the fold arm reads it or not, so a padded or wide event pays for fields
+  nobody touches. Making it lazy means a hekla-owned value type with `get_attr`, which is a real
+  change to what handlers see (`dir()`, equality, `to_json_value`) rather than an allocation tweak.
+- **A code review caught the mutation hole before it shipped**, which is worth recording because the
+  first cut had reasoned its way to leaving it open. The argument for not freezing was that a module
+  per attempt would give up a pooled temp heap; `Module::with_temp_heap` calls `Heap::temp`, which
+  builds a fresh `OwnedHeap` every call and pools nothing. A wrong premise, a plausible-sounding
+  conclusion, and a silent-wrong-commit left in the tree behind it.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

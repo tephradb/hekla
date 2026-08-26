@@ -698,14 +698,16 @@ pub(crate) fn run_handle(
             .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?;
         let state = match &boundary {
             Some(query) => {
+                let plan = dispatch::FoldPlan::build(frozen, &module, events, inv.keystore)?;
                 dispatch::fold_boundary(
                     &module,
                     &dispatch::FoldInputs {
                         frozen,
                         store: inv.store,
                         query,
+                        plan: &plan,
                         events,
-                        keystore: inv.keystore,
+                        resume_after: Position::ZERO,
                         upto: Some(inv.position),
                         verify: inv.verify,
                     },

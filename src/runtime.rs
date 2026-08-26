@@ -360,9 +360,11 @@ impl Runtime {
         self.run_with_retry(command, &body, ctx, &now, idem_tag.as_deref())
     }
 
-    /// Run the decision cycle, retrying on a DCB conflict so a re-read rebuilds the
-    /// decision model, with a small exponential backoff so a hot boundary does not
-    /// hammer the single writer. When a keyed request already committed (a crash or a
+    /// Run the decision cycle, retrying on a DCB conflict so the decision model is
+    /// rebuilt against the new tail, with a small exponential backoff so a hot
+    /// boundary does not hammer the single writer. The retry loop itself lives in
+    /// `dispatch`, which folds only what landed since the last attempt; this decides
+    /// the budget and the wait. When a keyed request already committed (a crash or a
     /// concurrent duplicate), `run_command` returns `AlreadyCommitted` with the
     /// outcome recovered from the log rather than re-deciding, so a duplicate never
     /// re-runs `handle`.
@@ -382,60 +384,47 @@ impl Runtime {
             });
         }
 
-        let max_attempts = max_attempts();
-        for attempt in 0..max_attempts {
-            match dispatch::run_command(
-                &self.store,
-                &command.loaded,
-                &self.events,
-                self.keystore.as_ref(),
-                body,
-                ctx,
-                now,
-                idem_tag,
-                self.verify,
-            )? {
-                CommandOutcome::Conflict => {
-                    if attempt + 1 < max_attempts {
-                        thread::sleep(Duration::from_millis(1u64 << attempt));
-                    }
-                }
-                CommandOutcome::Committed { events, positions } => {
-                    return Ok(ExecResult {
-                        status: 200,
-                        body: success_body(ctx, positions, &events, &self.events),
-                    });
-                }
-                CommandOutcome::AlreadyCommitted(recovered) => {
-                    return Ok(ExecResult {
-                        status: 200,
-                        body: recovered_body(&recovered),
-                    });
-                }
-                CommandOutcome::Rejected { code, message } => {
-                    return Ok(ExecResult {
-                        status: 422,
-                        body: error_body(ctx, &code, &message),
-                    });
-                }
-                CommandOutcome::InvalidInput { message } => {
-                    return Ok(ExecResult {
-                        status: 400,
-                        body: error_body(ctx, "invalid_input", &message),
-                    });
-                }
-                CommandOutcome::Unavailable { message } => {
-                    return Ok(ExecResult {
-                        status: 503,
-                        body: error_body(ctx, "unavailable", &message),
-                    });
-                }
-            }
+        let retry = dispatch::Retry {
+            max_attempts: max_attempts(),
+            backoff: &|attempt| thread::sleep(Duration::from_millis(1u64 << attempt)),
+        };
+        match dispatch::run_command(
+            &self.store,
+            &command.loaded,
+            &self.events,
+            self.keystore.as_ref(),
+            body,
+            ctx,
+            now,
+            idem_tag,
+            self.verify,
+            &retry,
+        )? {
+            CommandOutcome::Conflict => Ok(ExecResult {
+                status: 409,
+                body: conflict_body(ctx),
+            }),
+            CommandOutcome::Committed { events, positions } => Ok(ExecResult {
+                status: 200,
+                body: success_body(ctx, positions, &events, &self.events),
+            }),
+            CommandOutcome::AlreadyCommitted(recovered) => Ok(ExecResult {
+                status: 200,
+                body: recovered_body(&recovered),
+            }),
+            CommandOutcome::Rejected { code, message } => Ok(ExecResult {
+                status: 422,
+                body: error_body(ctx, &code, &message),
+            }),
+            CommandOutcome::InvalidInput { message } => Ok(ExecResult {
+                status: 400,
+                body: error_body(ctx, "invalid_input", &message),
+            }),
+            CommandOutcome::Unavailable { message } => Ok(ExecResult {
+                status: 503,
+                body: error_body(ctx, "unavailable", &message),
+            }),
         }
-        Ok(ExecResult {
-            status: 409,
-            body: conflict_body(ctx),
-        })
     }
 
     /// A JSON snapshot for `GET /status`. Reports the log head, the loaded-module
