@@ -20,5 +20,6 @@ pub mod runtime;
 pub mod server;
 pub mod starlark_builtins;
 pub mod testing;
+pub mod ui;
 pub mod validate;
 pub mod verify;

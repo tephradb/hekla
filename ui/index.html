@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>hekla</title>
+    <!-- Absolute, not relative: this one document is served from every /admin path,
+         so `./app.js` would resolve differently at /admin/events than at
+         /admin/effects/send-welcome. -->
+    <link rel="icon" href="/admin/assets/favicon.svg" />
+    <link rel="stylesheet" href="/admin/assets/style.css" />
+    <script type="module" src="/admin/assets/app.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>
+      <p style="padding: 24px; font-family: system-ui, sans-serif">
+        The hekla admin console needs JavaScript. Every page it renders is also a JSON
+        endpoint at the same URL: request it with
+        <code>Accept: application/json</code> and you get the data directly. Start at
+        <a href="/admin">/admin</a> for the index.
+      </p>
+    </noscript>
+  </body>
+</html>

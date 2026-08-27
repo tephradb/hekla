@@ -10,11 +10,13 @@
 //! lock.
 
 use std::collections::HashMap;
+use std::iter;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::crypto;
 
@@ -36,6 +38,28 @@ pub struct OpDb {
 /// nothing. Saturate instead, which is the bound the caller meant.
 fn clamp_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// The statement [`OpDb::invocations_at`] runs, built once so the test that explains
+/// the plan and the code that executes it cannot describe different queries.
+fn invocations_at_sql(effects: usize, positions: usize) -> String {
+    let mut next = 0;
+    let mut placeholders = |count: usize| {
+        (0..count)
+            .map(|_| {
+                next += 1;
+                format!("?{next}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let effect_list = placeholders(effects);
+    let position_list = placeholders(positions);
+    let limit = placeholders(1);
+    format!(
+        "SELECT effect, position, status FROM effect_invocation \
+         WHERE effect IN ({effect_list}) AND position IN ({position_list}) LIMIT {limit}"
+    )
 }
 
 fn row_to_invocation(row: &rusqlite::Row) -> rusqlite::Result<InvocationRow> {
@@ -587,6 +611,103 @@ impl OpDb {
             .context("collecting invocations")
     }
 
+    /// Which of `effects` ran at which of `positions`, sorted by `(position, effect)`.
+    ///
+    /// This is what lets a correlation trace say *which* effect produced an event
+    /// rather than only that one did: the envelope records the triggering event, and
+    /// the journal is keyed by `(effect, position)`, so the join is exact and needs
+    /// no second durable field on the log.
+    ///
+    /// Both columns are constrained, and that is not belt-and-braces: the table's
+    /// only index is its `(effect, position)` primary key, so filtering on `position`
+    /// alone would scan a table that grows with traffic, behind the mutex every
+    /// journaled call contends for. With both, SQLite walks the key as nested `IN`
+    /// loops and touches at most `effects x positions` rows, which is also the
+    /// `LIMIT`. `effects` is fixed at boot and `positions` is one clamped page, so
+    /// the bind count stays a few hundred, far under SQLite's parameter ceiling.
+    /// [`OpDb::explain_invocations_at`] pins the plan so this stays true.
+    ///
+    /// An invocation the retention sweeper has already reclaimed is simply absent,
+    /// and is indistinguishable from one that never existed. That is deliberate: the
+    /// alternative is dating every position against the cutoff and being wrong at the
+    /// boundary. Callers that care read the window from `/admin/system`.
+    pub fn invocations_at(
+        &self,
+        effects: &[&str],
+        positions: &[u64],
+    ) -> anyhow::Result<Vec<InvocationAt>> {
+        // `IN ()` is a syntax error, and both are legitimately empty: a project may
+        // declare no effects, and a trace page may hold no events.
+        if effects.is_empty() || positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(&invocations_at_sql(effects.len(), positions.len()))
+            .context("preparing the invocations-at-position query")?;
+        let limit = (effects.len() * positions.len()) as i64;
+        let bound = params_from_iter(
+            effects
+                .iter()
+                .map(|effect| SqlValue::from((*effect).to_owned()))
+                .chain(
+                    positions
+                        .iter()
+                        .copied()
+                        .map(|position| SqlValue::from(clamp_i64(position))),
+                )
+                .chain(iter::once(SqlValue::from(limit))),
+        );
+        let rows = stmt
+            .query_map(bound, |row| {
+                let position: i64 = row.get(1)?;
+                Ok(InvocationAt {
+                    effect: row.get(0)?,
+                    position: position as u64,
+                    status: row.get(2)?,
+                })
+            })
+            .context("querying invocations by position")?;
+        let mut found = rows
+            .collect::<Result<Vec<_>, _>>()
+            .context("collecting invocations by position")?;
+        // The nested-loop order is an implementation detail of the query planner, and
+        // this is rendered into a response that must not churn between runs.
+        found.sort_by(|left, right| {
+            (left.position, &left.effect).cmp(&(right.position, &right.effect))
+        });
+        Ok(found)
+    }
+
+    /// The query plan [`OpDb::invocations_at`] actually gets, for the test that pins
+    /// it to a key search rather than a table scan.
+    #[cfg(test)]
+    fn explain_invocations_at(&self, effects: usize, positions: usize) -> anyhow::Result<String> {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            invocations_at_sql(effects, positions)
+        );
+        let mut stmt = self.conn.prepare(&sql).context("preparing the explain")?;
+        // The planner sees bound values, so they have to be present and of the right
+        // types for the plan to be the one the real call gets. Bound in the same three
+        // groups the statement declares (effects, positions, then the limit) rather
+        // than as one run of `positions + 1` integers that happens to add up: an edit
+        // that adds a parameter to the real query should fail where it was made.
+        let bound = params_from_iter(
+            (0..effects)
+                .map(|index| SqlValue::from(format!("effect-{index}")))
+                .chain((0..positions).map(|index| SqlValue::from(index as i64)))
+                .chain(iter::once(SqlValue::from((effects * positions) as i64))),
+        );
+        let rows = stmt
+            .query_map(bound, |row| row.get::<_, String>(3))
+            .context("explaining")?;
+        Ok(rows
+            .collect::<Result<Vec<_>, _>>()
+            .context("collecting the plan")?
+            .join("\n"))
+    }
+
     /// One invocation by position.
     pub fn invocation(&self, effect: &str, position: u64) -> anyhow::Result<Option<InvocationRow>> {
         self.conn
@@ -970,6 +1091,15 @@ pub struct InvocationRow {
     pub completed_at: Option<String>,
 }
 
+/// One invocation found by position, carrying the effect it belongs to. Narrower
+/// than [`InvocationRow`] on purpose: a trace joins many positions at once and needs
+/// only enough to name the invocation and link to it.
+pub struct InvocationAt {
+    pub effect: String,
+    pub position: u64,
+    pub status: String,
+}
+
 /// One journaled call, in the order it was made. `kind` is `None` for a row written
 /// before schema v5. The call arguments are deliberately absent: they are not stored,
 /// only hashed.
@@ -1350,6 +1480,72 @@ mod tests {
         assert_eq!(calls[0].kind, None);
         assert_eq!(calls[0].call_hash, "old");
         assert_eq!(calls[1].kind.as_deref(), Some("http"));
+    }
+
+    #[test]
+    fn the_invocation_join_reads_the_primary_key_rather_than_scanning() {
+        // The table's only index is its `(effect, position)` primary key, so a join
+        // constrained on `position` alone would scan a table that grows with traffic,
+        // behind the mutex every journaled call contends for. This is the assertion
+        // that keeps the query honest: a later edit that drops the `effect IN (...)`
+        // half would still return the right rows and would still pass every other
+        // test in this file.
+        let db = OpDb::open_in_memory().unwrap();
+        let plan = db.explain_invocations_at(2, 3).unwrap();
+        assert!(
+            plan.contains("SEARCH"),
+            "the join must reach rows through the primary key: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN effect_invocation"),
+            "a full scan of a traffic-scaled table is what the bounded-reader \
+             contract above forbids: {plan}"
+        );
+    }
+
+    #[test]
+    fn the_invocation_join_returns_only_the_asked_for_pairs_in_a_stable_order() {
+        let db = OpDb::open_in_memory().unwrap();
+        for effect in ["b-effect", "a-effect", "unasked"] {
+            for position in 1..=4 {
+                db.begin_invocation(effect, position, "h", "t0").unwrap();
+            }
+        }
+        db.complete_invocation("a-effect", 2, "t9").unwrap();
+
+        let found = db
+            .invocations_at(&["a-effect", "b-effect"], &[2, 1])
+            .unwrap();
+        let pairs: Vec<(&str, u64, &str)> = found
+            .iter()
+            .map(|row| (row.effect.as_str(), row.position, row.status.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("a-effect", 1, "running"),
+                ("b-effect", 1, "running"),
+                ("a-effect", 2, "terminal"),
+                ("b-effect", 2, "running"),
+            ],
+            "sorted by position then effect regardless of the order asked for or the \
+             order the planner walks, because this is rendered into a response"
+        );
+        assert!(
+            !found.iter().any(|row| row.effect == "unasked"),
+            "an effect the caller did not name must not leak in"
+        );
+    }
+
+    #[test]
+    fn the_invocation_join_is_empty_rather_than_a_syntax_error_when_asked_for_nothing() {
+        // `IN ()` does not parse, and both sides are legitimately empty: a project can
+        // declare no effects, and a trace page can come back with no events.
+        let db = OpDb::open_in_memory().unwrap();
+        db.begin_invocation("e", 1, "h", "t0").unwrap();
+        assert!(db.invocations_at(&[], &[1]).unwrap().is_empty());
+        assert!(db.invocations_at(&["e"], &[]).unwrap().is_empty());
+        assert!(db.invocations_at(&[], &[]).unwrap().is_empty());
     }
 
     #[test]

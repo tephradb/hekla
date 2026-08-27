@@ -38,7 +38,8 @@ use crate::effect::{self, EffectRuntime, EffectShared, HttpClient};
 use crate::loader::{CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::lock::DataDirLock;
 use crate::opdb::{
-    EffectState, InvocationRow, InvocationState, JournalRow, ModuleRow, OpDb, SubjectInfo,
+    EffectState, InvocationAt, InvocationRow, InvocationState, JournalRow, ModuleRow, OpDb,
+    SubjectInfo,
 };
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
@@ -556,6 +557,9 @@ impl Runtime {
                 let position = handle.position();
                 json!({
                     "name": handle.name,
+                    // The same one-word summary `/admin/effects` reports, from the
+                    // same function, so the two can never drift.
+                    "state": handle.state(head),
                     "position": position,
                     "lag": head.saturating_sub(position),
                     "consecutive_failures": handle.consecutive_failures(),
@@ -745,6 +749,14 @@ impl Runtime {
         position: u64,
     ) -> anyhow::Result<Option<InvocationRow>> {
         self.lock_opdb().invocation(effect, position)
+    }
+
+    pub(crate) fn invocations_at(
+        &self,
+        effects: &[&str],
+        positions: &[u64],
+    ) -> anyhow::Result<Vec<InvocationAt>> {
+        self.lock_opdb().invocations_at(effects, positions)
     }
 
     pub(crate) fn journal_entries(

@@ -618,6 +618,15 @@ consistent copy is not required for them.
   over a wider surface (every field of every event, rather than the columns one projector chose to
   materialise), which is why a decrypting request is audited. A journaled call's *arguments* are never
   stored, only hashed, so introspection cannot resurrect plaintext an erasure was meant to shred.
+- **The admin console is served from those same URLs**, chosen by `Accept`: `text/html` gets the
+  console's shell, everything else gets the JSON unchanged. `*/*` (curl's default, and a bare
+  `fetch()`'s) counts as everything else, so no existing client changes behaviour. Deep links fall
+  out of this for free, since every view's URL is already a real endpoint. The negotiation is a
+  layer attached per route from the same table the router folds, not to the whole router: a path
+  outside `/admin` is untouched, and an unrouted `/admin/...` still 404s rather than becoming a 200
+  page. Responses carry `Vary: Accept`, because one URL with two representations behind a proxy is
+  otherwise a poisoned cache. `GET /admin/assets/{file}` serves the console's own files from a table
+  compiled into the binary, and is the one path under the prefix that is not negotiated.
 - An admin-only, read-only SQL endpoint behind a flag, off in production, for debugging.
 - Direct SQLite file access is not a supported surface. The table layout stays private behind the
   generated read API.
@@ -769,7 +778,8 @@ revisited only when a seam proves real (embeddability, or compile times that act
 `starlark_builtins` and `schema` depend on nothing internal; `dispatch` depends on those; `runtime`
 (projectors, effects, journal, storage) depends on `dispatch`; `verify` and `introspect` sit above
 the runtime, reaching into the projector, effect and storage paths they read; `api` and `cli` sit on
-top. `lock` depends on nothing internal.
+top. `lock` and `ui` depend on nothing internal: `ui` is the console's bytes plus the content
+negotiation over them, so the server depends on it and it depends on nothing.
 
 ## 15. Subject-scoped encryption and erasure
 

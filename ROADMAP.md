@@ -1141,6 +1141,92 @@ Honest scope:
   them once per listing rather than once per page. Anti-vacuity: removing the correlation tag makes
   the command-effect-command trace test return an empty chain rather than a shorter one.
 
+## Phase 20: an admin console, in the binary (done)
+
+Phase 19 answered every operational question over HTTP and left all of it as JSON. The only rendered
+surface hekla shipped was `/docs`, a Scalar page loaded from a CDN. So the data existed and nobody
+could look at it: diagnosing a wedged effect meant `curl | jq` against an API you had to read the
+generated document to discover, and a correlation trace, the feature the log format was changed for,
+came back as an array you assembled into a causal tree in your head.
+
+What shipped: a keyboard-driven console compiled into the binary, served from the same URLs as the
+API, plus three small additions to that API which the console needed and every client benefits from.
+
+- **One URL, two representations.** `Accept: text/html` gets the console's shell; everything else
+  gets the JSON, byte for byte unchanged. Deep links then cost nothing, because every view's URL is
+  already an endpoint: `/admin/effects/send-welcome` opens that effect in a browser and returns that
+  effect to a client. `hekla serve` prints one URL and it is both.
+- **No build step.** Plain ES modules and one vendored 13KB runtime (Preact plus htm, `ui/VENDOR.md`),
+  in a flat asset table compiled in with `include_bytes!`. `cargo build` stays hekla's only build,
+  the console works with no network, and `HEKLA_UI_DIR` serves it from disk for editing it.
+- **The three API additions.** An effect's `state` in one word (`healthy` / `lagging` / `wedged` /
+  `quarantined`), derived once on `EffectShared` so `/status`, `/admin/effects` and any dashboard
+  cannot disagree; `retry_in_ms`, so a wedge can be counted down rather than polled blindly; and
+  `invocations` on a trace, joining the journal so a chain says *which* effect produced an event
+  rather than only that one did.
+- **It can act.** The projector and effect views drive the existing `replay` and `skip` endpoints
+  behind a type-the-name confirmation. `/admin` itself stays read-only; those two have always lived
+  outside it.
+
+Judgment calls worth recording:
+
+- **Negotiation on the existing routes, not a `/admin/ui` prefix.** A second prefix would have meant
+  a second route table for the console's own views, kept in step with the first by hand. Sharing the
+  URLs makes the console's route list and the router's the same list, and makes every page shareable
+  as a link that also answers `curl`. The cost is one subtlety that had to be got right: `*/*` is
+  what curl and a bare `fetch()` send, so a "does the client accept HTML" check written the obvious
+  way would have turned every existing client's JSON into a web page.
+- **A layer per route, not on the `Router`.** `Router::layer` wraps the fallback too, so negotiating
+  there would have turned every unrouted `/admin/typo` 404 into a 200 shell, and would have run the
+  check on `/commands` and `/read`. Attaching it inside the existing fold, selected from the same
+  table, means a future `/admin` route gets a deep link without anyone remembering to.
+- **The asset table is the namespace, and the dev override is a content substitution.** axum
+  percent-decodes a path parameter, so an override that joined the requested name onto a directory
+  would be a traversal. Resolving against the compiled-in table first and joining only the table's
+  own name makes that unrepresentable rather than defended against.
+- **The trace join constrains both columns.** `effect_invocation` is keyed `(effect, position)` and
+  has no index on `position` alone, so the obvious `WHERE position IN (...)` would have scanned a
+  table that grows with traffic, behind the mutex every journaled call contends for. The query names
+  both, and a test runs `EXPLAIN QUERY PLAN` over it, because the correct and the incorrect version
+  return identical rows and differ only in cost.
+- **`retry_in_ms`, not `retry_at`.** A deadline published as an instant has to be compared against
+  the reader's clock, which is a different machine's. A remaining duration is immune to that and to
+  a server clock step, and the value's only consumer is a countdown.
+- **The document describes the negotiation in prose, not as a second media type on all fourteen
+  200s.** Listing `text/html` beside each page schema would be literally accurate and would make
+  every generated client model each call as a union with a string, for a representation no
+  programmatic client asks for.
+- **Decryption is per event, not per page.** A decrypting request emits an audit line, so the console
+  lists with `?decrypt=false` and opens one event with `?decrypt=true`. One line in the log then
+  means one operator read one event. A list renders no payload anyway.
+
+Honest scope:
+
+- **No live tail.** A shared 3s poll of `/status` backs the badges and the views, pausing when the
+  tab is hidden. `Subscription` still makes SSE cheap, and the console is what will make it worth
+  wanting, but it is a different transport with its own backpressure and shutdown story.
+- **The overview's sparkline is not a metric.** It is bucketed in the browser from the timestamps on
+  one page of events, and is labelled as such. hekla has no metrics endpoint and this does not
+  pretend to be one.
+- **The schema graph does not draw effect-invokes-command, and cannot.** The targets are chosen at
+  runtime inside Starlark, so reading the project does not reveal them, and the journal is no help
+  either: `journaled` records each call's *result*, and an `invoke_command` result is the invoked
+  command's `{status, body}`, which does not carry its name. The page says so rather than drawing an
+  edge it would have to guess at. Recording the name in the journal result would fix it and is not a
+  console change: the result is what a replaying effect receives back from `invoke_command`, so
+  adding a key to it changes what authors' Starlark sees. That deserves its own decision.
+- **`/docs` keeps its CDN.** An offline console arguably pulls "vendoring Scalar" forward, and this
+  phase deliberately does not do it: the reference is a different artefact with its own visual
+  language and about a megabyte of third-party JavaScript.
+- **No auth, unchanged.** The console is served from the prefix a proxy can already deny, and adding
+  a login to one prefix would imply the rest is protected.
+- **The JavaScript has no test runner.** Its two failure modes that Rust can see are covered instead:
+  every `/admin` URL the console builds is checked against `server::routes()`, and every asset it
+  references is checked against the compiled-in table, both by scanning the shipped bytes. Rendering
+  bugs are found by opening it. Anti-vacuity: dropping the `effect IN (...)` half of the trace join
+  makes the plan test report `SCAN effect_invocation` rather than a slower pass, and both scanning
+  tests assert they found a plausible number of things before checking any of them.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

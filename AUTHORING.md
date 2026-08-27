@@ -933,6 +933,44 @@ carry nothing to find them by.
 can already append events and skip an effect's work; the bind address is the boundary and defaults to
 `127.0.0.1`. One prefix is what lets a deployment that binds wider deny `/admin` in a proxy.
 
+### The console
+
+`hekla serve` prints a URL. Open it and you get an admin console over everything above: the log with
+filters and a payload viewer, a correlation chain drawn as the causal tree it is, an effect's
+journaled calls, projector shapes, the loaded project, and the subject-key inventory.
+
+**It is the same URL as the API, not a second one.** A request that names `text/html` in its `Accept`
+header gets the console; everything else gets the JSON above, byte for byte unchanged. `curl` sends
+`*/*` and so does a bare `fetch()`, so neither is affected. That is also where deep links come from:
+
+```sh
+curl localhost:8080/admin/effects/send-welcome            # the effect, as JSON
+open http://localhost:8080/admin/effects/send-welcome     # the console, on that effect
+```
+
+The console is compiled into the binary. There is no build step, no npm, and no CDN: it is plain ES
+modules plus one vendored 13KB runtime (`ui/VENDOR.md`), served from `/admin/assets/{file}`, so it
+works with no network at all. `HEKLA_UI_DIR=./ui` serves it from disk instead, for editing it without
+a recompile.
+
+Two things it does that the raw API does not:
+
+- **It can act.** `POST /projectors/{name}/replay` and `POST /effects/{name}/skip/{position}` are
+  reachable from the projector and effect views, each behind a confirmation that makes you type the
+  module's name. `/admin` itself stays read-only; these are the same operator endpoints that have
+  always lived outside it.
+- **It decrypts one event at a time.** A list is fetched with `?decrypt=false` and a payload with
+  `?decrypt=true`, so one audit line in the server log means one operator read one event, rather than
+  one page having decrypted a hundred fields nobody looked at.
+
+| Key | Does |
+|---|---|
+| `⌘K` / `Ctrl-K` | Jump to a position, a correlation id, an effect, a projector, or a view |
+| `j` / `k` | Move the row cursor |
+| `Enter` | Open the row |
+| `Esc` | Close the drawer or dialog |
+| `/` | Focus the filter |
+
 ## 14. CLI and config
 
 | Command | Purpose |

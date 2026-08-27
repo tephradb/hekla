@@ -1138,3 +1138,141 @@ fn strings(value: &Value) -> Vec<String> {
         .map(|item| item.as_str().unwrap().to_owned())
         .collect()
 }
+
+// --- effect state, retry deadline, and the trace-to-invocation join --------
+
+/// The one-word state and the retry deadline are the two things a dashboard needs
+/// that the raw counters do not give: whether this effect is stuck, and how long
+/// until it tries again. Both must come from the runtime rather than be re-derived,
+/// so this also pins that `/status` and `/admin/effects` cannot disagree.
+#[tokio::test]
+async fn a_wedged_effect_reports_the_state_and_when_the_next_attempt_is_due() {
+    let harness = boot_with(Arc::new(StubHttpClient::status(500)));
+    let app = harness.app();
+    post_command(&app, "register-user", register(ALICE), None).await;
+
+    // Wait for a backoff long enough that it is still pending when the request below
+    // lands. The wedge backoff doubles from 200ms, so this is true from the third
+    // attempt on and only grows after that.
+    wait_until(
+        "the effect is waiting out a backoff of at least a second",
+        || {
+            harness
+                .rt
+                .effect("send-welcome")
+                .unwrap()
+                .retry_in_ms()
+                .is_some_and(|remaining| remaining > 1_000)
+        },
+    );
+
+    let (status, listed) = get(&app, "/admin/effects").await;
+    assert_eq!(status, 200);
+    let effect = &listed["effects"][0];
+    assert_eq!(effect["name"], "send-welcome");
+    assert_eq!(
+        effect["state"], "wedged",
+        "a non-zero failure count is a wedge, not lag: a terminal skip never touches it"
+    );
+    let retry_in = effect["retry_in_ms"]
+        .as_u64()
+        .expect("a wedged effect says how long until it tries again");
+    assert!(
+        retry_in > 0,
+        "a duration, not an instant: a reader counts down without its clock having to \
+         agree with the servers"
+    );
+
+    let (_, status_body) = get(&app, "/status").await;
+    assert_eq!(
+        status_body["effects"][0]["state"], "wedged",
+        "`/status` and `/admin/effects` derive the state from one function, so they \
+         cannot report different words for the same effect"
+    );
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn a_caught_up_effect_is_healthy_and_names_no_deadline() {
+    let harness = boot_with(Arc::new(StubHttpClient::ok()));
+    let app = harness.app();
+    post_command(&app, "register-user", register(ALICE), None).await;
+    wait_until("the effect catches up", || {
+        let head = support::log_head(&harness.rt);
+        harness.rt.effect("send-welcome").unwrap().state(head) == "healthy"
+    });
+
+    let (status, listed) = get(&app, "/admin/effects").await;
+    assert_eq!(status, 200);
+    let effect = &listed["effects"][0];
+    assert_eq!(effect["state"], "healthy");
+    assert!(
+        effect["retry_in_ms"].is_null(),
+        "nothing is waiting, so there is no countdown to report"
+    );
+
+    harness.shutdown();
+}
+
+/// The envelope records that *an* effect produced an event, never which one. The
+/// journal is keyed by effect and position, so the trace joins it and answers exactly.
+#[tokio::test]
+async fn a_trace_names_the_effect_that_ran_on_each_of_its_events() {
+    let harness = boot_with(Arc::new(StubHttpClient::ok()));
+    let app = harness.app();
+    let response = post_command(&app, "register-user", register(ALICE), None).await;
+    let correlation = response.1["correlation_id"].as_str().unwrap().to_owned();
+    // The head reaching 2 only means the effect's `invoke_command` committed; the
+    // invocation is marked terminal after the handler returns. Waiting on the head
+    // alone would sometimes read the row while it is still `running`.
+    wait_until("the effect finishes the invocation", || {
+        harness.rt.effect("send-welcome").unwrap().position() >= 1
+    });
+
+    let (status, trace) = get(&app, &format!("/admin/traces/{correlation}")).await;
+    assert_eq!(status, 200);
+    let invocations = trace["invocations"].as_array().unwrap();
+    assert_eq!(
+        invocations.len(),
+        1,
+        "one effect subscribes to `user.registered`, so exactly one invocation ran \
+         over this chain: {invocations:?}"
+    );
+    assert_eq!(invocations[0]["effect"], "send-welcome");
+    assert_eq!(
+        invocations[0]["position"], 1,
+        "the invocation is keyed by the position of the event that triggered it, \
+         which is the first event of the chain rather than the one it appended"
+    );
+    assert_eq!(invocations[0]["status"], "terminal");
+
+    harness.shutdown();
+}
+
+/// The contrast that keeps the test above from passing vacuously: a chain no effect
+/// subscribes to joins nothing, rather than every invocation in the journal.
+#[tokio::test]
+async fn a_chain_no_effect_subscribes_to_joins_no_invocations() {
+    let harness = boot_with(Arc::new(StubHttpClient::ok()));
+    let app = harness.app();
+    post_command(&app, "register-user", register(ALICE), None).await;
+    wait_for_head(&harness.rt, 2);
+
+    // `schedule-reminder` appends `reminder.scheduled`, which `send-welcome` does not
+    // subscribe to, so this second chain has no invocation over it even though the
+    // journal now holds one from the first.
+    let response = post_command(&app, "schedule-reminder", json!({ "user_id": ALICE }), None).await;
+    let correlation = response.1["correlation_id"].as_str().unwrap().to_owned();
+
+    let (status, trace) = get(&app, &format!("/admin/traces/{correlation}")).await;
+    assert_eq!(status, 200);
+    assert_eq!(trace["events"].as_array().unwrap().len(), 1);
+    assert!(
+        trace["invocations"].as_array().unwrap().is_empty(),
+        "the join is by position, so an unrelated invocation must not leak in: {:?}",
+        trace["invocations"]
+    );
+
+    harness.shutdown();
+}

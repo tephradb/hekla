@@ -656,6 +656,11 @@ fn a_recorded_quarantine_stops_the_effect_at_the_next_boot() {
         json!(true),
         "/status must surface it"
     );
+    assert_eq!(
+        harness.rt.status()["effects"][0]["state"],
+        json!("quarantined"),
+        "a quarantine outranks every other label, including the lag it causes"
+    );
 
     harness.shutdown();
 }

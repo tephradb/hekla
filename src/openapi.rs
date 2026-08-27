@@ -31,6 +31,7 @@ use crate::server::{self, READ_WAIT_DEFAULT, READ_WAIT_MAX};
 use crate::starlark_builtins::{
     EntityDef, EventDef, EventSpec, FieldKind, FieldMeta, InputSchema, ModuleDef,
 };
+use crate::ui;
 
 const COMMANDS_TAG: &str = "commands";
 const OPERATIONS_TAG: &str = "operations";
@@ -281,7 +282,7 @@ impl ComponentNames {
 }
 
 /// The schemas that are always present, whatever the project declares.
-const FIXED_SCHEMAS: [&str; 21] = [
+const FIXED_SCHEMAS: [&str; 22] = [
     "ErrorDetail",
     "Error",
     "CommandError",
@@ -295,6 +296,7 @@ const FIXED_SCHEMAS: [&str; 21] = [
     "EffectDetail",
     "EffectInvocation",
     "EffectInvocationDetail",
+    "TraceInvocation",
     "JournalCall",
     "FieldDetail",
     "EventDetail",
@@ -928,7 +930,39 @@ fn introspection_paths(surface: &Surface) -> Vec<(String, Value)> {
         (server::ADMIN_SYSTEM_ROUTE.to_owned(), system_path()),
         (server::ADMIN_SUBJECTS_ROUTE.to_owned(), subjects_path()),
         (server::ADMIN_SUBJECT_ROUTE.to_owned(), subject_path()),
+        (server::ADMIN_ASSETS_ROUTE.to_owned(), assets_path()),
     ]
+}
+
+/// `GET /admin/assets/{file}`: one file of the bundled console.
+///
+/// Described from [`ui::ASSETS`] alone and never from the `HEKLA_UI_DIR` override, so
+/// [`build`] stays a pure function of the loaded project. Otherwise two developers
+/// would generate different documents from the same source, which is exactly what the
+/// single-generator guarantee exists to prevent.
+fn assets_path() -> Value {
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_admin_asset",
+            "summary": "one file of the bundled admin console",
+            "description": "The console is compiled into the binary and this serves one \
+                of its files. The name is a closed set: the route captures a single path \
+                segment and the files are flat, so nothing outside this enum resolves. \n\n\
+                Unlike every other path under this prefix, this one is not \
+                content-negotiated. It delivers the console rather than being a view of \
+                it, so a browser asking for it gets the file.",
+            "parameters": [path_param(
+                "file",
+                "Which file. Every name the binary carries is listed here.",
+                name_schema(&ui::asset_names()),
+            )],
+            "responses": {
+                "200": { "description": "the file", "content": ui::media_types() },
+                "404": response("no asset by that name", schema_ref("Error")),
+            },
+        }
+    })
 }
 
 /// The `?decrypt=` parameter, shared by every endpoint that renders a stored payload.
@@ -1090,6 +1124,14 @@ fn trace_path() -> Value {
         "properties": {
             "correlation_id": { "type": "string", "format": "uuid" },
             "events": { "type": "array", "items": schema_ref("LogEvent") },
+            "invocations": {
+                "type": "array",
+                "items": schema_ref("TraceInvocation"),
+                "description": "Which effect invocations ran on the positions on this page. \
+                    An event's envelope records that an effect produced it but not which one; \
+                    the journal is keyed by effect and position, so this answers that exactly. \
+                    An invocation the retention sweeper has already reclaimed is absent.",
+            },
             "complete": {
                 "type": "boolean",
                 "description": "False when `limit` cut the chain off. A causal chain read \
@@ -1101,7 +1143,7 @@ fn trace_path() -> Value {
                 "The `cursor` for the rest of the chain, or null when this page is all of it.",
             ),
         },
-        "required": ["correlation_id", "events", "complete", "next_cursor"],
+        "required": ["correlation_id", "events", "invocations", "complete", "next_cursor"],
         "additionalProperties": false,
     });
     json!({
@@ -1567,6 +1609,7 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
         "EffectInvocationDetail".to_owned(),
         effect_invocation_detail_schema(),
     );
+    out.insert("TraceInvocation".to_owned(), trace_invocation_schema());
     out.insert("JournalCall".to_owned(), journal_call_schema());
     out.insert("FieldDetail".to_owned(), field_detail_schema());
     out.insert("EventDetail".to_owned(), event_detail_schema());
@@ -1811,11 +1854,29 @@ fn projector_status_schema() -> Value {
     })
 }
 
+/// The one-word effect state, written once because `/status` and `/admin/effects`
+/// both report it and it comes from one function in the runtime.
+fn effect_state_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["healthy", "lagging", "quarantined", "wedged"],
+        "description": "What the counters below add up to, derived once in the runtime \
+            so no two readers disagree. `quarantined` outranks `wedged`, which outranks \
+            `lagging`: a quarantine restored from an earlier process carries no failure \
+            count, and a wedged effect lags precisely because it is wedged, so reporting \
+            the symptom would bury the cause. \n\n\
+            `lagging` is normal and transient. The driver polls on an interval while the \
+            log head is read per request, so every append leaves a healthy effect briefly \
+            behind. Treat a sustained `lagging` as a signal and a momentary one as noise.",
+    })
+}
+
 fn effect_status_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "name": { "type": "string" },
+            "state": effect_state_schema(),
             "position": position_schema("Its durable watermark."),
             "lag": { "type": "integer", "minimum": 0 },
             "consecutive_failures": {
@@ -1840,7 +1901,7 @@ fn effect_status_schema() -> Value {
             "last_terminal_error": { "type": ["string", "null"] },
         },
         "required": [
-            "name", "position", "lag", "consecutive_failures", "last_error",
+            "name", "state", "position", "lag", "consecutive_failures", "last_error",
             "quarantined", "terminal_skips", "last_terminal_error",
         ],
         "additionalProperties": false,
@@ -2189,8 +2250,21 @@ fn effect_detail_schema() -> Value {
         "type": "object",
         "properties": {
             "name": { "type": "string" },
+            "state": effect_state_schema(),
             "position": position_schema("The effect's in-memory watermark."),
             "lag": position_schema("Log head minus position."),
+            "retry_in_ms": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "format": "int64",
+                "description": "Milliseconds until the next attempt, so a client can count \
+                    down rather than poll blindly. A remaining duration rather than an \
+                    instant on purpose: the reader's clock is a different machine's, and a \
+                    published deadline would render as a negative or hour-long countdown for \
+                    a retry that is actually moments away. Null when nothing is waiting; \
+                    null alongside a non-zero `consecutive_failures` means an attempt is in \
+                    flight right now.",
+            },
             "sources": sources_schema(),
             "watermark": {
                 "type": ["integer", "null"],
@@ -2232,9 +2306,30 @@ fn effect_detail_schema() -> Value {
             },
         },
         "required": [
-            "name", "position", "lag", "sources", "watermark", "consecutive_failures",
-            "last_error", "terminal_skips", "last_terminal_error", "quarantined", "quarantine"
+            "name", "state", "position", "lag", "retry_in_ms", "sources", "watermark",
+            "consecutive_failures", "last_error", "terminal_skips", "last_terminal_error",
+            "quarantined", "quarantine"
         ],
+        "additionalProperties": false,
+    })
+}
+
+/// An invocation as a trace sees it: enough to name it and link to its journal, and
+/// no more. The full row is `EffectInvocation`, one request away.
+fn trace_invocation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "effect": { "type": "string" },
+            "position": position_schema("The log position of the triggering event."),
+            "status": {
+                "type": "string",
+                "enum": ["running", "terminal"],
+                "description": "`running` on an event in this chain means the effect is \
+                    still working on it, or is wedged on it.",
+            },
+        },
+        "required": ["effect", "position", "status"],
         "additionalProperties": false,
     })
 }
@@ -3195,9 +3290,17 @@ mod tests {
         let doc = full_doc();
         let paths = doc["paths"].as_object().unwrap();
         let admin: Vec<&String> = paths.keys().filter(|p| p.starts_with("/admin")).collect();
+        // Counted from the router rather than written down. A literal here is a second
+        // hand-maintained copy of the route table, which is the exact failure mode the
+        // table's own doc comment argues against: it catches a typo but not the thing
+        // that matters, someone adding a route and updating only the number.
+        let registered = server::routes()
+            .iter()
+            .filter(|route| route.starts_with(server::ADMIN_ROUTE))
+            .count();
         assert_eq!(
             admin.len(),
-            14,
+            registered,
             "every /admin route the router registers needs a path: {admin:?}"
         );
         for path in admin {
@@ -3322,6 +3425,39 @@ mod tests {
             declared,
             vec!["decrypted", "encrypted", "erased", "stale", "unreadable"]
         );
+    }
+
+    #[test]
+    fn both_effect_schemas_declare_the_same_state_vocabulary() {
+        let doc = full_doc();
+        let enum_of = |schema: &str| -> Vec<String> {
+            doc["components"]["schemas"][schema]["properties"]["state"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{schema} declares a state enum"))
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect()
+        };
+        let detail = enum_of("EffectDetail");
+        assert_eq!(detail, ["healthy", "lagging", "quarantined", "wedged"]);
+        // `/status` and `/admin/effects` read one function on the shared handle, so a
+        // client that learned the vocabulary from either must not meet a word from the
+        // other. Both schemas carry `additionalProperties: false`, which makes a
+        // one-sided edit a document that describes a response the server violates.
+        assert_eq!(
+            enum_of("EffectStatus"),
+            detail,
+            "the two schemas describe the same value from the same function"
+        );
+        for schema in ["EffectDetail", "EffectStatus"] {
+            let required = doc["components"]["schemas"][schema]["required"]
+                .as_array()
+                .unwrap();
+            assert!(
+                required.iter().any(|name| name == "state"),
+                "{schema} always carries a state, so it is required"
+            );
+        }
     }
 
     #[test]

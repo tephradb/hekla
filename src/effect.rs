@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -105,6 +105,19 @@ pub struct EffectShared {
     /// The position an operator asked to skip, or `0` for none (no event sits at
     /// position 0).
     skip_position: AtomicU64,
+    /// When this effect started, so a retry deadline can be held as a monotonic
+    /// offset from it.
+    started: Instant,
+    /// Millis since [`EffectShared::started`] at which the current backoff expires, or
+    /// `0` for "not waiting". Monotonic rather than wall clock on both ends: the
+    /// server's clock can step, and the reader's clock is a different machine's, so a
+    /// deadline published as an instant would render as a negative or hour-long
+    /// countdown for a retry that is actually 400ms away. A remaining duration is
+    /// immune to both.
+    ///
+    /// Zero is a safe sentinel: `retry_delay` never returns less than [`BACKOFF_BASE`],
+    /// so a real deadline is never at offset zero.
+    retry_at_ms: AtomicU64,
     /// Set when a verify-mode check found a broken invariant. The driver stops
     /// rather than retries: a divergence is not a transient failure, and every
     /// later position would be processed on the strength of an assumption that has
@@ -174,6 +187,59 @@ impl EffectShared {
             .last_error
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// How long until the next retry attempt, or `None` when nothing is waiting.
+    ///
+    /// Saturates at zero rather than going negative: the deadline can pass between
+    /// this load and the driver actually waking.
+    pub fn retry_in_ms(&self) -> Option<u64> {
+        match self.retry_at_ms.load(Ordering::Relaxed) {
+            0 => None,
+            due => Some(due.saturating_sub(self.elapsed_ms())),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn set_retry_deadline(&self, delay: Duration) {
+        let due = self.elapsed_ms().saturating_add(delay.as_millis() as u64);
+        self.retry_at_ms.store(due, Ordering::Relaxed);
+    }
+
+    fn clear_retry_deadline(&self) {
+        self.retry_at_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// This effect's health in one word, against a log head.
+    ///
+    /// Derived here rather than by each reader so `/status`, the introspection API
+    /// and any dashboard cannot disagree about what "stuck" means.
+    ///
+    /// The order is load-bearing. A quarantine outranks everything because
+    /// [`EffectShared::restore_quarantine`] sets the flag and `last_error` but never
+    /// touches `consecutive_failures`, so an effect quarantined by an *earlier*
+    /// process has a zero failure count and would otherwise read as merely lagging. A
+    /// wedge outranks lag because a wedged effect lags precisely because it is
+    /// wedged, and reporting the symptom would bury the cause.
+    ///
+    /// `terminal_skips` is deliberately not a state here: it is cumulative and never
+    /// cleared, so a label derived from it would stick for the life of the process
+    /// and hide a later wedge.
+    pub fn state(&self, head: u64) -> &'static str {
+        if self.quarantined() {
+            "quarantined"
+        } else if self.consecutive_failures() > 0 {
+            // Both an invocation retrying under backoff and the driver re-subscribing
+            // after a store error land here. Both are stuck and retrying.
+            "wedged"
+        } else if self.position() < head {
+            "lagging"
+        } else {
+            "healthy"
+        }
     }
 
     /// Whether a verify-mode check stopped this effect. Unlike a wedge, nothing
@@ -348,6 +414,8 @@ fn spawn(
         terminal_skips: AtomicU64::new(0),
         last_terminal_error: Mutex::new(None),
         skip_position: AtomicU64::new(0),
+        started: Instant::now(),
+        retry_at_ms: AtomicU64::new(0),
         quarantined: AtomicBool::new(false),
     });
     let task_shared = Arc::clone(&shared);
@@ -370,11 +438,19 @@ fn run(
     // "retry forever" promise. `run_inner` returns `Ok` only on a clean stop.
     let mut attempt: u32 = 0;
     loop {
-        match run_inner(&shared, &unit, &runtime, http.as_ref()) {
+        // Whether the driver got as far as re-subscribing. A run that did is a
+        // recovery however it ended: the ladder is for a driver that cannot start,
+        // and without this a few unrelated blips over a process's life park every
+        // later re-subscribe at the 60s cap, now published as a countdown.
+        let mut subscribed = false;
+        match run_inner(&shared, &unit, &runtime, http.as_ref(), &mut subscribed) {
             Ok(()) => break,
             Err(err) => {
                 if shared.shutdown.load(Ordering::Relaxed) {
                     break;
+                }
+                if subscribed {
+                    attempt = 0;
                 }
                 shared.record_failure(&format!("driver: {err:#}"));
                 tracing::error!(
@@ -382,7 +458,11 @@ fn run(
                     shared.name,
                     attempt + 1
                 );
-                if sleep_watching(&shared, None, backoff(attempt)) {
+                let delay = backoff(attempt);
+                shared.set_retry_deadline(delay);
+                let stop = sleep_watching(&shared, None, delay);
+                shared.clear_retry_deadline();
+                if stop {
                     break;
                 }
                 attempt = attempt.saturating_add(1);
@@ -404,6 +484,7 @@ fn run_inner(
     unit: &EffectUnit,
     runtime: &Arc<Runtime>,
     http: &dyn HttpClient,
+    subscribed: &mut bool,
 ) -> anyhow::Result<()> {
     let ModuleDef::Effect { name, sources } = &unit.loaded.def else {
         anyhow::bail!("run called on a non-effect module");
@@ -423,6 +504,14 @@ fn run_inner(
     }
     let resume = runtime.effect_resume_after(name)?;
     let mut sub = runtime.store().subscribe(query, Position::new(resume));
+    // Back on the log, so whatever failure the supervisor recorded for the error that
+    // sent us round its loop is over. Nothing else clears it: on an idle effect there
+    // is no next invocation to, so a single transient store error left `state()`
+    // reporting `wedged` until an unrelated event happened to arrive. An invocation
+    // wedge is not lost here, since that position replays below and records its own
+    // failure again.
+    *subscribed = true;
+    shared.clear_failures();
     loop {
         let batch = sub
             .poll_batch()
@@ -580,7 +669,10 @@ fn run_invocation(
                     attempt + 1,
                     failure.message
                 );
-                if sleep_watching(shared, Some(position), delay) {
+                shared.set_retry_deadline(delay);
+                let stop = sleep_watching(shared, Some(position), delay);
+                shared.clear_retry_deadline();
+                if stop {
                     return Ok(Progress::Interrupted);
                 }
                 attempt = attempt.saturating_add(1);
@@ -1517,6 +1609,8 @@ mod tests {
             terminal_skips: AtomicU64::new(0),
             last_terminal_error: Mutex::new(None),
             skip_position: AtomicU64::new(0),
+            started: Instant::now(),
+            retry_at_ms: AtomicU64::new(0),
             quarantined: AtomicBool::new(false),
         }
     }

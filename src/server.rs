@@ -25,6 +25,7 @@ use anyhow::Context;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
@@ -41,6 +42,7 @@ use crate::projector::{ProjectorSet, ProjectorShared, Readiness};
 use crate::read_api;
 use crate::runtime::{Runtime, error_body};
 use crate::starlark_builtins::{EntityDef, EventDef, ModuleDef};
+use crate::ui;
 
 type Shared = Arc<Runtime>;
 
@@ -61,8 +63,10 @@ pub async fn serve(
         .await
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!("hekla listening on http://{addr}");
+    // The console and the introspection API are one URL, told apart by `Accept`, so
+    // this is both lines at once: a browser opens the console, curl gets the JSON.
+    tracing::info!("  admin console   http://{addr}{ADMIN_ROUTE}");
     tracing::info!("  api reference   http://{addr}{DOCS_ROUTE}");
-    tracing::info!("  introspection   http://{addr}{ADMIN_ROUTE}");
     axum::serve(listener, service)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -104,6 +108,12 @@ pub const ADMIN_SYSTEM_ROUTE: &str = "/admin/system";
 pub const ADMIN_SUBJECTS_ROUTE: &str = "/admin/subjects";
 pub const ADMIN_SUBJECT_ROUTE: &str = "/admin/subjects/{field}/{value}";
 
+/// The admin console's own files. Flat, because `{file}` captures a single segment: a
+/// nested asset would be unroutable, and worse, undescribable, since the drift test's
+/// matcher compares segment counts exactly. It is the one `/admin` route that is not
+/// content-negotiated, since it serves the console rather than being a view of it.
+pub const ADMIN_ASSETS_ROUTE: &str = "/admin/assets/{file}";
+
 /// Every route, as one table.
 ///
 /// [`app`] folds this into a `Router` and [`routes`] projects out the paths, so a route
@@ -136,6 +146,7 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (ADMIN_SYSTEM_ROUTE, get(admin_system)),
         (ADMIN_SUBJECTS_ROUTE, get(admin_subjects)),
         (ADMIN_SUBJECT_ROUTE, get(admin_subject)),
+        (ADMIN_ASSETS_ROUTE, get(admin_asset)),
     ]
 }
 
@@ -150,6 +161,19 @@ pub fn app(shared: Shared) -> Router {
     route_table()
         .into_iter()
         .fold(Router::new(), |router, (path, handler)| {
+            // Content negotiation is attached per route, from the same table the
+            // routes come from, so an `/admin` route added later gets a deep link
+            // without anyone remembering to. Layering the whole `Router` instead would
+            // run the check on `/commands` and `/read`, and would turn every unrouted
+            // `/admin/...` 404 into a 200 page, which is a worse answer than the 404.
+            let handler = if path.starts_with(ADMIN_ROUTE) && path != ADMIN_ASSETS_ROUTE {
+                // `route_layer`, not `layer`: `MethodRouter::layer` wraps the
+                // method-not-allowed fallback too, so a `POST` here would short-circuit
+                // into the console shell and answer 200 instead of 405.
+                handler.route_layer(middleware::from_fn(ui::negotiate))
+            } else {
+                handler
+            };
             router.route(path, handler)
         })
         .with_state(shared)
@@ -754,12 +778,33 @@ where
     }
 }
 
+/// `GET /admin/assets/{file}`: one file of the bundled console.
+async fn admin_asset(Path(file): Path<String>) -> Response {
+    // Resolution is over the compiled-in table and nothing else, so a name carrying
+    // `..` simply does not match an entry. The development override then substitutes
+    // the content of a name that already resolved, never a path from the request.
+    let Some(asset) = ui::asset(&file) else {
+        return ui::empty(StatusCode::NOT_FOUND);
+    };
+    // The override reads from disk, so it does not belong on the async runtime.
+    match tokio::task::spawn_blocking(move || ui::serve(asset)).await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::error!("asset task panicked: {err}");
+            ui::empty(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 /// `GET /admin`: what is under this prefix.
 ///
 /// The startup line points here, so it has to be a useful landing page rather than a
 /// 404. Static: it describes the shape of the surface, not the state of the process.
 async fn admin_index() -> Json<Value> {
     Json(json!({
+        // A browser asking this same URL for `text/html` gets the console instead, so
+        // point a reader who found the JSON at the other representation.
+        "console": ADMIN_ROUTE,
         "endpoints": [
             { "path": ADMIN_EVENTS_ROUTE, "description": "page the event log, newest first" },
             { "path": ADMIN_EVENT_ROUTE, "description": "one event, with its payload and subject states" },
@@ -909,10 +954,23 @@ async fn admin_trace(
             .map(|(position, event)| renderer.event(*position, event))
             .collect::<anyhow::Result<Vec<_>>>()?;
         renderer.audit(&format!("GET /admin/traces/{correlation_id}"));
+        // Which effects ran on the positions in this page. The envelope records that
+        // an effect produced an event but not which one; the journal is keyed by
+        // `(effect, position)`, so joining it here answers that exactly instead of
+        // leaving every client to guess from the subscription lists.
+        let positions: Vec<u64> = events.iter().map(|(position, _)| *position).collect();
+        let handles = runtime.effect_handles();
+        let effects: Vec<&str> = handles.iter().map(|shared| shared.name.as_str()).collect();
+        let invocations: Vec<Value> = runtime
+            .invocations_at(&effects, &positions)?
+            .iter()
+            .map(introspect::invocation_at)
+            .collect();
         let next_cursor = next_cursor.flatten();
         Ok(json!({
             "correlation_id": correlation_id,
             "events": rendered,
+            "invocations": invocations,
             // A causal chain read partially is worse than one read whole, so say
             // outright when the page cut it off rather than letting the count imply it.
             "complete": next_cursor.is_none(),

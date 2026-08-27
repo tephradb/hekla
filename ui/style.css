@@ -1,0 +1,1121 @@
+/* hekla admin console.
+ *
+ * Hand-written, no framework: a build step is what a framework would cost, and the
+ * console is a few dozen components with one visual language. Every colour is a
+ * token; nothing below the token block names a literal colour.
+ *
+ * Dark first, because this is a tool you open next to a terminal. `:root` holds the
+ * dark palette, and light comes from either an explicit choice or the system
+ * preference, so the toggle wins in both directions. */
+
+:root {
+  --bg: #0d0f12;
+  --bg-raised: #14171c;
+  --bg-inset: #1a1e24;
+  --bg-hover: #1e232a;
+  --bg-active: #252b34;
+  --border: #23282f;
+  --border-strong: #333a44;
+
+  --text: #e7ebf0;
+  --text-dim: #9aa4b1;
+  --text-faint: #6b7480;
+
+  --accent: #6ea8fe;
+  --accent-dim: #2a4a7f;
+  --accent-text: #0d0f12;
+
+  --ok: #4ac97e;
+  --warn: #e3b341;
+  --err: #f2777a;
+  --info: #a78bfa;
+
+  --ok-bg: #14301f;
+  --warn-bg: #33290d;
+  --err-bg: #3a1a1c;
+  --info-bg: #241b3d;
+  --accent-bg: #16263f;
+
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+
+  --radius: 6px;
+  --radius-lg: 10px;
+  --rail: 208px;
+  --row: 30px;
+
+  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+
+  --shadow: 0 8px 24px rgb(0 0 0 / 45%);
+  --motion: 130ms cubic-bezier(0.2, 0, 0.2, 1);
+
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-raised: #f7f8fa;
+  --bg-inset: #eef1f5;
+  --bg-hover: #eaeef3;
+  --bg-active: #dfe5ec;
+  --border: #e2e6ec;
+  --border-strong: #c8d0da;
+
+  --text: #16191d;
+  --text-dim: #5a636e;
+  --text-faint: #8a939f;
+
+  --accent: #2563c9;
+  --accent-dim: #b9d0f5;
+  --accent-text: #ffffff;
+
+  --ok: #167d43;
+  --warn: #97690b;
+  --err: #c3312f;
+  --info: #6d3fd4;
+
+  --ok-bg: #e4f6eb;
+  --warn-bg: #fdf3d9;
+  --err-bg: #fdeaea;
+  --info-bg: #efe9fd;
+  --accent-bg: #e7f0fd;
+
+  --shadow: 0 8px 24px rgb(20 30 45 / 12%);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #ffffff;
+    --bg-raised: #f7f8fa;
+    --bg-inset: #eef1f5;
+    --bg-hover: #eaeef3;
+    --bg-active: #dfe5ec;
+    --border: #e2e6ec;
+    --border-strong: #c8d0da;
+
+    --text: #16191d;
+    --text-dim: #5a636e;
+    --text-faint: #8a939f;
+
+    --accent: #2563c9;
+    --accent-dim: #b9d0f5;
+    --accent-text: #ffffff;
+
+    --ok: #167d43;
+    --warn: #97690b;
+    --err: #c3312f;
+    --info: #6d3fd4;
+
+    --ok-bg: #e4f6eb;
+    --warn-bg: #fdf3d9;
+    --err-bg: #fdeaea;
+    --info-bg: #efe9fd;
+    --accent-bg: #e7f0fd;
+
+    --shadow: 0 8px 24px rgb(20 30 45 / 12%);
+
+    color-scheme: light;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+/* The app mounts into #root, so it is part of the chain a percentage height resolves
+ * against. Without it the shell's `height: 100%` measures against an auto-height div
+ * and the sidebar stops at the bottom of whatever the page happens to contain. */
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Every number in this console is compared against the one above it. */
+code,
+kbd,
+pre,
+.num,
+.mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.num {
+  text-align: right;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+::selection {
+  background: var(--accent-dim);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* --- shell -------------------------------------------------------------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+  grid-template-rows: 100%;
+  height: 100%;
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  padding: var(--s3) var(--s2);
+  border-right: 1px solid var(--border);
+  background: var(--bg-raised);
+  overflow-y: auto;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s1) var(--s2) var(--s3);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.brand svg {
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+}
+
+.brand .project {
+  color: var(--text-faint);
+  font-weight: 400;
+  font-size: 12px;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.nav a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  padding: 5px var(--s2);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  transition: background var(--motion), color var(--motion);
+}
+
+.nav a:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.nav a[aria-current="page"] {
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.rail-foot {
+  margin-top: auto;
+  padding-top: var(--s3);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.rail-foot .kv {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s2);
+  padding: 1px var(--s2);
+}
+
+.rail-foot .kv span:last-child {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+.rail-actions {
+  display: flex;
+  gap: var(--s1);
+  padding-top: var(--s2);
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s3) var(--s5);
+  border-bottom: 1px solid var(--border);
+  min-height: 52px;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.topbar .spacer {
+  flex: 1;
+}
+
+.content {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s5);
+}
+
+.content > * + * {
+  margin-top: var(--s5);
+}
+
+/* --- primitives --------------------------------------------------------- */
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  overflow: hidden;
+}
+
+.card > header {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.card > .body {
+  padding: var(--s4);
+}
+
+.grid {
+  display: grid;
+  gap: var(--s4);
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-inset);
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--motion), color var(--motion), border-color var(--motion);
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 500;
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-text);
+  filter: brightness(1.08);
+}
+
+.btn.danger {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: var(--err-bg);
+  color: var(--err);
+}
+
+.btn.icon {
+  padding: 4px 6px;
+}
+
+kbd {
+  display: inline-block;
+  padding: 0 5px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-inset);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.pill.plain::before {
+  display: none;
+}
+
+.pill.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.pill.warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.pill.err {
+  background: var(--err-bg);
+  color: var(--err);
+}
+
+.pill.info {
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.pill.mute {
+  background: var(--bg-inset);
+  color: var(--text-dim);
+}
+
+/* A trailing annotation after a value: "1284 <in memory>", "0 <since this process
+ * started>". The gap comes from the margin rather than from a space in the template,
+ * because htm drops whitespace that spans a newline: a space written inline vanishes
+ * the moment the line is wrapped, which is a formatting change away at all times. */
+.note {
+  margin-left: var(--s2);
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-weight: 400;
+  /* Annotations sit inside uppercased, tracked-out headings as well as ordinary
+   * values, and an annotation is prose either way. */
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.dim {
+  color: var(--text-dim);
+}
+
+.faint {
+  color: var(--text-faint);
+}
+
+.tiny {
+  font-size: 11.5px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+
+.wrap {
+  flex-wrap: wrap;
+}
+
+.scroll-x {
+  overflow-x: auto;
+}
+
+/* --- tables ------------------------------------------------------------- */
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+table.data th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+table.data th.num {
+  text-align: right;
+}
+
+table.data td {
+  height: var(--row);
+  padding: 0 var(--s3);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+table.data tbody tr {
+  transition: background var(--motion);
+}
+
+table.data tbody tr.clickable {
+  cursor: pointer;
+}
+
+table.data tbody tr.clickable:hover {
+  background: var(--bg-hover);
+}
+
+table.data tbody tr.cursor {
+  background: var(--bg-active);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+table.data tbody tr.selected td:first-child {
+  color: var(--accent);
+}
+
+/* --- key/value ---------------------------------------------------------- */
+
+dl.kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--s2) var(--s4);
+  margin: 0;
+  font-size: 13px;
+}
+
+dl.kv dt {
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+dl.kv dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- json --------------------------------------------------------------- */
+
+.json {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.65;
+  overflow-x: auto;
+}
+
+.json .line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  white-space: pre;
+}
+
+.json .key {
+  color: var(--text-dim);
+}
+
+.json .str {
+  color: var(--ok);
+}
+
+.json .num-v {
+  color: var(--info);
+}
+
+.json .bool {
+  color: var(--warn);
+}
+
+.json .null {
+  color: var(--text-faint);
+}
+
+.json .toggle {
+  border: 0;
+  background: none;
+  padding: 0 2px;
+  cursor: pointer;
+  color: var(--text-faint);
+  width: 14px;
+  text-align: left;
+}
+
+.json .toggle:hover {
+  color: var(--text);
+}
+
+.json .indent {
+  padding-left: var(--s4);
+  border-left: 1px solid var(--border);
+  margin-left: 5px;
+}
+
+/* --- states ------------------------------------------------------------- */
+
+.empty,
+.error-state {
+  padding: var(--s6) var(--s4);
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.empty h3,
+.error-state h3 {
+  margin: 0 0 var(--s2);
+  font-size: 14px;
+  color: var(--text);
+}
+
+.error-state {
+  border: 1px solid var(--err);
+  border-radius: var(--radius-lg);
+  background: var(--err-bg);
+}
+
+.error-state code {
+  color: var(--err);
+}
+
+.skeleton {
+  height: 10px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    var(--bg-inset) 25%,
+    var(--bg-hover) 37%,
+    var(--bg-inset) 63%
+  );
+  background-size: 400% 100%;
+  animation: shimmer 1.2s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+.skeleton-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding: var(--s4);
+}
+
+/* --- detail panel -------------------------------------------------------- */
+
+/* The list and its detail sit side by side, so opening another row swaps the panel
+ * rather than needing the first one dismissed. Below the breakpoint the grid collapses
+ * to one column and the panel goes *first*: stacked under fifty rows it would be off
+ * screen at the moment it appeared. */
+.with-detail {
+  display: grid;
+  gap: var(--s4);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 480px);
+  /* Deliberately not `align-items: start`: a sticky element needs room to move inside
+   * its grid area, and a start-aligned item's area is exactly its own height, so it
+   * would scroll away with the table. Stretching gives the panel the full row height
+   * to stick within, and its own `max-height` keeps it viewport-sized. */
+  align-items: stretch;
+}
+
+.panel {
+  /* `.content` is the scroll container, so the panel stays put while the table scrolls
+   * under it, and never grows taller than the viewport. */
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  /* The viewport less the topbar (52px) and the content padding above and below
+   * (24px each), so a long payload scrolls inside the panel rather than pushing it
+   * off the bottom of the page. */
+  max-height: calc(100vh - 100px);
+  animation: panel-in var(--motion);
+}
+
+@keyframes panel-in {
+  from {
+    transform: translateX(6px);
+    opacity: 0;
+  }
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-title {
+  font-weight: 600;
+  font-family: var(--mono);
+}
+
+.panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s4);
+}
+
+.section-title {
+  margin: var(--s5) 0 var(--s2);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.panel-body > .section-title:first-child {
+  margin-top: 0;
+}
+
+/* --- filters ------------------------------------------------------------ */
+
+.filters {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+  padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--border);
+}
+
+.filter-input {
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+}
+
+input,
+select {
+  padding: 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-inset);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+input::placeholder {
+  color: var(--text-faint);
+}
+
+input:focus,
+select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--radius);
+  background: var(--accent-bg);
+  font-size: 12px;
+}
+
+.chip-kind {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.chip button {
+  border: 0;
+  background: none;
+  cursor: pointer;
+  color: var(--text-faint);
+  padding: 0 3px;
+  line-height: 1;
+}
+
+.chip button:hover {
+  color: var(--err);
+}
+
+/* --- modal and palette --------------------------------------------------- */
+
+.modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  background: rgb(0 0 0 / 45%);
+  backdrop-filter: blur(2px);
+}
+
+.modal,
+.palette {
+  width: min(520px, 92vw);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.modal {
+  padding: var(--s5);
+}
+
+.modal h2 {
+  margin: 0 0 var(--s3);
+  font-size: 15px;
+}
+
+.modal p {
+  margin: 0 0 var(--s3);
+}
+
+.confirm-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  margin: var(--s4) 0;
+}
+
+.confirm-field input {
+  font-family: var(--mono);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--s2);
+}
+
+.palette input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  padding: var(--s4);
+  font-size: 15px;
+}
+
+.palette-list {
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: var(--s2);
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  width: 100%;
+  padding: 6px var(--s3);
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.palette-item.active {
+  background: var(--accent-bg);
+}
+
+.palette-group {
+  width: 76px;
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.palette-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.palette-empty {
+  padding: var(--s4);
+  color: var(--text-faint);
+  text-align: center;
+}
+
+/* --- trace -------------------------------------------------------------- */
+
+.trace,
+.trace-children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.trace-children {
+  margin-left: 9px;
+  padding-left: var(--s4);
+  border-left: 1px solid var(--border-strong);
+}
+
+.trace-node {
+  padding: 2px 0;
+}
+
+.trace-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 3px 0;
+}
+
+.trace-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.trace-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 0 0 4px 19px;
+}
+
+/* --- overview and schema ------------------------------------------------- */
+
+.stat {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.spark-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  margin-top: var(--s3);
+  color: var(--accent);
+}
+
+.spark {
+  width: 120px;
+  height: 26px;
+  flex: none;
+}
+
+.module-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.attention {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.attention:last-child {
+  border-bottom: 0;
+}
+
+.graph {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+
+.graph-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+}
+
+.graph-event {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 240px;
+}
+
+.graph-arrow {
+  color: var(--text-faint);
+  flex: none;
+}
+
+.graph-consumers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.graph-fields {
+  padding: 0 0 var(--s3) var(--s2);
+  border-bottom: 1px solid var(--border);
+}
+
+.graph-fields summary {
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.graph-fields dl {
+  padding-top: var(--s2);
+}
+
+.effect-edges {
+  padding: var(--s3) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.effect-edges:last-child {
+  border-bottom: 0;
+}
+
+.split {
+  display: grid;
+  gap: var(--s4);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .split,
+  .with-detail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .with-detail .panel {
+    /* Stacked under fifty rows the panel would be off screen the moment it opened,
+     * so it leads instead, and stops being sticky because there is nothing beside it
+     * to stay level with. */
+    order: -1;
+    position: static;
+    max-height: none;
+  }
+}

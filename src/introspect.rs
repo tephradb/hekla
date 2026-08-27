@@ -33,7 +33,7 @@ use crate::crypto::{KeyStore, RowDecryptor};
 use crate::dispatch::{self, EventDefs, RESERVED_TAG_PREFIX};
 use crate::effect::EffectShared;
 use crate::envelope;
-use crate::opdb::{EffectState, InvocationRow, JournalRow, ModuleRow, SubjectInfo};
+use crate::opdb::{EffectState, InvocationAt, InvocationRow, JournalRow, ModuleRow, SubjectInfo};
 use crate::projector::ProjectorShared;
 use crate::read_api::{self, filterable_fields};
 use crate::read_model::key_kind;
@@ -315,8 +315,17 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
     let quarantine = state.and_then(|state| state.quarantine.as_ref());
     json!({
         "name": shared.name,
+        // One word for what the counters below add up to, derived in the runtime so
+        // `/status`, this endpoint and the console cannot disagree about it.
+        "state": shared.state(head),
         "position": position,
         "lag": head.saturating_sub(position),
+        // A remaining duration rather than an instant, so a reader can count down
+        // without its clock having to agree with this process's. Null whenever nothing
+        // is waiting, which covers both a healthy effect and one whose attempt is in
+        // flight right now: the driver clears the deadline before it retries. So null
+        // alongside a non-zero `consecutive_failures` is an attempt in progress.
+        "retry_in_ms": shared.retry_in_ms(),
         // Null is `all_events()`, an empty array is a module subscribed to nothing.
         // Collapsing the two would invert the meaning of the commonest subscription.
         "sources": shared.sources,
@@ -335,6 +344,17 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
             "reason": row.reason,
             "at": row.at,
         })),
+    })
+}
+
+/// One effect invocation found by position, for a trace to attribute an event to the
+/// effect that produced it. Narrower than [`invocation`]: a trace links to the full
+/// journal rather than inlining it.
+pub fn invocation_at(row: &InvocationAt) -> Value {
+    json!({
+        "effect": row.effect,
+        "position": row.position,
+        "status": row.status,
     })
 }
 
