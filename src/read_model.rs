@@ -227,6 +227,23 @@ impl ReadModel {
         Ok(())
     }
 
+    /// How many rows an entity holds.
+    ///
+    /// A full table scan, which is why introspection asks for it only on request
+    /// rather than on every projector listing. Callers take it inside the same
+    /// transaction as [`ReadModel::read_checkpoint`] so the count and the position
+    /// describe one snapshot, and only once the projector is `Ready`: a model whose
+    /// table is still at a previous definition's shape would error here rather than
+    /// report a number.
+    pub fn count(&self, entity: &EntityDef) -> anyhow::Result<u64> {
+        let sql = format!("SELECT count(*) FROM {}", quote_ident(&entity.name));
+        let count: i64 = self
+            .conn
+            .query_row(&sql, [], |row| row.get(0))
+            .with_context(|| format!("counting rows in `{}`", entity.name))?;
+        Ok(count as u64)
+    }
+
     /// Read every row of an entity back as a JSON object (NULL columns omitted),
     /// ordered by key. For inspection and display.
     pub fn rows(&self, entity: &EntityDef) -> anyhow::Result<Vec<serde_json::Value>> {

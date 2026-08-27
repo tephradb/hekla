@@ -96,6 +96,31 @@ pub fn idempotency_tag(command: &str, key: &str) -> String {
     format!("{IDEMPOTENCY_TAG_KEY}:{}", hash::sha256_hex(&material))
 }
 
+/// The reserved tag key carrying the correlation id of the flow an event belongs to.
+/// Every event gets one, which is what makes a causal chain an indexed tag probe
+/// rather than a scan with an envelope decode per event: the id lives in the envelope
+/// payload, and a tephra query can only filter on type and tags.
+const CORRELATION_TAG_KEY: &str = "_hekla_corr";
+
+/// The correlation tag for one flow: `_hekla_corr:<uuid>`.
+///
+/// Unlike the idempotency tag this is not hashed. The value is already a uuid, so it
+/// is fixed-length and fixed-charset, and leaving it readable means an operator can
+/// take a `correlation_id` out of a command response and query for it directly.
+pub fn correlation_tag(correlation_id: Uuid) -> String {
+    // Rendered into a stack buffer rather than through `to_string`, so stamping the tag
+    // on each of a command's events costs one allocation per event and not two. This is
+    // the append path.
+    let mut buf = Uuid::encode_buffer();
+    correlation_tag_value(correlation_id.hyphenated().encode_lower(&mut buf))
+}
+
+/// The correlation tag for an already-rendered id, so a request that received one as
+/// a path segment does not have to round-trip it through [`Uuid`] to query for it.
+pub fn correlation_tag_value(correlation_id: &str) -> String {
+    format!("{CORRELATION_TAG_KEY}:{correlation_id}")
+}
+
 /// A command outcome recovered from the log by its idempotency tag: a prior committed
 /// attempt's events and identity, enough to rebuild the exact success response a
 /// replay must return without re-running `handle`.
@@ -1089,9 +1114,10 @@ pub(crate) fn arm_selects(item: Option<&QueryItem>, event: EventRef<'_>) -> bool
 }
 /// Pack an emitted event for the store: its payload wrapped in a host-stamped
 /// envelope, with the derived tags kept separate as tephra tags so the DCB index
-/// still matches on them. When `idem_tag` is set it is added as an extra host tag,
-/// so the append condition and a later recovery read can find this request's events.
-/// This is the only place enveloping happens.
+/// still matches on them. Every event carries the flow's correlation tag, and when
+/// `idem_tag` is set it is added as a second host tag, so the append condition and a
+/// later recovery read can find this request's events. This is the only place
+/// enveloping happens.
 ///
 /// `event_id` is the caller's, rather than minted here, because a handler can now
 /// read it back as `event.id` and derive ids from it: a live append wants a fresh
@@ -1109,8 +1135,10 @@ pub fn build_event(
     let ty = EventType::new(event.event_type.as_str())
         .map_err(|err| anyhow::anyhow!("invalid event type `{}`: {err}", event.event_type))?;
     let (data, derived) = lower_event(event, event_def, keystore)?;
-    let extra = idem_tag.as_slice();
-    let tags = to_tags(&derived, extra)?;
+    let corr_tag = correlation_tag(ctx.correlation_id);
+    let mut extra: Vec<&str> = vec![corr_tag.as_str()];
+    extra.extend(idem_tag);
+    let tags = to_tags(&derived, &extra)?;
     let envelope = Envelope {
         event_id,
         timestamp: now.to_owned(),

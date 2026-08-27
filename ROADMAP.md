@@ -1057,6 +1057,90 @@ The `Retry-After` test asserts wall-clock: a 1s window against a 200ms first bac
 against a build with the honoring removed, where the retry landed at 223ms, so it discriminates
 rather than passing on timing slack.
 
+## Phase 19: read-only introspection under `/admin` (done)
+
+hekla is an event-sourcing runtime that had **no way to look at the event log**. `/status` reported
+counters and that was the whole window into a running system: no `/events`, no correlation trace, no
+way to see what a wedged effect had actually done. Debugging "why did this happen" meant writing a
+Starlark effect or opening the SQLite files, which ARCHITECTURE.md declares unsupported.
+
+Most of the primitives were already there and unused. `WriteHandle::read_back` had never been called
+from hekla, though its own doc names this use case. `journal_keys` plus `journal_get` already
+reconstruct an invocation's exact ordered call sequence, which is what `verify_replay` compares
+against. `module_metadata` had been written at every boot since the first schema and **never read**:
+it is the deployed-inventory table, and a projector's and effect's `source_hash` survive nowhere else
+once their units move into their threads.
+
+What shipped: fourteen `GET` routes under one prefix, a new `src/introspect.rs` sitting above the
+runtime alongside `verify`, nine bounded readers on `OpDb`, and the paths and schemas to describe all
+of it in the generated document.
+
+- **The log.** `/admin/events` pages newest-first over `read_back`; `?type=` and `?tag=` repeat and
+  lower to exactly one tephra query item (types OR, tags AND), so nothing is reinterpreted on the way
+  through. Positions are dense and 1-based, so the cursor is a position and needs no opaque encoding.
+- **Traces.** `/admin/traces/{correlation_id}` is the one feature that needed a write-path change.
+  The correlation id has always been in the envelope, but a store query filters on type and tags
+  only, so finding a chain meant decoding every event in the log. Every event now carries a reserved
+  `_hekla_corr` tag, making a trace an indexed probe. `build_event` already threaded `extra` tags for
+  idempotency, so it was three lines; both command-response paths already strip the `_hekla_` prefix,
+  and `hekla check` already forbids an author from naming it.
+- **Effects.** `/admin/effects/{name}/invocations/{position}` lists every journaled call with its
+  recorded result, which turns "my effect is stuck" into one request: the calls already listed will
+  replay rather than re-fire, and the first one missing is where it is wedged.
+- **Projectors, schema, system, subjects.** Entity shapes and the definition hash read out of the
+  read model itself (so it is what the rows were built from, not what the project declares); the
+  loaded project with per-module source hashes; the effective configuration, which `Runtime` had been
+  discarding at boot; and the subject-key inventory, never the key material.
+
+Judgment calls worth recording:
+
+- **Always on, no flag.** ARCHITECTURE.md had contemplated an admin surface "behind a flag, off in
+  production", and the flag turned out to protect nothing the bind address does not. `DEFAULT_ADDR`
+  is already loopback, and the surface already lets any caller who reaches it append events and skip
+  an effect's work. What a flag would have cost is concrete: `openapi::Surface` grows a boolean, the
+  route-drift test becomes a matrix, and the served document either lies about what is routed or
+  disagrees with `hekla openapi` (the exact guarantee Phase 17 exists to provide). Auth, when it
+  comes, is one layer over the whole surface; gating one prefix would imply the rest is protected.
+  The escape hatch is the prefix itself, which a proxy can deny without hekla's cooperation.
+- **Payloads are shown and subject fields decrypt by default.** Not a new boundary: `decrypt_row`
+  already decrypts a projector's subject columns on every `GET /read/...` over the same port. It is a
+  slightly *wider* one, since the log holds subject values no projector materialised, so the request
+  emits one audit line the way `reveal()` does. `?decrypt=false` opts out.
+- **An unreadable field keeps its ciphertext and says which kind of unreadable it is.**
+  `decrypt_row` removes such a column, which is right for a read model that must look like an
+  ordinary row and exactly wrong for an operator, who would have to already know the field existed to
+  notice it was gone. The four failure states are kept apart rather than collapsed to "erased":
+  the decryptor returns `Ok(None)` both when a key is gone and when a live key simply does not match
+  this ciphertext, and calling the second one erased would report permanent loss that did not happen.
+- **A journaled call's arguments stay unstored.** Only the result is recorded, so this reports what
+  came back and not what was sent. Storing arguments would be far more useful and would let plaintext
+  that came out of `reveal()` outlive the erasure of the subject it belonged to.
+- **Schema v5 adds `effect_journal.kind`.** The kind lives only inside the call hash's pre-image, so
+  without a column an invocation view could show what a call returned but not what it was. Nullable,
+  because a pre-v5 row genuinely does not record it and an invented value would read as a real one.
+
+Honest scope:
+
+- **Only events appended from this version forward are traceable.** Older events carry no correlation
+  tag. The tag costs roughly 50 bytes per event in the log and the tag index.
+- **`terminal_skips` remains process-local**, and a skipped position's durable trace is a terminal
+  invocation row indistinguishable from a completed one. Introspection reports this rather than
+  papering over it.
+- **A projector quarantine is still in-memory only** while an effect's is durable. The asymmetry is
+  now visible rather than merely true.
+- **Row counts are opt-in** (`?counts=true`) and gated on a `ready` projector: a count is a full table
+  scan, and a model at a previous definition's shape has no table to count.
+- **No live tail.** `Subscription` makes an SSE stream cheap and it is the obvious next step, but it
+  is a different transport with its own backpressure and shutdown story.
+- **The admin read-only SQL endpoint deferred in Phase 3 is still deferred.** This makes it less
+  necessary rather than delivering it.
+- Every reader over a table that grows with traffic takes a caller-supplied limit, because the
+  operational database is one mutex shared with each effect's hot path. Three do not, and say so:
+  the module inventory and the per-effect runtime state are bounded by the module count, fixed at
+  boot, and the subject-key counts are an aggregate no limit can bound, so `/admin/subjects` takes
+  them once per listing rather than once per page. Anti-vacuity: removing the correlation tag makes
+  the command-effect-command trace test return an empty chain rather than a shorter one.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
@@ -1081,8 +1165,9 @@ warranted.
 Deferrals recorded in the "honest scope" of a completed phase that no trigger above already pulls
 forward. Collected here so they are not lost in the prose of the phase that introduced them.
 
-- **Admin read-only SQL endpoint** (Phase 3): a read-only query surface over the projector databases,
-  deferred with no successor phase named.
+- **Admin read-only SQL endpoint** (Phase 3): a read-only query surface over the projector databases.
+  Phase 19 delivered structured introspection over the same state, which lowers the pressure for it
+  without answering the arbitrary-query case.
 - **`money` scale and decimal wire form** (Phase 3): read-API `money` is the raw stored integer minor
   units; the decimal-string wire form waits on the scale decision, and no entity uses `money` yet.
 - **Multi-field (composite-prefix) scan filters** (Phase 3): a scan supports a single indexed filter

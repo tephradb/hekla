@@ -42,7 +42,7 @@ const AD_VERSION: u8 = 1;
 
 /// The reserved subject that holds the global uniqueness secret. It backs the
 /// `unique` tags that must survive erasure, so it is never deletable.
-const GLOBAL_SUBJECT_FIELD: &str = "_hekla_global";
+pub(crate) const GLOBAL_SUBJECT_FIELD: &str = "_hekla_global";
 const GLOBAL_SUBJECT_VALUE: &str = "global";
 
 /// The set of master keys the runtime holds, keyed by a fingerprint id. One is the
@@ -354,6 +354,20 @@ pub struct RowDecryptor<'a> {
 }
 
 impl RowDecryptor<'_> {
+    /// Whether the subject had a key the last time this decryptor loaded one, or
+    /// `None` if it never looked.
+    ///
+    /// Reads the cache a preceding [`RowDecryptor::decrypt`] already filled, so it
+    /// costs no database work. It exists because `decrypt` returns `Ok(None)` for two
+    /// different situations, and a caller reporting to a human has to separate them:
+    /// the key is gone (erasure, irreversible) or the key is present and this
+    /// particular ciphertext will not decrypt under it (written under a superseded
+    /// key, or corrupt).
+    pub fn key_present(&self, subject_field: &str, subject_value: &str) -> Option<bool> {
+        let cache_key = (subject_field.to_owned(), subject_value.to_owned());
+        self.secrets.borrow().get(&cache_key).map(Option::is_some)
+    }
+
     /// Decrypt a subject-scoped ciphertext, reusing a cached secret. `Ok(None)` when
     /// the value is unreadable under the current key: the subject's key is gone (erased
     /// or never created), or the ciphertext will not decrypt under the present key (a

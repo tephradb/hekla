@@ -163,7 +163,7 @@ fn decrypt_row(
 /// Re-type a decrypted plaintext string to the field's declared kind, so an
 /// encrypted integer reads back as a JSON number. `money` stays a decimal string (its
 /// wire form), and `u64` parses as unsigned so values above `i64::MAX` survive.
-fn typed_from_string(kind: &FieldKind, text: String) -> Value {
+pub(crate) fn typed_from_string(kind: &FieldKind, text: String) -> Value {
     match kind.base() {
         FieldKind::I64 => text
             .parse::<i64>()
@@ -241,7 +241,7 @@ fn key_string(value: &Value) -> Option<String> {
 /// Open the read model read-only, retrying once after a brief pause. The `.db`
 /// path is always present (a replay swaps it in atomically), so this only guards
 /// the vanishing window around the rename. Runs on a blocking thread.
-fn open_with_retry(db_path: &Path) -> anyhow::Result<ReadModel> {
+pub fn open_with_retry(db_path: &Path) -> anyhow::Result<ReadModel> {
     match ReadModel::open_readonly(db_path) {
         Ok(model) => Ok(model),
         Err(_) => {

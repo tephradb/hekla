@@ -86,6 +86,26 @@ impl FieldKind {
         matches!(self, FieldKind::Optional(_))
     }
 
+    /// The kind in the vocabulary the author declared it in, so introspection
+    /// reports `uint()` rather than the storage type it happens to share with `int()`.
+    pub fn describe(&self) -> String {
+        match self {
+            FieldKind::Text {
+                max_length: Some(n),
+            } => format!("str(max_length = {n})"),
+            FieldKind::Text { max_length: None } => "str()".to_owned(),
+            FieldKind::I64 => "int()".to_owned(),
+            FieldKind::U64 => "uint()".to_owned(),
+            FieldKind::Bool => "bool()".to_owned(),
+            FieldKind::Uuid => "uuid()".to_owned(),
+            FieldKind::Timestamp => "timestamp()".to_owned(),
+            FieldKind::Money => "money()".to_owned(),
+            FieldKind::Json => "json()".to_owned(),
+            FieldKind::OneOf(values) => format!("one_of({values:?})"),
+            FieldKind::Optional(inner) => format!("optional({})", inner.describe()),
+        }
+    }
+
     /// Strip an `Optional(..)` wrapper to reach the underlying kind.
     pub fn base(&self) -> &FieldKind {
         match self {
@@ -817,6 +837,23 @@ impl EventSpec {
             EventSpec::All => None,
             EventSpec::Filter { event_type, .. } => Some(event_type),
         }
+    }
+
+    /// The event types a subscription selects, sorted and deduplicated, or `None` when
+    /// any clause is `all_events()` and the subscription is therefore everything.
+    ///
+    /// `None` is "every event", not "no events". Anything rendering this has to keep the
+    /// two apart: an empty list is a module subscribed to nothing.
+    pub fn source_types(sources: &[EventSpec]) -> Option<Vec<&str>> {
+        let mut types = Vec::new();
+        for spec in sources {
+            let event_type = spec.event_type()?;
+            if !types.contains(&event_type) {
+                types.push(event_type);
+            }
+        }
+        types.sort_unstable();
+        Some(types)
     }
 
     /// The identity of the definition this clause was built from, or `None` for

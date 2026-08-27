@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
+use crate::introspect;
 use crate::loader::LoadedProject;
 use crate::read_api;
 use crate::read_model::key_kind;
@@ -33,6 +34,7 @@ use crate::starlark_builtins::{
 
 const COMMANDS_TAG: &str = "commands";
 const OPERATIONS_TAG: &str = "operations";
+const INTROSPECTION_TAG: &str = "introspection";
 
 // ---------------------------------------------------------------------------
 // The surface
@@ -88,7 +90,7 @@ impl<'a> Surface<'a> {
                 projectors.push(ProjectorSurface {
                     name: name.as_str(),
                     entities: entities.as_slice(),
-                    sources: source_types(sources),
+                    sources: EventSpec::source_types(sources),
                 });
             }
         }
@@ -99,7 +101,7 @@ impl<'a> Surface<'a> {
             if let ModuleDef::Effect { name, sources } = &unit.loaded.def {
                 effects.push(EffectSurface {
                     name: name.as_str(),
-                    sources: source_types(sources),
+                    sources: EventSpec::source_types(sources),
                 });
             }
         }
@@ -137,20 +139,6 @@ impl<'a> Surface<'a> {
     }
 }
 
-/// The event types a subscription selects, sorted and deduplicated, or `None` when
-/// any clause is `all_events()` and the subscription is therefore everything.
-fn source_types(sources: &[EventSpec]) -> Option<Vec<&str>> {
-    let mut types = Vec::new();
-    for spec in sources {
-        let event_type = spec.event_type()?;
-        if !types.contains(&event_type) {
-            types.push(event_type);
-        }
-    }
-    types.sort_unstable();
-    Some(types)
-}
-
 // ---------------------------------------------------------------------------
 // The document
 // ---------------------------------------------------------------------------
@@ -179,6 +167,15 @@ Operator and diagnostic endpoints. `/health` is a liveness check; `/status` repo
 per-module positions and lag. The replay and skip endpoints are explicit manual \
 actions, never automatic.";
 
+const INTROSPECTION_TAG_DESCRIPTION: &str = "\
+Read-only introspection: browse the event log, follow a request through the causal \
+chain it set off, see what a wedged effect actually did, and read back what this \
+process loaded and is configured with. Every endpoint here is a `GET` and none of \
+them writes; replaying a projector and skipping an effect stay under `operations`.\n\n\
+Like the rest of this API, none of it is authenticated. The bind address is the \
+boundary, and it defaults to loopback. A single prefix is what lets a deployment that \
+binds wider deny it in a proxy.";
+
 pub fn build(surface: &Surface) -> Value {
     // Assigned before anything emits a `$ref`, because a ref has to name the key the
     // schema is finally stored under.
@@ -201,6 +198,9 @@ pub fn build(surface: &Surface) -> Value {
         }
     }
     for (path, item) in operation_paths(surface) {
+        paths.insert(path, item);
+    }
+    for (path, item) in introspection_paths(surface) {
         paths.insert(path, item);
     }
     disambiguate_operation_ids(&mut paths);
@@ -281,7 +281,7 @@ impl ComponentNames {
 }
 
 /// The schemas that are always present, whatever the project declares.
-const FIXED_SCHEMAS: [&str; 8] = [
+const FIXED_SCHEMAS: [&str; 21] = [
     "ErrorDetail",
     "Error",
     "CommandError",
@@ -290,6 +290,19 @@ const FIXED_SCHEMAS: [&str; 8] = [
     "Status",
     "ProjectorStatus",
     "EffectStatus",
+    "LogEvent",
+    "SubjectState",
+    "EffectDetail",
+    "EffectInvocation",
+    "EffectInvocationDetail",
+    "JournalCall",
+    "FieldDetail",
+    "EventDetail",
+    "EntityDetail",
+    "ProjectorDetail",
+    "ModuleSummary",
+    "SystemInfo",
+    "SubjectEntry",
 ];
 
 /// Make every `operationId` unique, which OpenAPI requires and a client generator
@@ -343,6 +356,10 @@ fn tags(surface: &Surface) -> Value {
     out.push(json!({
         "name": OPERATIONS_TAG,
         "description": OPERATIONS_TAG_DESCRIPTION,
+    }));
+    out.push(json!({
+        "name": INTROSPECTION_TAG,
+        "description": INTROSPECTION_TAG_DESCRIPTION,
     }));
     Value::Array(out)
 }
@@ -791,10 +808,10 @@ fn skip_path(effects: &[&str]) -> Value {
             ],
             "responses": {
                 "202": response("the skip was scheduled", accepted),
-                // The only typed path parameter in the whole surface, so the only place
-                // the request can be rejected before a handler runs. That rejection is
-                // axum's, not hekla's, so it is plain text rather than the `Error`
-                // envelope every other documented error uses.
+                // A typed path parameter, so the request can be rejected before a
+                // handler runs. That rejection is axum's, not hekla's, so it is plain
+                // text rather than the `Error` envelope. The introspection paths with an
+                // integer segment document the same thing.
                 "400": {
                     "description": "`position` was not a non-negative integer. This one is \
                         rejected by the routing layer before the handler runs, so the body \
@@ -879,6 +896,656 @@ fn docs_path() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Introspection
+// ---------------------------------------------------------------------------
+
+/// The `/admin` paths, keyed by `server`'s own route constants for the same reason
+/// the operator paths are.
+fn introspection_paths(surface: &Surface) -> Vec<(String, Value)> {
+    let projectors = surface.projector_names();
+    let effects = surface.effect_names();
+    vec![
+        (server::ADMIN_ROUTE.to_owned(), admin_index_path()),
+        (server::ADMIN_EVENTS_ROUTE.to_owned(), events_path(surface)),
+        (server::ADMIN_EVENT_ROUTE.to_owned(), event_path()),
+        (server::ADMIN_TRACE_ROUTE.to_owned(), trace_path()),
+        (server::ADMIN_EFFECTS_ROUTE.to_owned(), effects_path()),
+        (server::ADMIN_EFFECT_ROUTE.to_owned(), effect_path(&effects)),
+        (
+            server::ADMIN_INVOCATIONS_ROUTE.to_owned(),
+            invocations_path(&effects),
+        ),
+        (
+            server::ADMIN_INVOCATION_ROUTE.to_owned(),
+            invocation_path(&effects),
+        ),
+        (server::ADMIN_PROJECTORS_ROUTE.to_owned(), projectors_path()),
+        (
+            server::ADMIN_PROJECTOR_ROUTE.to_owned(),
+            projector_path(&projectors),
+        ),
+        (server::ADMIN_SCHEMA_ROUTE.to_owned(), schema_path()),
+        (server::ADMIN_SYSTEM_ROUTE.to_owned(), system_path()),
+        (server::ADMIN_SUBJECTS_ROUTE.to_owned(), subjects_path()),
+        (server::ADMIN_SUBJECT_ROUTE.to_owned(), subject_path()),
+    ]
+}
+
+/// The `?decrypt=` parameter, shared by every endpoint that renders a stored payload.
+fn decrypt_param() -> Value {
+    query_param(
+        "decrypt",
+        "Whether to decrypt subject-scoped fields (default `true`). Decryption here is \
+         the same boundary `GET /read/...` already crosses for a projector's subject \
+         columns; it is not a way around erasure, which removes the key itself. Pass \
+         `false` to see the stored ciphertext instead.",
+        json!({ "type": "boolean", "default": true }),
+    )
+}
+
+/// The `?limit=` parameter. No `maximum`, because the handler clamps.
+fn admin_limit_param(what: &str) -> Value {
+    query_param(
+        "limit",
+        &format!(
+            "How many {what} to return. Larger values are clamped to {} rather than \
+             rejected.",
+            introspect::MAX_LIMIT
+        ),
+        json!({ "type": "integer", "minimum": 1, "default": introspect::DEFAULT_LIMIT }),
+    )
+}
+
+fn admin_index_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "endpoints": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "description": { "type": "string" },
+                    },
+                    "required": ["path", "description"],
+                    "additionalProperties": false,
+                },
+            },
+        },
+        "required": ["endpoints"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_admin_index",
+            "summary": "what is under /admin",
+            "description": "A directory of the introspection endpoints. Static: it describes \
+                the surface, not the state of the process. The startup log points here.",
+            "responses": { "200": response("the introspection endpoints", body) },
+        }
+    })
+}
+
+fn events_path(surface: &Surface) -> Value {
+    let page = json!({
+        "type": "object",
+        "properties": {
+            "events": { "type": "array", "items": schema_ref("LogEvent") },
+            "next_cursor": position_nullable("The `cursor` for the next page, or null at the end."),
+            "log_head": position_schema("The log's head position, which is also its event count."),
+        },
+        "required": ["events", "next_cursor", "log_head"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "list_events",
+            "summary": "page the event log",
+            "description": "Newest first by default. `type` and `tag` may each be repeated: \
+                types are OR'd and tags are AND'd, which is one query item in the store's own \
+                terms, so nothing is reinterpreted on the way through. Pagination is by log \
+                position rather than an opaque cursor, because positions are dense and 1-based.",
+            "parameters": [
+                query_param(
+                    "type",
+                    &format!(
+                        "Restrict to these event types. Repeatable; an event matching any of \
+                         them is returned. Deliberately not an enum of the declared set: the \
+                         log outlives any one deployment, and an event type this project no \
+                         longer declares (the case `LogEvent.declared` exists to report) is \
+                         exactly what an operator needs to filter for. This project declares \
+                         {}.",
+                        backticked(&surface.event_types()),
+                    ),
+                    json!({ "type": "array", "items": { "type": "string" } }),
+                ),
+                query_param(
+                    "tag",
+                    "Restrict to events carrying all of these stored tags, each rendered \
+                     `key:value` (or bare `key`). Repeatable. A subject-encrypted field's tag \
+                     holds ciphertext, so filtering on one means pasting the ciphertext from a \
+                     rendered event, not the plaintext.",
+                    json!({ "type": "array", "items": { "type": "string" } }),
+                ),
+                query_param(
+                    "direction",
+                    "`back` (default) walks from newest to oldest; `forward` walks from oldest \
+                     to newest.",
+                    json!({ "type": "string", "enum": ["back", "forward"], "default": "back" }),
+                ),
+                query_param(
+                    "cursor",
+                    "A log position: the exclusive upper bound going back, the exclusive lower \
+                     bound going forward. Pass the previous page's `next_cursor`.",
+                    json!({ "type": "integer", "minimum": 0, "format": "int64" }),
+                ),
+                admin_limit_param("events"),
+                decrypt_param(),
+            ],
+            "responses": {
+                "200": response("a page of the log", page),
+                "400": response("a malformed filter, direction, cursor or limit", schema_ref("Error")),
+                "500": response("the log could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn event_path() -> Value {
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_event",
+            "summary": "one event",
+            "description": "The stored event at a log position: its envelope identity, its \
+                payload, the state of every subject-scoped field, and its tags including the \
+                host's own.",
+            "parameters": [
+                path_param(
+                    "position",
+                    "The event's log position. Positions are dense and 1-based.",
+                    json!({ "type": "integer", "minimum": 1, "format": "int64" }),
+                ),
+                decrypt_param(),
+            ],
+            "responses": {
+                "200": response("the event", schema_ref("LogEvent")),
+                "400": path_or_query_400(
+                    "`decrypt` was not a boolean (JSON), or `position` was not a \
+                     non-negative integer (plain text)",
+                ),
+                "404": response("the log holds no event at that position", schema_ref("Error")),
+                "500": response("the log could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn trace_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "correlation_id": { "type": "string", "format": "uuid" },
+            "events": { "type": "array", "items": schema_ref("LogEvent") },
+            "complete": {
+                "type": "boolean",
+                "description": "False when `limit` cut the chain off. A causal chain read \
+                    partially is worse than one read whole, so this is stated rather than \
+                    left to be inferred from the count. Always the inverse of whether \
+                    `next_cursor` is set.",
+            },
+            "next_cursor": position_nullable(
+                "The `cursor` for the rest of the chain, or null when this page is all of it.",
+            ),
+        },
+        "required": ["correlation_id", "events", "complete", "next_cursor"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_trace",
+            "summary": "every event of one correlated flow",
+            "description": "The whole causal chain a request set off, in log order: the \
+                command's own events, then any appended by an effect that reacted to them, \
+                transitively. A command response's `correlation_id` is the key. \n\n\
+                This is an indexed tag lookup, not a scan: every event carries its flow's \
+                correlation as a reserved tag. Events appended before that tag existed carry \
+                no correlation tag and cannot appear here.",
+            "parameters": [
+                path_param(
+                    "correlation_id",
+                    "The `correlation_id` from a command response, or the `X-Correlation-Id` \
+                     the caller sent.",
+                    json!({ "type": "string", "format": "uuid" }),
+                ),
+                query_param(
+                    "cursor",
+                    "A log position, exclusive: pass the previous page's `next_cursor` to \
+                     continue a chain longer than one page.",
+                    json!({ "type": "integer", "minimum": 0, "format": "int64" }),
+                ),
+                admin_limit_param("events"),
+                decrypt_param(),
+            ],
+            "responses": {
+                "200": response("the flow's events", body),
+                "400": response("the correlation id is not a uuid", schema_ref("Error")),
+                "500": response("the log could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn effects_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "effects": { "type": "array", "items": schema_ref("EffectDetail") },
+            "log_head": position_schema("The log's head position."),
+        },
+        "required": ["effects", "log_head"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "list_effects",
+            "summary": "every effect and its durable state",
+            "description": "What `/status` reports, plus the durable watermark and the \
+                quarantine record behind the flag.",
+            "responses": {
+                "200": response("every effect", body),
+                "500": response("the operational database could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn effect_path(effects: &[&str]) -> Value {
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_effect",
+            "summary": "one effect",
+            "parameters": [
+                path_param("name", "The effect.", name_schema(effects)),
+            ],
+            "responses": {
+                "200": response("the effect", schema_ref("EffectDetail")),
+                "404": response("no such effect", schema_ref("Error")),
+                "500": response("the operational database could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn invocations_path(effects: &[&str]) -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "effect": { "type": "string" },
+            "invocations": { "type": "array", "items": schema_ref("EffectInvocation") },
+            "next_cursor": position_nullable("The `cursor` for the next page, or null at the end."),
+        },
+        "required": ["effect", "invocations", "next_cursor"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "list_effect_invocations",
+            "summary": "an effect's invocations, newest first",
+            "description": "One row per event position the effect has reacted to. A `running` \
+                row is either in flight or wedged; the two are told apart by the effect's \
+                `consecutive_failures`. Completed invocations are swept after the retention \
+                window, so this is not the whole history of a long-lived effect.",
+            "parameters": [
+                path_param("name", "The effect.", name_schema(effects)),
+                query_param(
+                    "cursor",
+                    "An invocation position: the exclusive upper bound of the next page.",
+                    json!({ "type": "integer", "minimum": 0, "format": "int64" }),
+                ),
+                admin_limit_param("invocations"),
+            ],
+            "responses": {
+                "200": response("a page of invocations", body),
+                "400": response("a malformed cursor or limit", schema_ref("Error")),
+                "404": response("no such effect", schema_ref("Error")),
+                "500": response("the operational database could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn invocation_path(effects: &[&str]) -> Value {
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_effect_invocation",
+            "summary": "one invocation and every call it journaled",
+            "description": "The ordered sequence of impure calls the handler made and what \
+                each returned. This is what a wedged effect is diagnosed from: the calls \
+                already listed are recorded, so a retry replays them rather than re-firing, \
+                and the first one missing is where it is stuck.\n\n\
+                A call's *arguments* are not stored, only hashed, so this reports what came \
+                back and not what was sent. That is deliberate: a request body can hold \
+                plaintext that came out of `reveal()`, which would then outlive the erasure \
+                of the subject it belonged to.",
+            "parameters": [
+                path_param("name", "The effect.", name_schema(effects)),
+                path_param(
+                    "position",
+                    "The log position of the event that triggered the invocation.",
+                    json!({ "type": "integer", "minimum": 0, "format": "int64" }),
+                ),
+                query_param(
+                    "cursor",
+                    "The `next_cursor` of the previous page: the `seq` of its last call. \
+                     The calls page, because reading a truncated list as the whole \
+                     sequence would point at the wrong call as the one it is stuck on.",
+                    json!({ "type": "integer", "minimum": 0, "format": "int64" }),
+                ),
+                admin_limit_param("journaled calls"),
+            ],
+            "responses": {
+                "200": response(
+                    "the invocation and its journaled calls",
+                    schema_ref("EffectInvocationDetail"),
+                ),
+                "400": path_or_query_400(
+                    "a malformed `cursor` or `limit` (JSON), or a `position` that is not a \
+                     non-negative integer (plain text)",
+                ),
+                "404": response("no such effect, or no invocation at that position", schema_ref("Error")),
+                "500": response("the operational database could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn projectors_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "projectors": { "type": "array", "items": schema_ref("ProjectorDetail") },
+            "log_head": position_schema("The log's head position."),
+        },
+        "required": ["projectors", "log_head"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "list_projectors",
+            "summary": "every projector and its entities",
+            "description": "Reads no projector database, so `definition_hash` and each \
+                entity's `rows` are null here. Ask for one projector to get those.",
+            "responses": { "200": response("every projector", body) },
+        }
+    })
+}
+
+fn projector_path(projectors: &[&str]) -> Value {
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_projector",
+            "summary": "one projector, with the definition its model was built under",
+            "description": "`definition_hash` is read out of the read model itself, so it is \
+                what the stored rows were actually built from rather than what the loaded \
+                project declares. The two differing is what a rebuild resolves.",
+            "parameters": [
+                path_param("name", "The projector.", name_schema(projectors)),
+                query_param(
+                    "counts",
+                    "Include each entity's row count (default `false`). Opt-in because a count \
+                     is a full table scan per entity, and it requires a `ready` projector: a \
+                     model still at a previous definition's shape has no table to count.",
+                    json!({ "type": "boolean", "default": false }),
+                ),
+            ],
+            "responses": {
+                "200": response("the projector", schema_ref("ProjectorDetail")),
+                "400": response("a malformed `counts`", schema_ref("Error")),
+                "404": response("no such projector", schema_ref("Error")),
+                "503": response(
+                    "counts were asked for but the read model is not servable",
+                    schema_ref("Error"),
+                ),
+                "500": response("the read model could not be opened", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn schema_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "events": { "type": "array", "items": schema_ref("EventDetail") },
+            "commands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "internal": {
+                            "type": "boolean",
+                            "description": "An internal command is not routed, so it is absent \
+                                from this document. It is reported here because it exists and \
+                                an effect can invoke it.",
+                        },
+                        "path": { "type": "string", "description": "Project-relative source path." },
+                        "source_hash": { "type": "string" },
+                        // Not a `FieldDetail`: a command's `input = schema(...)` carries
+                        // a name and a kind and nothing else. Tagging, subjects and
+                        // uniqueness are event and entity policy, and `schema()` rejects
+                        // them outright, so there is no `indexed`/`subject`/`unique` to
+                        // report and claiming otherwise would fail every validator.
+                        "input": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "kind": {
+                                        "type": "string",
+                                        "description": "The field constructor as declared, \
+                                            e.g. `uuid()` or `optional(str())`.",
+                                    },
+                                },
+                                "required": ["name", "kind"],
+                                "additionalProperties": false,
+                            },
+                        },
+                    },
+                    "required": ["name", "internal", "path", "source_hash", "input"],
+                    "additionalProperties": false,
+                },
+            },
+            "projectors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "sources": sources_schema(),
+                        "entities": { "type": "array", "items": { "type": "string" } },
+                    },
+                    "required": ["name", "sources", "entities"],
+                    "additionalProperties": false,
+                },
+            },
+            "effects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "sources": sources_schema(),
+                    },
+                    "required": ["name", "sources"],
+                    "additionalProperties": false,
+                },
+            },
+            "modules": { "type": "array", "items": schema_ref("ModuleSummary") },
+        },
+        "required": ["events", "commands", "projectors", "effects", "modules"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_project_schema",
+            "summary": "the project this process loaded",
+            "description": "The declared vocabulary and the modules serving it, with the source \
+                hash of each as recorded at boot. Answers \"is what is running what I \
+                deployed?\" without shelling into the host.",
+            "responses": {
+                "200": response("the loaded project", body),
+                "500": response("the operational database could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn system_path() -> Value {
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_system",
+            "summary": "version, uptime, storage and effective configuration",
+            "responses": {
+                "200": response("the process", schema_ref("SystemInfo")),
+                "500": response("the operational database could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn subjects_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "counts": {
+                "type": ["array", "null"],
+                "description": "Live key counts per subject field. Present on the first page \
+                    and null on every continuation: a count of a group is an aggregate no \
+                    limit can bound, and it cannot change between pages of one walk.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "subject_field": { "type": "string" },
+                        "live_keys": { "type": "integer", "minimum": 0, "format": "int64" },
+                    },
+                    "required": ["subject_field", "live_keys"],
+                    "additionalProperties": false,
+                },
+            },
+            "subjects": { "type": "array", "items": schema_ref("SubjectEntry") },
+            "next": {
+                "type": ["object", "null"],
+                "properties": {
+                    "after_field": { "type": "string" },
+                    "after_value": { "type": "string" },
+                },
+                "required": ["after_field", "after_value"],
+                "additionalProperties": false,
+                "description": "Pass both back as query parameters for the next page.",
+            },
+        },
+        "required": ["counts", "subjects", "next"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "list_subjects",
+            "summary": "which subjects still hold key material",
+            "description": "Never the key material itself. A subject absent from this list has \
+                either been erased or never had a value encrypted under it: erasure deletes the \
+                row, so on disk the two are one state. The reserved global uniqueness secret is \
+                excluded, since it is not a subject and cannot be erased.",
+            "parameters": [
+                query_param("after_field", "The previous page's `next.after_field`.", json!({ "type": "string" })),
+                query_param("after_value", "The previous page's `next.after_value`.", json!({ "type": "string" })),
+                admin_limit_param("subjects"),
+            ],
+            "responses": {
+                "200": response("the subject-key inventory", body),
+                "400": response("a malformed limit, or only one half of the cursor", schema_ref("Error")),
+                "500": response("the operational database could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn subject_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "subject_field": { "type": "string" },
+            "subject_value": { "type": "string" },
+            "state": {
+                "type": "string",
+                "enum": ["live", "absent"],
+                "description": "`absent` rather than `erased`: a subject that never had a value \
+                    encrypted under it is indistinguishable from an erased one, because erasure \
+                    deletes the row.",
+            },
+        },
+        "required": ["subject_field", "subject_value", "state"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_subject",
+            "summary": "whether one subject still has a key",
+            "parameters": [
+                path_param("field", "The subject field, e.g. `customer_id`.", json!({ "type": "string" })),
+                path_param("value", "The subject id value.", json!({ "type": "string" })),
+            ],
+            "responses": {
+                "200": response("the subject's key state", body),
+                "500": response("the operational database could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+/// The `400` for a path whose parameters can be rejected in two different layers.
+///
+/// A bad query parameter reaches the handler and comes back as the JSON `Error`
+/// envelope; a bad typed path segment is rejected by axum before the handler runs and
+/// comes back as plain text. Documenting only the first would make a client that parses
+/// `error.code` on every 4xx fail on the second.
+fn path_or_query_400(description: &str) -> Value {
+    json!({
+        "description": description,
+        "content": {
+            "application/json": { "schema": schema_ref("Error") },
+            "text/plain": { "schema": { "type": "string" } },
+        },
+    })
+}
+
+/// A module's declared subscription: the event types it selects, or null for
+/// `all_events()`.
+fn sources_schema() -> Value {
+    json!({
+        "type": ["array", "null"],
+        "items": { "type": "string" },
+        "description": "The event types this module subscribes to, or null for `all_events()`.",
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Schemas
 // ---------------------------------------------------------------------------
 
@@ -892,6 +1559,22 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("Status".to_owned(), status_schema());
     out.insert("ProjectorStatus".to_owned(), projector_status_schema());
     out.insert("EffectStatus".to_owned(), effect_status_schema());
+    out.insert("LogEvent".to_owned(), log_event_schema());
+    out.insert("SubjectState".to_owned(), subject_state_schema());
+    out.insert("EffectDetail".to_owned(), effect_detail_schema());
+    out.insert("EffectInvocation".to_owned(), effect_invocation_schema());
+    out.insert(
+        "EffectInvocationDetail".to_owned(),
+        effect_invocation_detail_schema(),
+    );
+    out.insert("JournalCall".to_owned(), journal_call_schema());
+    out.insert("FieldDetail".to_owned(), field_detail_schema());
+    out.insert("EventDetail".to_owned(), event_detail_schema());
+    out.insert("EntityDetail".to_owned(), entity_detail_schema());
+    out.insert("ProjectorDetail".to_owned(), projector_detail_schema());
+    out.insert("ModuleSummary".to_owned(), module_summary_schema());
+    out.insert("SystemInfo".to_owned(), system_info_schema());
+    out.insert("SubjectEntry".to_owned(), subject_entry_schema());
     for (event_type, def) in &surface.events {
         out.insert(
             names.event(event_type).to_owned(),
@@ -1400,6 +2083,473 @@ fn field_schema(kind: &FieldKind) -> Value {
     }
 }
 
+/// A stored event as introspection renders it.
+fn log_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One event as the log holds it. Unlike `EmittedEvent`, which reports \
+            what a command appended, this is the stored form: the full payload, the host's \
+            own reserved tags, and the state of every subject-scoped field.",
+        "properties": {
+            "position": position_schema("The event's log position. Dense and 1-based."),
+            "type": { "type": "string" },
+            "declared": {
+                "type": "boolean",
+                "description": "Whether the loaded project declares this event type. False \
+                    means the log holds an event this deployment no longer knows about, which \
+                    is a fact about the two disagreeing rather than corruption.",
+            },
+            "event_id": { "type": "string", "format": "uuid" },
+            "timestamp": { "type": "string", "format": "date-time" },
+            "correlation_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The flow this event belongs to. Pass it to `/admin/traces/{correlation_id}`.",
+            },
+            "causation_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The command execution that produced this event. Every event of \
+                    one execution shares it.",
+            },
+            "triggering_event_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The event that triggered the command that produced this one. \
+                    Absent for a command called directly over HTTP.",
+            },
+            "data": {
+                "type": "object",
+                "description": "The event's payload. A subject-scoped field holds its plaintext \
+                    when it could be decrypted and its stored ciphertext otherwise; `subjects` \
+                    says which.",
+            },
+            "subjects": {
+                "type": "object",
+                "additionalProperties": schema_ref("SubjectState"),
+                "description": "One entry per subject-scoped field the event declares. Empty \
+                    when it declares none.",
+            },
+            "tags": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The event's stored tags, `key:value` or bare `key`. A \
+                    subject-scoped field's tag holds ciphertext, which is what makes it a usable \
+                    join key without revealing the value.",
+            },
+            "hekla_tags": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The host's own reserved tags: the correlation tag, a keyed \
+                    command's idempotency tag, and a `unique` field's global-key tag. Stripped \
+                    from command responses; shown here because they are what the log holds.",
+            },
+        },
+        "required": [
+            "position", "type", "declared", "event_id", "timestamp",
+            "correlation_id", "causation_id", "data", "subjects", "tags", "hekla_tags"
+        ],
+    })
+}
+
+fn subject_state_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "subject": {
+                "type": "string",
+                "description": "The sibling field whose value scopes this field's key.",
+            },
+            "subject_value": {
+                "type": ["string", "null"],
+                "description": "That sibling's value, in plaintext (a subject id is not itself \
+                    encrypted, and subjects do not chain). Null if it could not be read.",
+            },
+            "state": {
+                "type": "string",
+                "enum": ["decrypted", "encrypted", "erased", "stale", "unreadable"],
+                "description": "`decrypted`: the value in `data` is plaintext. `erased`: the \
+                    subject's key is gone, so `data` holds ciphertext and always will. \
+                    `stale`: the subject has a key, but this value was written under a \
+                    superseded one (erased, then recreated by a later event) or is corrupt, \
+                    so it does not decrypt under the current key. `unreadable`: the key \
+                    could not be obtained at all, from a corrupt wrapping or a master that \
+                    is not configured; the server log names it. `encrypted`: nothing was \
+                    attempted, because the request passed `decrypt=false` or no master key \
+                    is configured.",
+            },
+        },
+        "required": ["subject", "subject_value", "state"],
+        "additionalProperties": false,
+    })
+}
+
+fn effect_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "position": position_schema("The effect's in-memory watermark."),
+            "lag": position_schema("Log head minus position."),
+            "sources": sources_schema(),
+            "watermark": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "format": "int64",
+                "description": "The durable resume point. Null means the effect has never run, \
+                    which the driver itself treats the same as zero but an operator should not.",
+            },
+            "consecutive_failures": {
+                "type": "integer",
+                "minimum": 0,
+                "format": "int64",
+                "description": "Retries at the current position. Non-zero with a `running` \
+                    invocation is a wedge.",
+            },
+            "last_error": { "type": ["string", "null"] },
+            "terminal_skips": {
+                "type": "integer",
+                "minimum": 0,
+                "format": "int64",
+                "description": "Invocations completed without doing their work since this \
+                    process started. Process-local: a restart resets it, and the durable trace \
+                    of a skipped position is a terminal invocation row indistinguishable from a \
+                    completed one.",
+            },
+            "last_terminal_error": { "type": ["string", "null"] },
+            "quarantined": { "type": "boolean" },
+            "quarantine": {
+                "type": ["object", "null"],
+                "properties": {
+                    "position": position_schema("Where the invariant broke."),
+                    "reason": { "type": "string" },
+                    "at": { "type": "string" },
+                },
+                "required": ["position", "reason", "at"],
+                "additionalProperties": false,
+                "description": "The durable quarantine record. Unlike a projector's, which is \
+                    in memory only, this survives a restart by design.",
+            },
+        },
+        "required": [
+            "name", "position", "lag", "sources", "watermark", "consecutive_failures",
+            "last_error", "terminal_skips", "last_terminal_error", "quarantined", "quarantine"
+        ],
+        "additionalProperties": false,
+    })
+}
+
+fn effect_invocation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "position": position_schema("The log position of the triggering event."),
+            "status": {
+                "type": "string",
+                "enum": ["running", "terminal"],
+                "description": "The only two persisted states. `terminal` covers success, an \
+                    operator skip and a terminal `reveal()` alike: the runtime records all three \
+                    as done.",
+            },
+            "script_hash": {
+                "type": "string",
+                "description": "The effect module's source hash at the time the invocation ran. \
+                    A replay check skips an invocation whose module has since been edited.",
+            },
+            "created_at": { "type": "string" },
+            "completed_at": { "type": ["string", "null"] },
+        },
+        "required": ["position", "status", "script_hash", "created_at", "completed_at"],
+        "additionalProperties": false,
+    })
+}
+
+/// The invocation view: the row plus its page of journaled calls.
+///
+/// Spelled out rather than composed with `allOf` over [`EffectInvocation`]. An `allOf`
+/// branch is validated against the whole instance, so a branch carrying
+/// `additionalProperties: false` rejects the very key the other branch adds, and the
+/// document would declare a response nothing can satisfy.
+fn effect_invocation_detail_schema() -> Value {
+    let Value::Object(mut base) = effect_invocation_schema() else {
+        unreachable!("an invocation schema is an object");
+    };
+    let Some(Value::Object(properties)) = base.get_mut("properties") else {
+        unreachable!("an invocation schema has properties");
+    };
+    properties.insert(
+        "calls".to_owned(),
+        json!({ "type": "array", "items": schema_ref("JournalCall") }),
+    );
+    properties.insert(
+        "next_cursor".to_owned(),
+        position_nullable(
+            "The `cursor` for the next page of calls, or null when this page is the \
+             end of the sequence.",
+        ),
+    );
+    let Some(Value::Array(required)) = base.get_mut("required") else {
+        unreachable!("an invocation schema has a required list");
+    };
+    required.push(json!("calls"));
+    required.push(json!("next_cursor"));
+    base.insert(
+        "description".to_owned(),
+        json!("One invocation and one page of the calls it journaled."),
+    );
+    Value::Object(base)
+}
+
+fn journal_call_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One journaled call, in the order the handler made it. A call recorded \
+            here will replay on the next attempt rather than fire again.",
+        "properties": {
+            "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The call's ordinal in the whole sequence, which keeps \
+                    counting across pages.",
+            },
+            "kind": {
+                "type": ["string", "null"],
+                "enum": ["http", "invoke_command", "now", "erase", null],
+                "description": "Which builtin made the call. Null for a row written before the \
+                    runtime recorded it; the kind is otherwise unrecoverable, since it exists \
+                    only inside the hash pre-image.",
+            },
+            "call_hash": {
+                "type": "string",
+                "description": "The content hash of the kind and arguments. The arguments \
+                    themselves are not stored.",
+            },
+            "disambiguator": {
+                "type": "integer",
+                "minimum": 0,
+                "format": "int64",
+                "description": "Counts repeats of a byte-identical call within one invocation, \
+                    so a handler that loops genuinely re-fires rather than replaying itself.",
+            },
+            "result": { "description": "What the call returned, as recorded." },
+            "created_at": { "type": "string" },
+        },
+        "required": ["seq", "kind", "call_hash", "disambiguator", "result", "created_at"],
+        "additionalProperties": false,
+    })
+}
+
+fn field_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One declared field, in the vocabulary its author wrote it in.",
+        "properties": {
+            "name": { "type": "string" },
+            "kind": {
+                "type": "string",
+                "description": "The field constructor as declared, e.g. `uuid()` or \
+                    `optional(str(max_length = 80))`.",
+            },
+            "optional": { "type": "boolean" },
+            "indexed": {
+                "type": "boolean",
+                "description": "Whether the field becomes a store tag, and so whether a query \
+                    can filter on it.",
+            },
+            "subject": {
+                "type": ["string", "null"],
+                "description": "The sibling field whose value scopes this field's encryption key.",
+            },
+            "unique": { "type": "boolean" },
+        },
+        "required": ["name", "kind", "optional", "indexed", "subject", "unique"],
+        "additionalProperties": false,
+    })
+}
+
+fn event_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A declared event type and its fields. Unlike the `event.*` schemas, \
+            which describe payload shape for a reader, this is the declaration itself.",
+        "properties": {
+            "type": { "type": "string" },
+            "fields": { "type": "array", "items": schema_ref("FieldDetail") },
+        },
+        "required": ["type", "fields"],
+        "additionalProperties": false,
+    })
+}
+
+fn entity_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" },
+            "key_kind": { "type": "string" },
+            "fields": { "type": "array", "items": schema_ref("FieldDetail") },
+            "indexes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "columns": { "type": "array", "items": { "type": "string" } },
+                    },
+                    "required": ["name", "columns"],
+                    "additionalProperties": false,
+                },
+            },
+            "filterable": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The fields `GET /read/...` accepts as a filter: the key plus \
+                    each index's leftmost column.",
+            },
+            "rows": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "format": "int64",
+                "description": "Null unless the request asked for counts.",
+            },
+        },
+        "required": ["name", "key", "key_kind", "fields", "indexes", "filterable", "rows"],
+        "additionalProperties": false,
+    })
+}
+
+fn projector_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "position": position_schema("The projector's checkpoint."),
+            "lag": position_schema("Log head minus position."),
+            "readiness": {
+                "type": "string",
+                "enum": ["ready", "rebuilding", "stale", "rebuild_failed", "quarantined"],
+            },
+            "running": { "type": "boolean" },
+            "failed": { "type": "boolean" },
+            "last_error": { "type": ["string", "null"] },
+            "sources": sources_schema(),
+            "definition_hash": {
+                "type": ["string", "null"],
+                "description": "The source set and entity schema the stored rows were built \
+                    under, read from the read model itself. Null on the list endpoint, which \
+                    opens no database.",
+            },
+            "entities": { "type": "array", "items": schema_ref("EntityDetail") },
+        },
+        "required": [
+            "name", "position", "lag", "readiness", "running", "failed",
+            "last_error", "sources", "definition_hash", "entities"
+        ],
+        "additionalProperties": false,
+    })
+}
+
+fn module_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A module as recorded at boot. The only place a projector's or effect's \
+            source hash survives: the units carrying it move into their threads.",
+        "properties": {
+            "name": { "type": "string" },
+            "kind": { "type": "string", "enum": ["command", "projector", "effect"] },
+            "source_hash": { "type": "string" },
+            "loaded_at": { "type": "string" },
+        },
+        "required": ["name", "kind", "source_hash", "loaded_at"],
+        "additionalProperties": false,
+    })
+}
+
+fn system_info_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "version": { "type": "string" },
+            "uptime_seconds": { "type": "integer", "minimum": 0, "format": "int64" },
+            "log_head": position_schema("The log's head position, which is also its event count."),
+            "data_dir": { "type": "string" },
+            "opdb_schema_version": { "type": "integer", "minimum": 0 },
+            "verify": {
+                "type": "boolean",
+                "description": "Whether the continuous invariant checks are running.",
+            },
+            "keystore": {
+                "type": "object",
+                "properties": {
+                    "configured": { "type": "boolean" },
+                    "master_key_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Which masters stored key material is wrapped under. More \
+                            than one means a rotation has begun and not finished.",
+                    },
+                },
+                "required": ["configured", "master_key_ids"],
+                "additionalProperties": false,
+            },
+            "config": {
+                "type": "object",
+                "description": "The effective configuration, after `hekla.toml` and any flag \
+                    that overrides it.",
+                "properties": {
+                    "effects": {
+                        "type": "object",
+                        "properties": { "pool_size": { "type": "integer", "minimum": 1 } },
+                        "required": ["pool_size"],
+                        "additionalProperties": false,
+                    },
+                    "retention": {
+                        "type": "object",
+                        "properties": { "effect_journal_days": { "type": "integer", "minimum": 0 } },
+                        "required": ["effect_journal_days"],
+                        "additionalProperties": false,
+                    },
+                    "projectors": {
+                        "type": "object",
+                        "properties": { "auto_rebuild": { "type": "boolean" } },
+                        "required": ["auto_rebuild"],
+                        "additionalProperties": false,
+                    },
+                    "verify": {
+                        "type": "object",
+                        "properties": { "enabled": { "type": "boolean" } },
+                        "required": ["enabled"],
+                        "additionalProperties": false,
+                    },
+                },
+                "required": ["effects", "retention", "projectors", "verify"],
+                "additionalProperties": false,
+            },
+        },
+        "required": [
+            "version", "uptime_seconds", "log_head", "data_dir",
+            "opdb_schema_version", "verify", "keystore", "config"
+        ],
+        "additionalProperties": false,
+    })
+}
+
+fn subject_entry_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One live subject key, without any key material.",
+        "properties": {
+            "subject_field": { "type": "string" },
+            "subject_value": { "type": "string" },
+            "master_key_id": { "type": "string" },
+            "created_at": { "type": "string" },
+        },
+        "required": ["subject_field", "subject_value", "master_key_id", "created_at"],
+        "additionalProperties": false,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Small builders
 // ---------------------------------------------------------------------------
@@ -1448,6 +2598,16 @@ fn header_param(name: &str, description: &str) -> Value {
 fn position_schema(description: &str) -> Value {
     json!({
         "type": "integer",
+        "minimum": 0,
+        "format": "int64",
+        "description": description,
+    })
+}
+
+/// A log position that may be absent, for a cursor that has run out.
+fn position_nullable(description: &str) -> Value {
+    json!({
+        "type": ["integer", "null"],
         "minimum": 0,
         "format": "int64",
         "description": description,
@@ -1788,7 +2948,7 @@ mod tests {
             .collect();
         assert_eq!(
             declared,
-            vec!["commands", "read: users", "operations"],
+            vec!["commands", "read: users", "operations", "introspection"],
             "tags render in declaration order, so the order is part of the contract"
         );
 
@@ -2030,6 +3190,164 @@ mod tests {
 
     /// The CLI dump exists to be committed and diffed, which needs the document to be
     /// a pure function of the project.
+    #[test]
+    fn every_introspection_route_is_described_and_grouped() {
+        let doc = full_doc();
+        let paths = doc["paths"].as_object().unwrap();
+        let admin: Vec<&String> = paths.keys().filter(|p| p.starts_with("/admin")).collect();
+        assert_eq!(
+            admin.len(),
+            14,
+            "every /admin route the router registers needs a path: {admin:?}"
+        );
+        for path in admin {
+            let tags = paths[path]["get"]["tags"].as_array().unwrap();
+            assert_eq!(tags, &vec![json!("introspection")], "{path} is ungrouped");
+        }
+    }
+
+    #[test]
+    fn the_introspection_module_params_enumerate_the_declared_names() {
+        let doc = full_doc();
+        let effect_param = |path: &str| -> Value {
+            doc["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|param| param["name"] == json!("name"))
+                .unwrap()["schema"]
+                .clone()
+        };
+        // The fixture declares one effect and one projector, so a client generator
+        // gets a closed set rather than a bare string.
+        assert_eq!(
+            effect_param("/admin/effects/{name}")["enum"],
+            json!(["notify"])
+        );
+        assert_eq!(
+            effect_param("/admin/effects/{name}/invocations")["enum"],
+            json!(["notify"])
+        );
+        assert_eq!(
+            effect_param("/admin/projectors/{name}")["enum"],
+            json!(["users"])
+        );
+    }
+
+    #[test]
+    fn a_decrypting_endpoint_documents_the_opt_out_and_a_paged_one_documents_the_clamp() {
+        let doc = full_doc();
+        let params = |path: &str| -> Vec<(String, Value)> {
+            doc["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|param| (param["name"].as_str().unwrap().to_owned(), param.clone()))
+                .collect()
+        };
+        for path in [
+            "/admin/events",
+            "/admin/events/{position}",
+            "/admin/traces/{correlation_id}",
+        ] {
+            let found = params(path);
+            let (_, decrypt) = found.iter().find(|(name, _)| name == "decrypt").unwrap();
+            assert_eq!(decrypt["schema"]["default"], json!(true));
+        }
+        // The handler clamps, so declaring a maximum would make a validating client
+        // refuse locally what the server would happily answer.
+        let (_, limit) = params("/admin/events")
+            .into_iter()
+            .find(|(name, _)| name == "limit")
+            .unwrap();
+        assert!(limit["schema"].get("maximum").is_none());
+        assert!(
+            limit["description"].as_str().unwrap().contains("clamped"),
+            "the clamp is the behaviour a caller has to know about"
+        );
+    }
+
+    /// Walks every object schema in the document and checks that each name in
+    /// `required` is also in `properties`.
+    ///
+    /// A schema requiring a property it does not declare, under
+    /// `additionalProperties: false`, is unsatisfiable: one clause demands the key and
+    /// the other forbids it, so every real response fails validation. `oas3` parses
+    /// such a document happily, which is exactly why this is checked here.
+    fn check_required_are_declared(value: &Value, path: &str, problems: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let (Some(Value::Array(required)), Some(Value::Object(properties))) =
+                    (map.get("required"), map.get("properties"))
+                {
+                    for name in required.iter().filter_map(Value::as_str) {
+                        if !properties.contains_key(name) {
+                            problems.push(format!("{path}: required `{name}` is not a property"));
+                        }
+                    }
+                }
+                for (key, child) in map {
+                    check_required_are_declared(child, &format!("{path}/{key}"), problems);
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    check_required_are_declared(child, &format!("{path}/{index}"), problems);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn every_required_property_is_a_declared_property() {
+        let mut problems = Vec::new();
+        check_required_are_declared(&full_doc(), "", &mut problems);
+        assert!(problems.is_empty(), "unsatisfiable schemas: {problems:#?}");
+    }
+
+    #[test]
+    fn the_subject_state_enum_covers_every_state_the_renderer_emits() {
+        let doc = full_doc();
+        let declared: Vec<&str> =
+            doc["components"]["schemas"]["SubjectState"]["properties"]["state"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect();
+        // The handler picks one of these five by name, and a strict generated client
+        // rejects a response carrying one the document never declared.
+        assert_eq!(
+            declared,
+            vec!["decrypted", "encrypted", "erased", "stale", "unreadable"]
+        );
+    }
+
+    #[test]
+    fn the_event_type_filter_is_not_closed_to_the_declared_set() {
+        let doc = full_doc();
+        let param = doc["paths"]["/admin/events"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|param| param["name"] == json!("type"))
+            .unwrap();
+        // The log outlives any one deployment, and `LogEvent.declared` exists to report
+        // exactly the types this project no longer knows. An enum of the declared set
+        // would make those unaddressable from a generated client.
+        assert!(
+            param["schema"]["items"].get("enum").is_none(),
+            "a historical event type has to stay filterable"
+        );
+        assert!(
+            param["description"]
+                .as_str()
+                .unwrap()
+                .contains("no longer declares")
+        );
+    }
+
     #[test]
     fn the_document_is_deterministic() {
         assert_eq!(full_doc().to_string(), full_doc().to_string());

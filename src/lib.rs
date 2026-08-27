@@ -7,6 +7,7 @@ pub mod effect;
 pub mod envelope;
 pub mod fmt;
 pub mod hash;
+pub mod introspect;
 pub mod loader;
 pub mod lock;
 pub mod lsp;

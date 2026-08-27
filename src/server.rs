@@ -1,7 +1,13 @@
 //! The HTTP surface: `POST /commands/{name}`, the generated read API
 //! (`GET /read/{projector}/{entity}[/{key}]`), `POST /projectors/{name}/replay`,
 //! `POST /effects/{name}/skip/{position}`, `GET /status`, `GET /health`, the
-//! generated `GET /openapi.json`, and a Scalar reference UI over it at `GET /docs`.
+//! generated `GET /openapi.json`, a Scalar reference UI over it at `GET /docs`, and
+//! the read-only introspection surface under `GET /admin`.
+//!
+//! Nothing here is authenticated, and that is not specific to `/admin`: a caller who
+//! can reach this port can already append events and skip an effect's work. The bind
+//! address is the boundary, and it defaults to loopback (`crate::cli`). One prefix for
+//! everything read-only is what lets a deployment that binds wider block it in a proxy.
 //!
 //! Handlers are thin. They pull the correlation id and idempotency key from
 //! headers, mint a per-request [`CommandContext`], and run the (synchronous)
@@ -30,10 +36,11 @@ use uuid::Uuid;
 
 use crate::context::CommandContext;
 use crate::effect::EffectRuntime;
+use crate::introspect;
 use crate::projector::{ProjectorSet, ProjectorShared, Readiness};
 use crate::read_api;
 use crate::runtime::{Runtime, error_body};
-use crate::starlark_builtins::EntityDef;
+use crate::starlark_builtins::{EntityDef, EventDef, ModuleDef};
 
 type Shared = Arc<Runtime>;
 
@@ -54,6 +61,8 @@ pub async fn serve(
         .await
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!("hekla listening on http://{addr}");
+    tracing::info!("  api reference   http://{addr}{DOCS_ROUTE}");
+    tracing::info!("  introspection   http://{addr}{ADMIN_ROUTE}");
     axum::serve(listener, service)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -78,6 +87,23 @@ pub const HEALTH_ROUTE: &str = "/health";
 pub const OPENAPI_ROUTE: &str = "/openapi.json";
 pub const DOCS_ROUTE: &str = "/docs";
 
+/// The read-only introspection surface. One prefix, so a deployment that binds
+/// beyond loopback can deny it wholesale without hekla's cooperation.
+pub const ADMIN_ROUTE: &str = "/admin";
+pub const ADMIN_EVENTS_ROUTE: &str = "/admin/events";
+pub const ADMIN_EVENT_ROUTE: &str = "/admin/events/{position}";
+pub const ADMIN_TRACE_ROUTE: &str = "/admin/traces/{correlation_id}";
+pub const ADMIN_EFFECTS_ROUTE: &str = "/admin/effects";
+pub const ADMIN_EFFECT_ROUTE: &str = "/admin/effects/{name}";
+pub const ADMIN_INVOCATIONS_ROUTE: &str = "/admin/effects/{name}/invocations";
+pub const ADMIN_INVOCATION_ROUTE: &str = "/admin/effects/{name}/invocations/{position}";
+pub const ADMIN_PROJECTORS_ROUTE: &str = "/admin/projectors";
+pub const ADMIN_PROJECTOR_ROUTE: &str = "/admin/projectors/{name}";
+pub const ADMIN_SCHEMA_ROUTE: &str = "/admin/schema";
+pub const ADMIN_SYSTEM_ROUTE: &str = "/admin/system";
+pub const ADMIN_SUBJECTS_ROUTE: &str = "/admin/subjects";
+pub const ADMIN_SUBJECT_ROUTE: &str = "/admin/subjects/{field}/{value}";
+
 /// Every route, as one table.
 ///
 /// [`app`] folds this into a `Router` and [`routes`] projects out the paths, so a route
@@ -96,6 +122,20 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (HEALTH_ROUTE, get(health)),
         (OPENAPI_ROUTE, get(openapi_doc)),
         (DOCS_ROUTE, get(docs)),
+        (ADMIN_ROUTE, get(admin_index)),
+        (ADMIN_EVENTS_ROUTE, get(admin_events)),
+        (ADMIN_EVENT_ROUTE, get(admin_event)),
+        (ADMIN_TRACE_ROUTE, get(admin_trace)),
+        (ADMIN_EFFECTS_ROUTE, get(admin_effects)),
+        (ADMIN_EFFECT_ROUTE, get(admin_effect)),
+        (ADMIN_INVOCATIONS_ROUTE, get(admin_invocations)),
+        (ADMIN_INVOCATION_ROUTE, get(admin_invocation)),
+        (ADMIN_PROJECTORS_ROUTE, get(admin_projectors)),
+        (ADMIN_PROJECTOR_ROUTE, get(admin_projector)),
+        (ADMIN_SCHEMA_ROUTE, get(admin_schema)),
+        (ADMIN_SYSTEM_ROUTE, get(admin_system)),
+        (ADMIN_SUBJECTS_ROUTE, get(admin_subjects)),
+        (ADMIN_SUBJECT_ROUTE, get(admin_subject)),
     ]
 }
 
@@ -622,6 +662,610 @@ async fn on_ctrl_c(installed: io::Result<()>) {
         future::pending::<()>().await;
     }
     tracing::info!("shutdown signal received");
+}
+
+// --- introspection ---------------------------------------------------------
+//
+// Every route below is a `GET` and none of them writes. They share one shape: parse
+// and validate the query string (cheap, on the async thread), then do the reading on
+// a blocking thread, because both the event log and SQLite run on the caller's.
+
+/// A query parameter that may repeat, collected in the order it was given.
+fn multi(params: &[(String, String)], key: &str) -> Vec<String> {
+    params
+        .iter()
+        .filter(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+        .collect()
+}
+
+/// The last value for a parameter, or `None`. Last rather than first so a hand-edited
+/// URL behaves the way a browser address bar does.
+fn single<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .rev()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
+}
+
+/// Boxed for the same reason [`resolve_entity`]'s error is: it is the rare variant of
+/// a `Result` the happy path returns everywhere, and a `Response` is large.
+fn bad_request(message: &str) -> Box<Response> {
+    Box::new(json_response(400, read_error("invalid_input", message)))
+}
+
+fn not_found(message: &str) -> Response {
+    json_response(404, read_error("not_found", message))
+}
+
+/// The page size, clamped rather than rejected, as everywhere else in the API.
+fn parse_limit(params: &[(String, String)]) -> Result<usize, Box<Response>> {
+    match single(params, "limit") {
+        None => Ok(introspect::DEFAULT_LIMIT),
+        Some(raw) => raw
+            .parse::<usize>()
+            .map(|limit| limit.clamp(1, introspect::MAX_LIMIT))
+            .map_err(|_| bad_request("limit must be a non-negative integer")),
+    }
+}
+
+fn parse_u64(params: &[(String, String)], key: &str) -> Result<Option<u64>, Box<Response>> {
+    match single(params, key) {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| bad_request(&format!("{key} must be a non-negative integer"))),
+    }
+}
+
+fn parse_flag(
+    params: &[(String, String)],
+    key: &str,
+    default: bool,
+) -> Result<bool, Box<Response>> {
+    match single(params, key) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(bad_request(&format!("{key} must be `true` or `false`"))),
+    }
+}
+
+fn parse_direction(params: &[(String, String)]) -> Result<introspect::Direction, Box<Response>> {
+    match single(params, "direction") {
+        None => Ok(introspect::Direction::Back),
+        Some(raw) => introspect::Direction::parse(raw)
+            .ok_or_else(|| bad_request("direction must be `back` or `forward`")),
+    }
+}
+
+/// Run a blocking read and render its result, mapping both failure modes the same way
+/// every other read endpoint does.
+async fn blocking_json<F>(work: F) -> Response
+where
+    F: FnOnce() -> anyhow::Result<Value> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(body)) => json_response(200, body),
+        Ok(Err(err)) => read_failed(err),
+        Err(err) => task_panicked(err),
+    }
+}
+
+/// `GET /admin`: what is under this prefix.
+///
+/// The startup line points here, so it has to be a useful landing page rather than a
+/// 404. Static: it describes the shape of the surface, not the state of the process.
+async fn admin_index() -> Json<Value> {
+    Json(json!({
+        "endpoints": [
+            { "path": ADMIN_EVENTS_ROUTE, "description": "page the event log, newest first" },
+            { "path": ADMIN_EVENT_ROUTE, "description": "one event, with its payload and subject states" },
+            { "path": ADMIN_TRACE_ROUTE, "description": "every event of one correlated flow" },
+            { "path": ADMIN_EFFECTS_ROUTE, "description": "every effect and its durable state" },
+            { "path": ADMIN_EFFECT_ROUTE, "description": "one effect" },
+            { "path": ADMIN_INVOCATIONS_ROUTE, "description": "an effect's invocations, newest first" },
+            { "path": ADMIN_INVOCATION_ROUTE, "description": "one invocation and every call it journaled" },
+            { "path": ADMIN_PROJECTORS_ROUTE, "description": "every projector and its readiness" },
+            { "path": ADMIN_PROJECTOR_ROUTE, "description": "one projector, its entities and their shapes" },
+            { "path": ADMIN_SCHEMA_ROUTE, "description": "the loaded project: events, commands, projectors, effects" },
+            { "path": ADMIN_SYSTEM_ROUTE, "description": "version, uptime, configuration and storage" },
+            { "path": ADMIN_SUBJECTS_ROUTE, "description": "the subject-key inventory" },
+            { "path": ADMIN_SUBJECT_ROUTE, "description": "whether one subject still has a key" },
+        ]
+    }))
+}
+
+/// `GET /admin/events`: a page of the log.
+///
+/// `type` and `tag` may each repeat: types OR together and tags AND together, which is
+/// exactly a tephra query item, so nothing is reinterpreted on the way through.
+async fn admin_events(
+    State(runtime): State<Shared>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let limit = match parse_limit(&params) {
+        Ok(limit) => limit,
+        Err(response) => return *response,
+    };
+    let direction = match parse_direction(&params) {
+        Ok(direction) => direction,
+        Err(response) => return *response,
+    };
+    let cursor = match parse_u64(&params, "cursor") {
+        Ok(cursor) => cursor,
+        Err(response) => return *response,
+    };
+    let decrypt = match parse_flag(&params, "decrypt", true) {
+        Ok(decrypt) => decrypt,
+        Err(response) => return *response,
+    };
+    let query = match introspect::build_query(&multi(&params, "type"), &multi(&params, "tag")) {
+        Ok(query) => query,
+        Err(err) => return *bad_request(&err.to_string()),
+    };
+    blocking_json(move || {
+        // One over the page, so "there is more" is a fact rather than an inference
+        // from a full page, the same trick the read-model scan uses.
+        let mut events = introspect::page(runtime.store(), &query, direction, cursor, limit + 1)?;
+        let next_cursor = (events.len() > limit).then(|| {
+            events.truncate(limit);
+            events.last().map(|(position, _)| *position)
+        });
+        let renderer = introspect::Renderer::new(runtime.events_map(), runtime.keystore(), decrypt);
+        let rendered = events
+            .iter()
+            .map(|(position, event)| renderer.event(*position, event))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        renderer.audit("GET /admin/events");
+        Ok(json!({
+            "events": rendered,
+            "next_cursor": next_cursor.flatten(),
+            "log_head": runtime.log_head(),
+        }))
+    })
+    .await
+}
+
+/// `GET /admin/events/{position}`: one event in full.
+async fn admin_event(
+    State(runtime): State<Shared>,
+    Path(position): Path<u64>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let decrypt = match parse_flag(&params, "decrypt", true) {
+        Ok(decrypt) => decrypt,
+        Err(response) => return *response,
+    };
+    let found = tokio::task::spawn_blocking({
+        let runtime = Arc::clone(&runtime);
+        move || {
+            let Some(event) = introspect::read_at(runtime.store(), position)? else {
+                return Ok(None);
+            };
+            let renderer =
+                introspect::Renderer::new(runtime.events_map(), runtime.keystore(), decrypt);
+            let rendered = renderer.event(position, &event)?;
+            renderer.audit(&format!("GET /admin/events/{position}"));
+            anyhow::Ok(Some(rendered))
+        }
+    })
+    .await;
+    match found {
+        Ok(Ok(Some(event))) => json_response(200, event),
+        Ok(Ok(None)) => not_found(&format!("no event at position {position}")),
+        Ok(Err(err)) => read_failed(err),
+        Err(err) => task_panicked(err),
+    }
+}
+
+/// `GET /admin/traces/{correlation_id}`: every event of one correlated flow.
+///
+/// An indexed tag probe, not a scan: every event carries its flow's correlation tag
+/// (`crate::dispatch::correlation_tag`). Events appended before that tag existed carry
+/// no correlation tag and so cannot appear here, which is a gap in history rather than
+/// in the query.
+async fn admin_trace(
+    State(runtime): State<Shared>,
+    Path(correlation_id): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let limit = match parse_limit(&params) {
+        Ok(limit) => limit,
+        Err(response) => return *response,
+    };
+    let decrypt = match parse_flag(&params, "decrypt", true) {
+        Ok(decrypt) => decrypt,
+        Err(response) => return *response,
+    };
+    let cursor = match parse_u64(&params, "cursor") {
+        Ok(cursor) => cursor,
+        Err(response) => return *response,
+    };
+    if Uuid::parse_str(&correlation_id).is_err() {
+        return *bad_request("correlation_id must be a uuid");
+    }
+    let query = match introspect::correlation_query(&correlation_id) {
+        Ok(query) => query,
+        Err(err) => return *bad_request(&err.to_string()),
+    };
+    blocking_json(move || {
+        let mut events = introspect::page(
+            runtime.store(),
+            &query,
+            introspect::Direction::Forward,
+            cursor,
+            limit + 1,
+        )?;
+        let next_cursor = (events.len() > limit).then(|| {
+            events.truncate(limit);
+            events.last().map(|(position, _)| *position)
+        });
+        let renderer = introspect::Renderer::new(runtime.events_map(), runtime.keystore(), decrypt);
+        let rendered = events
+            .iter()
+            .map(|(position, event)| renderer.event(*position, event))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        renderer.audit(&format!("GET /admin/traces/{correlation_id}"));
+        let next_cursor = next_cursor.flatten();
+        Ok(json!({
+            "correlation_id": correlation_id,
+            "events": rendered,
+            // A causal chain read partially is worse than one read whole, so say
+            // outright when the page cut it off rather than letting the count imply it.
+            "complete": next_cursor.is_none(),
+            "next_cursor": next_cursor,
+        }))
+    })
+    .await
+}
+
+/// `GET /admin/effects`: every effect, with what the operational database knows.
+///
+/// One read of the durable state for the whole listing, rather than one per effect:
+/// the operational database is behind the mutex every journaled call contends for, so
+/// lock traffic proportional to the module count is worth avoiding.
+async fn admin_effects(State(runtime): State<Shared>) -> Response {
+    blocking_json(move || {
+        let head = runtime.log_head();
+        let states = runtime.effect_states()?;
+        let effects: Vec<Value> = runtime
+            .effect_handles()
+            .into_iter()
+            .map(|shared| introspect::effect_detail(shared, head, states.get(&shared.name)))
+            .collect();
+        Ok(json!({ "effects": effects, "log_head": head }))
+    })
+    .await
+}
+
+/// `GET /admin/effects/{name}`.
+async fn admin_effect(State(runtime): State<Shared>, Path(name): Path<String>) -> Response {
+    if runtime.effect(&name).is_none() {
+        return not_found(&format!("no effect `{name}`"));
+    }
+    blocking_json(move || {
+        let head = runtime.log_head();
+        let states = runtime.effect_states()?;
+        let shared = runtime
+            .effect(&name)
+            .context("the effect disappeared between lookup and read")?;
+        Ok(introspect::effect_detail(
+            shared,
+            head,
+            states.get(&shared.name),
+        ))
+    })
+    .await
+}
+
+/// `GET /admin/effects/{name}/invocations`: newest first.
+async fn admin_invocations(
+    State(runtime): State<Shared>,
+    Path(name): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    if runtime.effect(&name).is_none() {
+        return not_found(&format!("no effect `{name}`"));
+    }
+    let limit = match parse_limit(&params) {
+        Ok(limit) => limit,
+        Err(response) => return *response,
+    };
+    let cursor = match parse_u64(&params, "cursor") {
+        Ok(cursor) => cursor,
+        Err(response) => return *response,
+    };
+    blocking_json(move || {
+        let before = cursor.unwrap_or(u64::MAX);
+        let mut rows = runtime.invocations(&name, before, limit + 1)?;
+        let next_cursor = (rows.len() > limit).then(|| {
+            rows.truncate(limit);
+            rows.last().map(|row| row.position)
+        });
+        Ok(json!({
+            "effect": name,
+            "invocations": rows.iter().map(introspect::invocation).collect::<Vec<_>>(),
+            "next_cursor": next_cursor.flatten(),
+        }))
+    })
+    .await
+}
+
+/// `GET /admin/effects/{name}/invocations/{position}`: what the invocation did.
+///
+/// The journal records each call's result but never its arguments, which are only
+/// hashed. So this answers "what came back" and "how far did it get", not "what was
+/// sent". Storing the arguments would let plaintext that came out of `reveal()` outlive
+/// the erasure of the subject it belonged to.
+///
+/// The call list pages, because the endpoint's whole use is "the first call missing is
+/// where it is stuck": a page boundary that looked like the end of the sequence would
+/// point an operator at the wrong call.
+async fn admin_invocation(
+    State(runtime): State<Shared>,
+    Path((name, position)): Path<(String, u64)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    if runtime.effect(&name).is_none() {
+        return not_found(&format!("no effect `{name}`"));
+    }
+    let limit = match parse_limit(&params) {
+        Ok(limit) => limit,
+        Err(response) => return *response,
+    };
+    let after_seq = match parse_u64(&params, "cursor") {
+        Ok(cursor) => cursor,
+        Err(response) => return *response,
+    };
+    let found = tokio::task::spawn_blocking(move || {
+        let Some(row) = runtime.invocation(&name, position)? else {
+            return anyhow::Ok(None);
+        };
+        let skip = after_seq.map_or(0, |seq| seq.saturating_add(1));
+        let mut calls = runtime.journal_entries(&name, position, skip, limit + 1)?;
+        let next_cursor = (calls.len() > limit).then(|| {
+            calls.truncate(limit);
+            skip + calls.len() as u64 - 1
+        });
+        Ok(Some(introspect::invocation_detail(
+            &row,
+            &calls,
+            skip,
+            next_cursor,
+        )))
+    })
+    .await;
+    match found {
+        Ok(Ok(Some(body))) => json_response(200, body),
+        Ok(Ok(None)) => not_found(&format!("no invocation at position {position}")),
+        Ok(Err(err)) => read_failed(err),
+        Err(err) => task_panicked(err),
+    }
+}
+
+/// `GET /admin/projectors`: every projector, without touching its database.
+async fn admin_projectors(State(runtime): State<Shared>) -> Response {
+    let head = runtime.log_head();
+    let projectors: Vec<Value> = runtime
+        .projector_handles()
+        .into_iter()
+        .map(|shared| introspect::projector_detail(shared, head, None, None))
+        .collect();
+    json_response(200, json!({ "projectors": projectors, "log_head": head }))
+}
+
+/// `GET /admin/projectors/{name}`: one projector, with the definition hash its read
+/// model was built under and, on request, its row counts.
+///
+/// `?counts=true` is opt-in because a count is a full table scan per entity, and it
+/// requires a `Ready` projector: a model still at a previous definition's shape would
+/// error on a table this one's entities no longer name.
+async fn admin_projector(
+    State(runtime): State<Shared>,
+    Path(name): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let Some(shared) = runtime.projector(&name) else {
+        return not_found(&format!("no projector `{name}`"));
+    };
+    let counts = match parse_flag(&params, "counts", false) {
+        Ok(counts) => counts,
+        Err(response) => return *response,
+    };
+    if counts && let Some(response) = not_servable(&name, shared.readiness()) {
+        return response;
+    }
+    let shared = Arc::clone(shared);
+    let head = runtime.log_head();
+    blocking_json(move || {
+        let model = read_api::open_with_retry(&shared.db_path)?;
+        let snapshot = model.begin()?;
+        let definition_hash = model.read_definition()?;
+        let counts = counts
+            .then(|| {
+                shared
+                    .entities
+                    .iter()
+                    .map(|entity| model.count(entity))
+                    .collect::<anyhow::Result<Vec<u64>>>()
+            })
+            .transpose()?;
+        drop(snapshot);
+        Ok(introspect::projector_detail(
+            &shared,
+            head,
+            definition_hash,
+            counts.as_deref(),
+        ))
+    })
+    .await
+}
+
+/// `GET /admin/schema`: what this process actually loaded.
+///
+/// Internal commands appear here, unlike in the generated OpenAPI document. They are
+/// not routed, which is why the document omits them, but they exist and an operator
+/// tracing an effect's `invoke_command` needs to see them.
+async fn admin_schema(State(runtime): State<Shared>) -> Response {
+    blocking_json(move || {
+        let modules = runtime.module_metadata()?;
+        let mut events: Vec<&EventDef> = runtime.events_map().values().collect();
+        events.sort_by(|a, b| a.event_type.cmp(&b.event_type));
+        let commands: Vec<Value> = runtime
+            .command_units()
+            .into_iter()
+            .map(|unit| {
+                // No fallback arm: the command map holds nothing else, and an arm
+                // reporting an empty input would render a command as taking no fields
+                // rather than surfacing the mismatch.
+                let ModuleDef::Command { input, .. } = &unit.loaded.def else {
+                    anyhow::bail!(
+                        "`{}` is in the command map but is not a command",
+                        unit.loaded.def.name()
+                    );
+                };
+                let input: Vec<Value> = input
+                    .fields
+                    .iter()
+                    .map(|(name, kind)| json!({ "name": name, "kind": kind.describe() }))
+                    .collect();
+                Ok(json!({
+                    "name": unit.loaded.def.name(),
+                    "internal": unit.internal,
+                    "path": unit.rel_path,
+                    "source_hash": unit.loaded.source_hash,
+                    "input": input,
+                }))
+            })
+            .collect::<anyhow::Result<Vec<Value>>>()?;
+        let projectors: Vec<Value> = runtime
+            .projector_handles()
+            .into_iter()
+            .map(|shared| {
+                json!({
+                    "name": shared.name,
+                    "sources": shared.sources,
+                    "entities": shared.entities.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let effects: Vec<Value> = runtime
+            .effect_handles()
+            .into_iter()
+            .map(|shared| {
+                json!({
+                    "name": shared.name,
+                    "sources": shared.sources,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "events": events.into_iter().map(introspect::event_def).collect::<Vec<_>>(),
+            "commands": commands,
+            "projectors": projectors,
+            "effects": effects,
+            "modules": modules.iter().map(introspect::module).collect::<Vec<_>>(),
+        }))
+    })
+    .await
+}
+
+/// `GET /admin/system`: the process, its storage and its effective configuration.
+async fn admin_system(State(runtime): State<Shared>) -> Response {
+    blocking_json(move || {
+        let config = runtime.config();
+        let keystore = runtime.keystore().is_some();
+        Ok(json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_seconds": runtime.uptime_seconds(),
+            "log_head": runtime.log_head(),
+            "data_dir": runtime.data_dir().display().to_string(),
+            "opdb_schema_version": runtime.opdb_schema_version()?,
+            "verify": runtime.verify(),
+            "keystore": {
+                "configured": keystore,
+                // Which masters stored key material is wrapped under. More than one
+                // means a rotation has started and not finished.
+                "master_key_ids": if keystore { runtime.master_key_ids()? } else { Vec::new() },
+            },
+            "config": {
+                "effects": { "pool_size": config.effects.pool_size },
+                "retention": { "effect_journal_days": config.retention.effect_journal_days },
+                "projectors": { "auto_rebuild": config.projectors.auto_rebuild },
+                "verify": { "enabled": config.verify.enabled },
+            },
+        }))
+    })
+    .await
+}
+
+/// `GET /admin/subjects`: which subjects still hold key material.
+///
+/// Never the key material itself. A subject absent from this list has either been
+/// erased or never had a value encrypted under it; erasure deletes the row, so the two
+/// are the same state on disk and this cannot tell them apart.
+async fn admin_subjects(
+    State(runtime): State<Shared>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let limit = match parse_limit(&params) {
+        Ok(limit) => limit,
+        Err(response) => return *response,
+    };
+    let after_field = single(&params, "after_field").map(str::to_owned);
+    let after_value = single(&params, "after_value").map(str::to_owned);
+    if after_field.is_some() != after_value.is_some() {
+        return *bad_request("after_field and after_value must be given together");
+    }
+    blocking_json(move || {
+        let after = after_field.as_deref().zip(after_value.as_deref());
+        let mut rows = runtime.subject_keys_page(after, limit + 1)?;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = more.then(|| rows.last()).flatten().map(
+            |row| json!({ "after_field": row.subject_field, "after_value": row.subject_value }),
+        );
+        // The counts are an aggregate no limit can bound, so they are taken once for a
+        // listing rather than rescanned for every page of one. They cannot change
+        // between pages of the same walk anyway.
+        let counts = match after {
+            None => Some(
+                runtime
+                    .subject_key_counts()?
+                    .into_iter()
+                    .map(|(field, count)| json!({ "subject_field": field, "live_keys": count }))
+                    .collect::<Vec<_>>(),
+            ),
+            Some(_) => None,
+        };
+        Ok(json!({
+            "counts": counts,
+            "subjects": rows.iter().map(introspect::subject).collect::<Vec<_>>(),
+            "next": next,
+        }))
+    })
+    .await
+}
+
+/// `GET /admin/subjects/{field}/{value}`: whether one subject still has a key.
+async fn admin_subject(
+    State(runtime): State<Shared>,
+    Path((field, value)): Path<(String, String)>,
+) -> Response {
+    blocking_json(move || {
+        let live = runtime.subject_key_exists(&field, &value)?;
+        Ok(json!({
+            "subject_field": field,
+            "subject_value": value,
+            // "absent" rather than "erased": a subject that never had a value
+            // encrypted under it looks exactly the same from here.
+            "state": if live { "live" } else { "absent" },
+        }))
+    })
+    .await
 }
 
 #[cfg(test)]

@@ -115,6 +115,12 @@ auto-tagging a float needs an encoding that sorts lexicographically, the same pr
 rejected at the write boundary. The one door left open is `json`, which validates nothing by design
 and so will store one.
 
+**Two host tags sit in a reserved `_hekla_` namespace** an author can neither emit nor query: a keyed
+command's idempotency tag, and the correlation tag every event carries. The correlation id lives in
+the envelope payload, but a store query filters on type and tags only, so without the tag a causal
+chain could be found only by decoding every event in the log. Both are stripped from command
+responses, and `hekla check` rejects the prefix on both sides.
+
 Three representations are pinned so they are not decided inconsistently in two places:
 
 - **`money`**: a decimal string on the wire (JSON event payloads and read-API responses), an integer
@@ -602,6 +608,16 @@ consistent copy is not required for them.
   past a genuinely unprocessable event. Never automatic.
 - `GET /status` and health: per-module positions and lag (position vs log head), plus each effect's
   consecutive-failure count and last error, so a wedge is distinguishable from ordinary lag.
+- **`GET /admin/*`: read-only introspection.** Page and filter the event log, follow a
+  `correlation_id` through the whole causal chain it set off, read an effect invocation's journaled
+  calls and their recorded results, inspect a projector's entities and definition hash, and read back
+  the loaded project and effective configuration. Every route is a `GET`; the mutating operator
+  routes stay outside the prefix. Always served, because the bind address is already the boundary for
+  a surface that appends events without authentication, and one prefix is what a proxy can deny.
+  Subject-scoped fields decrypt by default: the same kind of boundary the read API already crosses,
+  over a wider surface (every field of every event, rather than the columns one projector chose to
+  materialise), which is why a decrypting request is audited. A journaled call's *arguments* are never
+  stored, only hashed, so introspection cannot resurrect plaintext an erasure was meant to shred.
 - An admin-only, read-only SQL endpoint behind a flag, off in production, for debugging.
 - Direct SQLite file access is not a supported surface. The table layout stays private behind the
   generated read API.
@@ -751,9 +767,9 @@ the durable-effect journal sound. Multi-language authoring is permanently out of
 hekla is a single crate. The dependency direction is documented and enforced by discipline,
 revisited only when a seam proves real (embeddability, or compile times that actually hurt):
 `starlark_builtins` and `schema` depend on nothing internal; `dispatch` depends on those; `runtime`
-(projectors, effects, journal, storage) depends on `dispatch`; `verify` sits above the runtime,
-reaching into the projector and effect paths it checks; `api` and `cli` sit on top. `lock` depends on
-nothing internal.
+(projectors, effects, journal, storage) depends on `dispatch`; `verify` and `introspect` sit above
+the runtime, reaching into the projector, effect and storage paths they read; `api` and `cli` sit on
+top. `lock` depends on nothing internal.
 
 ## 15. Subject-scoped encryption and erasure
 

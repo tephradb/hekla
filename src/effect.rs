@@ -58,7 +58,7 @@ use crate::loader::EffectUnit;
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
 use crate::runtime::{self, Runtime};
 use crate::starlark_builtins::{
-    LoadedModule, ModuleDef, alloc_event, call_handler_with_effect_ctx,
+    EventSpec, LoadedModule, ModuleDef, alloc_event, call_handler_with_effect_ctx,
     call_handler_with_query_ctx, initial_state, parse_event_dispatch, parse_event_specs, thaw,
 };
 use crate::verify::Violation;
@@ -87,6 +87,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 /// the skip endpoint. Holds no reference to the runtime, so nothing cycles.
 pub struct EffectShared {
     pub name: String,
+    /// The event types this effect subscribes to, or `None` for `all_events()`. On the
+    /// handle for the same reason a projector's is.
+    pub sources: Option<Vec<String>>,
     position: AtomicU64,
     shutdown: AtomicBool,
     /// How many times the *current* position has failed in a row while retrying.
@@ -321,9 +324,11 @@ fn spawn(
     runtime: Arc<Runtime>,
     http: Arc<dyn HttpClient>,
 ) -> anyhow::Result<(Arc<EffectShared>, JoinHandle<()>)> {
-    let ModuleDef::Effect { name, .. } = &unit.loaded.def else {
+    let ModuleDef::Effect { name, sources } = &unit.loaded.def else {
         anyhow::bail!("spawn called on a non-effect module");
     };
+    let sources = EventSpec::source_types(sources)
+        .map(|types| types.into_iter().map(str::to_owned).collect());
     let name = name.clone();
     let resume = runtime.effect_resume_after(&name)?;
     for position in runtime.running_with_hash_mismatch(&name, &unit.loaded.source_hash)? {
@@ -335,6 +340,7 @@ fn spawn(
 
     let shared = Arc::new(EffectShared {
         name: name.clone(),
+        sources,
         position: AtomicU64::new(resume),
         shutdown: AtomicBool::new(false),
         consecutive_failures: AtomicU64::new(0),
@@ -893,7 +899,11 @@ impl EffectHostImpl<'_> {
     /// lock), run the side effect with no lock held, record (short lock). The
     /// side effect closure receives the call's disambiguator (for a deterministic
     /// idempotency key).
-    fn journaled<F>(&self, call_hash: &str, run: F) -> anyhow::Result<Value>
+    ///
+    /// `kind` is recorded alongside the result and is otherwise unrecoverable: it
+    /// only exists inside the pre-image of `call_hash`, so without the column a
+    /// stored row can say what a call returned but not what it was.
+    fn journaled<F>(&self, kind: &str, call_hash: &str, run: F) -> anyhow::Result<Value>
     where
         F: FnOnce(u64) -> anyhow::Result<Value>,
     {
@@ -921,6 +931,7 @@ impl EffectHostImpl<'_> {
             self.position,
             call_hash,
             disambiguator,
+            kind,
             &encoded,
             &runtime::now_rfc3339(),
         )?;
@@ -970,7 +981,7 @@ impl EffectHost for EffectHostImpl<'_> {
             "http",
             &json!({ "method": method, "url": url, "headers": headers_sorted, "body": body }),
         );
-        self.journaled(&hash, |_| {
+        self.journaled("http", &hash, |_| {
             let body_bytes = match &body {
                 Some(value) => Some(serde_json::to_vec(value).context("serialising an http body")?),
                 None => None,
@@ -1011,7 +1022,7 @@ impl EffectHost for EffectHostImpl<'_> {
             "invoke_command",
             &json!({ "command": name, "input": input }),
         );
-        self.journaled(&hash, |disambiguator| {
+        self.journaled("invoke_command", &hash, |disambiguator| {
             let idempotency_key =
                 format!("{}:{}:{hash}:{disambiguator}", self.effect, self.position);
             let ctx = CommandContext::from_effect(self.env.correlation_id, self.env.event_id);
@@ -1026,7 +1037,7 @@ impl EffectHost for EffectHostImpl<'_> {
     fn now(&self) -> anyhow::Result<String> {
         let hash = call_hash("now", &json!({}));
         let value = self
-            .journaled(&hash, |_| Ok(Value::String(runtime::now_rfc3339())))
+            .journaled("now", &hash, |_| Ok(Value::String(runtime::now_rfc3339())))
             .map_err(flatten_chain)?;
         value
             .as_str()
@@ -1060,7 +1071,7 @@ impl EffectHost for EffectHostImpl<'_> {
             "erase",
             &json!({ "subject_field": subject_field, "subject_value": subject_value }),
         );
-        let result = self.journaled(&hash, |_| {
+        let result = self.journaled("erase", &hash, |_| {
             let keystore = self.runtime.keystore().ok_or_else(|| {
                 anyhow::anyhow!("erase() needs a master key, but none is configured")
             })?;
@@ -1498,6 +1509,7 @@ mod tests {
     fn test_shared() -> EffectShared {
         EffectShared {
             name: "test".to_owned(),
+            sources: None,
             position: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             consecutive_failures: AtomicU64::new(0),

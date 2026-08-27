@@ -30,13 +30,16 @@ use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::config::Config;
 use crate::context::CommandContext;
 use crate::crypto::{KeyStore, MasterKeys};
 use crate::dispatch::{self, CommandOutcome, EventDefs};
 use crate::effect::{self, EffectRuntime, EffectShared, HttpClient};
 use crate::loader::{CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::lock::DataDirLock;
-use crate::opdb::{InvocationState, OpDb};
+use crate::opdb::{
+    EffectState, InvocationRow, InvocationState, JournalRow, ModuleRow, OpDb, SubjectInfo,
+};
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
 use crate::starlark_builtins::{EmittedEvent, EventDef};
@@ -171,6 +174,14 @@ pub struct Runtime {
     /// The OpenAPI document serialized once at startup: the public command set is
     /// fixed for the process lifetime, so `/openapi.json` serves this verbatim.
     openapi_json: String,
+    /// The effective configuration, retained for introspection. Everything the
+    /// runtime itself needs is read out of it at boot (`auto_rebuild` into the
+    /// projector threads, the retention window into the sweeper closure), so
+    /// without this the values a process is actually running under would be
+    /// unreportable.
+    config: Config,
+    /// The resolved data directory, for the same reason.
+    data_dir: PathBuf,
 }
 
 impl Runtime {
@@ -226,6 +237,7 @@ impl Runtime {
             project.projectors.into_iter().map(Arc::new).collect();
         let auto_rebuild = project.config.projectors.auto_rebuild;
         let verify = project.config.verify.enabled;
+        let config = project.config.clone();
         for unit in &projector_units {
             opdb.upsert_module_metadata(
                 unit.loaded.def.name(),
@@ -294,6 +306,8 @@ impl Runtime {
             openapi_json,
             _lock: lock,
             verify,
+            config,
+            data_dir: data_dir.to_path_buf(),
         });
 
         // Effects need `Arc<Runtime>` (for `invoke_command` and the boundary fold), so they
@@ -359,6 +373,8 @@ impl Runtime {
             projectors: HashMap::new(),
             effects: OnceLock::new(),
             openapi_json: String::new(),
+            config: project.config.clone(),
+            data_dir: data_dir.to_path_buf(),
             _lock: lock,
             // The checks call what they need directly; leaving this off keeps a
             // sealed replay from folding twice for a determinism check the live run
@@ -515,10 +531,9 @@ impl Runtime {
         public.sort();
         internal.sort();
 
-        let head = self.store.head().get();
-        let mut handles: Vec<&Arc<ProjectorShared>> = self.projectors.values().collect();
-        handles.sort_by(|a, b| a.name.cmp(&b.name));
-        let projectors: Vec<Value> = handles
+        let head = self.log_head();
+        let projectors: Vec<Value> = self
+            .projector_handles()
             .iter()
             .map(|handle| {
                 let position = handle.position();
@@ -534,13 +549,8 @@ impl Runtime {
             })
             .collect();
 
-        let mut effect_handles: Vec<&Arc<EffectShared>> = self
-            .effects
-            .get()
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-        effect_handles.sort_by(|a, b| a.name.cmp(&b.name));
-        let effects: Vec<Value> = effect_handles
+        let effects: Vec<Value> = self
+            .effect_handles()
             .iter()
             .map(|handle| {
                 let position = handle.position();
@@ -568,7 +578,7 @@ impl Runtime {
 
         json!({
             "log_head": head,
-            "uptime_seconds": self.started.elapsed().as_secs(),
+            "uptime_seconds": self.uptime_seconds(),
             "verify": self.verify,
             "commands": { "public": public, "internal": internal },
             "projectors": projectors,
@@ -662,6 +672,120 @@ impl Runtime {
         self.lock_opdb().journal_keys(effect, position)
     }
 
+    /// The log head, which is also the total event count: positions are dense and
+    /// 1-based.
+    pub fn log_head(&self) -> u64 {
+        self.store.head().get()
+    }
+
+    /// Seconds since this runtime opened.
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    // --- introspection ------------------------------------------------------
+    //
+    // Each of these takes and releases the op-DB lock exactly once, the same
+    // discipline the effect hot path follows. The bounds are the caller's, so a
+    // browsing request can never hold the lock across an unbounded scan.
+
+    /// The effective configuration this process is running under.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// The resolved data directory.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Every projector handle, in name order.
+    pub fn projector_handles(&self) -> Vec<&Arc<ProjectorShared>> {
+        let mut handles: Vec<&Arc<ProjectorShared>> = self.projectors.values().collect();
+        handles.sort_by(|a, b| a.name.cmp(&b.name));
+        handles
+    }
+
+    /// Every effect handle, in name order. Empty before the effect threads spawn.
+    pub fn effect_handles(&self) -> Vec<&Arc<EffectShared>> {
+        let mut handles: Vec<&Arc<EffectShared>> = self
+            .effects
+            .get()
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        handles.sort_by(|a, b| a.name.cmp(&b.name));
+        handles
+    }
+
+    /// The command units, public and internal alike. Unlike the OpenAPI document,
+    /// introspection reports internal commands: they are not routed, but they exist
+    /// and an operator debugging an effect's `invoke_command` needs to see them.
+    pub fn command_units(&self) -> Vec<&Arc<CommandUnit>> {
+        let mut units: Vec<&Arc<CommandUnit>> = self.commands.values().collect();
+        units.sort_by_key(|unit| unit.loaded.def.name());
+        units
+    }
+
+    pub(crate) fn opdb_schema_version(&self) -> anyhow::Result<i64> {
+        self.lock_opdb().schema_version()
+    }
+
+    pub(crate) fn invocations(
+        &self,
+        effect: &str,
+        before: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<InvocationRow>> {
+        self.lock_opdb().invocations(effect, before, limit)
+    }
+
+    pub(crate) fn invocation(
+        &self,
+        effect: &str,
+        position: u64,
+    ) -> anyhow::Result<Option<InvocationRow>> {
+        self.lock_opdb().invocation(effect, position)
+    }
+
+    pub(crate) fn journal_entries(
+        &self,
+        effect: &str,
+        position: u64,
+        offset: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<JournalRow>> {
+        self.lock_opdb()
+            .journal_entries(effect, position, offset, limit)
+    }
+
+    pub(crate) fn effect_states(&self) -> anyhow::Result<HashMap<String, EffectState>> {
+        self.lock_opdb().effect_states()
+    }
+
+    pub(crate) fn module_metadata(&self) -> anyhow::Result<Vec<ModuleRow>> {
+        self.lock_opdb().module_metadata()
+    }
+
+    pub(crate) fn subject_key_counts(&self) -> anyhow::Result<Vec<(String, u64)>> {
+        self.lock_opdb().subject_key_counts()
+    }
+
+    pub(crate) fn subject_keys_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SubjectInfo>> {
+        self.lock_opdb().subject_keys_page(after, limit)
+    }
+
+    pub(crate) fn subject_key_exists(&self, field: &str, value: &str) -> anyhow::Result<bool> {
+        self.lock_opdb().subject_key_exists(field, value)
+    }
+
+    pub(crate) fn master_key_ids(&self) -> anyhow::Result<Vec<String>> {
+        self.lock_opdb().distinct_master_key_ids()
+    }
+
     /// Every terminal invocation recorded for an effect, with its script hash.
     pub(crate) fn terminal_invocations(&self, effect: &str) -> anyhow::Result<Vec<(u64, String)>> {
         self.lock_opdb().terminal_invocations(effect)
@@ -674,11 +798,19 @@ impl Runtime {
         position: u64,
         call_hash: &str,
         disambiguator: u64,
+        kind: &str,
         result: &str,
         now: &str,
     ) -> anyhow::Result<()> {
-        self.lock_opdb()
-            .journal_put(effect, position, call_hash, disambiguator, result, now)
+        self.lock_opdb().journal_put(
+            effect,
+            position,
+            call_hash,
+            disambiguator,
+            kind,
+            result,
+            now,
+        )
     }
 
     pub(crate) fn running_with_hash_mismatch(

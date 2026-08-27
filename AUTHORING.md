@@ -818,6 +818,12 @@ Practical rules:
   `HEKLA_MASTER_KEY_PREVIOUS`, without touching any ciphertext.
 - Erasure cannot un-send an email an effect already delivered. External sinks are outside the
   boundary.
+- **Three places decrypt**: the read API (a projector's subject columns, on every `GET /read/...`),
+  an effect's `reveal()`, and `GET /admin/events...` (section 13). All three are the same boundary
+  and all three fail the same way once a key is gone. Introspection renders an unreadable field as
+  its stored ciphertext with an explicit `erased` marker rather than dropping it, which is the one
+  way it differs from the read API: a read model has to look like an ordinary row, and an operator
+  should not have to infer that a field ever existed.
 
 ## 12. Reading values: dot vs subscript
 
@@ -875,6 +881,57 @@ A field the schema does not declare is a shape error; one the payload omits read
   commands append and your projectors and effects subscribe to. The one place the event set is
   load-bearing is `EmittedEvent.type`, the enum a command's 200 reports.
 - Opening the SQLite files directly is not a supported surface. The table layout is private.
+
+### Introspection (`/admin`)
+
+A read-only surface for looking at a running system. Every route is a `GET` and none of them writes;
+`replay` and `skip` stay where they are.
+
+| Endpoint | What it answers |
+|---|---|
+| `GET /admin` | An index of everything below. `hekla serve` prints this URL at startup. |
+| `GET /admin/events` | Page the log, newest first. `?type=` and `?tag=` may each repeat: types OR together, tags AND together. `?cursor=` is a log position, `?direction=forward` walks the other way. |
+| `GET /admin/events/{position}` | One event: its envelope ids, its payload, its tags including the host's own. |
+| `GET /admin/traces/{correlation_id}` | Every event of one causal chain: the command's own events, plus anything an effect appended in reaction, transitively. Pages, so a chain longer than one page reports `complete: false` and a cursor to finish it. |
+| `GET /admin/effects` and `/{name}` | Per effect: position, lag, durable watermark, failure count, last error, quarantine record. |
+| `GET /admin/effects/{name}/invocations[/{position}]` | An effect's invocations, and for one of them the calls it journaled with what each returned. This is how you diagnose a wedge. The call list pages (`?cursor=` is the previous page's `next_cursor`), so a truncated list never reads as the whole sequence. |
+| `GET /admin/projectors` and `/{name}` | Readiness, lag, entity shapes, and the definition hash the read model was built under. `?counts=true` adds row counts (a full scan, so opt-in). |
+| `GET /admin/schema` | The project this process loaded: events, commands (including internal ones), projectors, effects, and each module's source hash. |
+| `GET /admin/system` | Version, uptime, data directory, operational-DB schema version, keystore state, and the effective `hekla.toml`. |
+| `GET /admin/subjects` and `/{field}/{value}` | Which subjects still hold key material. Never the key material. |
+
+**Payloads are shown, and subject-scoped fields are decrypted by default.** That is the same boundary
+`GET /read/...` already crosses for a projector's subject columns; pass `?decrypt=false` to see the
+stored ciphertext instead. It is not a way around erasure: see section 11. It is a **wider** surface
+than the read API though, not merely an equal one: a read model exposes the columns a projector chose
+to materialise, while this reaches every field of every event. A decrypting request logs an audit line
+for that reason.
+
+Each subject field reports its own state, so one unreadable value marks one field rather than failing
+the request:
+
+| State | Meaning |
+|---|---|
+| `decrypted` | The value in `data` is plaintext. |
+| `encrypted` | Nothing was attempted: `?decrypt=false`, or no master key is configured. |
+| `erased` | The subject has no key. Irreversible, and `data` holds ciphertext forever. |
+| `stale` | The subject *has* a key, but this value was written under a superseded one (erased, then recreated by a later event) or is corrupt. Unreadable, but not the total loss `erased` reports. |
+| `unreadable` | The key could not be obtained at all: a corrupt wrapping, or a master that is not configured. The server log names it. |
+
+**A `sources` of `null` means `all_events()`**, and an empty list means a module subscribed to
+nothing. The two are different answers and are reported differently.
+
+**A journaled call's arguments are not stored, only hashed**, so an invocation view reports what came
+back and not what was sent. Storing the arguments would let plaintext that came out of `reveal()`
+outlive the erasure of the subject it belonged to.
+
+**Correlation tracing only covers events appended by a version of hekla that stamps the correlation
+tag.** The id has always been in the envelope, but a query filters on tags, so events older than that
+carry nothing to find them by.
+
+**None of this is authenticated, and neither is the rest of the API.** A caller who can reach the port
+can already append events and skip an effect's work; the bind address is the boundary and defaults to
+`127.0.0.1`. One prefix is what lets a deployment that binds wider deny `/admin` in a proxy.
 
 ## 14. CLI and config
 

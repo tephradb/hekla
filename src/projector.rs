@@ -117,6 +117,10 @@ pub struct ProjectorShared {
     pub name: String,
     pub db_path: PathBuf,
     pub entities: Arc<Vec<EntityDef>>,
+    /// The event types this projector subscribes to, or `None` for `all_events()`.
+    /// Carried on the handle because the unit holding the declaration moves into the
+    /// thread, and this is the introspection-facing view of the module.
+    pub sources: Option<Vec<String>>,
     /// Stored Release and loaded Acquire: a reader that observes a position must also
     /// observe the commit that produced it, which is what read-your-writes rests on.
     /// `readiness` is ordered the same way, for the same reason (a reader that sees
@@ -333,6 +337,8 @@ fn spawn(
         name: name.clone(),
         db_path,
         entities: Arc::new(entities),
+        sources: EventSpec::source_types(sources)
+            .map(|types| types.into_iter().map(str::to_owned).collect()),
         position: AtomicU64::new(start.get()),
         shutdown: AtomicBool::new(false),
         replay: AtomicBool::new(false),

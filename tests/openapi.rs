@@ -122,7 +122,13 @@ fn the_document_describes_the_projects_real_modules() {
         .collect();
     assert_eq!(
         tags,
-        vec!["commands", "read: user-stats", "read: users", "operations"],
+        vec![
+            "commands",
+            "read: user-stats",
+            "read: users",
+            "operations",
+            "introspection",
+        ],
     );
 
     // Events: every declared type gets a schema, and the emitted-event enum agrees.
