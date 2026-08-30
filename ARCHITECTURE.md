@@ -738,14 +738,13 @@ consistent copy is not required for them.
 - `hekla check <dir>`: parse the project and report every finding. Most of what this used to do is
   the language's now (section 4), so what is left is what hekla alone knows: that a declaration sits
   in the directory its kind requires, that a read model can be keyed and indexed the way the read API
-  needs, that no event field occupies the reserved `_hekla_` tag namespace, and three lints. For CI
-  and pre-commit.
+  needs, that no event field occupies the reserved `_hekla_` tag namespace, that a sealed column can
+  say it is absent, and two lints. For CI and pre-commit.
 
   The lints are warnings, never errors, because each is a judgement call and an error would stop a
-  valid project deploying over one: a personal-looking field with no `@subject` (it could never be
-  erased), a boundary with no filter on a high-cardinality field (it defeats the append's fast
-  reject), and a boundary pinning nearly every field of an event (a slice is a subset match, so
-  over-constraining matches nothing).
+  valid project deploying over one: a boundary with no filter on a high-cardinality field (it
+  defeats the append's fast reject), and a boundary pinning nearly every field of an event (a slice
+  is a subset match, so over-constraining matches nothing).
 - `hekla test <dir>`: events in, assert what the declaration did, for all three kinds. Every case
   seeds a throwaway world with `given` and then runs one declaration against it: `run` a **command**
   and expect its events or its refusal, `project` a **projector** and expect its rows, `deliver` an
@@ -985,7 +984,8 @@ and `order_total` under the shop key, and leaves the ids plaintext.
   and it holds with no key at all.
 - **A field appended without a subject cannot be erased** until a segment-rewrite tool exists (out of
   scope): its plaintext is already in the log payload and tag index, and replaying projectors just
-  re-reads it. `hekla check` warns when a personal-looking field name has no subject.
+  re-reads it. Which fields are personal is a judgement about meaning rather than about a name, so
+  nothing warns about one that has no subject.
 - **A fold decrypts eagerly**, which under Starlark it did not. heklang's seal holds plaintext and
   its key seam answers only "is this subject erased", so the adapter decrypts every subject-scoped
   field of every record a fold reads, where a handle used to keep ciphertext opaque all the way

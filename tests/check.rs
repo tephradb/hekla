@@ -453,29 +453,13 @@ fn a_finding_from_a_diagnostic_keeps_its_position() {
     assert_eq!(finding.location, "commands/do-thing.hk");
 }
 
-// --- the three lints -------------------------------------------------------
+// --- the boundary lints ---------------------------------------------------
 
-/// All three stay warnings. An error here would stop a valid project deploying over a
+/// Both stay warnings. An error here would stop a valid project deploying over a
 /// judgement call, and each of these is a judgement call.
 #[test]
-fn personal_data_and_weak_boundaries_warn_without_failing_the_check() {
-    // (a) An unsubjected personal-looking field can never be erased, which is worth
-    // saying out loud even though nothing about it is wrong.
-    let dir = write_project(&[(
-        "events/person.hk",
-        "event @person.signed_up { person_id: Uuid, email: String @max(200) }\n",
-    )]);
-    let project = LoadedProject::load(dir.path());
-    let warns = warnings(&project);
-    assert!(
-        warns
-            .iter()
-            .any(|warn| warn.contains("`email`") && warn.contains("looks like personal data")),
-        "expected the personal-data warning, got {warns:?}"
-    );
-    assert!(errors(&project).is_empty(), "must not fail the check");
-
-    // (b) A slice with no filter on a high-cardinality field guards a broad set of
+fn weak_boundaries_warn_without_failing_the_check() {
+    // (a) A slice with no filter on a high-cardinality field guards a broad set of
     // events, which defeats the append's fast reject.
     let dir = write_project(&[
         (
@@ -508,7 +492,7 @@ command SignUp(person_id: Uuid) {
     );
     assert!(errors(&project).is_empty(), "must not fail the check");
 
-    // (c) A slice pinning nearly every field of an event is usually a copied `emit`:
+    // (b) A slice pinning nearly every field of an event is usually a copied `emit`:
     // a boundary is a subset match, so it would match almost nothing.
     let dir = write_project(&[
         (
@@ -548,20 +532,6 @@ command SignUp(person_id: Uuid, email: String, plan: String, region: String) {
         "expected the over-constraint warning, got {warns:?}"
     );
     assert!(errors(&project).is_empty(), "must not fail the check");
-
-    // (d) The shipped example carries unsubjected `email` and `name` fields, so it
-    // pins the hint list itself against a silent removal.
-    let example = LoadedProject::load(&example_dir("users"));
-    let warns = warnings(&example);
-    for field in ["`email`", "`name`"] {
-        assert!(
-            warns
-                .iter()
-                .any(|warn| warn.contains(field) && warn.contains("looks like personal data")),
-            "expected the example's personal-data warning for {field}, got {warns:?}"
-        );
-    }
-    assert!(errors(&example).is_empty());
 }
 
 /// A slice narrowed by an id is what a boundary is for, so it must stay quiet.

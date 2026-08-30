@@ -6,9 +6,10 @@
 //! all parse-time errors there, and a `fold` without a `query` is not expressible at
 //! all: a `state` **is** its own slice declaration.
 //!
-//! What is left is advice rather than law. Each of these is a judgement about a design
-//! that parses perfectly well, which is why every one is a warning and why they live
-//! here rather than in the language.
+//! What is left is two kinds of thing. A declaration hekla cannot serve is an error,
+//! because only hekla knows its own tag namespace and what an erasure does to a column.
+//! The rest is advice: a judgement about a design that parses perfectly well and that
+//! hekla has no business refusing, which is why those stay warnings.
 
 use heklang::ir::{Command, Slice, Type};
 use heklang::{Defs, Program};
@@ -16,13 +17,6 @@ use heklang::{Defs, Program};
 use crate::loader::{Finding, LoadedProject, ProjectorUnit};
 use crate::schema::{EventDef, FieldKind, event_type};
 use crate::tags::RESERVED_TAG_PREFIX;
-
-/// Field names that usually mean personal data. A field whose name matches one and
-/// which carries no `@subject` can never be erased, which is worth saying out loud
-/// even though nothing about it is wrong.
-const PERSONAL_NAME_HINTS: [&str; 9] = [
-    "email", "phone", "address", "name", "dob", "ssn", "postcode", "zip", "birth",
-];
 
 /// How much of an event a clause may pin before it looks like a copied `emit`. A
 /// boundary is a subset match, and one that names nearly every field usually matches
@@ -49,7 +43,7 @@ fn check_events(events: &crate::schema::EventDefs, findings: &mut Vec<Finding>) 
     let mut sorted: Vec<(&String, &EventDef)> = events.iter().collect();
     sorted.sort_by_key(|(event_type, _)| *event_type);
     for (event_type, def) in sorted {
-        for (name, meta) in &def.fields {
+        for (name, _) in &def.fields {
             // An indexed field becomes a tag named after it, and hekla's own tags live
             // under this prefix. A field here could forge the idempotency tag an append
             // condition is guarded against, so the namespace is closed to programs.
@@ -60,22 +54,6 @@ fn check_events(events: &crate::schema::EventDefs, findings: &mut Vec<Finding>) 
                     format!(
                         "event `{event_type}` field `{name}` uses the reserved \
                          `{RESERVED_TAG_PREFIX}` prefix, which is hekla's own tag namespace"
-                    ),
-                ));
-            }
-            if meta.subject.is_some() {
-                continue;
-            }
-            let lowered = name.to_lowercase();
-            if PERSONAL_NAME_HINTS
-                .iter()
-                .any(|hint| lowered.contains(hint))
-            {
-                findings.push(Finding::warning(
-                    "events",
-                    format!(
-                        "event `{event_type}` field `{name}` looks like personal data but has no \
-                         `@subject`, so it could never be erased"
                     ),
                 ));
             }

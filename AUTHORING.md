@@ -179,9 +179,8 @@ Practical rules:
   field mints a fresh key, so values written after the erase are readable while everything before it
   stays shredded. No *read* path ever mints: re-projecting a log whose subject was erased writes the
   column NULL rather than creating the key the erasure destroyed.
-- **A field appended without a subject can never be erased.** `hekla check` warns when a
-  personal-looking name (`email`, `phone`, `address`, `name`, `dob`, `ssn`, `postcode`, `zip`,
-  `birth`) has no subject.
+- **A field appended without a subject can never be erased**, and nothing warns about it: which
+  fields are personal is a judgement about meaning, and hekla cannot make it from a name.
 - **`HEKLA_MASTER_KEY`** (32 bytes, base64) wraps every per-subject key. **Losing it is total,
   unrecoverable loss** of every subject-scoped value. `hekla rotate` rewraps under a new master,
   unwrapping with `HEKLA_MASTER_KEY_PREVIOUS`, without touching any ciphertext. Boot fails fast with
@@ -215,11 +214,12 @@ Errors:
 - an entity key the read API cannot paginate by, or an index it could never match (section 4)
 - a filterable column colliding with a reserved read query parameter
 - an event field in the reserved `_hekla_` tag namespace
+- a projector column sealed under a subject whose type cannot be absent: an erasure blanks it, so a
+  column that cannot say "absent" stalls the projector and breaks the read API's own schema
 - a project directory that cannot be walked, so a silently missing command cannot deploy
 
 Warnings, which never fail the check, because each is a judgement call:
 
-- a personal-looking field name with no `@subject`, so it could never be erased
 - a boundary with no filter on a high-cardinality field, so it defeats the append's fast reject
 - a boundary pinning most of an event's fields, which looks like a copied `emit`: a slice is a subset
   match, so over-constraining can match nothing

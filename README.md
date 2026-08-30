@@ -75,7 +75,7 @@ HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
 
 `check` reports the compiler's diagnostics plus what only hekla knows: that a declaration sits in
 the directory its kind requires, that a read model can be keyed and indexed the way the read API
-needs, and three warnings, including a personal-looking field with no `@subject`. Also `hekla erase`
+needs, and two warnings about a boundary too broad or too narrow to do its job. Also `hekla erase`
 and `hekla rotate` for key management, and `hekla verify` for the invariant sweep below.
 
 ## Checking the invariants
