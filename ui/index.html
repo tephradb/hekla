@@ -9,6 +9,21 @@
          so `./app.js` would resolve differently at /admin/events than at
          /admin/effects/send-welcome. -->
     <link rel="icon" href="/admin/assets/favicon.svg" />
+    <!-- Inline, and the only script here that is not a module, because a module is
+         deferred by definition: app.js runs after the document is parsed and painted,
+         by which point an explicit theme that disagrees with the system one has
+         already flashed the wrong palette across the whole page. Setting the attribute
+         before the stylesheet loads is what makes the first paint the right one.
+         `hekla.theme` is theme.js's KEY, which is where the rest of this lives. -->
+    <script>
+      try {
+        const theme = localStorage.getItem('hekla.theme')
+        if (theme === 'dark' || theme === 'light') document.documentElement.dataset.theme = theme
+      } catch {
+        /* A private window or blocked storage throws rather than returning null.
+           Following the system is the right fallback and needs no attribute. */
+      }
+    </script>
     <link rel="stylesheet" href="/admin/assets/style.css" />
     <script type="module" src="/admin/assets/app.js"></script>
   </head>

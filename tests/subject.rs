@@ -1,7 +1,31 @@
 //! Subject-scoped encryption end to end: a command emits an event with a
 //! subject-encrypted field, so the field is stored as ciphertext (in the tag index,
-//! the payload, and the read model), the opaque handle keeps plaintext out of a
-//! projector, and the command response never reports the encrypted value.
+//! the payload, and the read model), sealing keeps plaintext out of a projector, and
+//! the command response never reports the encrypted value.
+//!
+//! Seven of the Starlark suite's cases are gone rather than ported, in three groups.
+//!
+//! **`unique` is deleted**, so `unique_enforces_global_uniqueness_across_subjects` and
+//! the plaintext control beside it have nothing left to test that the ordinary
+//! boundary below does not. The feature existed to make one email match across every
+//! account through a never-erased global key, and it required an equality on sealed
+//! content, which heklang rejects (rule 12) because comparing two ciphertexts leaks
+//! whether they hold the same value. What survives is
+//! [`erasing_a_subject_does_not_reopen_its_handle`], the property the replacement was
+//! chosen to keep.
+//!
+//! **A misfiled seal is unrepresentable.** `a_handle_into_a_plaintext_column_is_rejected`
+//! and `a_handle_filed_under_the_wrong_subject_id_is_rejected` each stored a subject's
+//! ciphertext into a column that claimed a different subject, field or scope, and
+//! asserted the projector failed. `docs/projectors.md` rule 9 makes a column's subject
+//! *propagation rather than declaration*: it is computed from the value written into
+//! it, so a column and its content cannot disagree.
+//!
+//! **A boundary cannot filter on sealed content.** The three scoped-subject-query cases
+//! turned on encrypting a filter value under the subject's key and matching it against
+//! the tag the emit stored. Rule 12 rejects the equality that would express it, so the
+//! encrypt-a-filter path has no caller and neither do the two erased-subject cases that
+//! guarded its edges.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,21 +36,18 @@ use hekla::effect::StubHttpClient;
 use hekla::opdb::OpDb;
 use hekla::read_api;
 use hekla::read_model::ReadModel;
-use hekla::runtime::{ExecResult, Runtime};
 use serde_json::{Value, json};
 
 mod support;
 
 use support::{
-    ALICE, BOB, Boot, Harness, MASTER_KEY, ORDER_EVENTS, ORDERS_PROJECTOR, PLACE_ORDER,
-    UUID_A as ORDER, UUID_B, UUID_C, accounts_project, ctx, orders_project, orders_project_with,
-    orders_with_notify_effect, place_order, read_row, wait_position, wait_until, write_project,
+    ALICE, BOB, Boot, Harness, MASTER_KEY, ORDERS_PROJECTOR, accounts_project, assert_error, ctx,
+    orders_project, orders_project_with, orders_with_notify_effect, place_order, read_row,
+    wait_position, wait_until, write_project,
 };
 
-/// The extra event the read-modify-write projector also sources.
-const TOUCHED_EVENT: &str = r#"
-touched = event(type = "order.touched", fields = {"order_id": uuid()})
-"#;
+use support::UUID_A as ORDER;
+use support::UUID_B;
 
 /// The common shape: a subject-using project, the fixed master key, and an HTTP
 /// stub that answers 200.
@@ -85,33 +106,39 @@ fn the_command_response_omits_the_subject_field_tag() {
     harness.shutdown();
 }
 
+/// Rule 12's list of what may be done to sealed content: move it, ask whether it is
+/// there, or `reveal` it. Everything else is a compile error, and a projector may not
+/// `reveal` at all, so a projector that tries to derive a plaintext from a sealed
+/// column never boots.
+///
+/// The Starlark version drove this to a *runtime* failure and waited for the projector
+/// to report `failed`, because an opaque handle could only refuse an operation when the
+/// operation ran. A sealed value is typed, so the refusal is static.
 #[test]
-fn a_projector_cannot_turn_a_handle_back_into_plaintext() {
-    // The handle is opaque: string-concatenating it (an attempt to derive a
-    // plaintext value) is not a supported operation, so the projector's handle()
-    // errors and the projector reports failed rather than storing a derivative.
-    let dir = orders_project_with(&[(
-        "projectors/leaky.star",
-        r#"
-load("events/order.star", "order_placed")
+fn a_projector_cannot_derive_a_plaintext_from_a_sealed_column() {
+    assert_error(
+        &[
+            ("events/order.hk", support::ORDER_EVENTS),
+            ("commands/place-order.hk", support::PLACE_ORDER),
+            (
+                "projectors/leaky.hk",
+                r#"
+projector Leaky {
+  entity Leak {
+    order_id: Uuid @key,
+    domain: String @max(100),
+  }
 
-leaky = entity(key = "order_id", fields = {"order_id": uuid(), "domain": str()})
-
-def on_event(event):
-    # Deriving plaintext from the handle: not allowed, so this errors.
-    return [put(leaky, {"order_id": event.data.order_id, "domain": event.data.email + "!"})]
-
-handle = {order_placed(): on_event}
+  on @order.placed { order_id, email } {
+    // Deriving a plaintext from sealed content: interpolation reads it.
+    put Leak { order_id, domain: "{email}!" }
+  }
+}
 "#,
-    )]);
-    let harness = boot(dir.path());
-    place_order(&harness.rt, ORDER, 42, "alice@example.com");
-
-    wait_until("the projector to fail rather than derive plaintext", || {
-        harness.rt.projector("leaky").unwrap().failed()
-    });
-
-    harness.shutdown();
+            ),
+        ],
+        "cannot be interpolated into a string",
+    );
 }
 
 #[test]
@@ -120,15 +147,13 @@ fn the_projector_stores_ciphertext_for_the_subject_column() {
     let harness = boot(dir.path());
     place_order(&harness.rt, ORDER, 42, "alice@example.com");
 
-    wait_until("the orders projector to apply the event", || {
-        harness.rt.projector("orders").unwrap().position() >= 1
-    });
+    wait_position(&harness.rt, "Orders", 1);
 
     // Read the read model directly, bypassing the read API's decrypt: the stored
     // email column is ciphertext, never the plaintext.
-    let shared = harness.rt.projector("orders").unwrap();
+    let shared = harness.rt.projector("Orders").unwrap();
     let model = ReadModel::open_readonly(&shared.db_path).unwrap();
-    let entity = shared.entities.iter().find(|e| e.name == "orders").unwrap();
+    let entity = shared.entities.iter().find(|e| e.name == "Order").unwrap();
     let row = model.get(entity, ORDER).unwrap().unwrap();
     let stored = row["email"].as_str().unwrap();
     assert_ne!(
@@ -147,7 +172,7 @@ fn the_read_api_decrypts_the_subject_column() {
     let harness = boot(dir.path());
     place_order(&harness.rt, ORDER, 42, "alice@example.com");
 
-    let row = read_row(&harness, "orders", "orders", ORDER, 1).expect("a row");
+    let row = read_row(&harness, "Orders", "Order", ORDER, 1).expect("a row");
     // The read API decrypts on the way out: the caller sees plaintext, not ciphertext.
     assert_eq!(row["email"], "alice@example.com");
     assert_eq!(row["customer_id"].as_i64(), Some(42));
@@ -162,7 +187,7 @@ fn erasing_a_subject_shreds_the_read_model_and_the_log() {
     place_order(&harness.rt, ORDER, 42, "alice@example.com");
 
     // Before erasure the read API returns the plaintext.
-    let row = read_row(&harness, "orders", "orders", ORDER, 1).expect("a row");
+    let row = read_row(&harness, "Orders", "Order", ORDER, 1).expect("a row");
     assert_eq!(row["email"], "alice@example.com");
 
     // Erase customer 42: one key delete.
@@ -176,7 +201,7 @@ fn erasing_a_subject_shreds_the_read_model_and_the_log() {
 
     // The read model now reads the email as absent (its ciphertext is undecryptable);
     // the order itself and the plaintext customer id remain.
-    let row = read_row(&harness, "orders", "orders", ORDER, 1).expect("the order row still exists");
+    let row = read_row(&harness, "Orders", "Order", ORDER, 1).expect("the order row still exists");
     assert!(
         row.get("email").is_none(),
         "erased email must be absent: {row}"
@@ -187,75 +212,82 @@ fn erasing_a_subject_shreds_the_read_model_and_the_log() {
     harness.shutdown();
 }
 
+/// Rule 12 splits what the Starlark version treated as one prohibition. Moving sealed
+/// content into a field sealed under the *same* subject is legal, because moving is not
+/// reading; folding it under one subject and emitting it under another is not, because
+/// then one value would need two keys.
+///
+/// The Starlark version asserted only the refusal, and refused both: a handle was
+/// opaque to the constructor whatever it was being written into, so a command could not
+/// carry a customer's own address forward at all.
 #[test]
-fn a_handle_into_a_plaintext_column_is_rejected() {
-    // Storing a subject handle into a non-subject column would file unreadable
-    // ciphertext the read API never decrypts; the projector must fail instead.
-    let dir = orders_project_with(&[(
-        "projectors/leak.star",
-        r#"
-load("events/order.star", "order_placed")
+fn a_folded_subject_value_may_be_re_emitted_under_its_own_subject_and_no_other() {
+    let dir = orders_project_with(&[
+        ("projectors/orders.hk", ORDERS_PROJECTOR),
+        (
+            "commands/copy-order.hk",
+            r#"
+command CopyOrder(order_id: Uuid, customer_id: Int) {
+  // Folds this customer's own address. The variable is sealed under `customer_id`,
+  // and the emit below writes it into a field sealed under the same subject, so it
+  // moves without ever being read.
+  state email: String? = fold none
+    on @order.placed(customer_id) { email } => email
 
-leak = entity(key = "order_id", fields = {"order_id": uuid(), "note": str()})
-
-def on_event(event):
-    # `note` is a plaintext column; storing the encrypted handle there is rejected.
-    return [put(leak, {"order_id": event.data.order_id, "note": event.data.email})]
-
-handle = {order_placed(): on_event}
-"#,
-    )]);
-    let harness = boot(dir.path());
-    place_order(&harness.rt, ORDER, 42, "alice@example.com");
-
-    wait_until(
-        "storing a handle in a plaintext column to fail the projector",
-        || harness.rt.projector("leak").unwrap().failed(),
-    );
-
-    harness.shutdown();
+  emit @order.placed { order_id, customer_id, email }
 }
-
-#[test]
-fn re_emitting_a_folded_subject_value_is_rejected() {
-    // A fold sees a subject field as a handle; carrying it into an emit would
-    // double-encrypt. The constructor rejects a handle argument.
-    let dir = orders_project_with(&[(
-        "commands/copy-order.star",
-        r#"
-load("events/order.star", "order_placed")
-
-input = schema(order_id = uuid(), customer_id = uint())
-
-# Fold this customer's orders, capturing the (encrypted) email handle into state,
-# then try to re-emit it: the constructor must reject the handle.
-def query(input):
-    return order_placed(customer_id = input.customer_id)
-
-initial = {"email": None}
-
-def fold_event(state, event):
-    return dict(state, email = event.data.email)
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    return order_placed(
-        order_id = input.order_id,
-        customer_id = input.customer_id,
-        email = state["email"],
-    )
 "#,
-    )]);
+        ),
+    ]);
     let harness = boot(dir.path());
     place_order(&harness.rt, ORDER, 42, "alice@example.com");
-    let body = json!({ "order_id": UUID_B, "customer_id": 42 });
-    let failed = harness
+
+    let copied = harness
         .rt
-        .execute("copy-order", body, &ctx(), None)
-        .is_err();
-    assert!(failed, "re-emitting a folded subject handle must fail");
+        .execute(
+            "CopyOrder",
+            json!({ "order_id": UUID_B, "customer_id": 42 }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(copied.status, 200, "{:?}", copied.body);
+
+    // It really moved: the copy decrypts to the same address, under the same key.
+    let row = read_row(&harness, "Orders", "Order", UUID_B, 2).expect("the copied row");
+    assert_eq!(row["email"], "alice@example.com");
     harness.shutdown();
+
+    // The other half: a second subject on the same event, and a fold that tries to
+    // carry the customer's address into the shop's field.
+    assert_error(
+        &[
+            (
+                "events/order.hk",
+                r#"
+event @order.placed {
+  order_id: Uuid,
+  customer_id: Int,
+  shop_id: Int,
+  email: String? @subject(customer_id) @max(100),
+  contact: String? @subject(shop_id) @max(100),
+}
+"#,
+            ),
+            (
+                "commands/copy-order.hk",
+                r#"
+command CopyOrder(order_id: Uuid, customer_id: Int, shop_id: Int) {
+  state email: String? = fold none
+    on @order.placed(customer_id) { email } => email
+
+  emit @order.placed { order_id, customer_id, shop_id, email: none, contact: email }
+}
+"#,
+            ),
+        ],
+        "subject",
+    );
 }
 
 #[test]
@@ -278,7 +310,7 @@ fn a_read_does_not_resurrect_an_erased_subject_key() {
             .is_none()
     );
     // A read of the row (the read/query path) must not recreate the key.
-    let _ = read_row(&harness, "orders", "orders", ORDER, 1);
+    let _ = read_row(&harness, "Orders", "Order", ORDER, 1);
     assert!(
         ks.encrypt_subject_existing("customer_id", "42", "email", "x")
             .unwrap()
@@ -298,12 +330,12 @@ fn fresh_and_recovered_responses_match_for_a_subject_event() {
 
     let fresh = harness
         .rt
-        .execute("place-order", body.clone(), &ctx(), Some("idem-1"))
+        .execute("PlaceOrder", body.clone(), &ctx(), Some("idem-1"))
         .unwrap();
     assert_eq!(fresh.status, 200);
     let recovered = harness
         .rt
-        .execute("place-order", body, &ctx(), Some("idem-1"))
+        .execute("PlaceOrder", body, &ctx(), Some("idem-1"))
         .unwrap();
     assert_eq!(recovered.status, 200);
     assert_eq!(
@@ -326,7 +358,7 @@ fn an_effect_reveals_the_plaintext_to_act_on_it() {
     wait_until("the effect to post", || !stub.calls().is_empty());
     let call = stub.calls().into_iter().next().expect("a posted call");
     let body: Value = serde_json::from_slice(&call.body.expect("a body")).unwrap();
-    // reveal() gave the effect the real plaintext to send.
+    // `reveal` gave the effect the real plaintext to send.
     assert_eq!(body["to"], "alice@example.com");
 
     harness.shutdown();
@@ -335,23 +367,23 @@ fn an_effect_reveals_the_plaintext_to_act_on_it() {
 #[test]
 fn a_reveal_on_an_erased_subject_skips_terminally_without_wedging() {
     let dir = orders_with_notify_effect();
-    // A persistent 5xx wedges the effect on http.post, which runs after reveal() has
+    // A persistent 5xx wedges the effect on http.post, which runs after `reveal` has
     // already succeeded. That gives a window to erase the customer; each retry re-runs
-    // handle from the top, so once the key is gone reveal() fails terminally.
+    // the arm from the top, so once the key is gone `reveal` fails terminally.
     let harness = Boot::new(dir.path())
         .http_status(500)
         .with_master_key()
         .start();
 
     place_order(&harness.rt, ORDER, 42, "alice@example.com");
-    let effect = harness.rt.effect("notify").unwrap().clone();
+    let effect = harness.rt.effect("Notify").unwrap().clone();
 
-    // The 5xx wedges the effect: reveal() succeeded this attempt, http.post did not.
+    // The 5xx wedges the effect: `reveal` succeeded this attempt, http.post did not.
     wait_until("the effect to wedge on the 5xx", || {
         effect.consecutive_failures() > 0
     });
 
-    // Erase the customer. The next retry's reveal() can no longer decrypt.
+    // Erase the customer. The next retry's `reveal` can no longer decrypt.
     harness
         .rt
         .keystore()
@@ -390,68 +422,23 @@ fn a_reveal_on_an_erased_subject_skips_terminally_without_wedging() {
 }
 
 #[test]
-fn concurrent_plaintext_uniqueness_admits_only_one() {
-    // Control: a plaintext-tag uniqueness boundary under the same concurrent load, to
-    // confirm the DCB boundary itself catches concurrent first-writers.
-    let dir = write_project(&[
-        (
-            "events/thing.star",
-            r#"registered = event(type = "thing.registered", fields = {"id": uuid(), "email": str(max_length = 100)})
-"#,
-        ),
-        (
-            "commands/register.star",
-            r#"
-load("events/thing.star", "registered")
-
-input = schema(id = uuid(), email = str())
-
-def query(input):
-    return registered(email = input.email)
-
-initial = {"taken": False}
-
-def fold_event(state, event):
-    return dict(state, taken = True)
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    if state["taken"]:
-        return reject("email_taken", "taken")
-    return registered(id = input.id, email = input.email)
-"#,
-        ),
-    ]);
-    let harness = Boot::new(dir.path()).http_status(200).start();
-    let place = |id: &'static str| {
-        let rt = harness.rt.clone();
-        thread::spawn(move || {
-            let body = json!({ "id": id, "email": "race@example.com" });
-            rt.execute("register", body, &ctx(), None).unwrap().status
-        })
-    };
-    let a = place(ORDER);
-    let b = place(UUID_B);
-    let mut statuses = [a.join().unwrap(), b.join().unwrap()];
-    statuses.sort_unstable();
-    assert_eq!(statuses, [200, 422], "plaintext control; got {statuses:?}");
-    harness.shutdown();
-}
-
-#[test]
-fn concurrent_first_use_of_a_unique_value_admits_only_one() {
-    // Two concurrent first-ever writes of the same unique email (distinct accounts).
-    // The global-key boundary tag is deterministic even on first use, so the writer
-    // that appends second conflicts and is rejected rather than both committing.
+fn concurrent_first_use_of_a_boundaried_value_admits_only_one() {
+    // Two concurrent first-ever writes of the same handle, on distinct accounts. The
+    // slice is in both commands' append conditions, so the writer that appends second
+    // conflicts, re-folds against the winner's event and rejects rather than both
+    // committing.
     let dir = accounts_project();
     let harness = boot(dir.path());
 
     let register = |account_id: &'static str| {
         let rt = harness.rt.clone();
         thread::spawn(move || {
-            let body = json!({ "account_id": account_id, "email": "race@example.com" });
-            rt.execute("register-account", body, &ctx(), None)
+            let body = json!({
+                "account_id": account_id,
+                "handle": "race",
+                "email": "race@example.com",
+            });
+            rt.execute("RegisterAccount", body, &ctx(), None)
                 .unwrap()
                 .status
         })
@@ -469,64 +456,54 @@ fn concurrent_first_use_of_a_unique_value_admits_only_one() {
     harness.shutdown();
 }
 
+/// A `patch` reads the row it writes, sealed column included, so a projector can carry
+/// a credential it may never `reveal` across an update. That is rule 9's propagation
+/// seen from the store: the column is sealed because sealed content was written into
+/// it, and it stays sealed when it is written back.
 #[test]
 fn a_projector_can_read_modify_write_a_subject_column() {
-    // get() returns subject columns as handles, so a read-modify-write projector can
-    // re-store its own row without the encrypted column being rejected.
-    let events = format!("{ORDER_EVENTS}{TOUCHED_EVENT}");
     let dir = write_project(&[
-        ("events/order.star", events.as_str()),
-        ("commands/place-order.star", PLACE_ORDER),
         (
-            "commands/touch-order.star",
+            "events/order.hk",
             r#"
-load("events/order.star", "touched")
+event @order.placed {
+  order_id: Uuid,
+  customer_id: Int,
+  email: String? @subject(customer_id) @max(100),
+}
 
-input = schema(order_id = uuid())
-
-def handle(input, state):
-    return touched(order_id = input.order_id)
+event @order.touched { order_id: Uuid }
+"#,
+        ),
+        ("commands/place-order.hk", support::PLACE_ORDER),
+        (
+            "commands/touch-order.hk",
+            r#"
+command TouchOrder(order_id: Uuid) {
+  emit @order.touched { order_id }
+}
 "#,
         ),
         (
-            "projectors/orders.star",
+            "projectors/orders.hk",
             r#"
-load("events/order.star", "order_placed", "touched")
+projector Orders {
+  entity Order {
+    order_id: Uuid @key,
+    customer_id: Int @index,
+    email: String? @max(100),
+    touches: Int,
+  }
 
-orders = entity(
-    key = "order_id",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        "email": str(subject = "customer_id", max_length = 100),
-        "touches": int(),
-    },
-)
+  on @order.placed { order_id, customer_id, email } {
+    put Order { order_id, customer_id, email, touches: 0 }
+  }
 
-def on_placed(event):
-    return [put(orders, {
-        "order_id": event.data.order_id,
-        "customer_id": event.data.customer_id,
-        "email": event.data.email,
-        "touches": 0,
-    })]
-
-# Read-modify-write: re-store the whole row (carrying the encrypted email handle)
-# with an incremented counter.
-def on_touched(event):
-    row = get(orders, event.data.order_id)
-    if row == None:
-        return []
-    return [put(orders, {
-        "order_id": row["order_id"],
-        "customer_id": row["customer_id"],
-        "email": row["email"],
-        "touches": row["touches"] + 1,
-    })]
-
-handle = {
-    order_placed(): on_placed,
-    touched(): on_touched,
+  // Read-modify-write: the stored counter is loaded before the value expression
+  // runs, and the sealed column rides through untouched.
+  on @order.touched { order_id } {
+    update Order[order_id] { touches: .touches + 1 }
+  }
 }
 "#,
         ),
@@ -535,17 +512,15 @@ handle = {
     place_order(&harness.rt, ORDER, 42, "alice@example.com");
     harness
         .rt
-        .execute("touch-order", json!({ "order_id": ORDER }), &ctx(), None)
+        .execute("TouchOrder", json!({ "order_id": ORDER }), &ctx(), None)
         .unwrap();
 
-    wait_until("both events to project", || {
-        harness.rt.projector("orders").unwrap().position() >= 2
-    });
+    wait_position(&harness.rt, "Orders", 2);
     assert!(
-        !harness.rt.projector("orders").unwrap().failed(),
+        !harness.rt.projector("Orders").unwrap().failed(),
         "the read-modify-write projector must not fail"
     );
-    let row = read_row(&harness, "orders", "orders", ORDER, 2).expect("a row");
+    let row = read_row(&harness, "Orders", "Order", ORDER, 2).expect("a row");
     // The re-stored encrypted column still decrypts, and the counter advanced.
     assert_eq!(row["email"], "alice@example.com");
     assert_eq!(row["touches"].as_i64(), Some(1));
@@ -563,9 +538,7 @@ fn a_stale_row_after_erase_and_reuse_reads_as_absent_not_error() {
     let first = "aaaaaaaa-0000-0000-0000-000000000001";
     let second = "aaaaaaaa-0000-0000-0000-000000000002";
     place_order(&harness.rt, first, 42, "old@example.com");
-    wait_until("the first order to project", || {
-        harness.rt.projector("orders").unwrap().position() >= 1
-    });
+    wait_position(&harness.rt, "Orders", 1);
     harness
         .rt
         .keystore()
@@ -576,41 +549,66 @@ fn a_stale_row_after_erase_and_reuse_reads_as_absent_not_error() {
     place_order(&harness.rt, second, 42, "new@example.com");
 
     // The first order's email is unreadable (its key is gone); the second's is fine.
-    let old = read_row(&harness, "orders", "orders", first, 2).expect("first row");
+    let old = read_row(&harness, "Orders", "Order", first, 2).expect("first row");
     assert!(
         old.get("email").is_none(),
         "stale email must read as absent: {old}"
     );
-    let new = read_row(&harness, "orders", "orders", second, 2).expect("second row");
+    let new = read_row(&harness, "Orders", "Order", second, 2).expect("second row");
     assert_eq!(new["email"], "new@example.com");
 
     harness.shutdown();
 }
 
+/// What the `unique` replacement was chosen to preserve. The handle is plaintext, so
+/// the slice that enforces it is untouched by a shred: erasing an account takes its
+/// address and leaves the name it registered under claimed.
+///
+/// Under `unique` this worked through a never-erased global key, and the argument for
+/// it was exactly this case. The plaintext boundary reaches the same place with no key
+/// at all, which is why the feature was not replaced with another one.
 #[test]
-fn unique_enforces_global_uniqueness_across_subjects() {
+fn erasing_a_subject_does_not_reopen_its_handle() {
     let dir = accounts_project();
     let harness = boot(dir.path());
-
-    let register = |account_id: &str, email: &str| {
-        let body = json!({ "account_id": account_id, "email": email });
+    let register = |account_id: &str, handle: &str, email: &str| {
+        let body = json!({ "account_id": account_id, "handle": handle, "email": email });
         harness
             .rt
-            .execute("register-account", body, &ctx(), None)
+            .execute("RegisterAccount", body, &ctx(), None)
             .unwrap()
     };
 
-    // First account with the email succeeds.
-    let first = register(ALICE, "shared@example.com");
+    let first = register(ALICE, "shared", "alice@example.com");
     assert_eq!(first.status, 200, "first registration: {:?}", first.body);
-    // A second, different account with the same email is rejected: the query's
-    // global-key tag matched the first account's, across their distinct subject keys.
-    let second = register(BOB, "shared@example.com");
-    assert_eq!(second.status, 422, "second registration should be rejected");
-    assert_eq!(second.body["error"]["code"], "email_taken");
-    // A different email on the second account is fine.
-    let other = register(BOB, "other@example.com");
-    assert_eq!(other.status, 200, "distinct email: {:?}", other.body);
+    // A different account taking the same handle is refused while the first is live.
+    let second = register(BOB, "shared", "bob@example.com");
+    assert_eq!(second.status, 422, "{:?}", second.body);
+    assert_eq!(second.body["error"]["code"], "handle_taken");
+    // A different handle on the same account is fine, so the rule is the handle and
+    // not the account.
+    let other = register(BOB, "other", "bob@example.com");
+    assert_eq!(other.status, 200, "distinct handle: {:?}", other.body);
+
+    let ks = harness.rt.keystore().unwrap();
+    assert!(
+        ks.erase("account_id", ALICE).unwrap(),
+        "the subject key must exist to be erased"
+    );
+    assert!(
+        ks.encrypt_subject_existing("account_id", ALICE, "email", "alice@example.com")
+            .unwrap()
+            .is_none(),
+        "control: the erased account's scoped key is really gone"
+    );
+
+    let reuse = register(BOB, "shared", "bob@example.com");
+    assert_eq!(
+        reuse.status, 422,
+        "erasing a subject must not re-open the handle it claimed: {:?}",
+        reuse.body
+    );
+    assert_eq!(reuse.body["error"]["code"], "handle_taken");
 
     harness.shutdown();
 }
@@ -661,7 +659,7 @@ fn a_scan_decrypts_each_row_under_its_own_subject_key() {
     place_order(&harness.rt, ORDER_2, 43, "bob@example.com");
     place_order(&harness.rt, ORDER_3, 42, "alice+two@example.com");
 
-    let rows = scan_rows(&harness, "orders", "orders", 3);
+    let rows = scan_rows(&harness, "Orders", "Order", 3);
     assert_eq!(rows.len(), 3, "the page holds every order: {rows:?}");
     assert_eq!(row_for(&rows, ORDER_1)["email"], "alice@example.com");
     assert_eq!(row_for(&rows, ORDER_2)["email"], "bob@example.com");
@@ -676,7 +674,7 @@ fn a_scan_decrypts_each_row_under_its_own_subject_key() {
         .unwrap()
         .erase("customer_id", "42")
         .unwrap();
-    let rows = scan_rows(&harness, "orders", "orders", 3);
+    let rows = scan_rows(&harness, "Orders", "Order", 3);
     assert_eq!(rows.len(), 3, "an erasure removes columns, never rows");
     for key in [ORDER_1, ORDER_3] {
         let row = row_for(&rows, key);
@@ -697,72 +695,53 @@ fn a_scan_decrypts_each_row_under_its_own_subject_key() {
 
 /// An event whose subject-encrypted fields are not all text: the read API has to
 /// re-type each decrypted string back to its declared kind.
+///
+/// Each is optional, which is forced rather than incidental: an erased subject's
+/// column reads back *absent*, and a type that cannot be absent could not say so.
 const TYPED_EVENTS: &str = r#"
-order_placed = event(
-    type = "order.placed",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        "email": str(subject = "customer_id", max_length = 100),
-        "order_total": money(subject = "customer_id"),
-        "loyalty_points": int(subject = "customer_id"),
-    },
-)
+event @order.placed {
+  order_id: Uuid,
+  customer_id: Int,
+  email: String? @subject(customer_id) @max(100),
+  order_total: Money(2)? @subject(customer_id),
+  loyalty_points: Int? @subject(customer_id),
+}
 "#;
 
 const TYPED_PLACE_ORDER: &str = r#"
-load("events/order.star", "order_placed")
-
-input = schema(
-    order_id = uuid(),
-    customer_id = uint(),
-    email = str(),
-    order_total = money(),
-    loyalty_points = int(),
-)
-
-def handle(input, state):
-    return order_placed(
-        order_id = input.order_id,
-        customer_id = input.customer_id,
-        email = input.email,
-        order_total = input.order_total,
-        loyalty_points = input.loyalty_points,
-    )
+command PlaceOrder(
+  order_id: Uuid,
+  customer_id: Int,
+  email: String?,
+  order_total: Money(2)?,
+  loyalty_points: Int?,
+) {
+  emit @order.placed { order_id, customer_id, email, order_total, loyalty_points }
+}
 "#;
 
 const TYPED_PROJECTOR: &str = r#"
-load("events/order.star", "order_placed")
+projector Orders {
+  entity Order {
+    order_id: Uuid @key,
+    customer_id: Int @index,
+    email: String? @max(100),
+    order_total: Money(2)?,
+    loyalty_points: Int?,
+  }
 
-orders = entity(
-    key = "order_id",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        "email": str(subject = "customer_id", max_length = 100),
-        "order_total": money(subject = "customer_id"),
-        "loyalty_points": int(subject = "customer_id"),
-    },
-)
-
-def on_event(event):
-    return [put(orders, {
-        "order_id": event.data.order_id,
-        "customer_id": event.data.customer_id,
-        "email": event.data.email,
-        "order_total": event.data.order_total,
-        "loyalty_points": event.data.loyalty_points,
-    })]
-
-handle = {order_placed(): on_event}
+  on @order.placed { order_id, customer_id, email, order_total, loyalty_points } {
+    put Order { order_id, customer_id, email, order_total, loyalty_points }
+  }
+}
 "#;
 
 #[test]
 fn a_scanned_page_decrypts_typed_subject_columns_and_skips_erased_rows() {
     let dir = write_project(&[
-        ("events/order.star", TYPED_EVENTS),
-        ("commands/place-order.star", TYPED_PLACE_ORDER),
-        ("projectors/orders.star", TYPED_PROJECTOR),
+        ("events/order.hk", TYPED_EVENTS),
+        ("commands/place-order.hk", TYPED_PLACE_ORDER),
+        ("projectors/orders.hk", TYPED_PROJECTOR),
     ]);
     let harness = boot(dir.path());
     let place = |order_id: &str, customer_id: u64, total: &str, points: i64| {
@@ -775,15 +754,15 @@ fn a_scanned_page_decrypts_typed_subject_columns_and_skips_erased_rows() {
         });
         let result = harness
             .rt
-            .execute("place-order", body, &ctx(), None)
+            .execute("PlaceOrder", body, &ctx(), None)
             .unwrap();
-        assert_eq!(result.status, 200, "place-order failed: {:?}", result.body);
+        assert_eq!(result.status, 200, "PlaceOrder failed: {:?}", result.body);
     };
     place(ORDER_1, 42, "19.99", 250);
     place(ORDER_2, 99, "7.50", -3);
     place(ORDER_3, 42, "100.00", 0);
 
-    let rows = scan_rows(&harness, "orders", "orders", 3);
+    let rows = scan_rows(&harness, "Orders", "Order", 3);
     let survivor = row_for(&rows, ORDER_2);
     // Money stays a decimal string (its wire form); an integer comes back a number.
     assert_eq!(survivor["order_total"], Value::String("7.50".to_owned()));
@@ -800,7 +779,7 @@ fn a_scanned_page_decrypts_typed_subject_columns_and_skips_erased_rows() {
         .unwrap()
         .erase("customer_id", "42")
         .unwrap();
-    let rows = scan_rows(&harness, "orders", "orders", 3);
+    let rows = scan_rows(&harness, "Orders", "Order", 3);
     assert_eq!(rows.len(), 3, "an erased subject drops columns, not rows");
     for key in [ORDER_1, ORDER_3] {
         let row = row_for(&rows, key);
@@ -815,204 +794,6 @@ fn a_scanned_page_decrypts_typed_subject_columns_and_skips_erased_rows() {
     let survivor = row_for(&rows, ORDER_2);
     assert_eq!(survivor["order_total"], Value::String("7.50".to_owned()));
     assert_eq!(survivor["loyalty_points"].as_i64(), Some(-3));
-
-    harness.shutdown();
-}
-
-// --- scoped subject queries -----------------------------------------------
-
-/// A boundary that constrains the subject id *and* the subject-encrypted field, so
-/// the filter value is encrypted under that customer's existing key and has to match
-/// the ciphertext tag the emit path stored.
-const REORDER_COMMAND: &str = r#"
-load("events/order.star", "order_placed")
-
-input = schema(order_id = uuid(), customer_id = uint(), email = str())
-
-def query(input):
-    return order_placed(customer_id = input.customer_id, email = input.email)
-
-initial = {"seen": False}
-
-def fold_event(state, event):
-    return dict(state, seen = True)
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    if state["seen"]:
-        return reject("already_ordered", "that customer already ordered under that email")
-    return order_placed(
-        order_id = input.order_id,
-        customer_id = input.customer_id,
-        email = input.email,
-    )
-"#;
-
-fn reorder(rt: &Runtime, order_id: &str, customer_id: u64, email: &str) -> ExecResult {
-    let body = json!({ "order_id": order_id, "customer_id": customer_id, "email": email });
-    rt.execute("reorder", body, &ctx(), None).unwrap()
-}
-
-#[test]
-fn a_scoped_subject_query_matches_only_its_own_subject() {
-    let dir = orders_project_with(&[("commands/reorder.star", REORDER_COMMAND)]);
-    let harness = boot(dir.path());
-    place_order(&harness.rt, ORDER_1, 42, "alice@example.com");
-    // Give customer 99 a key of its own, so the cross-subject case below is a
-    // key-that-exists-but-differs case, not a missing-key one.
-    place_order(&harness.rt, ORDER_2, 99, "carol@example.com");
-
-    // Same subject, same value: the encrypted filter matches the stored tag.
-    let same = reorder(&harness.rt, ORDER_3, 42, "alice@example.com");
-    assert_eq!(same.status, 422, "the boundary must match: {:?}", same.body);
-    assert_eq!(same.body["error"]["code"], "already_ordered");
-
-    // Same value, a different subject: encrypted under 99's key, so a different
-    // ciphertext, so no match.
-    let cross = reorder(&harness.rt, ORDER_3, 99, "alice@example.com");
-    assert_eq!(
-        cross.status, 200,
-        "one subject's tag must not match another's: {:?}",
-        cross.body
-    );
-    // Same subject, a different value: also no match.
-    let other_value = reorder(&harness.rt, UUID_B, 42, "carol@example.com");
-    assert_eq!(
-        other_value.status, 200,
-        "a different plaintext must not match: {:?}",
-        other_value.body
-    );
-    // The event the cross-subject reorder appended is now itself matchable, which
-    // proves the emit and the query lower the same subject to the same tag.
-    let repeat = reorder(&harness.rt, UUID_C, 99, "alice@example.com");
-    assert_eq!(repeat.status, 422, "the appended tag must be matchable");
-    assert_eq!(repeat.body["error"]["code"], "already_ordered");
-
-    harness.shutdown();
-}
-
-#[test]
-fn a_query_over_an_erased_subject_matches_nothing_and_still_appends() {
-    // With the subject key gone the clause cannot be lowered, so it is made
-    // deliberately unmatchable. Dropping it instead would widen the boundary to every
-    // `order.placed` (another subject's events folding into this command's state);
-    // erroring instead would 500 every command touching an erased customer.
-    let dir = orders_project_with(&[("commands/reorder.star", REORDER_COMMAND)]);
-    let harness = boot(dir.path());
-    place_order(&harness.rt, ORDER_1, 42, "alice@example.com");
-    // A second customer's event stays in the log: if the erased clause degraded to
-    // "every order.placed", the fold would see this one too.
-    place_order(&harness.rt, ORDER_2, 99, "carol@example.com");
-
-    let blocked = reorder(&harness.rt, ORDER_3, 42, "alice@example.com");
-    assert_eq!(blocked.status, 422, "control: the guard fires while keyed");
-
-    harness
-        .rt
-        .keystore()
-        .unwrap()
-        .erase("customer_id", "42")
-        .unwrap();
-
-    let after = reorder(&harness.rt, ORDER_3, 42, "alice@example.com");
-    assert_eq!(
-        after.status, 200,
-        "an erased subject's clause must match nothing, not error or widen: {:?}",
-        after.body
-    );
-
-    harness.shutdown();
-}
-
-/// A boundaried command that never emits, so nothing on the append path can mint a
-/// subject key and the query is the only suspect.
-const CHECK_ORDER_COMMAND: &str = r#"
-load("events/order.star", "order_placed")
-
-input = schema(customer_id = uint(), email = str())
-
-def query(input):
-    return order_placed(customer_id = input.customer_id, email = input.email)
-
-initial = {"found": False}
-
-def fold_event(state, event):
-    return dict(state, found = True)
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    return []
-"#;
-
-#[test]
-fn a_query_scoped_to_an_erased_subject_matches_nothing_and_mints_no_key() {
-    let dir = orders_project_with(&[("commands/check-order.star", CHECK_ORDER_COMMAND)]);
-    let harness = boot(dir.path());
-    place_order(&harness.rt, ORDER_1, 42, "alice@example.com");
-    let ks = harness.rt.keystore().unwrap();
-    ks.erase("customer_id", "42").unwrap();
-
-    let body = json!({ "customer_id": 42, "email": "alice@example.com" });
-    let result = harness
-        .rt
-        .execute("check-order", body, &ctx(), None)
-        .unwrap();
-    assert_eq!(
-        result.status, 200,
-        "a query over an erased subject must not error: {:?}",
-        result.body
-    );
-    assert!(
-        ks.encrypt_subject_existing("customer_id", "42", "email", "x")
-            .unwrap()
-            .is_none(),
-        "lowering a query must not resurrect an erased subject key"
-    );
-
-    harness.shutdown();
-}
-
-// --- uniqueness across erasure --------------------------------------------
-
-#[test]
-fn unique_still_rejects_after_the_subject_is_erased() {
-    // The `unique` tag is minted under the never-erased global key precisely so
-    // uniqueness still fires once the subject's own key is shredded. If it were
-    // subject-scoped, erasing an account would silently re-open its email for reuse.
-    let dir = accounts_project();
-    let harness = boot(dir.path());
-    let register = |account_id: &str, email: &str| {
-        let body = json!({ "account_id": account_id, "email": email });
-        harness
-            .rt
-            .execute("register-account", body, &ctx(), None)
-            .unwrap()
-    };
-
-    let first = register(ALICE, "shared@example.com");
-    assert_eq!(first.status, 200, "first registration: {:?}", first.body);
-
-    let ks = harness.rt.keystore().unwrap();
-    assert!(
-        ks.erase("account_id", ALICE).unwrap(),
-        "the subject key must exist to be erased"
-    );
-    assert!(
-        ks.encrypt_subject_existing("account_id", ALICE, "email", "shared@example.com")
-            .unwrap()
-            .is_none(),
-        "control: the erased account's scoped key is really gone"
-    );
-
-    let reuse = register(BOB, "shared@example.com");
-    assert_eq!(
-        reuse.status, 422,
-        "erasing a subject must not re-open its unique value: {:?}",
-        reuse.body
-    );
-    assert_eq!(reuse.body["error"]["code"], "email_taken");
 
     harness.shutdown();
 }
@@ -1038,7 +819,7 @@ fn rotating_the_master_survives_a_restart_and_a_wrong_master_fails_boot() {
 
     let harness = boot_at(MasterKeys::new(MASTER_KEY, vec![])).expect("the first boot");
     place_order(&harness.rt, ORDER_1, 42, "alice@example.com");
-    let row = read_row(&harness, "orders", "orders", ORDER_1, 1).expect("a row");
+    let row = read_row(&harness, "Orders", "Order", ORDER_1, 1).expect("a row");
     assert_eq!(row["email"], "alice@example.com");
     harness.shutdown();
 
@@ -1058,7 +839,7 @@ fn rotating_the_master_survives_a_restart_and_a_wrong_master_fails_boot() {
 
     // The old master is gone now: only the rewrapping keeps the data readable.
     let harness = boot_at(MasterKeys::new(NEXT_MASTER_KEY, vec![])).expect("the rotated boot");
-    let row = read_row(&harness, "orders", "orders", ORDER_1, 1).expect("a row after rotation");
+    let row = read_row(&harness, "Orders", "Order", ORDER_1, 1).expect("a row after rotation");
     assert_eq!(
         row["email"], "alice@example.com",
         "rotation rewraps the key without touching the ciphertext"
@@ -1077,201 +858,52 @@ fn rotating_the_master_survives_a_restart_and_a_wrong_master_fails_boot() {
     );
 }
 
-// --- misfiled handles -----------------------------------------------------
-
-/// `order.placed` carries two ids, so a projector can file the customer-scoped email
-/// under the wrong one.
-const TWO_ID_EVENTS: &str = r#"
-order_placed = event(
-    type = "order.placed",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        "shop_id": uint(),
-        "email": str(subject = "customer_id", max_length = 100),
-    },
-)
-"#;
-
-const TWO_ID_PLACE_ORDER: &str = r#"
-load("events/order.star", "order_placed")
-
-input = schema(order_id = uuid(), customer_id = uint(), shop_id = uint(), email = str())
-
-def handle(input, state):
-    return order_placed(
-        order_id = input.order_id,
-        customer_id = input.customer_id,
-        shop_id = input.shop_id,
-        email = input.email,
-    )
-"#;
-
-/// The row's `customer_id` is the shop's id, so the handle's subject value disagrees
-/// with the row it would be filed under.
-const WRONG_ID_PROJECTOR: &str = r#"
-load("events/order.star", "order_placed")
-
-misfiled = entity(
-    key = "order_id",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        "email": str(subject = "customer_id", max_length = 100),
-    },
-)
-
-def on_event(event):
-    return [put(misfiled, {
-        "order_id": event.data.order_id,
-        "customer_id": event.data.shop_id,
-        "email": event.data.email,
-    })]
-
-handle = {order_placed(): on_event}
-"#;
-
-/// The handle is encrypted for `email`, but stored into a column named `note`.
-const WRONG_FIELD_PROJECTOR: &str = r#"
-load("events/order.star", "order_placed")
-
-misnamed = entity(
-    key = "order_id",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        "note": str(subject = "customer_id", max_length = 100),
-    },
-)
-
-def on_event(event):
-    return [put(misnamed, {
-        "order_id": event.data.order_id,
-        "customer_id": event.data.customer_id,
-        "note": event.data.email,
-    })]
-
-handle = {order_placed(): on_event}
-"#;
-
-/// The column is scoped to `shop_id`, but the handle is scoped to `customer_id`.
-const WRONG_SCOPE_PROJECTOR: &str = r#"
-load("events/order.star", "order_placed")
-
-misscoped = entity(
-    key = "order_id",
-    fields = {
-        "order_id": uuid(),
-        "shop_id": uint(),
-        "email": str(subject = "shop_id", max_length = 100),
-    },
-)
-
-def on_event(event):
-    return [put(misscoped, {
-        "order_id": event.data.order_id,
-        "shop_id": event.data.shop_id,
-        "email": event.data.email,
-    })]
-
-handle = {order_placed(): on_event}
-"#;
-
-#[test]
-fn a_handle_filed_under_the_wrong_subject_id_is_rejected() {
-    // Each of these would file one subject's ciphertext under a row that claims a
-    // different subject, a field, or a different scope: erasing the real subject would
-    // leave a permanently undecryptable row, and erasing the claimed one would fail to
-    // shred anything. All three must fail the projector instead of storing the row.
-    let dir = write_project(&[
-        ("events/order.star", TWO_ID_EVENTS),
-        ("commands/place-order.star", TWO_ID_PLACE_ORDER),
-        ("projectors/wrong-id.star", WRONG_ID_PROJECTOR),
-        ("projectors/wrong-field.star", WRONG_FIELD_PROJECTOR),
-        ("projectors/wrong-scope.star", WRONG_SCOPE_PROJECTOR),
-    ]);
-    let harness = boot(dir.path());
-    let body = json!({
-        "order_id": ORDER_1,
-        "customer_id": 42,
-        "shop_id": 7,
-        "email": "alice@example.com",
-    });
-    let result = harness
-        .rt
-        .execute("place-order", body, &ctx(), None)
-        .unwrap();
-    assert_eq!(result.status, 200, "place-order failed: {:?}", result.body);
-
-    for (projector, needle) in [
-        ("wrong-id", "holds data for"),
-        ("wrong-field", "encrypted for field `email`"),
-        ("wrong-scope", "is scoped to subject `shop_id`"),
-    ] {
-        wait_until(&format!("projector `{projector}` to fail"), || {
-            harness.rt.projector(projector).unwrap().failed()
-        });
-        let message = harness
-            .rt
-            .projector(projector)
-            .unwrap()
-            .last_error()
-            .expect("a failed projector records its error");
-        assert!(
-            message.contains(needle),
-            "projector `{projector}` failed for the wrong reason: {message}"
-        );
-        assert_eq!(
-            harness.rt.projector(projector).unwrap().position(),
-            0,
-            "a rejected row must not be checkpointed"
-        );
-    }
-
-    harness.shutdown();
-}
+// --- erasing from an effect -----------------------------------------------
 
 /// An effect that shreds the customer it was told to, the shape a GDPR redact handler
 /// takes: the subject id it erases comes from a plaintext field, not from a value
 /// scoped to the key it is about to destroy.
+///
+/// The Starlark version put the "only customer 42" condition in the handler's clause.
+/// Rule 1 makes an event select exactly one arm, so an arm carries no filter and the
+/// condition is an ordinary `if` in the body.
 const SHRED_EFFECT: &str = r#"
-load("events/order.star", "order_placed")
-
-def shred(event, state):
-    erase("customer_id", str(event.data.customer_id))
-
-# Constrained to one customer, so the assertion that erasure is scoped to the subject
-# it named is not a race against a second order.
-handle = {order_placed(customer_id = 42): shred}
+effect Shred {
+  on @order.placed { customer_id } {
+    if customer_id == 42 {
+      erase(customer_id)
+    }
+  }
+}
 "#;
 
 #[test]
 fn an_effect_erases_a_subject_and_shreds_its_data() {
     let dir = orders_project_with(&[
-        ("effects/shred.star", SHRED_EFFECT),
-        ("projectors/orders.star", ORDERS_PROJECTOR),
+        ("effects/shred.hk", SHRED_EFFECT),
+        ("projectors/orders.hk", ORDERS_PROJECTOR),
     ]);
     let harness = boot(dir.path());
     place_order(&harness.rt, ORDER, 42, "alice@example.com");
 
-    let effect = harness.rt.effect("shred").unwrap().clone();
+    let effect = harness.rt.effect("Shred").unwrap().clone();
     wait_until("the effect to erase the first customer", || {
         effect.position() >= 1
     });
 
-    // The same shred `hekla erase` performs, reached from a handler: the read model's
+    // The same shred `hekla erase` performs, reached from an arm: the read model's
     // ciphertext no longer decrypts, while the plaintext ids stay.
-    let row = read_row(&harness, "orders", "orders", ORDER, 1).expect("the order row survives");
+    let row = read_row(&harness, "Orders", "Order", ORDER, 1).expect("the order row survives");
     assert!(
         row.get("email").is_none(),
         "the erased email must be absent: {row}"
     );
     assert_eq!(row["customer_id"].as_i64(), Some(42));
 
-    // Scoped to the subject it named, not a blanket decrypt failure. The handler's
-    // clause selects only customer 42, so 43 is never erased.
+    // Scoped to the subject it named, not a blanket decrypt failure. The arm's guard
+    // admits only customer 42, so 43 is never erased.
     place_order(&harness.rt, UUID_B, 43, "bob@example.com");
-    let row = read_row(&harness, "orders", "orders", UUID_B, 2).expect("bob's row");
+    let row = read_row(&harness, "Orders", "Order", UUID_B, 2).expect("bob's row");
     assert_eq!(row["email"], "bob@example.com");
 
     // Erasing is not a failure: the invocation completed rather than wedging or
@@ -1282,20 +914,24 @@ fn an_effect_erases_a_subject_and_shreds_its_data() {
 }
 
 /// Erases the same subject twice in one invocation. Identical calls get successive
-/// disambiguators, so both are journalled separately.
+/// ordinals, so both are journaled separately and a replay skips both.
 const DOUBLE_SHRED_EFFECT: &str = r#"
-load("events/order.star", "order_placed")
-
-def shred(event, state):
-    erase("customer_id", str(event.data.customer_id))
-    erase("customer_id", str(event.data.customer_id))
-
-handle = {order_placed(): shred}
+effect Shred {
+  on @order.placed { customer_id } {
+    erase(customer_id)
+    erase(customer_id)
+  }
+}
 "#;
 
+/// The Starlark version read the two journaled results back and asserted `true` then
+/// `false`, because `erase` returned whether a key was really deleted. heklang
+/// deliberately drops that result: it is a race that is always already lost, and an
+/// author reading it would branch on whether someone else got there first. So what is
+/// left to pin is the ordinal channel itself, on a call that has no result at all.
 #[test]
-fn an_effect_erase_is_journaled_so_a_replay_reports_the_first_answer() {
-    let dir = orders_project_with(&[("effects/shred.star", DOUBLE_SHRED_EFFECT)]);
+fn an_effect_erase_is_journaled_under_successive_ordinals() {
+    let dir = orders_project_with(&[("effects/shred.hk", DOUBLE_SHRED_EFFECT)]);
     let data = tempfile::tempdir().unwrap();
     let harness = Boot::new(dir.path())
         .data_dir(data.path())
@@ -1304,22 +940,27 @@ fn an_effect_erase_is_journaled_so_a_replay_reports_the_first_answer() {
         .start();
     place_order(&harness.rt, ORDER, 42, "alice@example.com");
 
-    let effect = harness.rt.effect("shred").unwrap().clone();
+    let effect = harness.rt.effect("Shred").unwrap().clone();
     wait_until("the effect to complete", || effect.position() >= 1);
     harness.shutdown();
 
-    // The first call deleted a key and the second found none already gone, so the
-    // journal holds both answers. A replay returns these rather than re-running the
-    // deletion, which is what keeps a replayed handler on the branch it first took:
-    // live, both calls would now answer `false`.
     let db = rusqlite::Connection::open(data.path().join("hekla.db")).unwrap();
     let mut stmt = db
-        .prepare("SELECT result FROM effect_journal WHERE effect = 'shred' ORDER BY disambiguator")
+        .prepare(
+            "SELECT kind, disambiguator, call_hash FROM effect_journal \
+             WHERE effect = 'Shred' ORDER BY disambiguator",
+        )
         .unwrap();
-    let results: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
+    let rows: Vec<(String, i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(results, vec!["true".to_owned(), "false".to_owned()]);
+    assert_eq!(rows.len(), 2, "both calls are journaled: {rows:?}");
+    assert_eq!(rows[0].0, "erase");
+    assert_eq!((rows[0].1, rows[1].1), (0, 1));
+    assert_eq!(
+        rows[0].2, rows[1].2,
+        "identical calls share a key, so only the ordinal separates them"
+    );
 }

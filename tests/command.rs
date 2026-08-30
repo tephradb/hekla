@@ -20,7 +20,7 @@ fn commits_a_new_registration() {
     let result = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(ALICE, "alice@example.com", "Alice"),
             &ctx,
             None,
@@ -43,7 +43,7 @@ fn rejects_a_taken_email_with_422() {
     harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(ALICE, "dup@example.com", "Alice"),
             &ctx(),
             None,
@@ -52,7 +52,7 @@ fn rejects_a_taken_email_with_422() {
     let result = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(BOB, "dup@example.com", "Bob"),
             &ctx(),
             None,
@@ -69,7 +69,7 @@ fn missing_required_field_is_400() {
     let result = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             json!({ "user_id": ALICE, "email": "alice@example.com" }),
             &ctx(),
             None,
@@ -86,7 +86,7 @@ fn wrong_typed_field_is_400() {
     let result = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             json!({ "user_id": ALICE, "email": 42, "name": "Alice" }),
             &ctx(),
             None,
@@ -112,7 +112,7 @@ fn internal_command_is_not_routed() {
     let harness = boot_example();
     let result = harness
         .rt
-        .execute("record-welcome", json!({ "user_id": ALICE }), &ctx(), None)
+        .execute("RecordWelcome", json!({ "user_id": ALICE }), &ctx(), None)
         .unwrap();
     assert_eq!(result.status, 404);
     harness.shutdown();
@@ -125,7 +125,7 @@ fn idempotent_replay_returns_the_original_outcome() {
     let body = register_body(ALICE, "alice@example.com", "Alice");
     let first = harness
         .rt
-        .execute("register-user", body.clone(), &ctx1, Some("k1"))
+        .execute("RegisterUser", body.clone(), &ctx1, Some("k1"))
         .unwrap();
     assert_eq!(first.status, 200);
 
@@ -134,7 +134,7 @@ fn idempotent_replay_returns_the_original_outcome() {
     // original correlation id.
     let replay = harness
         .rt
-        .execute("register-user", body, &ctx(), Some("k1"))
+        .execute("RegisterUser", body, &ctx(), Some("k1"))
         .unwrap();
     assert_eq!(replay.status, 200);
     assert_eq!(replay.body, first.body);
@@ -151,7 +151,7 @@ fn now_is_available_in_handle() {
     let result = harness
         .rt
         .execute(
-            "schedule-reminder",
+            "ScheduleReminder",
             json!({ "user_id": ALICE }),
             &ctx(),
             None,
@@ -174,7 +174,7 @@ fn boundaryless_command_recovers_from_the_log_across_a_restart() {
     let first = harness
         .rt
         .execute(
-            "schedule-reminder",
+            "ScheduleReminder",
             json!({ "user_id": ALICE }),
             &ctx1,
             Some("k1"),
@@ -194,7 +194,7 @@ fn boundaryless_command_recovers_from_the_log_across_a_restart() {
     let replay = harness
         .rt
         .execute(
-            "schedule-reminder",
+            "ScheduleReminder",
             json!({ "user_id": ALICE }),
             &ctx(),
             Some("k1"),
@@ -217,7 +217,7 @@ fn boundaryless_command_recovers_from_the_log_across_a_restart() {
     let fresh = harness
         .rt
         .execute(
-            "schedule-reminder",
+            "ScheduleReminder",
             json!({ "user_id": BOB }),
             &ctx(),
             Some("k2"),
@@ -236,7 +236,7 @@ fn boundaried_command_recovers_instead_of_re_rejecting_across_a_restart() {
     let first = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(ALICE, "alice@example.com", "Alice"),
             &ctx(),
             Some("k1"),
@@ -256,7 +256,7 @@ fn boundaried_command_recovers_instead_of_re_rejecting_across_a_restart() {
     let replay = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(ALICE, "alice@example.com", "Alice"),
             &ctx(),
             Some("k1"),
@@ -287,7 +287,7 @@ fn concurrent_same_key_requests_commit_once_and_all_recover() {
                 let body = body.clone();
                 scope.spawn(move || {
                     let result = rt
-                        .execute("register-user", body, &ctx(), Some("dup"))
+                        .execute("RegisterUser", body, &ctx(), Some("dup"))
                         .unwrap();
                     (result.status, result.body)
                 })
@@ -312,38 +312,30 @@ fn concurrent_same_key_requests_commit_once_and_all_recover() {
 /// A minimal project whose only command is idempotent by construction: once the
 /// account is closed, `handle` returns no events rather than rejecting.
 const CLOSE_ACCOUNT_EVENTS: &str = r#"
-account_closed = event(
-    type = "account.closed",
-    fields = {"account_id": uuid()},
-)
+event @account.closed { account_id: Uuid }
 "#;
 
 const CLOSE_ACCOUNT: &str = r#"
-load("events/e.star", "account_closed")
+command CloseAccount(account_id: Uuid) {
+  state closed: Bool = fold false
+    on @account.closed(account_id) => true
 
-input = schema(account_id = uuid())
+  // Emitting nothing on the second call is what makes the replay interesting: no
+  // append happens, so the existence clause never fires and recovery has to come from
+  // the tag re-read instead.
+  if closed {
+    return
+  }
 
-def query(input):
-    return account_closed(account_id = input.account_id)
-
-initial = False
-
-def fold_event(state, event):
-    return True
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    if state:
-        return []
-    return account_closed(account_id = input.account_id)
+  emit @account.closed { account_id }
+}
 "#;
 
 #[test]
 fn empty_emit_replay_recovers_the_original_outcome() {
     let project = write_project(&[
-        ("events/e.star", CLOSE_ACCOUNT_EVENTS),
-        ("commands/close-account.star", CLOSE_ACCOUNT),
+        ("events/e.hk", CLOSE_ACCOUNT_EVENTS),
+        ("commands/close-account.hk", CLOSE_ACCOUNT),
     ]);
     let harness = Boot::new(project.path()).http_status(200).start();
 
@@ -351,7 +343,7 @@ fn empty_emit_replay_recovers_the_original_outcome() {
     let ctx1 = ctx();
     let first = harness
         .rt
-        .execute("close-account", body.clone(), &ctx1, Some("k1"))
+        .execute("CloseAccount", body.clone(), &ctx1, Some("k1"))
         .unwrap();
     assert_eq!(first.status, 200);
     assert_eq!(first.body["events"][0]["type"], "account.closed");
@@ -362,7 +354,7 @@ fn empty_emit_replay_recovers_the_original_outcome() {
     // committed events and positions.
     let replay = harness
         .rt
-        .execute("close-account", body, &ctx(), Some("k1"))
+        .execute("CloseAccount", body, &ctx(), Some("k1"))
         .unwrap();
     assert_eq!(replay.status, 200);
     assert_eq!(
@@ -383,7 +375,7 @@ fn concurrent_renames_of_the_same_user_all_commit_after_retrying() {
     let registered = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(ALICE, "alice@example.com", "Alice"),
             &ctx(),
             None,
@@ -402,7 +394,7 @@ fn concurrent_renames_of_the_same_user_all_commit_after_retrying() {
                 scope.spawn(move || {
                     let result = rt
                         .execute(
-                            "rename-user",
+                            "RenameUser",
                             json!({ "user_id": ALICE, "name": format!("n{i}") }),
                             &ctx(),
                             None,
@@ -460,7 +452,7 @@ fn a_drained_write_coordinator_returns_503_unavailable() {
     // append itself.
     let result = rt
         .execute(
-            "schedule-reminder",
+            "ScheduleReminder",
             json!({ "user_id": ALICE }),
             &ctx(),
             None,
@@ -485,7 +477,7 @@ fn the_same_idempotency_key_on_two_commands_does_not_collide() {
     let first = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(ALICE, "alice@example.com", "Alice"),
             &ctx(),
             Some("shared-key"),
@@ -497,7 +489,7 @@ fn the_same_idempotency_key_on_two_commands_does_not_collide() {
     let second = harness
         .rt
         .execute(
-            "schedule-reminder",
+            "ScheduleReminder",
             json!({ "user_id": ALICE }),
             &ctx(),
             Some("shared-key"),
@@ -522,7 +514,7 @@ fn a_keyed_request_that_rejects_returns_422_and_does_not_burn_the_key() {
     let committed = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(ALICE, "dup@example.com", "Alice"),
             &ctx(),
             None,
@@ -535,7 +527,7 @@ fn a_keyed_request_that_rejects_returns_422_and_does_not_burn_the_key() {
     let rejected = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(BOB, "dup@example.com", "Bob"),
             &ctx(),
             Some("k9"),
@@ -554,7 +546,7 @@ fn a_keyed_request_that_rejects_returns_422_and_does_not_burn_the_key() {
     let retried = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(BOB, "bob@example.com", "Bob"),
             &ctx(),
             Some("k9"),
@@ -576,7 +568,7 @@ fn an_unknown_field_in_the_body_is_rejected_with_400() {
     let result = harness
         .rt
         .execute(
-            "register-user",
+            "RegisterUser",
             json!({
                 "user_id": ALICE,
                 "email": "alice@example.com",

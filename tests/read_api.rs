@@ -27,23 +27,23 @@ use support::{
 async fn reads_a_row_and_the_indexed_filter_through_http() {
     let harness = boot_example();
     register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    wait_position_async(&harness.rt, "users", 1).await;
+    wait_position_async(&harness.rt, "Users", 1).await;
     let app = harness.app();
 
-    let (status, body) = get(&app, &format!("/read/users/users/{ALICE}")).await;
+    let (status, body) = get(&app, &format!("/read/Users/User/{ALICE}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["item"]["email"], "alice@example.com");
     assert_eq!(body["item"]["user_id"], ALICE);
     assert!(body["position"].as_u64().unwrap() >= 1);
 
     // Indexed filter on email returns the same row.
-    let (status, body) = get(&app, "/read/users/users?email=alice@example.com").await;
+    let (status, body) = get(&app, "/read/Users/User?email=alice@example.com").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["items"][0]["user_id"], ALICE);
     assert!(body["position"].as_u64().unwrap() >= 1);
 
     // A get() projector maintained the running count.
-    let (status, body) = get(&app, "/read/user-stats/totals/all").await;
+    let (status, body) = get(&app, "/read/UserStats/Totals/all").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["item"]["count"].as_i64(), Some(1));
 
@@ -54,20 +54,20 @@ async fn reads_a_row_and_the_indexed_filter_through_http() {
 async fn unindexed_filter_and_missing_targets_are_rejected() {
     let harness = boot_example();
     register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    wait_position_async(&harness.rt, "users", 1).await;
+    wait_position_async(&harness.rt, "Users", 1).await;
     let app = harness.app();
 
     // `name` is not indexed: a 400, never a table scan.
-    let (status, body) = get(&app, "/read/users/users?name=Alice").await;
+    let (status, body) = get(&app, "/read/Users/User?name=Alice").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "unindexed_filter");
 
     // Missing row, unknown entity, and unknown projector are all 404.
-    let (status, _) = get(&app, &format!("/read/users/users/{MISSING}")).await;
+    let (status, _) = get(&app, &format!("/read/Users/User/{MISSING}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = get(&app, "/read/users/ghosts/x").await;
+    let (status, _) = get(&app, "/read/Users/Ghost/x").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = get(&app, "/read/ghost/users/x").await;
+    let (status, _) = get(&app, "/read/Ghost/User/x").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     harness.shutdown();
@@ -80,11 +80,11 @@ async fn scan_paginates_with_a_cursor() {
         let id = format!("00000000-0000-0000-0000-00000000000{i}");
         register_user(&harness.rt, &id, &format!("user{i}@example.com"), "User");
     }
-    wait_position_async(&harness.rt, "users", 5).await;
+    wait_position_async(&harness.rt, "Users", 5).await;
     let app = harness.app();
 
     let mut seen = Vec::new();
-    let mut uri = "/read/users/users?limit=2".to_owned();
+    let mut uri = "/read/Users/User?limit=2".to_owned();
     loop {
         let (status, body) = get(&app, &uri).await;
         assert_eq!(status, StatusCode::OK);
@@ -92,7 +92,7 @@ async fn scan_paginates_with_a_cursor() {
             seen.push(item["user_id"].as_str().unwrap().to_owned());
         }
         match body["next_cursor"].as_str() {
-            Some(cursor) => uri = format!("/read/users/users?limit=2&cursor={cursor}"),
+            Some(cursor) => uri = format!("/read/Users/User?limit=2&cursor={cursor}"),
             None => break,
         }
     }
@@ -112,10 +112,10 @@ async fn scan_paginates_with_a_cursor() {
 async fn replay_route_is_accepted() {
     let harness = boot_example();
     register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    wait_position_async(&harness.rt, "users", 1).await;
+    wait_position_async(&harness.rt, "Users", 1).await;
     let app = harness.app();
 
-    let (status, body) = send(&app, Method::POST, "/projectors/users/replay").await;
+    let (status, body) = send(&app, Method::POST, "/projectors/Users/replay").await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(body["status"], "replay_scheduled");
 
@@ -133,7 +133,7 @@ async fn after_waits_for_the_projector_then_reads_your_write() {
     let pos = register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
     let app = harness.app();
 
-    let (status, body) = get(&app, &format!("/read/users/users/{ALICE}?after={pos}")).await;
+    let (status, body) = get(&app, &format!("/read/Users/User/{ALICE}?after={pos}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["item"]["user_id"], ALICE);
     assert!(body["position"].as_u64().unwrap() >= pos);
@@ -147,7 +147,7 @@ async fn after_waits_for_the_projector_on_a_scan() {
     let pos = register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
     let app = harness.app();
 
-    let (status, body) = get(&app, &format!("/read/users/users?after={pos}")).await;
+    let (status, body) = get(&app, &format!("/read/Users/User?after={pos}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["items"][0]["user_id"], ALICE);
     assert!(body["position"].as_u64().unwrap() >= pos);
@@ -164,7 +164,7 @@ async fn after_reserves_its_slot_and_does_not_shadow_a_filter() {
     // `after` is a reserved param, not a filter field; the email filter still binds.
     let (status, body) = get(
         &app,
-        &format!("/read/users/users?email=alice@example.com&after={pos}"),
+        &format!("/read/Users/User?email=alice@example.com&after={pos}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -185,7 +185,7 @@ async fn after_resolves_on_a_selective_projector_past_a_non_matching_tail() {
     let rename = harness
         .rt
         .execute(
-            "rename-user",
+            "RenameUser",
             json!({ "user_id": ALICE, "name": "Alicia" }),
             &ctx(),
             None,
@@ -197,7 +197,7 @@ async fn after_resolves_on_a_selective_projector_past_a_non_matching_tail() {
 
     let (status, body) = get(
         &app,
-        &format!("/read/user-stats/totals/all?after={pos}&timeout_ms=2000"),
+        &format!("/read/UserStats/Totals/all?after={pos}&timeout_ms=2000"),
     )
     .await;
     assert_eq!(
@@ -215,13 +215,13 @@ async fn after_resolves_on_a_selective_projector_past_a_non_matching_tail() {
 async fn timeout_ms_zero_is_an_immediate_check() {
     let harness = boot_example();
     let pos = register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    wait_position_async(&harness.rt, "users", pos).await;
+    wait_position_async(&harness.rt, "Users", pos).await;
     let app = harness.app();
 
     // Already caught up: a 0ms wait still succeeds on the first check.
     let (status, _) = get(
         &app,
-        &format!("/read/users/users/{ALICE}?after={pos}&timeout_ms=0"),
+        &format!("/read/Users/User/{ALICE}?after={pos}&timeout_ms=0"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -230,7 +230,7 @@ async fn timeout_ms_zero_is_an_immediate_check() {
     let unreachable = pos + 1000;
     let (status, body) = get(
         &app,
-        &format!("/read/users/users/{ALICE}?after={unreachable}&timeout_ms=0"),
+        &format!("/read/Users/User/{ALICE}?after={unreachable}&timeout_ms=0"),
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -243,10 +243,10 @@ async fn timeout_ms_zero_is_an_immediate_check() {
 async fn a_non_numeric_after_is_a_400() {
     let harness = boot_example();
     register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    wait_position_async(&harness.rt, "users", 1).await;
+    wait_position_async(&harness.rt, "Users", 1).await;
     let app = harness.app();
 
-    let (status, body) = get(&app, &format!("/read/users/users/{ALICE}?after=abc")).await;
+    let (status, body) = get(&app, &format!("/read/Users/User/{ALICE}?after=abc")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "invalid_after");
 
@@ -257,7 +257,7 @@ async fn a_non_numeric_after_is_a_400() {
 async fn after_beyond_the_log_times_out_with_503_and_retry_after() {
     let harness = boot_example();
     let pos = register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    wait_position_async(&harness.rt, "users", pos).await;
+    wait_position_async(&harness.rt, "Users", pos).await;
     let app = harness.app();
 
     // A position the projector can never reach, with a short budget so the wait
@@ -266,7 +266,7 @@ async fn after_beyond_the_log_times_out_with_503_and_retry_after() {
     let request = Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "/read/users/users/{ALICE}?after={unreachable}&timeout_ms=100"
+            "/read/Users/User/{ALICE}?after={unreachable}&timeout_ms=100"
         ))
         .body(Body::empty())
         .unwrap();
@@ -289,7 +289,7 @@ async fn after_beyond_the_log_times_out_with_503_and_retry_after() {
 async fn status_reports_projector_position_and_lag() {
     let harness = boot_example();
     register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    wait_position_async(&harness.rt, "users", 1).await;
+    wait_position_async(&harness.rt, "Users", 1).await;
     let app = harness.app();
 
     let (status, body) = get(&app, "/status").await;
@@ -297,7 +297,7 @@ async fn status_reports_projector_position_and_lag() {
     let projectors = body["projectors"].as_array().unwrap();
     let users = projectors
         .iter()
-        .find(|entry| entry["name"] == "users")
+        .find(|entry| entry["name"] == "Users")
         .expect("users projector in status");
     assert!(users["position"].as_u64().unwrap() >= 1);
     assert!(users["lag"].is_number());
@@ -307,72 +307,63 @@ async fn status_reports_projector_position_and_lag() {
     harness.shutdown();
 }
 
+/// The event a failing projector chokes on, and one it does not.
+///
+/// A projector has no `fail`: it cannot refuse, because a rebuild has to reach the
+/// same rows every time. What it can still do is hit a real store error, and the one
+/// an author actually meets is a read model narrower than the event feeding it. The
+/// column below takes three characters and the event field takes fifty.
+const BOOM_EVENTS: &str = r#"
+event @boom.happened { id: Uuid, label: String @max(50) }
+"#;
+
+const EMIT_BOOM: &str = r#"
+command EmitBoom(id: Uuid, label: String) {
+  emit @boom.happened { id, label }
+}
+"#;
+
+const NARROW_PROJECTOR: &str = r#"
+projector Watch {
+  entity Thing {
+    id: Uuid @key,
+    label: String @max(3),
+  }
+
+  on @boom.happened { id, label } {
+    put Thing { id, label }
+  }
+}
+"#;
+
 #[tokio::test]
 async fn status_reports_a_failed_projector() {
-    // A projector whose handle fails on its first event: the thread dies rather
-    // than silently freezing the read model, and /status must surface it as failed
-    // with the error, not merely as lagging behind head.
+    // A projector that cannot apply an event: the thread dies rather than silently
+    // freezing the read model, and /status must surface it as failed with the error,
+    // not merely as lagging behind head.
     let dir = write_project(&[
-        (
-            "events/e.star",
-            r#"boom = event(type = "boom.happened", fields = {"id": uuid()})
-"#,
-        ),
-        (
-            "commands/emit-boom.star",
-            r#"
-load("events/e.star", "boom")
-
-input = schema(id = uuid())
-
-def handle(input, state):
-    return boom(id = input.id)
-"#,
-        ),
-        (
-            "projectors/watch.star",
-            r#"
-load("events/e.star", "boom")
-
-things = entity(key = "id", fields = {"id": uuid()})
-
-def on_event(event):
-    fail("projector boom")
-
-handle = {boom(): on_event}
-"#,
-        ),
+        ("events/e.hk", BOOM_EVENTS),
+        ("commands/emit-boom.hk", EMIT_BOOM),
+        ("projectors/watch.hk", NARROW_PROJECTOR),
     ]);
     let harness = boot_project(dir.path());
 
     let result = harness
         .rt
-        .execute("emit-boom", json!({ "id": ALICE }), &ctx(), None)
+        .execute(
+            "EmitBoom",
+            json!({ "id": ALICE, "label": "far too long for the column" }),
+            &ctx(),
+            None,
+        )
         .unwrap();
     assert_eq!(result.status, 200, "emit failed: {:?}", result.body);
 
     let app = harness.app();
-    let mut failed = None;
-    for _ in 0..200 {
-        let (_, body) = get(&app, "/status").await;
-        let watch = body["projectors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["name"] == "watch")
-            .cloned();
-        if let Some(entry) = watch
-            && entry["failed"] == json!(true)
-        {
-            failed = Some(entry);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let watch = failed.expect("watch projector should report failed in /status");
+    let watch = wait_failed(&app, "Watch").await;
     assert!(
-        watch["last_error"].as_str().unwrap().contains("boom"),
-        "expected the handle error in last_error: {watch:?}"
+        watch["last_error"].as_str().unwrap().contains("label"),
+        "the error names the column that would not take the value: {watch:?}"
     );
 
     harness.shutdown();
@@ -383,38 +374,32 @@ async fn a_filter_value_of_the_wrong_type_is_a_400() {
     // A value that cannot be the indexed column's type is a 400 up front, not a scan
     // that binds it as text and silently matches nothing.
     let dir = write_project(&[
+        ("events/e.hk", "event @scored { id: Uuid, n: Int }\n"),
         (
-            "events/e.star",
-            r#"scored = event(type = "scored", fields = {"id": uuid(), "n": int()})
-"#,
-        ),
-        (
-            "projectors/nums.star",
+            "projectors/scores.hk",
             r#"
-load("events/e.star", "scored")
+projector Scores {
+  entity Score {
+    id: Uuid @key,
+    n: Int @index,
+  }
 
-scores = entity(
-    key = "id",
-    fields = {"id": uuid(), "n": int()},
-    indexes = [index("by_n", ["n"])],
-)
-
-def on_event(event):
-    return [put(scores, {"id": event.data.id, "n": event.data.n})]
-
-handle = {scored(): on_event}
+  on @scored { id, n } {
+    put Score { id, n }
+  }
+}
 "#,
         ),
     ]);
     let harness = boot_project(dir.path());
     let app = harness.app();
 
-    let (status, body) = get(&app, "/read/nums/scores?n=abc").await;
+    let (status, body) = get(&app, "/read/Scores/Score?n=abc").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "invalid_input");
 
     // A well-typed value is accepted (no rows yet, so it just scans empty).
-    let (ok, _) = get(&app, "/read/nums/scores?n=5").await;
+    let (ok, _) = get(&app, "/read/Scores/Score?n=5").await;
     assert_eq!(ok, StatusCode::OK);
 
     harness.shutdown();
@@ -440,143 +425,43 @@ async fn wait_failed(app: &Router, projector: &str) -> Value {
     panic!("projector `{projector}` never reported failed in /status");
 }
 
-/// A project whose only projector has `handle_body` as the body of `handle`,
-/// plus a command that emits the single event it sources.
-fn projector_project(handle_body: &str) -> TempDir {
-    let projector = format!(
-        r#"
-load("events/e.star", "boom")
-
-things = entity(key = "id", fields = {{"id": uuid()}})
-
-def on_event(event):
-{handle_body}
-
-handle = {{boom(): on_event}}
-"#
-    );
-    write_project(&[
-        (
-            "events/e.star",
-            r#"boom = event(type = "boom.happened", fields = {"id": uuid()})
-"#,
-        ),
-        (
-            "commands/emit-boom.star",
-            r#"
-load("events/e.star", "boom")
-
-input = schema(id = uuid())
-
-def handle(input, state):
-    return boom(id = input.id)
-"#,
-        ),
-        ("projectors/watch.star", &projector),
-    ])
-}
-
-#[tokio::test]
-async fn status_reports_a_projector_whose_handle_returns_a_non_list() {
-    // `hekla check` cannot see what `handle` returns, so a projector that returns a
-    // dict (or a list of non-ops) loads clean and only breaks at the first event. The
-    // runtime must surface that as a failed projector naming the shape problem, not
-    // freeze at a stale position that merely looks like lag.
-    for (handle_body, needle) in [
-        ("    return {\"id\": event.data.id}", "must return a list"),
-        ("    return [1]", "projector ops must be put"),
-    ] {
-        let dir = projector_project(handle_body);
-        let harness = boot_project(dir.path());
-        let result = harness
-            .rt
-            .execute("emit-boom", json!({ "id": ALICE }), &ctx(), None)
-            .unwrap();
-        assert_eq!(result.status, 200, "emit failed: {:?}", result.body);
-
-        let app = harness.app();
-        let watch = wait_failed(&app, "watch").await;
-        let last_error = watch["last_error"].as_str().unwrap();
-        assert!(
-            last_error.contains(needle),
-            "expected `{needle}` in last_error for `{handle_body}`: {last_error}"
-        );
-        // The bad shape is named, not just "handle() failed".
-        assert!(
-            last_error.contains("dict") || last_error.contains("int"),
-            "the error names the offending type: {last_error}"
-        );
-
-        harness.shutdown();
-    }
-}
-
 #[tokio::test]
 async fn a_failed_projector_still_serves_its_last_good_rows() {
     // A dead projector freezes its read model; it must not take the read surface with
     // it. Rows written before the failure stay readable, and a `?after=` past the
     // frozen position fails closed with a 503 rather than pinning the request forever.
     let dir = write_project(&[
-        (
-            "events/thing.star",
-            r#"
-thing_ok = event(type = "thing.ok", fields = {"id": uuid()})
-thing_bad = event(type = "thing.bad", fields = {"id": uuid()})
-"#,
-        ),
-        (
-            "commands/emit-ok.star",
-            r#"
-load("events/thing.star", "thing_ok")
-
-input = schema(id = uuid())
-
-def handle(input, state):
-    return thing_ok(id = input.id)
-"#,
-        ),
-        (
-            "commands/emit-bad.star",
-            r#"
-load("events/thing.star", "thing_bad")
-
-input = schema(id = uuid())
-
-def handle(input, state):
-    return thing_bad(id = input.id)
-"#,
-        ),
-        (
-            "projectors/watch.star",
-            r#"
-load("events/thing.star", "thing_ok", "thing_bad")
-
-things = entity(key = "id", fields = {"id": uuid()})
-
-handle = {
-    thing_ok(): lambda event: [put(things, {"id": event.data.id})],
-    thing_bad(): lambda event: fail("projector boom"),
-}
-"#,
-        ),
+        ("events/e.hk", BOOM_EVENTS),
+        ("commands/emit-boom.hk", EMIT_BOOM),
+        ("projectors/watch.hk", NARROW_PROJECTOR),
     ]);
     let harness = boot_project(dir.path());
     let app = harness.app();
 
     let ok = harness
         .rt
-        .execute("emit-ok", json!({ "id": ALICE }), &ctx(), None)
+        .execute(
+            "EmitBoom",
+            json!({ "id": ALICE, "label": "ok" }),
+            &ctx(),
+            None,
+        )
         .unwrap();
-    assert_eq!(ok.status, 200, "emit-ok failed: {:?}", ok.body);
+    assert_eq!(ok.status, 200, "the first emit failed: {:?}", ok.body);
     let ok_pos = ok.body["positions"]["last"].as_u64().unwrap();
-    wait_position_async(&harness.rt, "watch", ok_pos).await;
+    wait_position_async(&harness.rt, "Watch", ok_pos).await;
 
     let bad = harness
         .rt
-        .execute("emit-bad", json!({ "id": BOB }), &ctx(), None)
+        .execute(
+            "EmitBoom",
+            json!({ "id": BOB, "label": "far too long for the column" }),
+            &ctx(),
+            None,
+        )
         .unwrap();
-    assert_eq!(bad.status, 200, "emit-bad failed: {:?}", bad.body);
-    let watch = wait_failed(&app, "watch").await;
+    assert_eq!(bad.status, 200, "the second emit failed: {:?}", bad.body);
+    let watch = wait_failed(&app, "Watch").await;
     let frozen = watch["position"].as_u64().unwrap();
     assert!(
         frozen >= ok_pos,
@@ -584,24 +469,24 @@ handle = {
     );
 
     // The pre-failure row is still served, by point read and by scan.
-    let (status, body) = get(&app, &format!("/read/watch/things/{ALICE}")).await;
+    let (status, body) = get(&app, &format!("/read/Watch/Thing/{ALICE}")).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["item"]["id"], ALICE);
 
-    let (status, body) = get(&app, "/read/watch/things").await;
+    let (status, body) = get(&app, "/read/Watch/Thing").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["items"].as_array().unwrap().len(), 1);
     assert_eq!(body["items"][0]["id"], ALICE);
 
     // A row the dead projector never got to is a plain 404, not a 500.
-    let (status, _) = get(&app, &format!("/read/watch/things/{BOB}")).await;
+    let (status, _) = get(&app, &format!("/read/Watch/Thing/{BOB}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // `?after=` past the frozen position gives up rather than blocking forever.
     let unreachable = frozen + 10;
     let (status, body) = get(
         &app,
-        &format!("/read/watch/things/{ALICE}?after={unreachable}&timeout_ms=100"),
+        &format!("/read/Watch/Thing/{ALICE}?after={unreachable}&timeout_ms=100"),
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
@@ -617,12 +502,12 @@ async fn scan_limit_is_clamped_and_validated() {
         let id = format!("00000000-0000-0000-0000-00000000000{i}");
         register_user(&harness.rt, &id, &format!("user{i}@example.com"), "User");
     }
-    wait_position_async(&harness.rt, "users", 3).await;
+    wait_position_async(&harness.rt, "Users", 3).await;
     let app = harness.app();
 
     // `limit=0` clamps up to 1: a literal LIMIT 0 would return an empty page while
     // still handing back a forward cursor, so a paginating client would spin.
-    let (status, body) = get(&app, "/read/users/users?limit=0").await;
+    let (status, body) = get(&app, "/read/Users/User?limit=0").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["items"].as_array().unwrap().len(), 1);
     assert!(
@@ -631,13 +516,13 @@ async fn scan_limit_is_clamped_and_validated() {
     );
 
     // A limit above MAX_LIMIT is clamped down, not rejected.
-    let (status, body) = get(&app, "/read/users/users?limit=100000").await;
+    let (status, body) = get(&app, "/read/Users/User?limit=100000").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["items"].as_array().unwrap().len(), 3);
     assert_eq!(body["next_cursor"], Value::Null);
 
     for bad in ["abc", "-1", "1.5", ""] {
-        let (status, body) = get(&app, &format!("/read/users/users?limit={bad}")).await;
+        let (status, body) = get(&app, &format!("/read/Users/User?limit={bad}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "limit={bad}: {body:?}");
         assert_eq!(body["error"]["code"], "invalid_input", "limit={bad}");
     }
@@ -649,16 +534,16 @@ async fn scan_limit_is_clamped_and_validated() {
 async fn a_bad_cursor_and_multiple_filters_are_rejected() {
     let harness = boot_example();
     register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    wait_position_async(&harness.rt, "users", 1).await;
+    wait_position_async(&harness.rt, "Users", 1).await;
     let app = harness.app();
 
     // Not base64url at all.
-    let (status, body) = get(&app, "/read/users/users?cursor=***not-base64").await;
+    let (status, body) = get(&app, "/read/Users/User?cursor=***not-base64").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "invalid_input");
 
     // Valid base64url over bytes that are not UTF-8 (`__g` decodes to 0xff 0xfe).
-    let (status, body) = get(&app, "/read/users/users?cursor=__g").await;
+    let (status, body) = get(&app, "/read/Users/User?cursor=__g").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "invalid_input");
 
@@ -666,7 +551,7 @@ async fn a_bad_cursor_and_multiple_filters_are_rejected() {
     // other silently dropped (which would over-return rows and look like success).
     let (status, body) = get(
         &app,
-        &format!("/read/users/users?email=alice@example.com&user_id={ALICE}"),
+        &format!("/read/Users/User?email=alice@example.com&user_id={ALICE}"),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
@@ -680,13 +565,13 @@ async fn a_bad_cursor_and_multiple_filters_are_rejected() {
     );
 
     // A filter on the key column itself is allowed: it is filterable without an index.
-    let (status, body) = get(&app, &format!("/read/users/users?user_id={ALICE}")).await;
+    let (status, body) = get(&app, &format!("/read/Users/User?user_id={ALICE}")).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["items"].as_array().unwrap().len(), 1);
     assert_eq!(body["items"][0]["user_id"], ALICE);
 
     // And it really filters, rather than returning everything.
-    let (status, body) = get(&app, &format!("/read/users/users?user_id={MISSING}")).await;
+    let (status, body) = get(&app, &format!("/read/Users/User?user_id={MISSING}")).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert!(body["items"].as_array().unwrap().is_empty());
 
@@ -717,36 +602,30 @@ async fn page_through(app: &Router, uri: &str, field: &str) -> (Vec<String>, usi
 fn catalog_project() -> TempDir {
     write_project(&[
         (
-            "events/item.star",
-            r#"item_added = event(type = "item.added", fields = {"id": uuid(), "bucket": str()})
+            "events/item.hk",
+            "event @item.added { id: Uuid, bucket: String @max(20) }\n",
+        ),
+        (
+            "commands/add-item.hk",
+            r#"
+command AddItem(id: Uuid, bucket: String) {
+  emit @item.added { id, bucket }
+}
 "#,
         ),
         (
-            "commands/add-item.star",
+            "projectors/catalog.hk",
             r#"
-load("events/item.star", "item_added")
+projector Catalog {
+  entity Item {
+    id: Uuid @key,
+    bucket: String @max(20) @index,
+  }
 
-input = schema(id = uuid(), bucket = str())
-
-def handle(input, state):
-    return item_added(id = input.id, bucket = input.bucket)
-"#,
-        ),
-        (
-            "projectors/catalog.star",
-            r#"
-load("events/item.star", "item_added")
-
-items = entity(
-    key = "id",
-    fields = {"id": uuid(), "bucket": str()},
-    indexes = [index("by_bucket", ["bucket"])],
-)
-
-def on_event(event):
-    return [put(items, {"id": event.data.id, "bucket": event.data.bucket})]
-
-handle = {item_added(): on_event}
+  on @item.added { id, bucket } {
+    put Item { id, bucket }
+  }
+}
 "#,
         ),
     ])
@@ -776,19 +655,19 @@ async fn a_filtered_scan_paginates_without_dropping_or_repeating_rows() {
         let result = harness
             .rt
             .execute(
-                "add-item",
+                "AddItem",
                 json!({ "id": id, "bucket": bucket }),
                 &ctx(),
                 None,
             )
             .unwrap();
-        assert_eq!(result.status, 200, "add-item failed: {:?}", result.body);
+        assert_eq!(result.status, 200, "AddItem failed: {:?}", result.body);
         last = result.body["positions"]["last"].as_u64().unwrap();
     }
-    wait_position_async(&harness.rt, "catalog", last).await;
+    wait_position_async(&harness.rt, "Catalog", last).await;
     let app = harness.app();
 
-    let (seen, requests) = page_through(&app, "/read/catalog/items?bucket=a&limit=2", "id").await;
+    let (seen, requests) = page_through(&app, "/read/Catalog/Item?bucket=a&limit=2", "id").await;
     assert_eq!(
         seen,
         vec![
@@ -805,7 +684,7 @@ async fn a_filtered_scan_paginates_without_dropping_or_repeating_rows() {
     );
 
     // The same boundary unfiltered: 6 rows at limit 3.
-    let (seen, requests) = page_through(&app, "/read/catalog/items?limit=3", "id").await;
+    let (seen, requests) = page_through(&app, "/read/Catalog/Item?limit=3", "id").await;
     assert_eq!(seen.len(), 6);
     let mut deduped = seen.clone();
     deduped.dedup();
@@ -827,32 +706,30 @@ async fn an_integer_keyed_entity_reads_and_paginates_by_key() {
     // pages would come back in the wrong order, or repeat.
     let dir = write_project(&[
         (
-            "events/count.star",
-            r#"counted = event(type = "counted", fields = {"n": uint(), "label": str()})
+            "events/count.hk",
+            "event @counted { n: Int, label: String @max(20) }\n",
+        ),
+        (
+            "commands/count.hk",
+            r#"
+command Count(n: Int, label: String) {
+  emit @counted { n, label }
+}
 "#,
         ),
         (
-            "commands/count.star",
+            "projectors/tally.hk",
             r#"
-load("events/count.star", "counted")
+projector Tally {
+  entity Counter {
+    n: Int @key,
+    label: String @max(20),
+  }
 
-input = schema(n = uint(), label = str())
-
-def handle(input, state):
-    return counted(n = input.n, label = input.label)
-"#,
-        ),
-        (
-            "projectors/tally.star",
-            r#"
-load("events/count.star", "counted")
-
-counters = entity(key = "n", fields = {"n": uint(), "label": str()})
-
-def on_event(event):
-    return [put(counters, {"n": event.data.n, "label": event.data.label})]
-
-handle = {counted(): on_event}
+  on @counted { n, label } {
+    put Counter { n, label }
+  }
+}
 "#,
         ),
     ]);
@@ -863,25 +740,25 @@ handle = {counted(): on_event}
         let result = harness
             .rt
             .execute(
-                "count",
+                "Count",
                 json!({ "n": n, "label": format!("row-{n}") }),
                 &ctx(),
                 None,
             )
             .unwrap();
-        assert_eq!(result.status, 200, "count failed: {:?}", result.body);
+        assert_eq!(result.status, 200, "Count failed: {:?}", result.body);
         last = result.body["positions"]["last"].as_u64().unwrap();
     }
-    wait_position_async(&harness.rt, "tally", last).await;
+    wait_position_async(&harness.rt, "Tally", last).await;
     let app = harness.app();
 
     // The path segment coerces to INTEGER, so the row is found by its numeric key.
-    let (status, body) = get(&app, "/read/tally/counters/10").await;
+    let (status, body) = get(&app, "/read/Tally/Counter/10").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["item"]["n"], json!(10));
     assert_eq!(body["item"]["label"], "row-10");
 
-    let (seen, requests) = page_through(&app, "/read/tally/counters?limit=2", "n").await;
+    let (seen, requests) = page_through(&app, "/read/Tally/Counter?limit=2", "n").await;
     assert_eq!(
         seen,
         vec!["1", "2", "10", "20"],
@@ -903,32 +780,30 @@ async fn an_entity_field_named_a_sql_keyword_reads_and_writes_end_to_end() {
     // TABLE was a syntax error that killed the whole runtime at boot.
     let dir = write_project(&[
         (
-            "events/item.star",
-            r#"item_added = event(type = "item.added", fields = {"id": uuid(), "group": str()})
+            "events/item.hk",
+            "event @item.added { id: Uuid, group: String @max(20) }\n",
+        ),
+        (
+            "commands/add-item.hk",
+            r#"
+command AddItem(id: Uuid, group: String) {
+  emit @item.added { id, group }
+}
 "#,
         ),
         (
-            "commands/add-item.star",
+            "projectors/catalog.hk",
             r#"
-load("events/item.star", "item_added")
+projector Catalog {
+  entity Item {
+    id: Uuid @key,
+    group: String @max(20),
+  }
 
-input = schema(id = uuid(), group = str())
-
-def handle(input, state):
-    return item_added(id = input.id, group = input.group)
-"#,
-        ),
-        (
-            "projectors/catalog.star",
-            r#"
-load("events/item.star", "item_added")
-
-items = entity(key = "id", fields = {"id": uuid(), "group": str()})
-
-def on_event(event):
-    return [put(items, {"id": event.data.id, "group": event.data.group})]
-
-handle = {item_added(): on_event}
+  on @item.added { id, group } {
+    put Item { id, group }
+  }
+}
 "#,
         ),
     ]);
@@ -937,24 +812,24 @@ handle = {item_added(): on_event}
     let result = harness
         .rt
         .execute(
-            "add-item",
+            "AddItem",
             json!({ "id": UUID_A, "group": "widgets" }),
             &ctx(),
             None,
         )
         .unwrap();
-    assert_eq!(result.status, 200, "add-item failed: {:?}", result.body);
+    assert_eq!(result.status, 200, "AddItem failed: {:?}", result.body);
     let last = result.body["positions"]["last"].as_u64().unwrap();
-    wait_position_async(&harness.rt, "catalog", last).await;
+    wait_position_async(&harness.rt, "Catalog", last).await;
     let app = harness.app();
 
-    let (status, body) = get(&app, &format!("/read/catalog/items/{UUID_A}")).await;
+    let (status, body) = get(&app, &format!("/read/Catalog/Item/{UUID_A}")).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["item"]["id"], UUID_A);
     assert_eq!(body["item"]["group"], "widgets");
 
     // The scan selects the same column list, so a missed quote there would 500 here.
-    let (status, body) = get(&app, "/read/catalog/items").await;
+    let (status, body) = get(&app, "/read/Catalog/Item").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["items"][0]["group"], "widgets");
 
@@ -967,43 +842,37 @@ handle = {item_added(): on_event}
 fn keyword_columns_project() -> TempDir {
     write_project(&[
         (
-            "events/row.star",
-            r#"row_added = event(
-    type = "row.added",
-    fields = {"order": uuid(), "select": str(), "group": str()},
-)
+            "events/row.hk",
+            r#"
+event @row.added {
+  order: Uuid,
+  select: String @max(20),
+  group: String @max(20),
+}
 "#,
         ),
         (
-            "commands/add-row.star",
+            "commands/add-row.hk",
             r#"
-load("events/row.star", "row_added")
-
-input = schema(order = uuid(), select = str(), group = str())
-
-def handle(input, state):
-    return row_added(order = input.order, select = input.select, group = input.group)
+command AddRow(order: Uuid, select: String, group: String) {
+  emit @row.added { order, select, group }
+}
 "#,
         ),
         (
-            "projectors/keys.star",
+            "projectors/keys.hk",
             r#"
-load("events/row.star", "row_added")
+projector Keys {
+  entity Row {
+    order: Uuid @key,
+    select: String @max(20) @index,
+    group: String @max(20),
+  }
 
-rows = entity(
-    key = "order",
-    fields = {"order": uuid(), "select": str(), "group": str()},
-    indexes = [index("by_select", ["select"])],
-)
-
-def on_event(event):
-    return [put(rows, {
-        "order": event.data.order,
-        "select": event.data.select,
-        "group": event.data.group,
-    })]
-
-handle = {row_added(): on_event}
+  on @row.added { order, select, group } {
+    put Row { order, select, group }
+  }
+}
 "#,
         ),
     ])
@@ -1015,13 +884,13 @@ async fn add_keyword_rows(rt: &Runtime, rows: &[(&str, &str)]) -> u64 {
     for (order, select) in rows {
         let result = rt
             .execute(
-                "add-row",
+                "AddRow",
                 json!({ "order": order, "select": select, "group": "g" }),
                 &ctx(),
                 None,
             )
             .unwrap();
-        assert_eq!(result.status, 200, "add-row failed: {:?}", result.body);
+        assert_eq!(result.status, 200, "AddRow failed: {:?}", result.body);
         last = result.body["positions"]["last"].as_u64().unwrap();
     }
     last
@@ -1035,15 +904,15 @@ async fn a_sql_keyword_as_the_entity_key_reads_by_key_and_paginates() {
     let harness = boot_project(dir.path());
 
     let last = add_keyword_rows(&harness.rt, &[(UUID_A, "a"), (UUID_B, "b"), (UUID_C, "a")]).await;
-    wait_position_async(&harness.rt, "keys", last).await;
+    wait_position_async(&harness.rt, "Keys", last).await;
     let app = harness.app();
 
-    let (status, body) = get(&app, &format!("/read/keys/rows/{UUID_B}")).await;
+    let (status, body) = get(&app, &format!("/read/Keys/Row/{UUID_B}")).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["item"]["order"], UUID_B);
     assert_eq!(body["item"]["select"], "b");
 
-    let (seen, requests) = page_through(&app, "/read/keys/rows?limit=2", "order").await;
+    let (seen, requests) = page_through(&app, "/read/Keys/Row?limit=2", "order").await;
     assert_eq!(
         seen,
         vec![UUID_A, UUID_B, UUID_C],
@@ -1064,10 +933,10 @@ async fn a_sql_keyword_column_filters_through_its_index() {
     let harness = boot_project(dir.path());
 
     let last = add_keyword_rows(&harness.rt, &[(UUID_A, "a"), (UUID_B, "b"), (UUID_C, "a")]).await;
-    wait_position_async(&harness.rt, "keys", last).await;
+    wait_position_async(&harness.rt, "Keys", last).await;
     let app = harness.app();
 
-    let (status, body) = get(&app, "/read/keys/rows?select=a").await;
+    let (status, body) = get(&app, "/read/Keys/Row?select=a").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     let matched: Vec<&str> = body["items"]
         .as_array()
@@ -1082,7 +951,7 @@ async fn a_sql_keyword_column_filters_through_its_index() {
     );
 
     // The filter is still an equality match, not a substring or a no-op.
-    let (status, body) = get(&app, "/read/keys/rows?select=b").await;
+    let (status, body) = get(&app, "/read/Keys/Row?select=b").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["items"].as_array().unwrap().len(), 1);
     assert_eq!(body["items"][0]["order"], UUID_B);

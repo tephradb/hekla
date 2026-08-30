@@ -41,7 +41,7 @@ use crate::introspect;
 use crate::projector::{ProjectorSet, ProjectorShared, Readiness};
 use crate::read_api;
 use crate::runtime::{Runtime, error_body};
-use crate::starlark_builtins::{EntityDef, EventDef, ModuleDef};
+use crate::schema::{EntityDef, EventDef, ModuleDef};
 use crate::ui;
 
 type Shared = Arc<Runtime>;
@@ -779,15 +779,23 @@ where
 }
 
 /// `GET /admin/assets/{file}`: one file of the bundled console.
-async fn admin_asset(Path(file): Path<String>) -> Response {
+async fn admin_asset(headers: HeaderMap, Path(file): Path<String>) -> Response {
     // Resolution is over the compiled-in table and nothing else, so a name carrying
     // `..` simply does not match an entry. The development override then substitutes
     // the content of a name that already resolved, never a path from the request.
     let Some(asset) = ui::asset(&file) else {
-        return ui::empty(StatusCode::NOT_FOUND);
+        // The same envelope every other 404 here answers with, and what the generated
+        // document promises for this one: a client that deserializes the documented
+        // error body must not be handed an empty response instead.
+        return not_found(&format!("no console asset named `{file}`"));
     };
-    // The override reads from disk, so it does not belong on the async runtime.
-    match tokio::task::spawn_blocking(move || ui::serve(asset)).await {
+    // Only the development override reads from disk. With none configured this is a
+    // table lookup and a refcount bump, so a pool hop per asset would cost more than
+    // the work it moves off the runtime, ~25 times per page load.
+    if ui::override_dir().is_none() {
+        return ui::serve(asset, &headers);
+    }
+    match tokio::task::spawn_blocking(move || ui::serve(asset, &headers)).await {
         Ok(response) => response,
         Err(err) => {
             tracing::error!("asset task panicked: {err}");
@@ -958,6 +966,12 @@ async fn admin_trace(
         // an effect produced an event but not which one; the journal is keyed by
         // `(effect, position)`, so joining it here answers that exactly instead of
         // leaving every client to guess from the subscription lists.
+        //
+        // The names come from the running project, so an invocation by an effect since
+        // renamed or deleted is absent and reads as though nothing ran. Listing every
+        // name the journal holds instead would answer for effects this binary knows
+        // nothing about, which is worse: a trace is read to understand the code in
+        // front of you. The document says which absence is which.
         let positions: Vec<u64> = events.iter().map(|(position, _)| *position).collect();
         let handles = runtime.effect_handles();
         let effects: Vec<&str> = handles.iter().map(|shared| shared.name.as_str()).collect();
@@ -1179,10 +1193,10 @@ async fn admin_schema(State(runtime): State<Shared>) -> Response {
                 // No fallback arm: the command map holds nothing else, and an arm
                 // reporting an empty input would render a command as taking no fields
                 // rather than surfacing the mismatch.
-                let ModuleDef::Command { input, .. } = &unit.loaded.def else {
+                let ModuleDef::Command { input, .. } = &unit.def else {
                     anyhow::bail!(
                         "`{}` is in the command map but is not a command",
-                        unit.loaded.def.name()
+                        unit.def.name()
                     );
                 };
                 let input: Vec<Value> = input
@@ -1191,10 +1205,10 @@ async fn admin_schema(State(runtime): State<Shared>) -> Response {
                     .map(|(name, kind)| json!({ "name": name, "kind": kind.describe() }))
                     .collect();
                 Ok(json!({
-                    "name": unit.loaded.def.name(),
+                    "name": unit.def.name(),
                     "internal": unit.internal,
                     "path": unit.rel_path,
-                    "source_hash": unit.loaded.source_hash,
+                    "source_hash": unit.source_hash,
                     "input": input,
                 }))
             })

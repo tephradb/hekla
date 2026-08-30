@@ -1,0 +1,22 @@
+// `@order.placed` carries data for two different subjects: the customer and the shop.
+// Per-field subjects (rather than scoping the whole event to one) let each be erased
+// independently: shredding the customer leaves the shop's order record intact, and
+// shredding the shop never touches the customer's personal fields.
+//
+// The customer's two fields are optional, and that is load-bearing rather than
+// incidental. An erased subject's column reads back absent, so the type has to admit
+// absence for erasure to be observable through a read model at all.
+
+event @order.placed {
+  order_id: Uuid,
+  // Subject ids stay plaintext: they are how the runtime finds the key.
+  customer_id: Int,
+  shop_id: Int,
+  // Personal, scoped to the customer.
+  email: String? @subject(customer_id) @max(200),
+  shipping_address: String? @subject(customer_id) @max(200),
+  // The shop's commercial figure, scoped to the shop.
+  order_total: Money(2) @subject(shop_id),
+  // Free text nobody queries: opt out of tagging, and of being a huge tag.
+  notes: String @no_index @max(500),
+}

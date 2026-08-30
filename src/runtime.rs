@@ -9,7 +9,7 @@
 //! Idempotency lives in the event log, not here: a keyed command tags its events and
 //! guards the append against that tag, and [`Runtime::execute`] reconstructs the
 //! original `(status, body)` from those events on a replay. It is synchronous
-//! (Starlark and tephra appends are), so the server calls it on a blocking thread.
+//! (the interpreter and tephra appends are), so the server calls it on a blocking thread.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -30,11 +30,14 @@ use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use heklang::Program;
+
 use crate::config::Config;
 use crate::context::CommandContext;
 use crate::crypto::{KeyStore, MasterKeys};
-use crate::dispatch::{self, CommandOutcome, EventDefs};
-use crate::effect::{self, EffectRuntime, EffectShared, HttpClient};
+use crate::dispatch::{self, CommandOutcome};
+use crate::effect::{self, EffectRuntime, EffectShared};
+use crate::http::HttpClient;
 use crate::loader::{CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::lock::DataDirLock;
 use crate::opdb::{
@@ -43,7 +46,8 @@ use crate::opdb::{
 };
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
-use crate::starlark_builtins::{EmittedEvent, EventDef};
+use crate::schema::{EmittedEvent, EventDef, EventDefs};
+use crate::tags;
 
 /// Individual event segments before rolling to a new file. 256 MiB matches
 /// tephra's own default sizing.
@@ -158,7 +162,10 @@ pub struct Runtime {
     events: Arc<EventDefs>,
     /// The subject-key store, present when a master key is configured. Required at
     /// boot when the project uses subject-scoped encryption.
-    keystore: Option<KeyStore>,
+    keystore: Option<Arc<KeyStore>>,
+    /// The one parsed program every thread reads. `Program` is `Send + Sync`, so this
+    /// is shared rather than copied.
+    program: Arc<Program>,
     started: Instant,
     projectors: HashMap<String, Arc<ProjectorShared>>,
     /// The effect handles, for `/status` and the skip endpoint. Set once, right
@@ -189,7 +196,7 @@ impl Runtime {
     /// Open the store and operational DB under `data_dir`, start one thread per
     /// projector and per effect (plus the retention sweeper), and build the runtime
     /// from an already-loaded, error-free project. `http` is the transport the
-    /// journaled `http.*` builtins use (a [`UreqClient`](crate::effect::UreqClient)
+    /// journaled `http.*` builtins use (a [`UreqClient`](crate::http::UreqClient)
     /// in production, a stub in tests). Returns the runtime, the write coordinator,
     /// the projector set, and the effect runtime; the caller keeps the last three
     /// to drain and join on shutdown.
@@ -221,13 +228,8 @@ impl Runtime {
 
         let mut commands = HashMap::new();
         for unit in project.commands {
-            opdb.upsert_module_metadata(
-                unit.loaded.def.name(),
-                "command",
-                &unit.loaded.source_hash,
-                &now,
-            )?;
-            let name = unit.loaded.def.name().to_owned();
+            opdb.upsert_module_metadata(unit.def.name(), "command", &unit.source_hash, &now)?;
+            let name = unit.def.name().to_owned();
             commands.insert(name, Arc::new(unit));
         }
 
@@ -240,16 +242,11 @@ impl Runtime {
         let verify = project.config.verify.enabled;
         let config = project.config.clone();
         for unit in &projector_units {
-            opdb.upsert_module_metadata(
-                unit.loaded.def.name(),
-                "projector",
-                &unit.loaded.source_hash,
-                &now,
-            )?;
+            opdb.upsert_module_metadata(unit.def.name(), "projector", &unit.source_hash, &now)?;
         }
         // Event field metadata, shared with the projector and effect runtimes so a
         // fold or a `handle` sees subject fields as opaque handles.
-        let events = Arc::new(project.events.by_type.clone());
+        let events = Arc::new(project.events.clone());
         let uses_subjects = events
             .values()
             .any(|def| def.fields.iter().any(|(_, meta)| meta.subject.is_some()));
@@ -259,31 +256,10 @@ impl Runtime {
             );
         }
 
-        // Each projector reconciles its own definition hash (stored in its read model)
-        // against the current one at startup, rebuilding if it changed before applying
-        // any batch. Recording the hash with the rebuild's atomic swap makes this
-        // crash-safe, unlike recording it here at boot.
-        let (shared, projector_set) = projector::start_all(
-            projector_units,
-            &store,
-            &projectors_dir,
-            events.clone(),
-            auto_rebuild,
-        )?;
-        let projectors: HashMap<String, Arc<ProjectorShared>> = shared
-            .into_iter()
-            .map(|handle| (handle.name.clone(), handle))
-            .collect();
-
         let effect_units: Vec<Arc<EffectUnit>> =
             project.effects.into_iter().map(Arc::new).collect();
         for unit in &effect_units {
-            opdb.upsert_module_metadata(
-                unit.loaded.def.name(),
-                "effect",
-                &unit.loaded.source_hash,
-                &now,
-            )?;
+            opdb.upsert_module_metadata(unit.def.name(), "effect", &unit.source_hash, &now)?;
         }
 
         let opdb = Arc::new(Mutex::new(opdb));
@@ -294,12 +270,33 @@ impl Runtime {
         if let Some(keystore) = &keystore {
             keystore.verify_masters_present()?;
         }
+        let keystore = keystore.map(Arc::new);
+        let program = Arc::new(project.program);
+
+        // Each projector reconciles its own definition hash (stored in its read model)
+        // against the current one at startup, rebuilding if it changed before applying
+        // any batch. Recording the hash with the rebuild's atomic swap makes this
+        // crash-safe, unlike recording it here at boot.
+        let (shared, projector_set) = projector::start_all(
+            projector_units,
+            &store,
+            &projectors_dir,
+            Arc::clone(&program),
+            keystore.clone(),
+            events.clone(),
+            auto_rebuild,
+        )?;
+        let projectors: HashMap<String, Arc<ProjectorShared>> = shared
+            .into_iter()
+            .map(|handle| (handle.name.clone(), handle))
+            .collect();
 
         let runtime = Arc::new(Runtime {
             commands,
             store,
             opdb,
             events: events.clone(),
+            program,
             keystore,
             started: Instant::now(),
             projectors,
@@ -344,7 +341,7 @@ impl Runtime {
         let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default())
             .context("starting the write coordinator")?;
 
-        let events = Arc::new(project.events.by_type.clone());
+        let events = Arc::new(project.events.clone());
         // The same guard `open` applies. Without it a sweep of a subject-using project
         // with no master key runs every check against a keystore-less runtime, where
         // `reveal` fails before the host can mark the failure terminal, so the replay
@@ -359,7 +356,9 @@ impl Runtime {
             );
         }
         let opdb = Arc::new(Mutex::new(OpDb::open(&data_dir.join("hekla.db"))?));
-        let keystore = master.map(|master| KeyStore::new(opdb.clone(), master));
+        let keystore = master
+            .map(|master| KeyStore::new(opdb.clone(), master))
+            .map(Arc::new);
         if let Some(keystore) = &keystore {
             keystore.verify_masters_present()?;
         }
@@ -369,6 +368,7 @@ impl Runtime {
             store,
             opdb,
             events: events.clone(),
+            program: Arc::new(project.program.clone()),
             keystore,
             started: Instant::now(),
             projectors: HashMap::new(),
@@ -441,14 +441,14 @@ impl Runtime {
         idem_key: Option<&str>,
     ) -> anyhow::Result<ExecResult> {
         let now = now_rfc3339();
-        let idem_tag = idem_key.map(|key| dispatch::idempotency_tag(name, key));
+        let idem_tag = idem_key.map(|key| tags::idempotency_tag(name, key));
         self.run_with_retry(command, &body, ctx, &now, idem_tag.as_deref())
     }
 
     /// Run the decision cycle, retrying on a DCB conflict so the decision model is
     /// rebuilt against the new tail, with a capped jittered backoff so a hot
-    /// boundary does not hammer the single writer. The retry loop itself lives in
-    /// `dispatch`, which folds only what landed since the last attempt; this decides
+    /// boundary does not hammer the single writer. The attempts themselves happen
+    /// inside heklang, which folds only what landed since the last one; this decides
     /// the budget and the wait. When a keyed request already committed (a crash or a
     /// concurrent duplicate), `run_command` returns `AlreadyCommitted` with the
     /// outcome recovered from the log rather than re-deciding, so a duplicate never
@@ -462,7 +462,7 @@ impl Runtime {
         idem_tag: Option<&str>,
     ) -> anyhow::Result<ExecResult> {
         // Input is invariant across attempts, so validate once before the loop.
-        if let Err(err) = dispatch::validate_input(&command.loaded, body) {
+        if let Err(err) = dispatch::validate_input(&self.program, command.def.name(), body) {
             return Ok(ExecResult {
                 status: 400,
                 body: error_body(ctx, "invalid_input", &format!("{err}")),
@@ -475,14 +475,14 @@ impl Runtime {
         };
         match dispatch::run_command(
             &self.store,
-            &command.loaded,
-            &self.events,
-            self.keystore.as_ref(),
+            self.program_shared(),
+            self.events_shared(),
+            command.def.name(),
+            self.keystore_shared(),
             body,
             ctx,
             now,
             idem_tag,
-            self.verify,
             &retry,
         )? {
             CommandOutcome::Conflict => Ok(ExecResult {
@@ -524,9 +524,9 @@ impl Runtime {
         let mut internal: Vec<&str> = Vec::new();
         for unit in self.commands.values() {
             if unit.internal {
-                internal.push(unit.loaded.def.name());
+                internal.push(unit.def.name());
             } else {
-                public.push(unit.loaded.def.name());
+                public.push(unit.def.name());
             }
         }
         public.sort();
@@ -571,15 +571,6 @@ impl Runtime {
             })
             .collect();
 
-        // Read amplification is the diagnostic number for a DCB workload, and a command
-        // API cannot report it per request: the caller sees a decision, not the events
-        // behind it. Counted per process instead, so `events / commands` is the mean
-        // boundary depth this deployment is actually paying for. `chunk_seams` is what
-        // makes the chunked fold observable at all, since chunking is invisible in the
-        // result. Both are process-wide rather than per runtime; one process holds one
-        // data directory, so that is the same thing here.
-        let (events_folded, chunk_seams) = dispatch::fold_counters();
-
         json!({
             "log_head": head,
             "uptime_seconds": self.uptime_seconds(),
@@ -588,7 +579,6 @@ impl Runtime {
             "projectors": projectors,
             "effects": effects,
             "events": self.events.len(),
-            "folds": { "events_folded": events_folded, "chunk_seams": chunk_seams },
         })
     }
 
@@ -639,17 +629,6 @@ impl Runtime {
         now: &str,
     ) -> anyhow::Result<()> {
         self.lock_opdb().complete_invocation(effect, position, now)
-    }
-
-    pub(crate) fn journal_get(
-        &self,
-        effect: &str,
-        position: u64,
-        call_hash: &str,
-        disambiguator: u64,
-    ) -> anyhow::Result<Option<String>> {
-        self.lock_opdb()
-            .journal_get(effect, position, call_hash, disambiguator)
     }
 
     /// Record a durable verify-mode quarantine for an effect.
@@ -726,7 +705,7 @@ impl Runtime {
     /// and an operator debugging an effect's `invoke_command` needs to see them.
     pub fn command_units(&self) -> Vec<&Arc<CommandUnit>> {
         let mut units: Vec<&Arc<CommandUnit>> = self.commands.values().collect();
-        units.sort_by_key(|unit| unit.loaded.def.name());
+        units.sort_by_key(|unit| unit.def.name());
         units
     }
 
@@ -803,28 +782,6 @@ impl Runtime {
         self.lock_opdb().terminal_invocations(effect)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn journal_put(
-        &self,
-        effect: &str,
-        position: u64,
-        call_hash: &str,
-        disambiguator: u64,
-        kind: &str,
-        result: &str,
-        now: &str,
-    ) -> anyhow::Result<()> {
-        self.lock_opdb().journal_put(
-            effect,
-            position,
-            call_hash,
-            disambiguator,
-            kind,
-            result,
-            now,
-        )
-    }
-
     pub(crate) fn running_with_hash_mismatch(
         &self,
         effect: &str,
@@ -839,6 +796,30 @@ impl Runtime {
     }
 
     /// The OpenAPI document, serialized once at startup.
+    /// The one parsed program, for anything that runs a declaration.
+    pub fn program(&self) -> &Program {
+        &self.program
+    }
+
+    /// The same, as a handle a host can keep. `Program` is `Send + Sync`, so a world
+    /// shares this rather than copying it.
+    pub fn program_shared(&self) -> &Arc<Program> {
+        &self.program
+    }
+
+    pub fn events_shared(&self) -> &Arc<EventDefs> {
+        &self.events
+    }
+
+    pub fn keystore_shared(&self) -> Option<&Arc<KeyStore>> {
+        self.keystore.as_ref()
+    }
+
+    /// The operational database, which is where an invocation's journal lives.
+    pub fn opdb(&self) -> &Arc<Mutex<OpDb>> {
+        &self.opdb
+    }
+
     pub fn openapi_json(&self) -> &str {
         &self.openapi_json
     }
@@ -862,7 +843,7 @@ impl Runtime {
     /// The subject-key store, if a master key is configured. The read API decrypts
     /// subject columns through it, and an effect's `reveal()` reads plaintext.
     pub fn keystore(&self) -> Option<&KeyStore> {
-        self.keystore.as_ref()
+        self.keystore.as_deref()
     }
 
     fn lock_opdb(&self) -> MutexGuard<'_, OpDb> {

@@ -30,14 +30,16 @@ use serde_json::{Map, Value, json};
 use tephra::{Event, EventType, Position, Query, QueryItem, Tag, Tags, WriteHandle};
 
 use crate::crypto::{KeyStore, RowDecryptor};
-use crate::dispatch::{self, EventDefs, RESERVED_TAG_PREFIX};
 use crate::effect::EffectShared;
 use crate::envelope;
 use crate::opdb::{EffectState, InvocationAt, InvocationRow, JournalRow, ModuleRow, SubjectInfo};
 use crate::projector::ProjectorShared;
 use crate::read_api::{self, filterable_fields};
 use crate::read_model::key_kind;
-use crate::starlark_builtins::{EntityDef, EventDef, FieldMeta, scalar_to_string};
+use crate::schema::EventDefs;
+use crate::schema::{EntityDef, EventDef, FieldMeta, scalar_to_string};
+use crate::tags;
+use crate::tags::RESERVED_TAG_PREFIX;
 
 /// Default page size when a request does not set `limit`.
 pub const DEFAULT_LIMIT: usize = 50;
@@ -95,11 +97,11 @@ pub fn build_query(types: &[String], tags: &[String]) -> anyhow::Result<Query> {
 
 /// The query matching every event of one correlated flow.
 ///
-/// Goes through [`dispatch::correlation_tag_value`] rather than taking the bare id:
+/// Goes through [`tags::correlation_tag_value`] rather than taking the bare id:
 /// the stored tag is `_hekla_corr:<uuid>`, so a probe for the id alone matches
 /// nothing at all, which is the shape of bug that reads as "this flow had no events".
 pub fn correlation_query(correlation_id: &str) -> anyhow::Result<Query> {
-    build_query(&[], &[dispatch::correlation_tag_value(correlation_id)])
+    build_query(&[], &[tags::correlation_tag_value(correlation_id)])
 }
 
 /// One page of the log. `cursor` is a position: the exclusive upper bound walking
@@ -470,7 +472,6 @@ fn field(name: &str, meta: &FieldMeta) -> Value {
         "optional": meta.kind.is_nullable(),
         "indexed": meta.indexed,
         "subject": meta.subject,
-        "unique": meta.unique,
     })
 }
 

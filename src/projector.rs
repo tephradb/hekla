@@ -21,23 +21,15 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::Context;
-use starlark::environment::{FrozenModule, Module};
+use heklang::{Program, Projection};
 use tephra::{Event, Position, WaitOutcome, WriteHandle};
 
-use crate::context::{EntityReader, ProjectorCtx};
-use crate::dispatch::{self, EventDefs};
-use crate::dispatch::{arm_selects, lower_dispatch};
-use crate::envelope;
+use crate::crypto::KeyStore;
+use crate::heklang_host::{self, RowWriter};
+use crate::invariant::Violation;
 use crate::loader::ProjectorUnit;
 use crate::read_model::ReadModel;
-use crate::starlark_builtins::{
-    EntityDef, EventSpec, LoadedModule, ModuleDef, alloc_event, call_handler_with_projector_ctx,
-    parse_entity_ops, parse_event_dispatch, thaw,
-};
-use crate::verify::Violation;
-
-/// Per-handler instruction budget, matching the command dispatch bound.
-const MAX_TICKS: u64 = 10_000_000;
+use crate::schema::{EntityDef, EventDefs, ModuleDef};
 
 /// How long a caught-up projector blocks before re-checking its shutdown flag.
 const IDLE_POLL: Duration = Duration::from_millis(250);
@@ -285,6 +277,8 @@ pub fn start_all(
     projectors: Vec<Arc<ProjectorUnit>>,
     store: &WriteHandle,
     projectors_dir: &Path,
+    program: Arc<Program>,
+    keystore: Option<Arc<KeyStore>>,
     events: Arc<EventDefs>,
     auto_rebuild: bool,
 ) -> anyhow::Result<(Vec<Arc<ProjectorShared>>, ProjectorSet)> {
@@ -295,6 +289,8 @@ pub fn start_all(
             unit,
             store.clone(),
             projectors_dir,
+            Arc::clone(&program),
+            keystore.clone(),
             events.clone(),
             auto_rebuild,
         )?;
@@ -304,10 +300,13 @@ pub fn start_all(
     Ok((shared, set))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     unit: Arc<ProjectorUnit>,
     store: WriteHandle,
     projectors_dir: &Path,
+    program: Arc<Program>,
+    keystore: Option<Arc<KeyStore>>,
     events: Arc<EventDefs>,
     auto_rebuild: bool,
 ) -> anyhow::Result<(Arc<ProjectorShared>, JoinHandle<()>)> {
@@ -315,7 +314,7 @@ fn spawn(
         name,
         entities,
         sources,
-    } = &unit.loaded.def
+    } = &unit.def
     else {
         anyhow::bail!("spawn called on a non-projector module");
     };
@@ -337,8 +336,7 @@ fn spawn(
         name: name.clone(),
         db_path,
         entities: Arc::new(entities),
-        sources: EventSpec::source_types(sources)
-            .map(|types| types.into_iter().map(str::to_owned).collect()),
+        sources: Some(sources.clone()),
         position: AtomicU64::new(start.get()),
         shutdown: AtomicBool::new(false),
         replay: AtomicBool::new(false),
@@ -351,7 +349,19 @@ fn spawn(
     let task_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
         .name(format!("projector-{name}"))
-        .spawn(move || run(task_shared, unit, store, model, events, definition, plan))
+        .spawn(move || {
+            run(
+                task_shared,
+                unit,
+                store,
+                program,
+                keystore,
+                model,
+                events,
+                definition,
+                plan,
+            )
+        })
         .with_context(|| format!("spawning projector `{name}`"))?;
     Ok((shared, join))
 }
@@ -414,10 +424,13 @@ fn reconcile_plan(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     shared: Arc<ProjectorShared>,
     unit: Arc<ProjectorUnit>,
     store: WriteHandle,
+    program: Arc<Program>,
+    keystore: Option<Arc<KeyStore>>,
     model: ReadModel,
     events: Arc<EventDefs>,
     definition: String,
@@ -426,28 +439,40 @@ fn run(
     // Declared first so it drops last: `running` is cleared however the thread leaves,
     // a panic included, and only once the failure below has been recorded.
     let _running = RunningFlag(&shared);
-    if let Err(err) = run_inner(&shared, &unit, &store, model, &events, &definition, plan) {
+    if let Err(err) = run_inner(
+        &shared,
+        &unit,
+        &store,
+        &program,
+        keystore.as_deref(),
+        model,
+        &events,
+        &definition,
+        plan,
+    ) {
         let message = format!("{err:#}");
         tracing::error!("projector `{}` stopped: {message}", shared.name);
         shared.record_failure(&message);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     shared: &ProjectorShared,
     unit: &ProjectorUnit,
     store: &WriteHandle,
+    program: &Program,
+    keystore: Option<&KeyStore>,
     mut model: ReadModel,
     events: &EventDefs,
     definition: &str,
     plan: Reconcile,
 ) -> anyhow::Result<()> {
-    let ModuleDef::Projector { sources, .. } = &unit.loaded.def else {
+    let ModuleDef::Projector { sources, .. } = &unit.def else {
         anyhow::bail!("run called on a non-projector module");
     };
-    let query = dispatch::to_query(sources, events, None)?;
-    let by_id = by_id_map(&shared.entities);
-    let frozen = &unit.loaded.module;
+    let query = heklang_host::query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
+    let entities_by_name = by_name(&shared.entities);
 
     // Act on the plan [`spawn`] decided before publishing the handle. A rebuild has to
     // finish before any batch lands, or a reader could briefly see stale data at the
@@ -462,7 +487,9 @@ fn run_inner(
                 "projector `{}` definition changed; rebuilding its read model",
                 shared.name
             );
-            model = rebuild_or_degrade(shared, unit, store, model, events, definition)?;
+            model = rebuild_or_degrade(
+                shared, unit, store, program, keystore, model, events, definition,
+            )?;
         }
         // Do not stamp the current definition onto a model we did not rebuild: that
         // would bless possibly-stale data at a possibly-old shape as current and
@@ -480,7 +507,9 @@ fn run_inner(
         if shared.replay.swap(false, Ordering::Relaxed) {
             // A replay is the only way out of `Stale` or `Failed`, and it is harmless
             // otherwise.
-            model = rebuild_or_degrade(shared, unit, store, model, events, definition)?;
+            model = rebuild_or_degrade(
+                shared, unit, store, program, keystore, model, events, definition,
+            )?;
             sub = store.subscribe(query.clone(), model.read_checkpoint()?);
             continue;
         }
@@ -501,7 +530,16 @@ fn run_inner(
             .poll_batch()
             .map_err(|err| anyhow::anyhow!("reading events: {err}"))?;
         if !batch.is_empty() {
-            apply_batch(&model, frozen, &by_id, &batch, sub.position(), events)?;
+            apply_batch(
+                &model,
+                program,
+                &shared.name,
+                &entities_by_name,
+                keystore,
+                events,
+                &batch,
+                sub.position(),
+            )?;
             if let Err(violation) = shared.advance_position(sub.position().get()) {
                 shared.quarantine(&violation);
             }
@@ -539,15 +577,20 @@ fn run_inner(
 /// thread to pick it up: the only recovery was a restart. Recording the failure and
 /// idling instead keeps the replay endpoint meaningful, so an operator can fix the
 /// cause and retry in place.
+#[allow(clippy::too_many_arguments)]
 fn rebuild_or_degrade(
     shared: &ProjectorShared,
     unit: &ProjectorUnit,
     store: &WriteHandle,
+    program: &Program,
+    keystore: Option<&KeyStore>,
     model: ReadModel,
     events: &EventDefs,
     definition: &str,
 ) -> anyhow::Result<ReadModel> {
-    let err = match rebuild(shared, unit, store, model, events, definition) {
+    let err = match rebuild(
+        shared, unit, store, program, keystore, model, events, definition,
+    ) {
         Ok(fresh) => {
             shared.clear_failure();
             shared.set_readiness(Readiness::Ready);
@@ -591,7 +634,9 @@ fn rebuild_or_degrade(
 /// where it selects nothing at all.
 pub fn project_to(
     store: &WriteHandle,
-    unit: &LoadedModule,
+    unit: &ProjectorUnit,
+    program: &Program,
+    keystore: Option<&KeyStore>,
     model: &ReadModel,
     events: &EventDefs,
     upto: Option<Position>,
@@ -602,8 +647,9 @@ pub fn project_to(
     else {
         anyhow::bail!("project_to called on a non-projector module");
     };
-    let query = dispatch::to_query(sources, events, None)?;
-    let by_id = by_id_map(entities);
+    let query = heklang_host::query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
+    let entities_by_name = by_name(entities);
+    let name = unit.def.name().to_owned();
     let mut sub = store.subscribe(query, model.read_checkpoint()?);
     let mut seen = 0usize;
     loop {
@@ -635,7 +681,16 @@ pub fn project_to(
             _ => sub.position(),
         };
         seen += batch.len();
-        apply_batch(model, &unit.module, &by_id, &batch, checkpoint, events)?;
+        apply_batch(
+            model,
+            program,
+            &name,
+            &entities_by_name,
+            keystore,
+            events,
+            &batch,
+            checkpoint,
+        )?;
         if upto.is_some_and(|limit| checkpoint >= limit) {
             return Ok(seen);
         }
@@ -656,85 +711,56 @@ pub fn project_to(
 /// [`project_to`] with no upper bound: project everything to the current head.
 pub fn project_to_head(
     store: &WriteHandle,
-    unit: &LoadedModule,
+    unit: &ProjectorUnit,
+    program: &Program,
+    keystore: Option<&KeyStore>,
     model: &ReadModel,
     events: &EventDefs,
 ) -> anyhow::Result<usize> {
-    project_to(store, unit, model, events, None)
+    project_to(store, unit, program, keystore, model, events, None)
 }
 
-/// Apply one batch of events and advance the checkpoint, in one transaction. Every
-/// read and write runs on `model`'s single connection, so a `get()` in a later
-/// event sees a `put()` from an earlier one in the same batch.
+/// Apply one batch of events and advance the checkpoint, in one transaction.
+///
+/// Every read and write runs on `model`'s single connection, so a `patch`'s stored load
+/// in a later event sees a write from an earlier one in the same batch. That is the
+/// read-your-own-writes `Rows` requires, supplied by the transaction rather than by an
+/// overlay the runtime would otherwise have to keep.
+#[allow(clippy::too_many_arguments)]
 fn apply_batch(
     model: &ReadModel,
-    frozen: &FrozenModule,
-    by_id: &HashMap<u64, EntityDef>,
+    program: &Program,
+    projector_name: &str,
+    entities: &HashMap<String, EntityDef>,
+    keystore: Option<&KeyStore>,
+    events: &EventDefs,
     batch: &[(Position, Event)],
     checkpoint: Position,
-    events: &EventDefs,
 ) -> anyhow::Result<()> {
+    let declared = program
+        .projector(projector_name)
+        .ok_or_else(|| anyhow::anyhow!("projector `{projector_name}` is not declared"))?;
+    let projection =
+        Projection::new(program, projector_name).map_err(|err| anyhow::anyhow!("{err}"))?;
+
     let tx = model.begin()?;
-    Module::with_temp_heap(|module| {
-        let handle_owned = frozen
-            .get_option("handle")?
-            .ok_or_else(|| anyhow::anyhow!("projector has no handle() function"))?;
-        let handle = parse_event_dispatch(thaw(&handle_owned, &module))
-            .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
-        // `None` matches how a projector lowers its subscription: filtering a
-        // subject-encrypted field in a `handle` key is a static error, so no key is needed.
-        let lowered = lower_dispatch(&handle, events, None)
-            .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
-        for (_position, event) in batch {
-            // Matching before decoding: an event no arm selects costs nothing, and the
-            // checkpoint still advances past it.
-            let selected: Vec<usize> = lowered
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| arm_selects(item.as_ref(), event.as_ref()))
-                .map(|(index, _)| index)
-                .collect();
-            if selected.is_empty() {
-                continue;
-            }
-            let event_type = event.event_type();
-            let (envelope, data) = envelope::decode(event.data())
-                .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-            let value = alloc_event(
-                &module,
-                envelope.event_id,
-                &envelope.timestamp,
-                event_type,
-                &data,
-                events.get(event_type),
-            );
-            // Every selecting arm runs in declaration order, and `get()` reads through
-            // the batch's own uncommitted writes, so a later arm sees an earlier one's
-            // ops.
-            for index in selected {
-                let arm = &handle.arms()[index];
-                let reader = BatchReader { model, by_id };
-                let ctx = ProjectorCtx { reader: &reader };
-                let result =
-                    call_handler_with_projector_ctx(&module, arm.func, &[value], MAX_TICKS, &ctx)
-                        .map_err(|err| {
-                        anyhow::anyhow!(
-                            "{} failed: {err}",
-                            handle.label("handle", arm.spec.as_ref())
-                        )
-                    })?;
-                for op in parse_entity_ops(result)? {
-                    let entity = by_id.get(&op.entity_id).ok_or_else(|| {
-                        anyhow::anyhow!("op references an entity the projector didn't declare")
-                    })?;
-                    model
-                        .apply_one(entity, op.kind)
-                        .with_context(|| format!("applying an op to entity `{}`", entity.name))?;
-                }
-            }
+    {
+        let mut rows = RowWriter {
+            model,
+            program,
+            projector: declared,
+            entities,
+            keystore,
+        };
+        for (position, event) in batch {
+            let record =
+                heklang_host::record_of(program, events, keystore, *position, event.as_ref())
+                    .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
+            projection
+                .apply(&record, &mut rows)
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
         }
-        anyhow::Ok(())
-    })?;
+    }
     model.write_checkpoint(checkpoint, &tx)?;
     tx.commit().context("committing a projector batch")?;
     Ok(())
@@ -744,10 +770,13 @@ fn apply_batch(
 /// rename so state and position move together atomically. Consumes the live model
 /// (closing its connection before the swap), publishes the rebuilt checkpoint as the
 /// projector's position, and returns the reopened model.
+#[allow(clippy::too_many_arguments)]
 fn rebuild(
     shared: &ProjectorShared,
     unit: &ProjectorUnit,
     store: &WriteHandle,
+    program: &Program,
+    keystore: Option<&KeyStore>,
     model: ReadModel,
     events: &EventDefs,
     definition: &str,
@@ -757,7 +786,7 @@ fn rebuild(
     remove_db_files(&rebuild_path)?;
 
     let fresh = ReadModel::open(&rebuild_path, &shared.entities)?;
-    let count = project_to_head(store, &unit.loaded, &fresh, events)?;
+    let count = project_to_head(store, unit, program, keystore, &fresh, events)?;
     // Stamp the definition the fresh model was built under, so it swaps in atomically
     // with the data (and a crash before the swap leaves the old model and its old
     // definition intact).
@@ -784,27 +813,11 @@ fn rebuild(
 /// has changed and rebuild it. The entity's process-unique `id` and the handler body
 /// are deliberately excluded: an id changes every run, and a handler fix is the
 /// author's call to replay, not an automatic one.
-fn definition_hash(sources: &[EventSpec], entities: &[EntityDef]) -> String {
+fn definition_hash(sources: &[String], entities: &[EntityDef]) -> String {
     let mut canonical = String::new();
-    for spec in sources {
-        match spec {
-            EventSpec::All => canonical.push_str("all;"),
-            EventSpec::Filter {
-                event_type,
-                constraints,
-                ..
-            } => {
-                canonical.push_str(event_type);
-                canonical.push('(');
-                for (field, value) in constraints {
-                    canonical.push_str(field);
-                    canonical.push('=');
-                    canonical.push_str(value);
-                    canonical.push(',');
-                }
-                canonical.push_str(");");
-            }
-        }
+    for event_type in sources {
+        canonical.push_str(event_type);
+        canonical.push(';');
     }
     canonical.push('|');
     for entity in entities {
@@ -834,29 +847,12 @@ fn definition_hash(sources: &[EventSpec], entities: &[EntityDef]) -> String {
     crate::hash::sha256_hex(canonical.as_bytes())
 }
 
-/// Resolve `put`/`patch`/`delete`/`get` entity references (which carry only an id)
-/// back to their resolved definitions.
-fn by_id_map(entities: &[EntityDef]) -> HashMap<u64, EntityDef> {
+/// The tables of one projector, by entity name, which is what a write names.
+fn by_name(entities: &[EntityDef]) -> HashMap<String, EntityDef> {
     entities
         .iter()
-        .map(|entity| (entity.id, entity.clone()))
+        .map(|entity| (entity.name.clone(), entity.clone()))
         .collect()
-}
-
-/// The read model's view for one batch: `get()` resolves an entity id to its
-/// definition and reads the current row through the batch's open transaction.
-struct BatchReader<'a> {
-    model: &'a ReadModel,
-    by_id: &'a HashMap<u64, EntityDef>,
-}
-
-impl EntityReader for BatchReader<'_> {
-    fn get(&self, entity_id: u64, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
-        let entity = self.by_id.get(&entity_id).ok_or_else(|| {
-            anyhow::anyhow!("get() references an entity the projector didn't declare")
-        })?;
-        self.model.get(entity, key)
-    }
 }
 
 fn remove_db_files(db_path: &Path) -> anyhow::Result<()> {
@@ -889,11 +885,10 @@ mod tests {
     use tephra::Position;
 
     use super::*;
-    use crate::starlark_builtins::{FieldKind, FieldMeta};
+    use crate::schema::{FieldKind, FieldMeta};
 
     fn entity() -> EntityDef {
         EntityDef {
-            id: 1,
             name: "rows".to_owned(),
             key: "id".to_owned(),
             fields: vec![("id".to_owned(), FieldMeta::plain(FieldKind::Uuid))],

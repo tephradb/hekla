@@ -27,6 +27,8 @@
 
 use std::cmp::Ordering;
 use std::fmt;
+
+use crate::invariant::{Mismatch, Violation};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -35,92 +37,17 @@ use anyhow::Context;
 use serde_json::Value;
 use tephra::{Event, Position, Query, WriteHandle};
 
-use crate::crypto::MasterKeys;
-use crate::dispatch::{self, EventDefs};
+use heklang::Program;
+
+use crate::crypto::{KeyStore, MasterKeys};
 use crate::effect;
 use crate::envelope;
-use crate::loader::{EffectUnit, LoadedProject};
+use crate::loader::{EffectUnit, LoadedProject, ProjectorUnit};
 use crate::projector;
 use crate::read_model::ReadModel;
 use crate::runtime::Runtime;
-use crate::starlark_builtins::{EntityDef, LoadedModule, ModuleDef};
-
-/// A broken invariant, with enough detail to act on without re-running the check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Violation {
-    /// A rebuilt projector disagrees with the live read model.
-    RebuildMismatch {
-        projector: String,
-        entity: String,
-        key: String,
-        detail: Mismatch,
-    },
-    /// A sealed replay of a recorded invocation did not reproduce it.
-    ReplayDivergence {
-        effect: String,
-        position: u64,
-        detail: String,
-    },
-    /// A checkpoint moved backwards.
-    CheckpointRegression {
-        component: String,
-        from: u64,
-        to: u64,
-    },
-}
-
-/// How a rebuilt row differs from the live one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mismatch {
-    /// The live model has a row the rebuild does not produce.
-    OnlyLive(String),
-    /// The rebuild produces a row the live model does not have.
-    OnlyRebuilt(String),
-    /// Both have the row, with different contents.
-    Differs { live: String, rebuilt: String },
-}
-
-impl fmt::Display for Violation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Violation::RebuildMismatch {
-                projector,
-                entity,
-                key,
-                detail,
-            } => {
-                write!(f, "projector `{projector}` entity `{entity}` key `{key}`: ")?;
-                match detail {
-                    Mismatch::OnlyLive(row) => {
-                        write!(f, "live has a row a rebuild does not produce: {row}")
-                    }
-                    Mismatch::OnlyRebuilt(row) => {
-                        write!(f, "a rebuild produces a row live does not have: {row}")
-                    }
-                    Mismatch::Differs { live, rebuilt } => {
-                        write!(f, "live {live} but a rebuild gives {rebuilt}")
-                    }
-                }
-            }
-            Violation::ReplayDivergence {
-                effect,
-                position,
-                detail,
-            } => write!(
-                f,
-                "effect `{effect}` at position {position} does not replay faithfully: {detail}"
-            ),
-            Violation::CheckpointRegression {
-                component,
-                from,
-                to,
-            } => write!(
-                f,
-                "{component} moved its checkpoint backwards, from {from} to {to}"
-            ),
-        }
-    }
-}
+use crate::schema::EventDefs;
+use crate::schema::{EntityDef, ModuleDef, scalar_to_string};
 
 /// What a run of the checks found, and how much it covered.
 ///
@@ -166,24 +93,31 @@ impl fmt::Display for Report {
 /// Rebuild a projector from position 0 into a throwaway model and compare it, row
 /// for row, against the live one.
 ///
-/// The comparison is exact rather than approximate because two things hold: subject
-/// columns store the event's ciphertext verbatim rather than re-encrypting (so a
-/// rebuild copies bytes, and an erased subject does not perturb the result), and
-/// `rows` orders by key. Nothing here writes to the live model or the log.
+/// The comparison is exact rather than approximate because two things hold: `rows`
+/// orders by key, and a subject column re-encrypted from the same plaintext under the
+/// same key is the same bytes, because AES-SIV derives its IV from the two rather than
+/// drawing one. A nonce-carrying cipher here would make every encrypted column differ
+/// between the live model and the rebuild, so that property is load-bearing rather
+/// than incidental. What it does *not* survive is erasure, which leaves the live row
+/// holding ciphertext and the rebuild writing NULL; [`drop_shredded`] is what reconciles
+/// the two. Nothing here writes to the live model or the log.
 ///
 /// **The rebuild is bounded at the live model's own checkpoint.** Building to head
 /// instead would compare a shadow that has absorbed the whole log against a live
 /// model that stopped wherever it stopped, so every event in the gap would surface as
 /// a mismatch. A projector that was merely lagging when the server stopped is the
 /// ordinary case, not a corrupt one.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_equivalence(
     store: &WriteHandle,
-    loaded: &LoadedModule,
+    unit: &ProjectorUnit,
+    program: &Program,
+    keystore: Option<&KeyStore>,
     live_db: &Path,
     events: &EventDefs,
     scratch: &Path,
 ) -> anyhow::Result<Vec<Violation>> {
-    let ModuleDef::Projector { name, entities, .. } = &loaded.def else {
+    let ModuleDef::Projector { name, entities, .. } = &unit.def else {
         anyhow::bail!("rebuild_equivalence called on a non-projector module");
     };
 
@@ -191,12 +125,18 @@ pub fn rebuild_equivalence(
     let upto = live.read_checkpoint()?;
 
     let rebuilt_path = scratch.join(format!("{name}.verify.db"));
-    let rebuilt = ReadModel::open(&rebuilt_path, entities)?;
-    projector::project_to(store, loaded, &rebuilt, events, Some(upto))?;
+    let rebuilt = ReadModel::open(&rebuilt_path, entities.as_slice())?;
+    projector::project_to(store, unit, program, keystore, &rebuilt, events, Some(upto))?;
 
     let mut violations = Vec::new();
     for entity in entities {
-        violations.extend(compare_entity(name, entity, &live, &rebuilt)?);
+        violations.extend(compare_entity(
+            name.as_str(),
+            entity,
+            &live,
+            &rebuilt,
+            keystore,
+        )?);
     }
     Ok(violations)
 }
@@ -210,9 +150,15 @@ fn compare_entity(
     entity: &EntityDef,
     live: &ReadModel,
     rebuilt: &ReadModel,
+    keystore: Option<&KeyStore>,
 ) -> anyhow::Result<Vec<Violation>> {
-    let live_rows = keyed(entity, live.rows(entity)?);
-    let rebuilt_rows = keyed(entity, rebuilt.rows(entity)?);
+    let mut live_rows = keyed(entity, live.rows(entity)?);
+    let mut rebuilt_rows = keyed(entity, rebuilt.rows(entity)?);
+    for rows in [&mut live_rows, &mut rebuilt_rows] {
+        for (_, row) in rows.iter_mut() {
+            drop_shredded(entity, row, keystore);
+        }
+    }
 
     let mut violations = Vec::new();
     let mut mismatch = |key: &str, detail: Mismatch| {
@@ -260,6 +206,42 @@ fn compare_entity(
     }
     Ok(violations)
 }
+/// Blank every sealed column whose subject key is gone, on both sides.
+///
+/// The comparison is over stored bytes, which is sound only while the two sides *have*
+/// the same bytes to hold. Erasure breaks that: the live row keeps the ciphertext it
+/// was written with, because a shred rewrites nothing, while a rebuild re-encrypts from
+/// the log and finds no key, so it writes NULL rather than minting the key the erasure
+/// destroyed. Neither is readable and the read API reports both as absent, so they are
+/// equivalent everywhere it matters and differ only at rest.
+///
+/// Without this every erasure makes `verify` report that projector as corrupt forever,
+/// which is the worst failure a tool whose value is being believed can have. Tampering
+/// stays caught: a subject whose key exists is compared byte for byte as before, and
+/// that is the case `a_tampered_subject_column_is_still_caught` pins.
+fn drop_shredded(entity: &EntityDef, row: &mut Value, keystore: Option<&KeyStore>) {
+    let Some(keystore) = keystore else { return };
+    let Some(object) = row.as_object().cloned() else {
+        return;
+    };
+    for (name, meta) in &entity.fields {
+        let Some(subject_field) = &meta.subject else {
+            continue;
+        };
+        let Some(id) = object
+            .get(subject_field.as_str())
+            .and_then(scalar_to_string)
+        else {
+            continue;
+        };
+        if keystore.erased(subject_field, &id).unwrap_or(false)
+            && let Some(target) = row.as_object_mut()
+        {
+            target.remove(name.as_str());
+        }
+    }
+}
+
 /// Pair each row with its key column, rendered as text so keys of any declared type
 /// compare the same way.
 fn keyed(entity: &EntityDef, rows: Vec<Value>) -> Vec<(String, Value)> {
@@ -311,7 +293,7 @@ fn run_checks(
 
     let projectors_dir = data_dir.join("projectors");
     for unit in &project.projectors {
-        let name = unit.loaded.def.name();
+        let name = unit.def.name();
         let live_db = projectors_dir.join(format!("{name}.db"));
         // A projector with no model on disk has never run. There is nothing to
         // disagree with, and building one just to compare it against itself would
@@ -322,7 +304,9 @@ fn run_checks(
         report.projectors_checked += 1;
         report.absorb(rebuild_equivalence(
             runtime.store(),
-            &unit.loaded,
+            unit,
+            runtime.program(),
+            runtime.keystore(),
             &live_db,
             runtime.events_map(),
             scratch.path(),
@@ -341,18 +325,19 @@ fn sweep_effect(
     unit: &EffectUnit,
     report: &mut Report,
 ) -> anyhow::Result<()> {
-    let name = unit.loaded.def.name();
-    let ModuleDef::Effect { sources, .. } = &unit.loaded.def else {
+    let name = unit.def.name();
+    let ModuleDef::Effect { sources, .. } = &unit.def else {
         anyhow::bail!("sweep_effect called on a non-effect module");
     };
     // Sources filter on plaintext fields only, so lowering them needs no key store,
     // exactly as the live driver does it.
-    let query = dispatch::to_query(sources, runtime.events_map(), None)?;
+    let query =
+        crate::heklang_host::query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
 
     for (position, script_hash) in runtime.terminal_invocations(name)? {
         // An edited effect diverges legitimately: the recorded run and the current
         // code are different programs, and the journal is keyed to the old one.
-        if script_hash != unit.loaded.source_hash {
+        if script_hash != unit.source_hash {
             report.invocations_skipped += 1;
             continue;
         }
@@ -367,17 +352,13 @@ fn sweep_effect(
             continue;
         };
         debug_assert_eq!(event_position, position);
-        let (env, data) = envelope::decode(event.data())
+        let (_env, _data) = envelope::decode(event.data())
             .with_context(|| format!("reading the event effect `{name}` ran at {position}"))?;
         report.invocations_checked += 1;
         report.absorb(effect::verify_replay(
             name,
             position,
-            &env,
-            &event,
-            event.event_type(),
-            &data,
-            &unit.loaded,
+            runtime.program(),
             runtime,
         ));
     }

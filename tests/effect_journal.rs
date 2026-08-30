@@ -4,20 +4,26 @@
 //! These tests pin the replay machinery underneath: a retry (and a crash restart)
 //! must replay every completed journaled call instead of re-firing it, `now()` must
 //! hand back the same recorded instant on every attempt, two byte-identical calls
-//! must line up one-to-one through their disambiguators, and an edited script must
-//! replay an in-flight invocation against its new code.
+//! must line up one-to-one through their ordinals, and an edited effect must replay
+//! an in-flight invocation against its new code.
 //!
 //! Assertions go through the observable seams: the HTTP stub's call log, the
 //! effect's health signals, and the operational DB's `effect_invocation` /
 //! `effect_journal` tables read back with a second connection.
+//!
+//! One of the Starlark suite's cases is gone rather than ported. It drove a `handle`
+//! into the tick budget and asserted the resulting wedge; heklang has no `while`,
+//! rejects recursion and iterates only finite containers, so there is no runaway to
+//! cut off and no budget to cut it off with.
 
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use hekla::effect::{HttpClient, HttpResponse, StubHttpClient};
+use hekla::effect::StubHttpClient;
+use hekla::http::{HttpClient, HttpResponse};
 use hekla::runtime::Runtime;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -27,87 +33,62 @@ mod support;
 
 use support::{ALICE, BOB, Boot, Harness, ctx, log_head, wait_until};
 
-const EFFECT: &str = "notify";
+const EFFECT: &str = "Notify";
 
 const USER_EVENTS: &str = r#"
-user_registered = event(
-    type = "user.registered",
-    fields = {
-        "user_id": uuid(),
-        "email": str(),
-        "name": str(),
-    },
-)
+event @user.registered {
+  user_id: Uuid,
+  email: String @max(100),
+  name: String @max(50),
+}
 
-user_activated = event(
-    type = "user.activated",
-    fields = {"user_id": uuid()},
-)
+event @user.activated { user_id: Uuid }
 "#;
 
 const REGISTER_USER: &str = r#"
-load("events/user.star", "user_registered")
-
-input = schema(user_id = uuid(), email = str(), name = str())
-
-def handle(input, state):
-    return user_registered(
-        user_id = input.user_id,
-        email = input.email,
-        name = input.name,
-    )
+command RegisterUser(user_id: Uuid, email: String, name: String) {
+  emit @user.registered { user_id, email, name }
+}
 "#;
 
 const ACTIVATE_USER: &str = r#"
-load("events/user.star", "user_activated")
-
-input = schema(user_id = uuid())
-
-def handle(input, state):
-    return user_activated(user_id = input.user_id)
+command ActivateUser(user_id: Uuid) {
+  emit @user.activated { user_id }
+}
 "#;
 
 const USERS_PROJECTOR: &str = r#"
-load("events/user.star", "user_registered")
+projector Users {
+  entity User {
+    user_id: Uuid @key,
+    email: String @max(100) @index,
+    name: String @max(50),
+  }
 
-users = entity(
-    key = "user_id",
-    fields = {
-        "user_id": uuid(),
-        "email": str(),
-        "name": str(),
-    },
-    indexes = [index("by_email", ["email"])],
-)
-
-def on_event(event):
-    return [put(users, {
-        "user_id": event.data.user_id,
-        "email": event.data.email,
-        "name": event.data.name,
-    })]
-
-handle = {user_registered(): on_event}
+  on @user.registered { user_id, email, name } {
+    put User { user_id, email, name }
+  }
+}
 "#;
 
-/// A project whose only effect is `effects/notify.star`, with the given body.
+/// A project whose only effect is `effects/notify.hk`, with the given body.
 fn project(effect: &str) -> TempDir {
     support::write_project(&[
-        ("events/user.star", USER_EVENTS),
-        ("commands/register-user.star", REGISTER_USER),
-        ("effects/notify.star", effect),
+        ("events/user.hk", USER_EVENTS),
+        ("commands/register-user.hk", REGISTER_USER),
+        ("effects/notify.hk", effect),
     ])
 }
 
-/// The same, plus the `users` read model and the `activate-user` command, for the
+/// The same, plus the `Users` read model and the `ActivateUser` command, for the
 /// tests that need a second event type on the log.
 fn project_with_read_model(effect: &str) -> TempDir {
     support::write_project(&[
-        ("events/user.star", USER_EVENTS),
-        ("commands/register-user.star", REGISTER_USER),
-        ("commands/activate-user.star", ACTIVATE_USER),
-        ("projectors/users.star", USERS_PROJECTOR),
-        ("effects/notify.star", effect),
+        ("events/user.hk", USER_EVENTS),
+        ("commands/register-user.hk", REGISTER_USER),
+        ("commands/activate-user.hk", ACTIVATE_USER),
+        ("projectors/users.hk", USERS_PROJECTOR),
+        ("effects/notify.hk", effect),
     ])
 }
 
@@ -117,17 +98,16 @@ fn boot(project_dir: &Path, data_dir: &Path, http: Arc<dyn HttpClient>) -> Harne
 
 fn register(rt: &Runtime, user_id: &str) {
     let body = json!({ "user_id": user_id, "email": format!("{user_id}@x"), "name": "U" });
-    let result = rt.execute("register-user", body, &ctx(), None).unwrap();
+    let result = rt.execute("RegisterUser", body, &ctx(), None).unwrap();
     assert_eq!(result.status, 200, "register failed: {:?}", result.body);
 }
 
 fn activate(rt: &Runtime, user_id: &str) {
     let result = rt
-        .execute("activate-user", json!({ "user_id": user_id }), &ctx(), None)
+        .execute("ActivateUser", json!({ "user_id": user_id }), &ctx(), None)
         .unwrap();
     assert_eq!(result.status, 200, "activate failed: {:?}", result.body);
 }
-
 /// A stub that answers 500 for any URL ending in `fail_suffix` and 200 otherwise,
 /// so a handler wedges at a chosen call while the earlier ones succeed.
 fn stub_failing_on(fail_suffix: &'static str) -> Arc<StubHttpClient> {
@@ -160,19 +140,6 @@ fn post_body(stub: &StubHttpClient, suffix: &str) -> Value {
     serde_json::from_slice(call.body.as_deref().expect("a POST body")).unwrap()
 }
 
-/// [`wait_until`] with a caller-chosen budget, for the one wait that can legitimately
-/// outlast the shared helper's.
-fn wait_up_to<F: Fn() -> bool>(budget: Duration, label: &str, cond: F) {
-    let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
-        if cond() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("timed out waiting for {label}");
-}
-
 fn wait_for_failures(harness: &Harness, at_least: u64) {
     wait_until(&format!("{at_least} failed attempts"), || {
         harness.rt.effect(EFFECT).unwrap().consecutive_failures() >= at_least
@@ -192,7 +159,7 @@ fn journal_rows(data_dir: &Path, position: u64) -> Vec<(String, u64, Value)> {
     let mut stmt = conn
         .prepare(
             "SELECT call_hash, disambiguator, result FROM effect_journal \
-             WHERE effect = ?1 AND position = ?2 ORDER BY created_at, disambiguator",
+             WHERE effect = ?1 AND position = ?2 ORDER BY rowid",
         )
         .unwrap();
     let rows = stmt
@@ -223,13 +190,12 @@ fn invocation_status(data_dir: &Path, position: u64) -> Option<String> {
 // --- replay on a retry -----------------------------------------------------
 
 const TWO_POSTS: &str = r#"
-load("events/user.star", "user_registered")
-
-def on_event(event, state):
-    http.post(url = "https://a.test/first", body = {"id": event.data.user_id})
-    http.post(url = "https://a.test/second", body = {})
-
-handle = {user_registered(): on_event}
+effect Notify {
+  on @user.registered { user_id } {
+    http.post("https://a.test/first", { "id": user_id })
+    http.post("https://a.test/second", {})
+  }
+}
 "#;
 
 #[test]
@@ -258,8 +224,9 @@ fn retrying_a_wedged_invocation_replays_the_journal_without_refiring() {
     );
     assert_eq!(post_body(&stub, "/first")["id"], ALICE);
 
-    // Only the successful call was journaled: the failing one never reaches
-    // journal_put, which is why it is the one that re-runs.
+    // Only the successful call was journaled: rule 5 absorbs the 500 inside the
+    // language and the call never reaches `record`, which is why it is the one that
+    // re-runs.
     let rows = journal_rows(data.path(), 1);
     assert_eq!(rows.len(), 1, "exactly one journaled call: {rows:?}");
     assert_eq!(rows[0].1, 0);
@@ -272,7 +239,7 @@ fn retrying_a_wedged_invocation_replays_the_journal_without_refiring() {
 #[test]
 fn a_crashed_invocation_resumes_from_the_journal_and_runs_only_the_tail() {
     // Shutting down mid-wedge leaves the invocation `running`, the real crash
-    // window. The next boot re-enters handle(), replays `/first` from disk and runs
+    // window. The next boot re-enters the arm, replays `/first` from disk and runs
     // only the unjournaled tail live.
     let dir = project(TWO_POSTS);
     let data = tempfile::tempdir().unwrap();
@@ -327,21 +294,20 @@ fn a_crashed_invocation_resumes_from_the_journal_and_runs_only_the_tail() {
 // --- journaled now() -------------------------------------------------------
 
 const NOW_THEN_POST: &str = r#"
-load("events/user.star", "user_registered")
-
-def on_event(event, state):
-    t = now()
-    http.post(url = "https://a.test/at", body = {"t": t})
-    http.post(url = "https://a.test/fail", body = {})
-
-handle = {user_registered(): on_event}
+effect Notify {
+  on @user.registered {
+    let t = now()
+    http.post("https://a.test/at", { "t": t })
+    http.post("https://a.test/fail", {})
+  }
+}
 "#;
 
 #[test]
 fn now_replays_the_recorded_timestamp_on_every_retry() {
     // `now()` is journaled so a replay sees the same instant. If it were live, every
     // retry would produce a different timestamp, changing the POST body and hence
-    // the call hash, so the `/at` request would miss the journal and re-fire.
+    // the call key, so the `/at` request would miss the journal and re-fire.
     let dir = project(NOW_THEN_POST);
     let data = tempfile::tempdir().unwrap();
     let stub = stub_failing_on("/fail");
@@ -353,7 +319,7 @@ fn now_replays_the_recorded_timestamp_on_every_retry() {
     let retries = calls_ending(&stub, "/fail");
     assert!(
         retries >= 3,
-        "the handler re-ran to its failing tail {retries} times"
+        "the arm re-ran to its failing tail {retries} times"
     );
     assert_eq!(
         calls_ending(&stub, "/at"),
@@ -361,39 +327,40 @@ fn now_replays_the_recorded_timestamp_on_every_retry() {
         "a fresh now() on a retry would change the body and re-fire this call"
     );
     let recorded = post_body(&stub, "/at");
-    let timestamp = recorded["t"].as_str().expect("now() returns a string");
+    // A `Timestamp` on the wire is epoch microseconds, per rule 8's table. The RFC
+    // 3339 string the envelope stamps is hekla's own form and stops at the seam.
+    let micros = recorded["t"].as_i64().expect("now() is a Timestamp");
     assert!(
-        timestamp.starts_with("20") && timestamp.ends_with('Z'),
-        "expected an rfc3339 instant, got `{timestamp}`"
+        micros > 1_600_000_000_000_000,
+        "expected epoch microseconds, got {micros}"
     );
 
-    // Two journal rows: the now() string and the successful POST. The `/fail` POST
+    // Two journal rows: the pinned instant and the successful POST. The `/fail` POST
     // never gets one, which is why it alone re-runs.
     let rows = journal_rows(data.path(), 1);
     assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!(rows[0].2, Value::String(timestamp.to_owned()));
+    assert_eq!(rows[0].2["micros"], micros);
 
     harness.shutdown();
 }
 
-// --- disambiguators --------------------------------------------------------
+// --- ordinals --------------------------------------------------------------
 
 const IDENTICAL_TWICE: &str = r#"
-load("events/user.star", "user_registered")
-
-def on_event(event, state):
-    http.post(url = "https://a.test/twice", body = {"n": 1})
-    http.post(url = "https://a.test/twice", body = {"n": 1})
-    http.post(url = "https://a.test/fail", body = {})
-
-handle = {user_registered(): on_event}
+effect Notify {
+  on @user.registered {
+    http.post("https://a.test/twice", { "n": 1 })
+    http.post("https://a.test/twice", { "n": 1 })
+    http.post("https://a.test/fail", {})
+  }
+}
 "#;
 
 #[test]
-fn identical_repeated_calls_journal_under_separate_disambiguators() {
-    // Two byte-identical calls share a call hash, so only the per-hash counter keeps
+fn identical_repeated_calls_journal_under_separate_ordinals() {
+    // Two byte-identical calls share a call key, so only the per-key ordinal keeps
     // them apart. It must restart at 0 for each attempt (or every retry misses and
-    // re-fires both) and must be per-hash (or two different calls collide and one
+    // re-fires both) and must be per-key (or two different calls collide and one
     // replays the other's result).
     let dir = project(IDENTICAL_TWICE);
     let data = tempfile::tempdir().unwrap();
@@ -423,119 +390,154 @@ fn identical_repeated_calls_journal_under_separate_disambiguators() {
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(
         rows[0].0, rows[1].0,
-        "identical calls share a call hash, so only the disambiguator separates them"
+        "identical calls share a call key, so only the ordinal separates them"
     );
     assert_eq!((rows[0].1, rows[1].1), (0, 1));
-    // Each row holds its own call's response, so a replay hands the handler back the
-    // two results in the order it made the calls.
+    // Each row holds its own call's response, so a replay hands the arm back the two
+    // results in the order it made the calls.
     assert_eq!(rows[0].2["body"]["call"], 0);
     assert_eq!(rows[1].2["body"]["call"], 1);
 
     harness.shutdown();
 }
 
-// --- host-built wrappers read with a dot -----------------------------------
+// --- what a response and an outcome expose ---------------------------------
 
-/// Reads every field of the response struct and echoes what it saw, so the assertion
-/// below pins the shape rather than just that a dot parsed.
+/// Reads both fields of the response and echoes what it saw, so the assertion below
+/// pins the shape rather than just that a dot parsed.
 const RESPONSE_SHAPE: &str = r#"
-load("events/user.star", "user_registered")
-
-def on_event(event, state):
-    response = http.post(url = "https://a.test/first", body = {"x": 1})
-    http.post(url = "https://a.test/echo", body = {
-        "status": response.status,
-        "ok": response.body["ok"],
-        "kind": response.headers["content-type"][0],
+effect Notify {
+  on @user.registered {
+    let response = http.post("https://a.test/first", { "x": 1 })
+    http.post("https://a.test/echo", {
+      "status": response.status,
+      "ok": response.body.bool("ok"),
+      "id": response.body.string("id"),
     })
-
-handle = {user_registered(): on_event}
+  }
+}
 "#;
 
-/// `{status, body, headers}` is host-built with a fixed shape, so it reads with a dot
-/// like `input` and `event.data`. `body` and `headers` stay subscripted inside: a body
-/// is whatever parsed, and a header name is not an attribute.
+/// A response is `{status, body}` and nothing else. `status` is an `Int` read with a
+/// dot; `body` is an opaque `Json` read through the fallible one-step accessors of
+/// rule 8, because a body has no declared shape to promise.
+///
+/// The Starlark version also read `response.headers["content-type"]`. heklang's
+/// response carries no headers at all: the one header the runtime acts on is
+/// `Retry-After`, and rule 5 makes it the host's business precisely so an arm cannot
+/// see it. So this asserts two fields where that asserted three.
 #[test]
-fn an_http_response_reads_its_fixed_fields_with_a_dot() {
+fn a_response_exposes_its_status_and_its_body_and_nothing_else() {
     let dir = project(RESPONSE_SHAPE);
     let data = tempfile::tempdir().unwrap();
     let stub = Arc::new(StubHttpClient::new(|_n, _req| {
         Ok(HttpResponse {
             status: 201,
-            body: br#"{"ok": true}"#.to_vec(),
+            body: br#"{"ok": true, "id": "abc"}"#.to_vec(),
             headers: vec![("content-type".to_owned(), "application/json".to_owned())],
         })
     }));
     let harness = boot(dir.path(), data.path(), stub.clone());
 
     register(&harness.rt, ALICE);
-    wait_up_to(Duration::from_secs(30), "the echo call", || {
-        calls_ending(&stub, "/echo") == 1
-    });
+    wait_until("the echo call", || calls_ending(&stub, "/echo") == 1);
 
     let echoed = post_body(&stub, "/echo");
     assert_eq!(echoed["status"], 201);
     assert_eq!(echoed["ok"], true);
-    assert_eq!(echoed["kind"], "application/json");
+    assert_eq!(echoed["id"], "abc");
     harness.shutdown();
 }
 
-/// A body that is not JSON reads back as a string, so the struct field is a union and
-/// the dot does not imply a declared type the way an event field's does.
+/// A body that is not JSON is not a transport failure. Rule 5 already decided the
+/// attempt reached the far side, so the arm sees the status either way and the body
+/// answers every accessor with `none` rather than wedging the effect.
 #[test]
-fn a_non_json_response_body_reads_as_a_string() {
+fn a_non_json_response_body_is_not_a_failure_and_reads_as_absent() {
     let dir = project(
         r#"
-load("events/user.star", "user_registered")
-
-def on_event(event, state):
-    response = http.post(url = "https://a.test/first", body = {"x": 1})
-    http.post(url = "https://a.test/echo", body = {"body": response.body})
-
-handle = {user_registered(): on_event}
+effect Notify {
+  on @user.registered {
+    let response = http.post("https://a.test/first", { "x": 1 })
+    http.post("https://a.test/echo", {
+      "status": response.status,
+      "ok": response.body.bool("ok"),
+    })
+  }
+}
 "#,
     );
     let data = tempfile::tempdir().unwrap();
-    let stub = Arc::new(StubHttpClient::new(|_n, _req| {
+    let stub = Arc::new(StubHttpClient::new(|_n, req| {
         Ok(HttpResponse {
             status: 200,
-            body: b"not json".to_vec(),
+            body: if req.url.ends_with("/first") {
+                b"not json".to_vec()
+            } else {
+                b"{}".to_vec()
+            },
             headers: Vec::new(),
         })
     }));
     let harness = boot(dir.path(), data.path(), stub.clone());
 
     register(&harness.rt, ALICE);
-    wait_up_to(Duration::from_secs(30), "the echo call", || {
-        calls_ending(&stub, "/echo") == 1
-    });
-    assert_eq!(post_body(&stub, "/echo")["body"], "not json");
+    wait_until("the echo call", || calls_ending(&stub, "/echo") == 1);
+
+    let echoed = post_body(&stub, "/echo");
+    assert_eq!(echoed["status"], 200);
+    assert_eq!(
+        echoed["ok"],
+        Value::Null,
+        "an unparseable body reads absent"
+    );
+    assert_eq!(
+        harness.rt.effect(EFFECT).unwrap().consecutive_failures(),
+        0,
+        "a body the far side sent is not this runtime's failure"
+    );
     harness.shutdown();
 }
 
-/// A field the struct does not carry is an attribute error naming it, which a dict
-/// `invoke_command` returns `{status, body}`, the third host-built wrapper with a fixed
-/// shape, so it reads with a dot too. Its `body` stays subscripted: that is the
-/// command's own response payload, with no shape the host can promise.
+/// `invoke` answers with an outcome, read through `.ok()`, `.code()` and `.message()`.
+/// It is deliberately not a status and a body: rule 6 cuts the retryable outcomes out
+/// of the type entirely, so `Conflict` and `Unavailable` are unrepresentable here
+/// rather than filtered.
 #[test]
-fn an_invoke_command_outcome_reads_its_fields_with_a_dot() {
+fn an_invoke_outcome_reads_through_its_three_accessors() {
     let dir = support::write_project(&[
-        ("events/user.star", USER_EVENTS),
-        ("commands/register-user.star", REGISTER_USER),
-        ("commands/activate-user.star", ACTIVATE_USER),
+        ("events/user.hk", USER_EVENTS),
+        ("commands/register-user.hk", REGISTER_USER),
         (
-            "effects/notify.star",
+            "commands/activate-user.hk",
             r#"
-load("events/user.star", "user_registered")
+command ActivateUser(user_id: Uuid) {
+  state activated: Bool = fold false
+    on @user.activated(user_id) => true
 
-def on_event(event, state):
-    outcome = invoke_command("activate-user", {"user_id": event.data.user_id})
-    http.post(url = "https://a.test/echo", body = {
-        "status": outcome.status,
-        "type": outcome.body["events"][0]["type"],
+  if activated {
+    return reject("already_active", "that user is already active")
+  }
+
+  emit @user.activated { user_id }
+}
+"#,
+        ),
+        (
+            "effects/notify.hk",
+            r#"
+effect Notify {
+  on @user.registered { user_id } {
+    let first = invoke ActivateUser { user_id }
+    let second = invoke ActivateUser { user_id }
+    http.post("https://a.test/echo", {
+      "first_ok": first.ok(),
+      "second_ok": second.ok(),
+      "code": second.code(),
+      "message": second.message(),
     })
-
-handle = {user_registered(): on_event}
+  }
+}
 "#,
         ),
     ]);
@@ -544,58 +546,61 @@ handle = {user_registered(): on_event}
     let harness = boot(dir.path(), data.path(), stub.clone());
 
     register(&harness.rt, ALICE);
-    wait_up_to(Duration::from_secs(30), "the echo call", || {
-        calls_ending(&stub, "/echo") == 1
-    });
+    wait_until("the echo call", || calls_ending(&stub, "/echo") == 1);
 
     let echoed = post_body(&stub, "/echo");
-    assert_eq!(echoed["status"], 200);
-    assert_eq!(echoed["type"], "user.activated");
+    assert_eq!(echoed["first_ok"], true);
+    assert_eq!(echoed["second_ok"], false);
+    assert_eq!(echoed["code"], "already_active");
+    assert_eq!(echoed["message"], "that user is already active");
+    // Two distinct `invoke` calls, so two journal rows even though the arguments
+    // match: the outcomes differ and each replay must get its own back.
+    assert_eq!(journal_rows(data.path(), 1).len(), 3);
     harness.shutdown();
 }
 
-/// subscript could not do as precisely: the misspelling is the message.
+/// A field the response does not carry is a load error naming it, not a wedge.
+///
+/// The Starlark version drove this to a runtime attribute error and read it out of
+/// `/status`, because a misspelling could only be found by executing the line. A
+/// response has a declared shape here, so the misspelling never boots.
 #[test]
-fn an_unknown_response_field_names_itself() {
-    let dir = project(
-        r#"
-load("events/user.star", "user_registered")
-
-def on_event(event, state):
-    response = http.post(url = "https://a.test/first", body = {"x": 1})
-    log(str(response.stauts))
-
-handle = {user_registered(): on_event}
+fn an_unknown_response_field_is_refused_at_load() {
+    support::assert_error(
+        &[
+            ("events/user.hk", USER_EVENTS),
+            ("commands/register-user.hk", REGISTER_USER),
+            (
+                "effects/notify.hk",
+                r#"
+effect Notify {
+  on @user.registered {
+    let response = http.post("https://a.test/first", { "x": 1 })
+    log("{response.stauts}")
+  }
+}
 "#,
+            ),
+        ],
+        "stauts",
     );
-    let data = tempfile::tempdir().unwrap();
-    let stub = Arc::new(StubHttpClient::ok());
-    let harness = boot(dir.path(), data.path(), stub.clone());
-
-    register(&harness.rt, ALICE);
-    wait_for_failures(&harness, 1);
-
-    let error = harness.rt.effect(EFFECT).unwrap().last_error().unwrap();
-    assert!(error.contains("stauts"), "{error}");
-    harness.shutdown();
 }
 
 // --- editing an effect under an in-flight invocation -----------------------
 
 const TWO_POSTS_V2: &str = r#"
-load("events/user.star", "user_registered")
-
-def on_event(event, state):
-    http.post(url = "https://a.test/first-v2", body = {"id": event.data.user_id})
-    http.post(url = "https://a.test/second", body = {})
-
-handle = {user_registered(): on_event}
+effect Notify {
+  on @user.registered { user_id } {
+    http.post("https://a.test/first-v2", { "id": user_id })
+    http.post("https://a.test/second", {})
+  }
+}
 "#;
 
 #[test]
 fn an_edited_effect_replays_an_in_flight_invocation_against_the_new_code() {
-    // The journal is keyed by the content hash of each call, not by call order. Edit
-    // a journaled call's arguments and its hash changes, so it misses and the side
+    // The journal is keyed by the content of each call, not by call order. Edit a
+    // journaled call's arguments and its key changes, so it misses and the side
     // effect fires again against the new code, while untouched calls still replay.
     // This is the at-least-once boundary an operator hits when hotfixing a wedged
     // effect.
@@ -609,9 +614,9 @@ fn an_edited_effect_replays_an_in_flight_invocation_against_the_new_code() {
 
     let before = journal_rows(data.path(), 1);
     assert_eq!(before.len(), 1);
-    let stale_hash = before[0].0.clone();
+    let stale_key = before[0].0.clone();
 
-    fs::write(dir.path().join("effects/notify.star"), TWO_POSTS_V2).unwrap();
+    fs::write(dir.path().join("effects/notify.hk"), TWO_POSTS_V2).unwrap();
 
     let stub = Arc::new(StubHttpClient::ok());
     let harness = boot(dir.path(), data.path(), stub.clone());
@@ -638,130 +643,57 @@ fn an_edited_effect_replays_an_in_flight_invocation_against_the_new_code() {
     let after = journal_rows(data.path(), 1);
     assert_eq!(after.len(), 3, "{after:?}");
     assert!(
-        after.iter().any(|(hash, _, _)| hash == &stale_hash),
-        "the old row survives, keyed under a hash the new code never asks for"
+        after.iter().any(|(key, _, _)| key == &stale_key),
+        "the old row survives, keyed under a call the new code never makes"
     );
 }
 
-// --- the instruction budget ------------------------------------------------
+// --- per-type arm dispatch -------------------------------------------------
 
-const RUNAWAY: &str = r#"
-load("events/user.star", "user_registered")
-
-def on_event(event, state):
-    for i in range(100000000):
-        pass
-    http.post(url = "https://a.test/never", body = {})
-
-handle = {user_registered(): on_event}
+/// The arms are the subscription. `@user.activated` is deliberately absent, so the
+/// effect never reads those events at all, which is the point: there is no second list
+/// that could disagree with this one.
+///
+/// The Starlark version had two arms on one event type, the second constrained, and
+/// asserted both fired. Rule 1 makes an event select exactly one arm and two arms
+/// naming one type a parse error, so what is left to pin is that the subscription is
+/// exactly the arms and nothing else.
+const PER_TYPE_EFFECT: &str = r#"
+effect Notify {
+  on @user.registered { user_id, email } {
+    http.post("https://a.test/welcome/{user_id}", { "email": email })
+  }
+}
 "#;
 
 #[test]
-fn a_runaway_handler_is_cut_off_by_the_tick_budget_and_wedges() {
-    // The per-handler tick budget turns a runaway loop into an ordinary wedge. With
-    // no budget the effect thread would spin forever: no failure in `/status`, a
-    // frozen watermark, and a shutdown that blocks for the full join timeout.
-    let dir = project(RUNAWAY);
+fn an_effects_arms_are_exactly_its_subscription() {
+    let dir = project_with_read_model(PER_TYPE_EFFECT);
     let data = tempfile::tempdir().unwrap();
     let stub = Arc::new(StubHttpClient::ok());
     let harness = boot(dir.path(), data.path(), stub.clone());
 
-    register(&harness.rt, BOB);
-    // The budget is 10M instructions, not wall clock, and an unoptimised starlark
-    // interpreter can take well over a minute to burn through them.
-    wait_up_to(Duration::from_secs(120), "the tick budget to trip", || {
-        harness.rt.effect(EFFECT).unwrap().consecutive_failures() > 0
-    });
-
-    let error = harness.rt.effect(EFFECT).unwrap().last_error().unwrap();
-    assert!(error.contains("handle entry for"), "{error}");
-    assert_eq!(stub.call_count(), 0, "the loop never reached the http call");
-    assert!(journal_rows(data.path(), 1).is_empty());
-
-    // The thread is alive and still honoring operator input, not hung.
-    harness.rt.effect(EFFECT).unwrap().request_skip(1);
-    wait_until("the skip to advance the effect", || {
-        let effect = harness.rt.effect(EFFECT).unwrap();
-        effect.consecutive_failures() == 0 && effect.position() >= 1
-    });
-
-    let started = Instant::now();
-    harness.shutdown();
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "shutdown must not wait out the join timeout"
-    );
-}
-
-// --- per-type handle dispatch ---------------------------------------------
-
-/// The keys are the subscription. `user_activated` is deliberately absent, so the
-/// effect never reads those events at all, which is the point: there is no second list
-/// that could disagree with this one. The second arm is constrained, so it fires only
-/// for the registration that matches it.
-const PER_TYPE_EFFECT: &str = r#"
-load("events/user.star", "user_registered")
-
-handle = {
-    user_registered(): lambda event, state: http.post(
-        url = "https://a.test/welcome/" + event.data.user_id,
-        body = {"email": event.data.email},
-    ),
-    user_registered(name = "VIP"): lambda event, state: http.post(
-        url = "https://a.test/vip/" + event.data.user_id,
-        body = {},
-    ),
-}
-"#;
-
-#[test]
-fn a_per_type_effect_handle_subscribes_to_exactly_its_arms() {
-    let dir = project_with_read_model(PER_TYPE_EFFECT);
-    let data = tempfile::tempdir().unwrap();
-    let stub = Arc::new(StubHttpClient::new(|_, _| {
-        Ok(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: Vec::new(),
-        })
-    }));
-    let harness = boot(dir.path(), data.path(), stub.clone());
-
-    // A plain registration matches only the unconstrained arm.
-    register(&harness.rt, ALICE);
-    // A VIP registration matches both, so both fire for the one event.
-    let vip = json!({ "user_id": BOB, "email": "bob@x", "name": "VIP" });
-    let result = harness
-        .rt
-        .execute("register-user", vip, &ctx(), None)
-        .unwrap();
-    assert_eq!(result.status, 200, "{:?}", result.body);
-    activate(&harness.rt, ALICE);
+    register(&harness.rt, ALICE); // position 1
+    register(&harness.rt, BOB); // position 2
+    activate(&harness.rt, ALICE); // position 3, unsubscribed
 
     wait_until("both registrations to be handled", || {
         harness.rt.effect(EFFECT).unwrap().position() >= 2
     });
     thread::sleep(Duration::from_millis(100));
 
-    assert_eq!(calls_ending(&stub, ALICE), 1, "one arm matches ALICE");
     let urls: Vec<String> = stub.calls().iter().map(|call| call.url.clone()).collect();
-    assert!(
-        urls.contains(&format!("https://a.test/welcome/{BOB}"))
-            && urls.contains(&format!("https://a.test/vip/{BOB}")),
-        "both matching arms fire for one event, got {urls:?}"
-    );
-    // Declaration order, so a replay journals and replays the same call sequence.
-    let welcome = urls
-        .iter()
-        .position(|u| u.ends_with(&format!("welcome/{BOB}")));
-    let vip_call = urls.iter().position(|u| u.ends_with(&format!("vip/{BOB}")));
-    assert!(
-        welcome < vip_call,
-        "arms run in declaration order: {urls:?}"
+    assert_eq!(
+        urls,
+        vec![
+            format!("https://a.test/welcome/{ALICE}"),
+            format!("https://a.test/welcome/{BOB}"),
+        ],
+        "one call per subscribed event, in log order"
     );
 
-    // `user.activated` is not in any key, so the effect never subscribed to it and
-    // there is no invocation to account for.
+    // `@user.activated` is in no arm, so the effect never subscribed to it and there
+    // is no invocation to account for.
     assert_eq!(
         invocation_status(data.path(), 3),
         None,
@@ -773,32 +705,24 @@ fn a_per_type_effect_handle_subscribes_to_exactly_its_arms() {
 
 // --- the boundary is folded, never journaled -------------------------------
 
-/// Folds the registrations for this user and reports the count in the POST body, so
-/// the assertion below reads the state the handler actually saw.
+/// Folds the activations for this user and reports the count in the POST body, so the
+/// assertion below reads the state the arm actually saw.
 const FOLDING_EFFECT: &str = r#"
-load("events/user.star", "user_registered", "user_activated")
+effect Notify {
+  on @user.registered { user_id } {
+    state activations: Int = fold 0
+      on @user.activated(user_id) => activations + 1
 
-def query(event):
-    return [user_activated(user_id = event.data.user_id)]
-
-initial = {"activations": 0}
-
-fold = {user_activated(): lambda state, event: {"activations": state["activations"] + 1}}
-
-def on_event(event, state):
-    http.post(
-        url = "https://a.test/seen",
-        body = {"activations": state["activations"]},
-    )
-
-handle = {user_registered(): on_event}
+    http.post("https://a.test/seen", { "activations": activations })
+  }
+}
 "#;
 
 #[test]
 fn a_fold_reads_state_written_one_position_earlier_without_a_projector() {
-    // The case this whole design exists for. Under the old `read()` an effect at
-    // position N that needed state written at N-1 could observe the projector before
-    // it caught up, journal the miss as `null`, and then replay that null forever: a
+    // The case this whole design exists for. Under a read of a projector's row, an
+    // effect at position N that needed state written at N-1 could observe the read
+    // model before it caught up, journal the miss, and then replay it forever: a
     // permanent wedge only an operator skip could clear. A fold cannot miss, because
     // it reads the log itself, up to this event's own position.
     let dir = project_with_read_model(FOLDING_EFFECT);
@@ -862,7 +786,7 @@ fn a_fold_is_not_journaled_and_reproduces_itself_on_every_retry() {
 #[test]
 fn the_boundary_stops_at_the_triggering_position() {
     // Folding to the log head instead would make the state depend on how far the log
-    // had run by the time the handler happened to execute, which is exactly the
+    // had run by the time the arm happened to execute, which is exactly the
     // nondeterminism the design removes. Here the effect is deliberately kept behind:
     // it wedges on position 2 while position 3 lands, and every retry must still see
     // the log as it stood at position 2.
@@ -877,9 +801,7 @@ fn the_boundary_stops_at_the_triggering_position() {
 
     // A second activation lands while the effect is stuck at position 2.
     activate(&harness.rt, ALICE); // position 3
-    wait_up_to(Duration::from_secs(20), "further retries", || {
-        calls_ending(&stub, "/seen") >= 5
-    });
+    wait_until("further retries", || calls_ending(&stub, "/seen") >= 5);
 
     let bodies: Vec<Value> = stub
         .calls()

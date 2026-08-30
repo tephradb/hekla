@@ -1,0 +1,21 @@
+// Two slices over one user's history. `@user.renamed` is folded so a concurrent rename
+// conflicts, not because the decision needs it: `exists` is settled by the
+// registration. The boundary and the decision answer different questions, and a slice
+// serves both.
+
+command RenameUser(user_id: Uuid, name: String) {
+  state exists: Bool = fold false
+    on @user.registered(user_id) => true
+
+  state renames: Int = fold 0
+    on @user.renamed(user_id) => renames + 1
+
+  if is_blank(name) {
+    return reject("invalid_name", "name must not be blank")
+  }
+  if !exists {
+    return reject("unknown_user", "no such user")
+  }
+
+  emit @user.renamed { user_id, name }
+}

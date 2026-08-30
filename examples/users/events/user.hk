@@ -1,0 +1,24 @@
+// Shared event declarations. Every field is indexed and so becomes a store tag unless
+// it opts out with `@no_index`; the runtime derives the tags from the declaration, so
+// there is no second list to keep in step.
+
+event @user.registered {
+  user_id: Uuid,
+  email: String @max(200),
+  name: String @max(120),
+}
+
+event @user.renamed {
+  user_id: Uuid,
+  name: String @max(120),
+}
+
+event @user.welcomed {
+  user_id: Uuid,
+}
+
+event @reminder.scheduled {
+  user_id: Uuid,
+  // Domain time, set from the request's pinned clock by the command.
+  due_at: Timestamp,
+}

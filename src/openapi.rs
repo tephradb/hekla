@@ -27,10 +27,8 @@ use crate::introspect;
 use crate::loader::LoadedProject;
 use crate::read_api;
 use crate::read_model::key_kind;
+use crate::schema::{EntityDef, EventDef, FieldKind, FieldMeta, InputSchema, ModuleDef};
 use crate::server::{self, READ_WAIT_DEFAULT, READ_WAIT_MAX};
-use crate::starlark_builtins::{
-    EntityDef, EventDef, EventSpec, FieldKind, FieldMeta, InputSchema, ModuleDef,
-};
 use crate::ui;
 
 const COMMANDS_TAG: &str = "commands";
@@ -74,7 +72,7 @@ impl<'a> Surface<'a> {
             if unit.internal {
                 continue;
             }
-            if let ModuleDef::Command { name, input } = &unit.loaded.def {
+            if let ModuleDef::Command { name, input } = &unit.def {
                 commands.push((name.as_str(), input));
             }
         }
@@ -86,12 +84,12 @@ impl<'a> Surface<'a> {
                 name,
                 entities,
                 sources,
-            } = &unit.loaded.def
+            } = &unit.def
             {
                 projectors.push(ProjectorSurface {
                     name: name.as_str(),
                     entities: entities.as_slice(),
-                    sources: EventSpec::source_types(sources),
+                    sources: Some(sources.iter().map(String::as_str).collect()),
                 });
             }
         }
@@ -99,10 +97,10 @@ impl<'a> Surface<'a> {
 
         let mut effects = Vec::new();
         for unit in &project.effects {
-            if let ModuleDef::Effect { name, sources } = &unit.loaded.def {
+            if let ModuleDef::Effect { name, sources } = &unit.def {
                 effects.push(EffectSurface {
                     name: name.as_str(),
-                    sources: EventSpec::source_types(sources),
+                    sources: Some(sources.iter().map(String::as_str).collect()),
                 });
             }
         }
@@ -110,7 +108,6 @@ impl<'a> Surface<'a> {
 
         let mut events: Vec<(&str, &EventDef)> = project
             .events
-            .by_type
             .iter()
             .map(|(event_type, def)| (event_type.as_str(), def))
             .collect();
@@ -459,7 +456,7 @@ fn input_schema(schema: &InputSchema) -> Value {
     let mut required = Vec::new();
     for (field, kind) in &schema.fields {
         // An optional input may be omitted *or* sent as an explicit null: `check_value`
-        // (`starlark_builtins.rs`) accepts null before it looks at the inner kind. Absence
+        // (`schema.rs`) accepts null before it looks at the inner kind. Absence
         // alone is what `required` encodes, so the null has to be in the type too, or a
         // validating client refuses a body the server accepts.
         let property = if kind.is_nullable() {
@@ -1130,7 +1127,11 @@ fn trace_path() -> Value {
                 "description": "Which effect invocations ran on the positions on this page. \
                     An event's envelope records that an effect produced it but not which one; \
                     the journal is keyed by effect and position, so this answers that exactly. \
-                    An invocation the retention sweeper has already reclaimed is absent.",
+                    An invocation the retention sweeper has already reclaimed is absent. \
+                    So is one by an effect this process no longer loads: the join names the \
+                    effects the running project declares, so a renamed or deleted effect's \
+                    work reads the same as no effect having run. Both absences are silent by \
+                    design, and neither means the position was never processed.",
             },
             "complete": {
                 "type": "boolean",
@@ -1935,10 +1936,7 @@ fn event_schema(event_type: &str, def: &EventDef) -> Value {
 /// An event field: its schema, its declared policy as prose, and the same policy as
 /// `x-hekla-*` so a generator can read it without parsing English.
 fn annotated_event_field(meta: &FieldMeta) -> Value {
-    let mut extensions = vec![
-        ("x-hekla-indexed", Value::Bool(meta.indexed)),
-        ("x-hekla-unique", Value::Bool(meta.unique)),
-    ];
+    let mut extensions = vec![("x-hekla-indexed", Value::Bool(meta.indexed))];
     if let Some(subject) = &meta.subject {
         extensions.push(("x-hekla-subject", Value::String(subject.clone())));
     }
@@ -1962,14 +1960,6 @@ fn event_field_notes(meta: &FieldMeta) -> Vec<String> {
         }
         .to_owned(),
     );
-    if meta.unique {
-        notes.push(
-            "`unique`: also tagged under a global key, so it can be filtered across \
-             subjects without naming one. This makes the field filterable, not unique; \
-             enforcement is an ordinary query, fold and reject."
-                .to_owned(),
-        );
-    }
     notes
 }
 
@@ -2126,18 +2116,9 @@ fn field_schema(kind: &FieldKind) -> Value {
         }
         FieldKind::Uuid => json!({ "type": "string", "format": "uuid" }),
         FieldKind::Timestamp => json!({ "type": "string", "format": "date-time" }),
-        FieldKind::Money => json!({ "type": "string", "description": "decimal amount" }),
+        FieldKind::Money { .. } => json!({ "type": "string", "description": "decimal amount" }),
         FieldKind::OneOf(variants) => json!({ "type": "string", "enum": variants }),
         FieldKind::I64 => json!({ "type": "integer", "format": "int64" }),
-        // No standard format spans unsigned 64-bit. A numeric `maximum: 2^64-1` would
-        // be silently wrong for the many JSON tools that parse bounds as f64 (it does
-        // not round-trip past 2^53), so state the floor and describe the ceiling in
-        // words rather than declare a bound consumers would corrupt.
-        FieldKind::U64 => json!({
-            "type": "integer",
-            "minimum": 0,
-            "description": "unsigned 64-bit integer (0 to 2^64-1)",
-        }),
         FieldKind::Bool => json!({ "type": "boolean" }),
         FieldKind::Json => json!({}),
         FieldKind::Optional(_) => unreachable!("base() strips Optional"),
@@ -2750,13 +2731,13 @@ fn operation_id(prefix: &str, projector: &str, entity: &str) -> String {
 mod tests {
     use super::*;
 
-    use crate::starlark_builtins::IndexDef;
+    use crate::schema::IndexDef;
 
     fn schema() -> InputSchema {
         InputSchema {
             fields: vec![
                 ("id".to_owned(), FieldKind::Uuid),
-                ("amount".to_owned(), FieldKind::Money),
+                ("amount".to_owned(), FieldKind::Money { scale: 2 }),
                 (
                     "kind".to_owned(),
                     FieldKind::OneOf(vec!["a".to_owned(), "b".to_owned()]),
@@ -2776,7 +2757,6 @@ mod tests {
             kind,
             indexed: true,
             subject: Some(subject.to_owned()),
-            unique: false,
         }
     }
 
@@ -2784,12 +2764,11 @@ mod tests {
     /// indexed column, an unindexed one, a subject-encrypted one, and an optional.
     fn entity() -> EntityDef {
         EntityDef {
-            id: 1,
             name: "user_summary".to_owned(),
             key: "user_id".to_owned(),
             fields: vec![
                 ("user_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
-                ("shop_id".to_owned(), FieldMeta::plain(FieldKind::U64)),
+                ("shop_id".to_owned(), FieldMeta::plain(FieldKind::I64)),
                 (
                     "display_name".to_owned(),
                     FieldMeta::plain(FieldKind::Text { max_length: None }),
@@ -2814,7 +2793,6 @@ mod tests {
 
     fn event_def() -> EventDef {
         EventDef {
-            id: 1,
             event_type: "user.registered".to_owned(),
             fields: vec![
                 ("user_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
@@ -2912,19 +2890,25 @@ mod tests {
         );
     }
 
-    /// `field_schema` is the only place the wire form of `money` and `uint` is stated,
-    /// so a field annotation that replaced its description rather than appending would
-    /// leave every `money` column looking like any other string.
+    /// `field_schema` is the only place the wire form of `Money` is stated, so a field
+    /// annotation that replaced its description rather than appending would leave every
+    /// money column looking like any other string.
+    ///
+    /// The Starlark version also pinned `uint`'s `2^64-1` ceiling here, which was the
+    /// only place it appeared. heklang has no unsigned type, so an integer column is an
+    /// `Int` with nothing about its range worth saying.
     #[test]
     fn field_annotations_keep_the_kind_description() {
         let entity = EntityDef {
-            id: 2,
             name: "ledger".to_owned(),
             key: "entry_id".to_owned(),
             fields: vec![
                 ("entry_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
-                ("amount".to_owned(), FieldMeta::plain(FieldKind::Money)),
-                ("count".to_owned(), FieldMeta::plain(FieldKind::U64)),
+                (
+                    "amount".to_owned(),
+                    FieldMeta::plain(FieldKind::Money { scale: 2 }),
+                ),
+                ("count".to_owned(), FieldMeta::plain(FieldKind::I64)),
             ],
             indexes: Vec::new(),
         };
@@ -2949,11 +2933,10 @@ mod tests {
             amount.contains("Not filterable"),
             "the annotation is still there too: {amount}"
         );
+        // A plain integer has no wire form to state, so its description is the
+        // annotation alone: appending to nothing must still produce it.
         let count = props["count"]["description"].as_str().unwrap();
-        assert!(
-            count.contains("2^64-1"),
-            "`uint`'s ceiling is stated nowhere else, and no numeric bound carries it: {count}"
-        );
+        assert!(count.contains("Not filterable"), "{count}");
     }
 
     /// An optional command input may be omitted *or* sent as an explicit null, so
@@ -3550,12 +3533,10 @@ mod tests {
         let input = schema();
         let entities: Vec<EntityDef> = Vec::new();
         let spaced = EventDef {
-            id: 1,
             event_type: "order placed".to_owned(),
-            fields: vec![("shop".to_owned(), FieldMeta::plain(FieldKind::U64))],
+            fields: vec![("shop".to_owned(), FieldMeta::plain(FieldKind::I64))],
         };
         let underscored = EventDef {
-            id: 2,
             event_type: "order_placed".to_owned(),
             fields: vec![("customer".to_owned(), FieldMeta::plain(FieldKind::Uuid))],
         };

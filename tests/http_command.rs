@@ -22,7 +22,7 @@ async fn blank_idempotency_key_is_not_a_shared_key() {
     // the first request's cached 200 or refused as an in-flight duplicate.
     let (first, first_body) = post_command(
         &app,
-        "register-user",
+        "RegisterUser",
         json!({ "user_id": ALICE, "email": "dup@example.com", "name": "Alice" }),
         Some("   "),
     )
@@ -31,7 +31,7 @@ async fn blank_idempotency_key_is_not_a_shared_key() {
 
     let (second, second_body) = post_command(
         &app,
-        "register-user",
+        "RegisterUser",
         json!({ "user_id": BOB, "email": "dup@example.com", "name": "Bob" }),
         Some(""),
     )
@@ -52,7 +52,7 @@ async fn whitespace_only_differs_in_the_key_still_dedupes() {
     // outcome rather than re-running and rejecting the duplicate email.
     let (first, first_body) = post_command(
         &app,
-        "register-user",
+        "RegisterUser",
         json!({ "user_id": ALICE, "email": "dup@example.com", "name": "Alice" }),
         Some("k1"),
     )
@@ -61,7 +61,7 @@ async fn whitespace_only_differs_in_the_key_still_dedupes() {
 
     let (second, second_body) = post_command(
         &app,
-        "register-user",
+        "RegisterUser",
         json!({ "user_id": BOB, "email": "dup@example.com", "name": "Bob" }),
         Some("  k1  "),
     )
@@ -97,7 +97,7 @@ async fn openapi_is_served_as_json() {
     let doc: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(doc["openapi"], "3.1.0");
     assert!(
-        doc["paths"]["/commands/register-user"].is_object(),
+        doc["paths"]["/commands/RegisterUser"].is_object(),
         "the public command is documented: {doc}"
     );
 
@@ -128,13 +128,13 @@ async fn a_non_object_or_malformed_body_is_a_400() {
 
     // A JSON array is well-formed JSON but not a request body. It has to be refused
     // before dispatch: reaching input allocation would surface as an opaque 500.
-    let (status, body) = post_raw(&app, "register-user", "[1, 2]").await;
+    let (status, body) = post_raw(&app, "RegisterUser", "[1, 2]").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "invalid_input");
     assert_eq!(body["error"]["message"], "body must be a JSON object");
 
     // Malformed JSON is likewise a client error, with the parse failure explained.
-    let (status, body) = post_raw(&app, "register-user", "{not json").await;
+    let (status, body) = post_raw(&app, "RegisterUser", "{not json").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "invalid_input");
     let message = body["error"]["message"].as_str().unwrap();
@@ -146,7 +146,7 @@ async fn a_non_object_or_malformed_body_is_a_400() {
     // An empty body becomes `{}` (so a command with no fields needs no payload) and
     // reaches schema validation, which is what reports the missing fields. A 500
     // here would mean the empty body was handed to dispatch as a non-object.
-    let (status, body) = post_raw(&app, "register-user", "").await;
+    let (status, body) = post_raw(&app, "RegisterUser", "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "invalid_input");
     let message = body["error"]["message"].as_str().unwrap();

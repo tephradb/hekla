@@ -1,0 +1,49 @@
+// Two slices, one narrow and one wide, which is the whole argument for a Dynamic
+// Consistency Boundary in thirty lines.
+//
+// The Starlark version enforced one order per email address across customers, through
+// a global-key tag on a subject-encrypted field. heklang rejects an equality on sealed
+// content (an equality over two ciphertexts leaks whether they hold the same value), so
+// that rule cannot be written here and the machinery behind it is gone.
+//
+// What replaces it is a per-shop launch allocation: a hard cap that *must* be enforced
+// at append time, because a read model would race it. That is the constraint a boundary
+// exists for, and it is what gives the conflict-retry loop something real to do.
+
+command PlaceOrder(
+  order_id: Uuid,
+  customer_id: Int,
+  shop_id: Int,
+  email: String?,
+  shipping_address: String?,
+  order_total: Money(2),
+  notes: String,
+) {
+  // Narrow: this one order. A caller retrying the same `order_id` is a no-op rather
+  // than a second order.
+  state placed: Bool = fold false
+    on @order.placed(order_id) => true
+
+  // Wide on purpose: an allocation is a rule about every order in the shop, so every
+  // order in a shop conflicts with every other. That is what a hard cap costs, and the
+  // retry loop is what absorbs it.
+  state sold: Int = fold 0
+    on @order.placed(shop_id) => sold + 1
+
+  if placed {
+    return
+  }
+  if sold >= LAUNCH_ALLOCATION {
+    return reject("sold_out", "this shop's launch allocation is gone")
+  }
+
+  emit @order.placed {
+    order_id,
+    customer_id,
+    shop_id,
+    email,
+    shipping_address,
+    order_total,
+    notes,
+  }
+}

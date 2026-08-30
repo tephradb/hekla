@@ -4,6 +4,9 @@
 
 import { useEffect, useState } from './vendor-preact.js'
 
+/* Also spelled out inline in index.html, which applies the stored choice before the
+ * first paint. `the_shell_applies_the_stored_theme_before_the_first_paint` keeps the
+ * two spellings in step. */
 const KEY = 'hekla.theme'
 export const MODES = ['system', 'dark', 'light']
 
@@ -40,6 +43,3 @@ export function useTheme() {
   const cycle = () => setMode((current) => MODES[(MODES.indexOf(current) + 1) % MODES.length])
   return [mode, cycle]
 }
-
-/* Applied before the first render so the page never flashes the wrong palette. */
-apply(stored())

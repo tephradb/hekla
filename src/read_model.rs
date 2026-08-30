@@ -18,7 +18,7 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, Row, Transaction, params_from_iter};
 use tephra::Position;
 
-use crate::starlark_builtins::{EntityDef, EntityOpKind, FieldKind, FieldMeta};
+use crate::schema::{EntityDef, EntityOpKind, FieldKind, FieldMeta};
 
 /// The projector's internal tables: the checkpoint, co-located with the read-model
 /// tables so it commits in the same transaction as the state it describes, and the
@@ -401,15 +401,13 @@ fn to_sql(meta: &FieldMeta, value: &serde_json::Value) -> anyhow::Result<SqlValu
                 .context("expected a boolean")?;
             SqlValue::Integer(n)
         }
-        FieldKind::I64 | FieldKind::U64 => {
-            SqlValue::Integer(value.as_i64().context("expected an integer")?)
-        }
+        FieldKind::I64 => SqlValue::Integer(value.as_i64().context("expected an integer")?),
         // Money is a decimal string on the wire, stored verbatim as text.
         FieldKind::Text { .. }
         | FieldKind::Uuid
         | FieldKind::Timestamp
         | FieldKind::OneOf(_)
-        | FieldKind::Money => {
+        | FieldKind::Money { .. } => {
             SqlValue::Text(value.as_str().context("expected a string")?.to_owned())
         }
         FieldKind::Json => SqlValue::Text(value.to_string()),
@@ -431,9 +429,7 @@ pub(crate) fn coerce_value(kind: &FieldKind, raw: &str) -> anyhow::Result<SqlVal
             "false" | "0" => SqlValue::Integer(0),
             _ => anyhow::bail!("expected a boolean (`true` or `false`)"),
         },
-        FieldKind::I64 | FieldKind::U64 => {
-            SqlValue::Integer(raw.parse::<i64>().context("expected an integer")?)
-        }
+        FieldKind::I64 => SqlValue::Integer(raw.parse::<i64>().context("expected an integer")?),
         // Money and the text-shaped kinds bind as their string form.
         _ => SqlValue::Text(raw.to_owned()),
     })
@@ -500,11 +496,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::starlark_builtins::IndexDef;
+    use crate::schema::IndexDef;
 
     fn users_entity() -> EntityDef {
         EntityDef {
-            id: 1,
             name: "users".to_owned(),
             key: "user_id".to_owned(),
             fields: vec![
@@ -597,7 +592,6 @@ mod tests {
         // A bool filter must bind as INTEGER 0/1, matching how the column is stored;
         // binding it as the text `"true"` would match nothing (the phase-3 bug).
         let entity = EntityDef {
-            id: 1,
             name: "flags".to_owned(),
             key: "user_id".to_owned(),
             fields: vec![
@@ -632,7 +626,6 @@ mod tests {
         // below builds a different statement (CREATE, CREATE INDEX, INSERT, SELECT,
         // UPDATE, DELETE), so a single unquoted identifier anywhere is a syntax error.
         let entity = EntityDef {
-            id: 1,
             name: "order".to_owned(),
             key: "group".to_owned(),
             fields: vec![
@@ -816,7 +809,6 @@ mod tests {
         // Decoding them as null would drop the key from the row entirely, reporting
         // bad data as absent data.
         let as_text = EntityDef {
-            id: 1,
             name: "docs".to_owned(),
             key: "doc_id".to_owned(),
             fields: vec![

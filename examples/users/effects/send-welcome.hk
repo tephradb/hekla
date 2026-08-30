@@ -1,0 +1,18 @@
+// Reacts to a registration by sending a welcome email, then recording delivery through
+// the internal command.
+//
+// The runtime absorbs transport failures and every retryable status (408, 425, 429 and
+// any 5xx) before the arm sees them, so a `status >= 400` that reaches here is a real
+// rejection to decide on. A crash after the POST but before the journal write replays
+// the POST; the `invoke` lands exactly once.
+
+effect SendWelcome {
+  on @user.registered { user_id, email } {
+    let response = http.post("https://example.test/welcome", { "email": email })
+    if response.status >= 400 {
+      log("welcome email rejected with status {response.status}")
+      return
+    }
+    invoke RecordWelcome { user_id }
+  }
+}

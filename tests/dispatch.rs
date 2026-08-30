@@ -1,13 +1,31 @@
-//! Command dispatch internals: the per-handler instruction budget, the fail-closed
-//! lowering of a consistency boundary, the `fold` contracts, the append condition a
-//! boundaried command builds, and the recovery of a multi-event commit.
+//! Command dispatch internals: the append condition a boundaried command builds, the
+//! fold contracts, and the recovery of a multi-event commit.
 //!
 //! These are the seams `tests/command.rs` cannot reach from `examples/users`: every
 //! project here is a throwaway written to exercise one dispatch decision.
+//!
+//! Seven of the Starlark suite's cases are gone rather than ported, because the thing
+//! each of them guarded no longer exists:
+//!
+//! - **The instruction budget.** `MAX_TICKS` existed because a Starlark `handle` could
+//!   loop forever. heklang has no `while`, rejects recursion, and iterates only finite
+//!   containers, so termination is structural and there is nothing to meter.
+//! - **Fail-closed lowering of an unchecked `query` branch.** The static check used to
+//!   evaluate `query` once against a stubbed input, so a branch it never took could
+//!   lower to a tag that matched nothing. A heklang slice is declared by the `state`
+//!   that folds it and its fields are checked statically on every branch, so a
+//!   constraint on an unindexed or undeclared field is a parse error rather than a
+//!   runtime one.
+//! - **A `fold` or a fold arm that returns `None`.** A heklang arm is an expression of
+//!   the state's declared type. There is no falling off the end.
+//! - **A `fold` or a `handle` that mutates the state it was handed.** heklang has no
+//!   mutable binding, so the contract those two enforced at runtime is now the absence
+//!   of the syntax that broke it.
+//! - **A fold reading a stable `event.id`.** A heklang fold arm binds the event's
+//!   declared fields; a record's id is the host's, and no expression can reach it.
 
 use std::thread;
 
-use hekla::runtime::Runtime;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -15,228 +33,32 @@ mod support;
 
 use support::{ALICE, BOB, Boot, CAROL, ctx, log_head, write_project};
 
-/// Run a command that must fail at dispatch and return its rendered error.
-/// `ExecResult` is not `Debug`, so `Result::unwrap_err` is unavailable here.
-fn exec_err(rt: &Runtime, command: &str, body: Value) -> String {
-    match rt.execute(command, body, &ctx(), None) {
-        Ok(result) => panic!(
-            "`{command}` should have failed at dispatch, got status {} {:?}",
-            result.status, result.body
-        ),
-        Err(err) => format!("{err:#}"),
-    }
-}
-
-/// A single-field event, enough for a command that only needs to emit something.
-const THING_EVENTS: &str = r#"
-thing = event(type = "t.thing", fields = {"id": uuid()})
-"#;
-
-// --- the instruction budget ----------------------------------------------
-
-/// A `handle` that spins far past any sane budget. Only the tick limit stops it.
-const SPIN_HANDLE: &str = r#"
-load("events/t.star", "thing")
-
-input = schema(id = uuid())
-
-def handle(input, state):
-    total = 0
-    for i in range(50000000):
-        total += i
-    return thing(id = input.id)
-"#;
-
-/// `query` runs away, but only on a branch the static check never evaluates: a
-/// `bool()` stubs to False, so the project still loads clean.
-const SPIN_QUERY: &str = r#"
-load("events/t.star", "thing")
-
-input = schema(id = uuid(), spin = bool())
-
-def query(input):
-    if input.spin:
-        total = 0
-        for i in range(50000000):
-            total += i
-    return thing(id = input.id)
-
-def handle(input, state):
-    return thing(id = input.id)
-"#;
-
-#[test]
-fn a_runaway_handler_is_killed_by_the_instruction_budget() {
-    let project = write_project(&[
-        ("events/t.star", THING_EVENTS),
-        ("commands/spin.star", SPIN_HANDLE),
-        ("commands/spin-query.star", SPIN_QUERY),
-    ]);
-    let harness = Boot::new(project.path()).start();
-
-    // Both loops run to the budget before dying, which is not cheap in a debug
-    // build, so the two calls overlap rather than run back to back.
-    let (handle_err, query_err) = thread::scope(|scope| {
-        let handle = scope.spawn(|| exec_err(&harness.rt, "spin", json!({ "id": ALICE })));
-        // The same budget guards `query`, on a branch the static check cannot see.
-        let query = scope.spawn(|| {
-            exec_err(
-                &harness.rt,
-                "spin-query",
-                json!({ "id": ALICE, "spin": true }),
-            )
-        });
-        (handle.join().unwrap(), query.join().unwrap())
-    });
-    // Reaching here at all is most of the point: with no budget these handlers only
-    // stop when their 50-million-iteration loops run out, and `exec_err` would then
-    // panic on a successful commit rather than see an error.
-    assert!(
-        handle_err.contains("handle() failed"),
-        "a budget kill must surface as a handle() failure, got: {handle_err}"
-    );
-    assert!(
-        query_err.contains("query() failed"),
-        "a budget kill in query() must name query(), got: {query_err}"
-    );
-
-    // Neither runaway attempt wrote anything.
-    assert_eq!(log_head(&harness.rt), 0);
-    harness.shutdown();
-}
-
-// --- fail-closed boundary lowering ----------------------------------------
-
-const BRANCHY_EVENTS: &str = r#"
-registered = event(
-    type = "t.registered",
-    fields = {
-        "id": uuid(),
-        "email": str(max_length = 100),
-        "secret": str(max_length = 100, indexed = False),
-    },
-)
-"#;
-
-/// `mode` is a `uint()`, which the static check stubs to 0, so it only ever sees the
-/// clean `email` branch. The `secret` branch filters a field that is never tagged.
-const BRANCH_TO_NON_INDEXED: &str = r#"
-load("events/t.star", "registered")
-
-input = schema(id = uuid(), email = str(), mode = uint())
-
-def query(input):
-    if input.mode == 0:
-        return registered(email = input.email)
-    return registered(secret = input.email)
-
-initial = {"taken": False}
-
-def fold_event(state, event):
-    return dict(state, taken = True)
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    if state["taken"]:
-        return reject("email_taken", "that email is already registered")
-    return registered(id = input.id, email = input.email, secret = "s")
-"#;
-
-/// Same shape, but the unchecked branch constrains a field the event never declares.
-const BRANCH_TO_UNDECLARED: &str = r#"
-load("events/t.star", "registered")
-
-input = schema(id = uuid(), email = str(), mode = uint())
-
-def query(input):
-    if input.mode == 0:
-        return registered(email = input.email)
-    return registered(nope = input.email)
-
-def handle(input, state):
-    return registered(id = input.id, email = input.email, secret = "s")
-"#;
-
-#[test]
-fn a_query_branch_the_static_check_never_sees_fails_closed() {
-    let project = write_project(&[
-        ("events/t.star", BRANCHY_EVENTS),
-        ("commands/reg.star", BRANCH_TO_NON_INDEXED),
-        ("commands/reg-undeclared.star", BRANCH_TO_UNDECLARED),
-    ]);
-    // `Boot::start` asserts the project loads without errors, which is half the
-    // point: the static check evaluates `query` once with a stub input, so neither
-    // bad branch is visible to it.
-    let harness = Boot::new(project.path()).start();
-
-    // The checked branch works, so the commands are not simply broken.
-    let ok = harness
-        .rt
-        .execute(
-            "reg",
-            json!({ "id": ALICE, "email": "a@example.com", "mode": 0 }),
-            &ctx(),
-            None,
-        )
-        .unwrap();
-    assert_eq!(ok.status, 200, "{:?}", ok.body);
-
-    // The unchecked branch must fail rather than lower to a tag that matches
-    // nothing, which would fold an empty boundary and commit through the invariant.
-    let err = exec_err(
-        &harness.rt,
-        "reg",
-        json!({ "id": BOB, "email": "a@example.com", "mode": 1 }),
-    );
-    assert!(
-        err.contains("which is not indexed"),
-        "a non-indexed constraint must fail closed, got: {err}"
-    );
-
-    let err = exec_err(
-        &harness.rt,
-        "reg-undeclared",
-        json!({ "id": BOB, "email": "a@example.com", "mode": 1 }),
-    );
-    assert!(
-        err.contains("undeclared field"),
-        "an undeclared constraint must fail closed, got: {err}"
-    );
-
-    // Only the one legitimate commit landed.
-    assert_eq!(log_head(&harness.rt), 1);
-    harness.shutdown();
-}
-
 // --- multi-event recovery -------------------------------------------------
 
 const BATCH_EVENTS: &str = r#"
-opened = event(type = "t.opened", fields = {"id": uuid(), "who": str(max_length = 50)})
-logged = event(type = "t.logged", fields = {"id": uuid()})
+event @t.opened { id: Uuid, who: String @max(50) }
+event @t.logged { id: Uuid }
 "#;
 
 const OPEN_BATCH: &str = r#"
-load("events/t.star", "opened", "logged")
-
-input = schema(id = uuid(), who = str())
-
-def handle(input, state):
-    return [opened(id = input.id, who = input.who), logged(id = input.id)]
+command Open(id: Uuid, who: String) {
+  emit @t.opened { id, who }
+  emit @t.logged { id }
+}
 "#;
 
 #[test]
 fn a_multi_event_command_replays_byte_identically() {
     let project = write_project(&[
-        ("events/t.star", BATCH_EVENTS),
-        ("commands/open.star", OPEN_BATCH),
+        ("events/t.hk", BATCH_EVENTS),
+        ("commands/open.hk", OPEN_BATCH),
     ]);
     let harness = Boot::new(project.path()).start();
 
     let body = json!({ "id": ALICE, "who": "alice" });
     let first = harness
         .rt
-        .execute("open", body.clone(), &ctx(), Some("k1"))
+        .execute("Open", body.clone(), &ctx(), Some("k1"))
         .unwrap();
     assert_eq!(first.status, 200, "{:?}", first.body);
     assert_eq!(first.body["events"].as_array().unwrap().len(), 2);
@@ -254,7 +76,7 @@ fn a_multi_event_command_replays_byte_identically() {
     // committed than actually did.
     let replay = harness
         .rt
-        .execute("open", body, &ctx(), Some("k1"))
+        .execute("Open", body, &ctx(), Some("k1"))
         .unwrap();
     assert_eq!(replay.status, 200, "{:?}", replay.body);
     assert_eq!(
@@ -268,35 +90,28 @@ fn a_multi_event_command_replays_byte_identically() {
 // --- a boundary with no fold ----------------------------------------------
 
 const NOTED_EVENTS: &str = r#"
-noted = event(type = "t.noted", fields = {"id": uuid(), "topic": str(max_length = 50)})
+event @t.noted { id: Uuid, topic: String @max(50) }
 "#;
 
-/// A boundary with no `fold`: the events inside it are read (so `after` advances) but
-/// never folded, and `handle` decides on a `None` state.
+/// `guard` is the boundary with no fold: it declares a slice and binds nothing, so
+/// the events inside it are read (and `after` is taken before them) but no arm runs.
 const NOTE: &str = r#"
-load("events/t.star", "noted")
+command Note(id: Uuid, topic: String) {
+  guard @t.noted(topic)
 
-input = schema(id = uuid(), topic = str())
-
-def query(input):
-    return noted(topic = input.topic)
-
-def handle(input, state):
-    return noted(id = input.id, topic = input.topic)
+  emit @t.noted { id, topic }
+}
 "#;
 
 #[test]
-fn a_boundaried_command_without_fold_still_commits() {
-    let project = write_project(&[
-        ("events/t.star", NOTED_EVENTS),
-        ("commands/note.star", NOTE),
-    ]);
+fn a_guarded_command_with_no_fold_arm_still_commits() {
+    let project = write_project(&[("events/t.hk", NOTED_EVENTS), ("commands/note.hk", NOTE)]);
     let harness = Boot::new(project.path()).start();
 
     let first = harness
         .rt
         .execute(
-            "note",
+            "Note",
             json!({ "id": ALICE, "topic": "rust" }),
             &ctx(),
             None,
@@ -304,16 +119,16 @@ fn a_boundaried_command_without_fold_still_commits() {
         .unwrap();
     assert_eq!(first.status, 200, "{:?}", first.body);
 
-    // The boundary now matches the first event. It is read but not folded, so only
-    // the read loop can advance `after`; if it did not, the append condition would
-    // conflict against this command's own history and burn every retry.
+    // The boundary now matches the first event. `after` is the log length taken
+    // before the fold, so a slice that already holds an event must not conflict
+    // against it; if it did, this append would burn every retry.
     let second = harness
         .rt
-        .execute("note", json!({ "id": BOB, "topic": "rust" }), &ctx(), None)
+        .execute("Note", json!({ "id": BOB, "topic": "rust" }), &ctx(), None)
         .unwrap();
     assert_eq!(
         second.status, 200,
-        "a fold-less boundary must not self-conflict: {:?}",
+        "a guarded boundary must not self-conflict: {:?}",
         second.body
     );
     assert_eq!(second.body["positions"]["first"], 2);
@@ -321,98 +136,42 @@ fn a_boundaried_command_without_fold_still_commits() {
     harness.shutdown();
 }
 
-// --- the fold contract ----------------------------------------------------
+// --- invalid from the body ------------------------------------------------
 
-const UNIQUE_EMAIL_EVENTS: &str = r#"
-registered = event(
-    type = "t.registered",
-    fields = {"id": uuid(), "email": str(max_length = 100)},
-)
+const REGISTERED_EVENTS: &str = r#"
+event @t.registered { id: Uuid, email: String @max(100) }
 "#;
-
-/// `fold` builds the new state and falls off the end instead of returning it, so it
-/// returns None and the guard it stands behind (`state["taken"]`) would read as
-/// "nothing there".
-const BROKEN_FOLD: &str = r#"
-load("events/t.star", "registered")
-
-input = schema(id = uuid(), email = str())
-
-def query(input):
-    return registered(email = input.email)
-
-initial = {"taken": False}
-
-def fold_event(state, event):
-    updated = dict(state, taken = True)
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    if state["taken"]:
-        return reject("email_taken", "that email is already registered")
-    return registered(id = input.id, email = input.email)
-"#;
-
-#[test]
-fn a_fold_that_returns_none_fails_the_command() {
-    let project = write_project(&[
-        ("events/t.star", UNIQUE_EMAIL_EVENTS),
-        ("commands/reg.star", BROKEN_FOLD),
-    ]);
-    let harness = Boot::new(project.path()).start();
-
-    let body = json!({ "id": ALICE, "email": "dup@example.com" });
-    // The boundary is empty on the first call, so the broken fold never runs.
-    let first = harness
-        .rt
-        .execute("reg", body.clone(), &ctx(), None)
-        .unwrap();
-    assert_eq!(first.status, 200, "{:?}", first.body);
-
-    // The second call folds the committed event. A None state must be a hard error,
-    // not a silently absent guard that lets the duplicate through.
-    let err = exec_err(
-        &harness.rt,
-        "reg",
-        json!({ "id": BOB, "email": "dup@example.com" }),
-    );
-    assert!(
-        err.contains("must return the updated state"),
-        "a fold that falls off the end must fail loudly, got: {err}"
-    );
-    assert_eq!(log_head(&harness.rt), 1, "the duplicate must not commit");
-    harness.shutdown();
-}
-
-// --- invalid_input from handle --------------------------------------------
 
 const INVALID_INPUT_COMMAND: &str = r#"
-load("events/t.star", "registered")
+command Register(id: Uuid, email: String) {
+  if !email.contains("@") {
+    return invalid("email must contain @")
+  }
 
-input = schema(id = uuid(), email = str())
-
-def handle(input, state):
-    if "@" not in input.email:
-        return invalid_input("email must contain @")
-    return registered(id = input.id, email = input.email)
+  emit @t.registered { id, email }
+}
 "#;
 
 #[test]
-fn handle_returning_invalid_input_is_a_400_and_appends_nothing() {
+fn a_command_returning_invalid_is_a_400_and_appends_nothing() {
     let project = write_project(&[
-        ("events/t.star", UNIQUE_EMAIL_EVENTS),
-        ("commands/reg.star", INVALID_INPUT_COMMAND),
+        ("events/t.hk", REGISTERED_EVENTS),
+        ("commands/register.hk", INVALID_INPUT_COMMAND),
     ]);
     let harness = Boot::new(project.path()).start();
 
     let bad = harness
         .rt
-        .execute("reg", json!({ "id": ALICE, "email": "nope" }), &ctx(), None)
+        .execute(
+            "Register",
+            json!({ "id": ALICE, "email": "nope" }),
+            &ctx(),
+            None,
+        )
         .unwrap();
     assert_eq!(
         bad.status, 400,
-        "invalid_input is a malformed body, not a state rejection: {:?}",
+        "`invalid` is a malformed body, not a state rejection: {:?}",
         bad.body
     );
     assert_eq!(bad.body["error"]["code"], "invalid_input");
@@ -426,12 +185,12 @@ fn handle_returning_invalid_input_is_a_400_and_appends_nothing() {
     );
     assert_eq!(log_head(&harness.rt), 0);
 
-    // The other arm of the same handle still commits, so the 400 is the outcome and
+    // The other arm of the same command still commits, so the 400 is the outcome and
     // not the command being broken.
     let ok = harness
         .rt
         .execute(
-            "reg",
+            "Register",
             json!({ "id": ALICE, "email": "a@example.com" }),
             &ctx(),
             None,
@@ -443,25 +202,28 @@ fn handle_returning_invalid_input_is_a_400_and_appends_nothing() {
 
 // --- a commit with no events ----------------------------------------------
 
-const NOOP_COMMAND: &str = r#"
-input = schema(id = uuid())
+const THING_EVENTS: &str = r#"
+event @t.thing { id: Uuid }
+"#;
 
-def handle(input, state):
-    return []
+const NOOP_COMMAND: &str = r#"
+command Noop(id: Uuid) {
+  return
+}
 "#;
 
 #[test]
 fn a_command_that_emits_nothing_commits_with_null_positions() {
     let project = write_project(&[
-        ("events/t.star", THING_EVENTS),
-        ("commands/noop.star", NOOP_COMMAND),
+        ("events/t.hk", THING_EVENTS),
+        ("commands/noop.hk", NOOP_COMMAND),
     ]);
     let harness = Boot::new(project.path()).start();
 
     let body = json!({ "id": ALICE });
     let first = harness
         .rt
-        .execute("noop", body.clone(), &ctx(), Some("k1"))
+        .execute("Noop", body.clone(), &ctx(), Some("k1"))
         .unwrap();
     assert_eq!(first.status, 200, "{:?}", first.body);
     assert!(
@@ -472,13 +234,12 @@ fn a_command_that_emits_nothing_commits_with_null_positions() {
     assert_eq!(first.body["events"], json!([]));
     assert_eq!(log_head(&harness.rt), 0, "an empty emit must not append");
 
-    // Nothing carries the idempotency tag, and this command has no boundary, so
-    // there is nothing to recover: the replay legitimately re-runs `handle` and
-    // reports its own identity.
+    // Nothing carries the idempotency tag, so there is nothing to recover from the
+    // log: the replay legitimately re-runs the command and reports its own identity.
     let second_ctx = ctx();
     let replay = harness
         .rt
-        .execute("noop", body, &second_ctx, Some("k1"))
+        .execute("Noop", body, &second_ctx, Some("k1"))
         .unwrap();
     assert_eq!(replay.status, 200, "{:?}", replay.body);
     assert_eq!(
@@ -490,56 +251,51 @@ fn a_command_that_emits_nothing_commits_with_null_positions() {
     harness.shutdown();
 }
 
-// --- input schema type checking -------------------------------------------
+// --- input binding --------------------------------------------------------
 
 const SCALAR_EVENTS: &str = r#"
-recorded = event(
-    type = "t.recorded",
-    fields = {"qty": int(), "code": str(max_length = 3)},
-)
+event @t.recorded { qty: Int, flag: Bool, code: String @max(3) }
 "#;
 
 const RECORD_COMMAND: &str = r#"
-load("events/t.star", "recorded")
-
-input = schema(qty = int(), count = uint(), flag = bool(), code = str(max_length = 3))
-
-def handle(input, state):
-    return recorded(qty = input.qty, code = input.code)
+command Record(qty: Int, flag: Bool, code: String) {
+  emit @t.recorded { qty, flag, code }
+}
 "#;
 
+/// Two different rejections, both 400, and the split is worth naming. A wrongly typed
+/// or missing parameter never reaches the program: `bind_args` converts the body
+/// against the declaration and fails first. An over-length string does reach it, and
+/// comes back as `Outcome::Invalid` from the `emit`, because `@max` is a property of
+/// the event field rather than of the parameter.
 #[test]
-fn badly_typed_scalar_inputs_are_rejected_with_400() {
+fn a_body_that_does_not_bind_is_rejected_with_400() {
     let project = write_project(&[
-        ("events/t.star", SCALAR_EVENTS),
-        ("commands/record.star", RECORD_COMMAND),
+        ("events/t.hk", SCALAR_EVENTS),
+        ("commands/record.hk", RECORD_COMMAND),
     ]);
     let harness = Boot::new(project.path()).start();
 
     // Each body is well-formed apart from the one named field.
-    let cases: [(&str, serde_json::Value); 4] = [
+    let cases: [(&str, serde_json::Value); 5] = [
+        ("qty", json!({"qty": 1.5, "flag": true, "code": "abc"})),
+        ("flag", json!({"qty": 1, "flag": "yes", "code": "abc"})),
+        ("code", json!({"qty": 1, "flag": true, "code": "abcd"})),
+        // Absent, rather than holding the wrong thing: a different mistake with a
+        // different answer.
+        ("flag", json!({"qty": 1, "code": "abc"})),
+        // A key the command does not declare. heklang reads the parameters it knows
+        // and never looks at the rest, so nothing but this check would notice a typo.
         (
-            "count",
-            json!({"qty": 1, "count": -1, "flag": true, "code": "abc"}),
-        ),
-        (
-            "qty",
-            json!({"qty": 1.5, "count": 0, "flag": true, "code": "abc"}),
-        ),
-        (
-            "flag",
-            json!({"qty": 1, "count": 0, "flag": "yes", "code": "abc"}),
-        ),
-        (
-            "code",
-            json!({"qty": 1, "count": 0, "flag": true, "code": "abcd"}),
+            "quantity",
+            json!({"qty": 1, "flag": true, "code": "abc", "quantity": 2}),
         ),
     ];
     for (field, body) in cases {
-        let result = harness.rt.execute("record", body, &ctx(), None).unwrap();
+        let result = harness.rt.execute("Record", body, &ctx(), None).unwrap();
         assert_eq!(
             result.status, 400,
-            "`{field}` should not have type-checked: {:?}",
+            "`{field}` should not have bound: {:?}",
             result.body
         );
         assert_eq!(result.body["error"]["code"], "invalid_input");
@@ -554,15 +310,15 @@ fn badly_typed_scalar_inputs_are_rejected_with_400() {
     let ok = harness
         .rt
         .execute(
-            "record",
-            json!({ "qty": -3, "count": 0, "flag": true, "code": "abc" }),
+            "Record",
+            json!({ "qty": -3, "flag": true, "code": "abc" }),
             &ctx(),
             None,
         )
         .unwrap();
     assert_eq!(
         ok.status, 200,
-        "the schema must accept a well-typed body: {:?}",
+        "binding must accept a well-typed body: {:?}",
         ok.body
     );
     harness.shutdown();
@@ -570,54 +326,57 @@ fn badly_typed_scalar_inputs_are_rejected_with_400() {
 
 // --- per-type fold dispatch -----------------------------------------------
 
-/// Two event types over one subject, so a boundary can span both.
+/// Two event types over one owner, so a command can fold both.
 const ACCOUNT_EVENTS: &str = r#"
-opened = event(type = "t.opened", fields = {"id": uuid(), "owner": str(max_length = 50)})
-frozen = event(type = "t.frozen", fields = {"id": uuid(), "owner": str(max_length = 50)})
-noticed = event(type = "t.noticed", fields = {"id": uuid(), "owner": str(max_length = 50)})
+event @t.opened { id: Uuid, owner: String @max(50) }
+event @t.frozen { id: Uuid, owner: String @max(50) }
+event @t.noticed { id: Uuid, owner: String @max(50) }
 "#;
 
-/// A per-type map: one arm per type in the boundary, each returning new state.
+/// Two `state`s, one per type, each folding its own slice of one boundary.
 const PER_TYPE_FOLD: &str = r#"
-load("events/t.star", "opened", "frozen")
+command Open(id: Uuid, owner: String) {
+  state opened: Bool = fold false
+    on @t.opened(owner) => true
 
-input = schema(id = uuid(), owner = str())
+  state frozen: Bool = fold false
+    on @t.frozen(owner) => true
 
-def query(input):
-    return [opened(owner = input.owner), frozen(owner = input.owner)]
+  if frozen {
+    return reject("frozen", "that owner is frozen")
+  }
+  if opened {
+    return reject("already_open", "that owner already has an account")
+  }
 
-initial = {"opened": False, "frozen": False}
-
-fold = {
-    opened(): lambda state, event: dict(state, opened = True),
-    frozen(): lambda state, event: dict(state, frozen = True),
+  emit @t.opened { id, owner }
 }
+"#;
 
-def handle(input, state):
-    if state["frozen"]:
-        return reject("frozen", "that owner is frozen")
-    if state["opened"]:
-        return reject("already_open", "that owner already has an account")
-    return opened(id = input.id, owner = input.owner)
+/// Emits the second event type, so the per-type fold has something to dispatch on.
+const FREEZE: &str = r#"
+command Freeze(id: Uuid, owner: String) {
+  emit @t.frozen { id, owner }
+}
 "#;
 
 #[test]
 fn a_per_type_fold_dispatches_by_event_type() {
     let project = write_project(&[
-        ("events/t.star", ACCOUNT_EVENTS),
-        ("commands/open.star", PER_TYPE_FOLD),
-        ("commands/freeze.star", FREEZE),
+        ("events/t.hk", ACCOUNT_EVENTS),
+        ("commands/open.hk", PER_TYPE_FOLD),
+        ("commands/freeze.hk", FREEZE),
     ]);
     let harness = Boot::new(project.path()).start();
 
     let body = json!({ "id": ALICE, "owner": "kim" });
-    let first = harness.rt.execute("open", body, &ctx(), None).unwrap();
+    let first = harness.rt.execute("Open", body, &ctx(), None).unwrap();
     assert_eq!(first.status, 200, "{:?}", first.body);
 
-    // The `opened` arm ran, so the second attempt sees `opened` and not `frozen`.
+    // The `@t.opened` arm ran, so the second attempt sees `opened` and not `frozen`.
     let second = harness
         .rt
-        .execute("open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .execute("Open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
         .unwrap();
     assert_eq!(second.status, 422, "{:?}", second.body);
     assert_eq!(second.body["error"]["code"], "already_open");
@@ -626,282 +385,221 @@ fn a_per_type_fold_dispatches_by_event_type() {
     // changes with it, so each arm is genuinely reached by its own type.
     harness
         .rt
-        .execute("freeze", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .execute("Freeze", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
         .unwrap();
     let third = harness
         .rt
-        .execute("open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .execute("Open", json!({ "id": CAROL, "owner": "kim" }), &ctx(), None)
         .unwrap();
     assert_eq!(third.status, 422, "{:?}", third.body);
     assert_eq!(third.body["error"]["code"], "frozen");
     harness.shutdown();
 }
 
-/// Two clauses on one type, the narrower a subset of the wider. A command's `fold`
-/// could not express this before its keys became clauses.
-const FAN_OUT_FOLD: &str = r#"
-load("events/t.star", "opened", "frozen")
+// --- fan-out across two slices of one type --------------------------------
 
-input = schema(id = uuid(), owner = str())
-
-def query(input):
-    return [opened(owner = input.owner), frozen(owner = input.owner)]
-
-initial = {"seen": 0, "kim": 0}
-
-fold = {
-    opened(): lambda state, event: dict(state, seen = state["seen"] + 1),
-    opened(owner = "kim"): lambda state, event: dict(state, kim = state["kim"] + 1),
-}
-
-def handle(input, state):
-    if state["seen"] != state["kim"]:
-        return reject("wider_only", "the wide arm ran without the narrow one")
-    if state["seen"] > 0:
-        return reject("both_ran", "both arms ran")
-    return opened(id = input.id, owner = input.owner)
+const TIERED_EVENTS: &str = r#"
+event @t.opened { id: Uuid, owner: String @max(50), tier: String @max(20) }
 "#;
 
-/// Both arms run for an event the narrow one selects, and only the wide one runs for
-/// an event it does not: the fan-out rule, on the command side.
+/// Writes history without inspecting it, so the command below can be asked about a
+/// log it did not build.
+const RECORD_OPEN: &str = r#"
+command Record(id: Uuid, owner: String, tier: String) {
+  emit @t.opened { id, owner, tier }
+}
+"#;
+
+/// Two slices of one event type, the narrower a strict subset of the wider. Both are
+/// declared by this one command, so both are in its append condition, and a record
+/// matching the narrow one must be applied by both arms.
+const FAN_OUT_FOLD: &str = r#"
+command Open(id: Uuid, owner: String, tier: String) {
+  state seen: Int = fold 0
+    on @t.opened(owner) => seen + 1
+
+  state gold: Int = fold 0
+    on @t.opened(owner, tier: "gold") => gold + 1
+
+  if gold > seen {
+    return reject("narrow_only", "the narrow arm ran without the wide one")
+  }
+  if seen > gold {
+    return reject("wide_only", "only the wide arm ran")
+  }
+  if seen > 0 {
+    return reject("both_ran", "both arms ran")
+  }
+
+  emit @t.opened { id, owner, tier }
+}
+"#;
+
+/// Both arms run for a record the narrow slice selects, and only the wide one runs
+/// for a record it does not.
+///
+/// `narrow_only` is unreachable by construction, since a subset cannot match without
+/// its superset matching too. It is written anyway: a regression that dropped the
+/// wide arm would surface as that code rather than as a silent pass.
 #[test]
-fn a_fold_fans_out_across_two_clauses_of_one_type() {
+fn a_fold_fans_out_across_two_slices_of_one_type() {
     let project = write_project(&[
-        ("events/t.star", ACCOUNT_EVENTS),
-        ("commands/open.star", FAN_OUT_FOLD),
+        ("events/t.hk", TIERED_EVENTS),
+        ("commands/record.hk", RECORD_OPEN),
+        ("commands/open.hk", FAN_OUT_FOLD),
     ]);
     let harness = Boot::new(project.path()).start();
 
+    let record = |id: &str, owner: &str, tier: &str| {
+        let result = harness
+            .rt
+            .execute(
+                "Record",
+                json!({ "id": id, "owner": owner, "tier": tier }),
+                &ctx(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+    };
+
+    // An empty boundary: both counters are their seeds, so nothing rejects.
     let first = harness
         .rt
-        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
+        .execute(
+            "Open",
+            json!({ "id": ALICE, "owner": "kim", "tier": "gold" }),
+            &ctx(),
+            None,
+        )
         .unwrap();
     assert_eq!(first.status, 200, "{:?}", first.body);
 
-    // `owner = "kim"` matches both clauses, so both counters moved together.
+    // That commit is in both slices, so both counters moved together.
     let second = harness
         .rt
-        .execute("open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .execute(
+            "Open",
+            json!({ "id": BOB, "owner": "kim", "tier": "gold" }),
+            &ctx(),
+            None,
+        )
         .unwrap();
     assert_eq!(second.status, 422, "{:?}", second.body);
     assert_eq!(second.body["error"]["code"], "both_ran");
 
-    // A different owner is a different boundary, so this starts from `initial` and
-    // commits; the point is that the narrow clause did not fire for it.
+    // A different owner is a different boundary, and this one holds a record the
+    // narrow slice does not select, so only the wide arm ran for it.
+    record(CAROL, "sam", "silver");
     let third = harness
         .rt
-        .execute("open", json!({ "id": CAROL, "owner": "sam" }), &ctx(), None)
+        .execute(
+            "Open",
+            json!({ "id": ALICE, "owner": "sam", "tier": "gold" }),
+            &ctx(),
+            None,
+        )
         .unwrap();
-    assert_eq!(third.status, 200, "{:?}", third.body);
-
-    // Now only the wide arm has run for `sam`, so the counters disagree.
-    let fourth = harness
-        .rt
-        .execute("open", json!({ "id": ALICE, "owner": "sam" }), &ctx(), None)
-        .unwrap();
-    assert_eq!(fourth.status, 422, "{:?}", fourth.body);
-    assert_eq!(fourth.body["error"]["code"], "wider_only");
+    assert_eq!(third.status, 422, "{:?}", third.body);
+    assert_eq!(third.body["error"]["code"], "wide_only");
     harness.shutdown();
 }
 
-/// Emits the second event type, so the per-type fold has something to dispatch on.
-const FREEZE: &str = r#"
-load("events/t.star", "frozen")
+// --- a type in the boundary with no arm -----------------------------------
 
-input = schema(id = uuid(), owner = str())
+/// `@t.opened` is guarded, so it is in the append condition and is read, but nothing
+/// folds it. `@t.frozen` is folded.
+const GUARDED_AND_FOLDED: &str = r#"
+command Open(id: Uuid, owner: String) {
+  guard @t.opened(owner)
 
-def handle(input, state):
-    return frozen(id = input.id, owner = input.owner)
-"#;
+  state frozen: Int = fold 0
+    on @t.frozen(owner) => frozen + 1
 
-/// The boundary is every event, but the map names one type, so everything else is
-/// read into the boundary and left unfolded.
-const ALL_EVENTS_FOLD: &str = r#"
-load("events/t.star", "opened", "frozen")
+  if frozen > 0 {
+    return reject("frozen", "saw {frozen} frozen event(s)")
+  }
 
-input = schema(id = uuid(), owner = str())
-
-def query(input):
-    return all_events()
-
-initial = {"seen": 0}
-
-fold = {
-    frozen(): lambda state, event: dict(state, seen = state["seen"] + 1),
+  emit @t.opened { id, owner }
 }
-
-def handle(input, state):
-    if state["seen"] > 0:
-        return reject("frozen", "saw %d frozen event(s)" % state["seen"])
-    return opened(id = input.id, owner = input.owner)
 "#;
 
 #[test]
-fn an_event_type_with_no_fold_entry_is_read_but_not_folded() {
+fn an_event_type_in_the_boundary_with_no_fold_arm_is_read_but_not_folded() {
     let project = write_project(&[
-        ("events/t.star", ACCOUNT_EVENTS),
-        ("commands/open.star", ALL_EVENTS_FOLD),
-        ("commands/freeze.star", FREEZE),
+        ("events/t.hk", ACCOUNT_EVENTS),
+        ("commands/open.hk", GUARDED_AND_FOLDED),
+        ("commands/freeze.hk", FREEZE),
     ]);
     let harness = Boot::new(project.path()).start();
 
-    // An `opened` event has no arm. It still has to advance `after`, or the next
-    // command's append condition would conflict against history it already read.
+    // An `@t.opened` record has no arm. It is still inside the condition, so `after`
+    // has to be taken before the read, or the next command would conflict against
+    // history it already saw.
     let first = harness
         .rt
-        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
+        .execute("Open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
         .unwrap();
     assert_eq!(first.status, 200, "{:?}", first.body);
     let second = harness
         .rt
-        .execute("open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .execute("Open", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
         .unwrap();
     assert_eq!(
         second.status, 200,
-        "an unfolded event must not self-conflict: {:?}",
+        "an unfolded slice must not self-conflict: {:?}",
         second.body
     );
 
-    // The mapped type does fold, so state is not simply frozen at `initial`.
+    // The folded type does move the state, so it is not simply stuck at its seed.
     harness
         .rt
-        .execute("freeze", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
+        .execute("Freeze", json!({ "id": BOB, "owner": "kim" }), &ctx(), None)
         .unwrap();
     let third = harness
         .rt
-        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
+        .execute("Open", json!({ "id": CAROL, "owner": "kim" }), &ctx(), None)
         .unwrap();
     assert_eq!(third.status, 422, "{:?}", third.body);
     assert_eq!(third.body["error"]["message"], "saw 1 frozen event(s)");
     harness.shutdown();
 }
 
-/// One arm falls off the end. The failure has to name the entry, not just `fold`.
-const BROKEN_ARM: &str = r#"
-load("events/t.star", "opened", "frozen")
+// --- state accumulates ----------------------------------------------------
 
-input = schema(id = uuid(), owner = str())
-
-def query(input):
-    return [opened(owner = input.owner), frozen(owner = input.owner)]
-
-initial = {"opened": False}
-
-def bad(state, event):
-    updated = dict(state, opened = True)
-
-fold = {
-    opened(): bad,
-    frozen(): lambda state, event: state,
-}
-
-def handle(input, state):
-    return opened(id = input.id, owner = input.owner)
-"#;
-
-#[test]
-fn a_fold_entry_that_returns_none_names_the_entry() {
-    let project = write_project(&[
-        ("events/t.star", ACCOUNT_EVENTS),
-        ("commands/open.star", BROKEN_ARM),
-    ]);
-    let harness = Boot::new(project.path()).start();
-
-    harness
-        .rt
-        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
-        .unwrap();
-    let err = exec_err(&harness.rt, "open", json!({ "id": BOB, "owner": "kim" }));
-    assert!(
-        err.contains("fold entry for `t.opened()` must return the updated state"),
-        "the failing arm must name itself, got: {err}"
-    );
-    harness.shutdown();
-}
-
-/// `initial` is a frozen module global, so this is the mistake the contract exists
-/// to prevent, caught on the first event the fold ever sees.
-const MUTATING_FOLD: &str = r#"
-load("events/t.star", "opened")
-
-input = schema(id = uuid(), owner = str())
-
-def query(input):
-    return opened(owner = input.owner)
-
-initial = {"opened": False}
-
-def fold_event(state, event):
-    state["opened"] = True
-    return state
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    return opened(id = input.id, owner = input.owner)
-"#;
-
-#[test]
-fn a_fold_that_mutates_the_state_it_was_handed_fails_with_the_contract() {
-    let project = write_project(&[
-        ("events/t.star", ACCOUNT_EVENTS),
-        ("commands/open.star", MUTATING_FOLD),
-    ]);
-    let harness = Boot::new(project.path()).start();
-
-    harness
-        .rt
-        .execute("open", json!({ "id": ALICE, "owner": "kim" }), &ctx(), None)
-        .unwrap();
-    let err = exec_err(&harness.rt, "open", json!({ "id": BOB, "owner": "kim" }));
-    assert!(
-        err.contains("fold returns the new state"),
-        "a bare `Immutable` is not a usable message, got: {err}"
-    );
-    harness.shutdown();
-}
-
-/// State has to accumulate across events, not restart from `initial` each time.
 const COUNTING_FOLD: &str = r#"
-load("events/t.star", "opened", "noticed")
+command Notice(id: Uuid, owner: String) {
+  state seen: Int = fold 0
+    on @t.noticed(owner) => seen + 1
 
-input = schema(id = uuid(), owner = str())
+  if seen >= 2 {
+    return reject("enough", "seen {seen}")
+  }
 
-def query(input):
-    return noticed(owner = input.owner)
-
-initial = {"seen": 0}
-
-fold = {
-    noticed(): lambda state, event: dict(state, seen = state["seen"] + 1),
+  emit @t.noticed { id, owner }
 }
-
-def handle(input, state):
-    if state["seen"] >= 2:
-        return reject("enough", "seen %d" % state["seen"])
-    return noticed(id = input.id, owner = input.owner)
 "#;
 
 #[test]
 fn folded_state_accumulates_across_events() {
     let project = write_project(&[
-        ("events/t.star", ACCOUNT_EVENTS),
-        ("commands/notice.star", COUNTING_FOLD),
+        ("events/t.hk", ACCOUNT_EVENTS),
+        ("commands/notice.hk", COUNTING_FOLD),
     ]);
     let harness = Boot::new(project.path()).start();
 
     for id in [ALICE, BOB] {
         let result = harness
             .rt
-            .execute("notice", json!({ "id": id, "owner": "kim" }), &ctx(), None)
+            .execute("Notice", json!({ "id": id, "owner": "kim" }), &ctx(), None)
             .unwrap();
         assert_eq!(result.status, 200, "{:?}", result.body);
     }
     let third = harness
         .rt
         .execute(
-            "notice",
-            json!({ "id": ALICE, "owner": "kim" }),
+            "Notice",
+            json!({ "id": CAROL, "owner": "kim" }),
             &ctx(),
             None,
         )
@@ -911,134 +609,58 @@ fn folded_state_accumulates_across_events() {
     harness.shutdown();
 }
 
-// --- event.data is schema-shaped ------------------------------------------
+// --- a folded record is schema-shaped -------------------------------------
 
 /// A note whose body is optional, so a stored payload can legitimately omit it.
 const OPTIONAL_EVENTS: &str = r#"
-noted = event(
-    type = "t.noted",
-    fields = {"id": uuid(), "body": optional(str(max_length = 50))},
-)
+event @t.noted { id: Uuid, body: String? @max(50) }
 "#;
 
-/// Emits without `body`, so the stored payload has no such key at all.
+/// Emits without a body, so the stored payload carries no value for it.
 const NOTE_WITHOUT_BODY: &str = r#"
-load("events/t.star", "noted")
-
-input = schema(id = uuid())
-
-def handle(input, state):
-    return noted(id = input.id)
+command Note(id: Uuid) {
+  emit @t.noted { id, body: none }
+}
 "#;
 
-/// Folds the absent field. Reading it must give `None` rather than raising, the way
-/// `input.body` would: `event.data` is built from the definition's fields, not from
-/// whatever the payload happened to carry.
+/// Folds the absent field. It has to read as `none` rather than raising: a record is
+/// built from the event's declared fields, not from whatever the payload carried.
 const READ_ABSENT_FIELD: &str = r#"
-load("events/t.star", "noted")
+command Read(id: Uuid) {
+  state seen: String? = fold "unset"
+    on @t.noted(id) { body } => body
 
-input = schema(id = uuid())
+  if seen.is_none() {
+    return reject("absent", "an omitted optional field reads as none")
+  }
 
-def query(input):
-    return noted()
-
-initial = {"body": "unset"}
-
-fold = {
-    noted(): lambda state, event: dict(state, body = event.data.body),
+  emit @t.noted { id, body: seen }
 }
-
-def handle(input, state):
-    if state["body"] == None:
-        return reject("absent", "an omitted optional field reads as None")
-    return noted(id = input.id)
 "#;
 
 #[test]
 fn an_omitted_optional_field_reads_as_none() {
     let project = write_project(&[
-        ("events/t.star", OPTIONAL_EVENTS),
-        ("commands/note.star", NOTE_WITHOUT_BODY),
-        ("commands/read.star", READ_ABSENT_FIELD),
+        ("events/t.hk", OPTIONAL_EVENTS),
+        ("commands/note.hk", NOTE_WITHOUT_BODY),
+        ("commands/read.hk", READ_ABSENT_FIELD),
     ]);
     let harness = Boot::new(project.path()).start();
 
     let first = harness
         .rt
-        .execute("note", json!({ "id": ALICE }), &ctx(), None)
+        .execute("Note", json!({ "id": ALICE }), &ctx(), None)
         .unwrap();
     assert_eq!(first.status, 200, "{:?}", first.body);
 
-    // The fold reads `event.data.body` off a payload that never carried it. A
-    // payload-shaped dict would have raised here; a schema-shaped struct gives None.
+    // The fold reads a field the payload never carried a value for. A payload-shaped
+    // map would have had nothing there at all; a schema-shaped record gives `none`.
     let second = harness
         .rt
-        .execute("read", json!({ "id": BOB }), &ctx(), None)
+        .execute("Read", json!({ "id": ALICE }), &ctx(), None)
         .unwrap();
     assert_eq!(second.status, 422, "{:?}", second.body);
     assert_eq!(second.body["error"]["code"], "absent");
-    harness.shutdown();
-}
-
-// --- event.id ---------------------------------------------------------------
-
-const OPENED_EVENTS: &str = r#"
-opened = event(type = "t.opened", fields = {"id": uuid()})
-"#;
-
-/// Folds the boundary's own event id into state, so the rejection message carries a
-/// value only `event.id` could have produced.
-const FOLD_READS_EVENT_ID: &str = r#"
-load("events/t.star", "opened")
-
-input = schema(id = uuid())
-
-def query(input):
-    return opened(id = input.id)
-
-initial = {"seen": ""}
-
-fold = {opened(): lambda state, event: dict(state, seen = uuid5(event.id, "audit"))}
-
-def handle(input, state):
-    if state["seen"] != "":
-        return reject("seen", state["seen"])
-    return opened(id = input.id)
-"#;
-
-/// A fold reads `event.id`, and gets the same id every replay. The fold re-reads the
-/// boundary on every execution, so two rejections that disagreed would mean the id
-/// moved between reads, and any id derived from it in a real command would name a
-/// different entity each time.
-#[test]
-fn a_fold_reads_a_stable_event_id() {
-    let project = write_project(&[
-        ("events/t.star", OPENED_EVENTS),
-        ("commands/open.star", FOLD_READS_EVENT_ID),
-    ]);
-    let harness = Boot::new(project.path()).start();
-
-    let open = || {
-        harness
-            .rt
-            .execute("open", json!({ "id": ALICE }), &ctx(), None)
-            .unwrap()
-    };
-    assert_eq!(open().status, 200, "the first open has an empty boundary");
-
-    let second = open();
-    assert_eq!(second.status, 422, "{:?}", second.body);
-    let derived = second.body["error"]["message"].as_str().unwrap().to_owned();
-    assert!(
-        Uuid::parse_str(&derived).is_ok(),
-        "the fold saw a real event id, got `{derived}`"
-    );
-
-    let third = open();
-    assert_eq!(
-        third.body["error"]["message"], derived,
-        "a second fold over the same event derives the same id"
-    );
     harness.shutdown();
 }
 
@@ -1047,41 +669,31 @@ fn a_fold_reads_a_stable_event_id() {
 /// A counted resource: the boundary is one room's whole seating history, so every
 /// concurrent take collides on it.
 const SEAT_EVENTS: &str = r#"
-taken = event(type = "t.taken", fields = {"id": uuid(), "room": str(max_length = 20)})
+event @t.taken { id: Uuid, room: String @max(20) }
 "#;
 
 /// Capacity two. The interesting property is what a loser does on its retry: the
-/// winner's event is inside the boundary it already folded up to, so a retry that
-/// folded nothing new would decide on a stale count and conflict again until the
-/// budget ran out, while a retry that folds the delta sees the seat go and rejects.
+/// winner's event is inside the slice it already folded up to, so a retry that folded
+/// nothing new would decide on a stale count and conflict again until the budget ran
+/// out, while a retry that re-folds sees the seat go and rejects.
 const TAKE_SEAT: &str = r#"
-load("events/t.star", "taken")
+command Take(id: Uuid, room: String) {
+  state seats: Int = fold 0
+    on @t.taken(room) => seats + 1
 
-input = schema(id = uuid(), room = str())
+  if seats >= 2 {
+    return reject("full", "no seats left")
+  }
 
-def query(input):
-    return taken(room = input.room)
-
-initial = 0
-
-fold = {taken(): lambda state, event: state + 1}
-
-def handle(input, state):
-    if state >= 2:
-        return reject("full", "no seats left")
-    return taken(id = input.id, room = input.room)
+  emit @t.taken { id, room }
+}
 "#;
 
-/// Note what this can and cannot catch. Folding the delta and re-folding the whole
-/// boundary reach the same state by construction, so nothing observable separates
-/// them and this passes against either. What it holds is that the carry is *correct*:
-/// folding the delta onto `initial` rather than onto the carried state commits five
-/// seats against a capacity of two.
 #[test]
 fn a_retry_decides_on_the_events_that_beat_it() {
     let project = write_project(&[
-        ("events/t.star", SEAT_EVENTS),
-        ("commands/take.star", TAKE_SEAT),
+        ("events/t.hk", SEAT_EVENTS),
+        ("commands/take.hk", TAKE_SEAT),
     ]);
     let harness = Boot::new(project.path()).start();
 
@@ -1092,7 +704,7 @@ fn a_retry_decides_on_the_events_that_beat_it() {
                 scope.spawn(move || {
                     let result = rt
                         .execute(
-                            "take",
+                            "Take",
                             json!({ "id": Uuid::new_v4(), "room": "r1" }),
                             &ctx(),
                             None,
@@ -1129,61 +741,184 @@ fn a_retry_decides_on_the_events_that_beat_it() {
     harness.shutdown();
 }
 
-/// Capacity three, and a `handle` that writes into the state it was handed. The
-/// mutation must be refused rather than carried: with the state carried across
-/// attempts, a `handle` that reset the count would let every racer commit, blowing
-/// the capacity the boundary exists to hold and answering 200 to all of them.
-const MUTATING_HANDLE: &str = r#"
-load("events/t.star", "taken")
-
-input = schema(id = uuid(), room = str())
-
-def query(input):
-    return taken(room = input.room)
-
-initial = {"n": 0}
-
-fold = {taken(): lambda state, event: dict(state, n = state["n"] + 1)}
-
-def handle(input, state):
-    if state["n"] >= 3:
-        return reject("full", "no seats left")
-    if state["n"] > 0:
-        state["n"] = 0
-    return taken(id = input.id, room = input.room)
-"#;
-
+/// The same order id, submitted at once by everyone. The narrow slice is what makes
+/// this exactly-once: each attempt folds only that one id, so the winner's event is in
+/// every loser's boundary and every loser re-folds into the no-op arm rather than
+/// appending a second time.
 #[test]
-fn a_handle_that_mutates_the_folded_state_is_refused() {
+fn one_id_submitted_concurrently_appends_exactly_once() {
     let project = write_project(&[
-        ("events/t.star", SEAT_EVENTS),
-        ("commands/take.star", MUTATING_HANDLE),
+        (
+            "events/t.hk",
+            "event @t.opened { id: Uuid, who: String @max(50) }\n",
+        ),
+        (
+            "commands/open.hk",
+            r#"
+command Open(id: Uuid, who: String) {
+  state opened: Bool = fold false
+    on @t.opened(id) => true
+
+  if opened {
+    return
+  }
+  emit @t.opened { id, who }
+}
+"#,
+        ),
     ]);
     let harness = Boot::new(project.path()).start();
+    let id = Uuid::new_v4();
 
-    // The first take folds an empty boundary, so `state` is the frozen `initial` and
-    // the mutation is skipped: this is the call that gets a seat on the log.
-    let first = harness
-        .rt
-        .execute("take", json!({ "id": ALICE, "room": "r1" }), &ctx(), None)
-        .unwrap();
-    assert_eq!(first.status, 200, "{:?}", first.body);
+    let outcomes: Vec<(u16, Value)> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..24)
+            .map(|_| {
+                let rt = &harness.rt;
+                scope.spawn(move || {
+                    let result = rt
+                        .execute("Open", json!({ "id": id, "who": "a" }), &ctx(), None)
+                        .unwrap();
+                    (result.status, result.body)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
-    // Now the boundary has an event, so the fold builds real state and the mutation
-    // runs. It must fail loudly at the assignment.
-    let err = exec_err(&harness.rt, "take", json!({ "id": BOB, "room": "r1" }));
-    assert!(
-        err.contains("Immutable"),
-        "the folded state is read-only in handle: {err}"
-    );
-    assert!(
-        err.contains("a retry folds onto it"),
-        "the error says why, not just what: {err}"
-    );
+    for (status, body) in &outcomes {
+        assert_eq!(
+            *status, 200,
+            "a repeat is a no-op, never a conflict or a rejection: {body:?}"
+        );
+    }
     assert_eq!(
         log_head(&harness.rt),
         1,
-        "the refused attempt appended nothing"
+        "24 concurrent submissions of one id append once"
     );
+    harness.shutdown();
+}
+
+// --- numbers across the JSON boundary --------------------------------------
+
+/// A `Json` field is unchecked passthrough in both directions, and a number is the
+/// hard half of that. `Json::Num` carries the wire's own text rather than an `i64`, so
+/// what a caller wrote is what the log holds and what a reader gets back: `10.50` keeps
+/// its trailing zero and a decimal past what an `f64` can hold keeps its digits.
+///
+/// hekla owes the other half of that, which is why `serde_json` is built with
+/// `arbitrary_precision`: without it a `Value::Number` is an `f64` and the text is
+/// already rounded before heklang is ever handed it.
+#[test]
+fn a_json_field_keeps_a_number_exactly_as_written() {
+    let project = write_project(&[
+        (
+            "events/doc.hk",
+            "event @doc.saved { id: Uuid, body: Json }\n",
+        ),
+        (
+            "commands/save.hk",
+            "command Save(id: Uuid, body: Json) { emit @doc.saved { id, body } }\n",
+        ),
+        (
+            "projectors/docs.hk",
+            r#"
+projector Docs {
+  entity Doc {
+    id: Uuid @key,
+    body: Json,
+  }
+
+  on @doc.saved { id, body } {
+    put Doc { id, body }
+  }
+}
+"#,
+        ),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    // Spelled as wire text, because the whole question is what survives it.
+    let cases = [
+        ("trailing_zero", "10.50"),
+        ("past_an_f64", "1.234567890123456789"),
+        ("shortest_repr", "0.30000000000000004"),
+        ("past_an_i64_mantissa", "9007199254740993"),
+        ("negative", "-0.5"),
+        ("whole", "3"),
+        ("nested", "[1.5, {\"deep\": 2.50}]"),
+    ];
+    let raw = format!(
+        "{{{}}}",
+        cases
+            .iter()
+            .map(|(name, text)| format!("\"{name}\":{text}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let body: Value = serde_json::from_str(&raw).expect("the fixture is valid JSON");
+    let id = Uuid::new_v4();
+
+    let result = harness
+        .rt
+        .execute("Save", json!({ "id": id, "body": body }), &ctx(), None)
+        .unwrap();
+    assert_eq!(result.status, 200, "{:?}", result.body);
+
+    let position = log_head(&harness.rt);
+    let row = support::read_row(&harness, "Docs", "Doc", &id.to_string(), position)
+        .expect("the projected row");
+    let stored = row.get("body").expect("the body column");
+
+    for (name, wire) in cases {
+        let found = stored
+            .get(name)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let wire = wire.replace(", ", ",").replace(": ", ":");
+        assert_eq!(found, wire, "`{name}` did not survive the round trip");
+    }
+    harness.shutdown();
+}
+
+/// The inbound half of rule 8 still holds for the types that declare a wire form: a
+/// `Money(n)` is a quoted string, and an unquoted number is not one. `Json::Num` widened
+/// what a `Json` field can carry without widening that.
+#[test]
+fn a_money_parameter_still_refuses_an_unquoted_number() {
+    let project = write_project(&[
+        (
+            "events/t.hk",
+            "event @t.charged { id: Uuid, total: Money(2) }\n",
+        ),
+        (
+            "commands/charge.hk",
+            "command Charge(id: Uuid, total: Money(2)) { emit @t.charged { id, total } }\n",
+        ),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    let refused = harness
+        .rt
+        .execute(
+            "Charge",
+            json!({ "id": Uuid::new_v4(), "total": 10.5 }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(refused.status, 400, "{:?}", refused.body);
+    assert_eq!(log_head(&harness.rt), 0, "nothing reaches the log");
+
+    let taken = harness
+        .rt
+        .execute(
+            "Charge",
+            json!({ "id": Uuid::new_v4(), "total": "10.50" }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(taken.status, 200, "{:?}", taken.body);
     harness.shutdown();
 }

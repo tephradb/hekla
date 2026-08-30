@@ -1,0 +1,3 @@
+// How many orders a shop may take during the launch. Small enough that the example's
+// tests can reach it.
+const LAUNCH_ALLOCATION: Int = 3

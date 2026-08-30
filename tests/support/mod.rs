@@ -19,14 +19,14 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use hekla::context::CommandContext;
 use hekla::crypto::MasterKeys;
-use hekla::dispatch::build_event;
-use hekla::effect::{EffectRuntime, HttpClient, StubHttpClient};
+use hekla::effect::{EffectRuntime, StubHttpClient};
+use hekla::heklang_host::{HeklaHost, event_from_json};
+use hekla::http::HttpClient;
 use hekla::loader::{Finding, LoadedProject, Severity};
 use hekla::projector::ProjectorSet;
 use hekla::read_api;
 use hekla::runtime::Runtime;
 use hekla::server;
-use hekla::starlark_builtins::EmittedEvent;
 use hekla::validate;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -249,72 +249,54 @@ pub fn drop_op_db(data_dir: &Path) {
 
 /// `order.placed` carries a customer-scoped `email`, the canonical subject field.
 pub const ORDER_EVENTS: &str = r#"
-order_placed = event(
-    type = "order.placed",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        "email": str(subject = "customer_id", max_length = 100),
-    },
-)
+event @order.placed {
+  order_id: Uuid,
+  customer_id: Int,
+  // Optional because an erased subject's column reads back absent, and a type that
+  // cannot be absent could not say so.
+  email: String? @subject(customer_id) @max(100),
+}
 "#;
 
-/// The command that emits [`ORDER_EVENTS`]'s `order.placed`.
+/// The command that emits [`ORDER_EVENTS`]'s `@order.placed`.
 pub const PLACE_ORDER: &str = r#"
-load("events/order.star", "order_placed")
-
-input = schema(order_id = uuid(), customer_id = uint(), email = str())
-
-def handle(input, state):
-    return order_placed(
-        order_id = input.order_id,
-        customer_id = input.customer_id,
-        email = input.email,
-    )
+command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?) {
+  emit @order.placed { order_id, customer_id, email }
+}
 "#;
 
-/// An `orders` read model that stores the subject column as ciphertext.
+/// An `Order` read model that stores the subject column as ciphertext.
 pub const ORDERS_PROJECTOR: &str = r#"
-load("events/order.star", "order_placed")
+projector Orders {
+  entity Order {
+    order_id: Uuid @key,
+    customer_id: Int @index,
+    email: String? @max(100),
+  }
 
-orders = entity(
-    key = "order_id",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        "email": str(subject = "customer_id", max_length = 100),
-    },
-)
-
-def on_event(event):
-    return [put(orders, {
-        "order_id": event.data.order_id,
-        "customer_id": event.data.customer_id,
-        "email": event.data.email,
-    })]
-
-handle = {order_placed(): on_event}
+  on @order.placed { order_id, customer_id, email } {
+    put Order { order_id, customer_id, email }
+  }
+}
 "#;
 
-/// An effect that `reveal()`s the customer email and posts it, exercising the
-/// explicit decrypt boundary.
+/// An effect that `reveal`s the customer email and posts it, exercising the explicit
+/// decrypt boundary.
 pub const NOTIFY_EFFECT: &str = r#"
-load("events/order.star", "order_placed")
-
-def on_event(event, state):
-    # reveal() is the explicit boundary: the effect decrypts the customer email to
-    # send it. A projector could not; only an effect has reveal().
-    email = reveal(event.data.email)
-    http.post(url = "https://mail.test/send", body = {"to": email})
-
-handle = {order_placed(): on_event}
+effect Notify {
+  on @order.placed { email } {
+    // `reveal` is the explicit boundary: the effect decrypts the customer email to
+    // send it. A projector could not; only an effect has it.
+    http.post("https://mail.test/send", { "to": reveal(email) })
+  }
+}
 "#;
 
-/// The orders event module and its `place-order` command, plus `extra` modules.
+/// The orders event module and its `PlaceOrder` command, plus `extra` modules.
 pub fn orders_project_with(extra: &[(&str, &str)]) -> TempDir {
     let mut files = vec![
-        ("events/order.star", ORDER_EVENTS),
-        ("commands/place-order.star", PLACE_ORDER),
+        ("events/order.hk", ORDER_EVENTS),
+        ("commands/place-order.hk", PLACE_ORDER),
     ];
     files.extend_from_slice(extra);
     write_project(&files)
@@ -322,64 +304,57 @@ pub fn orders_project_with(extra: &[(&str, &str)]) -> TempDir {
 
 /// The orders project with the [`ORDERS_PROJECTOR`] read model.
 pub fn orders_project() -> TempDir {
-    orders_project_with(&[("projectors/orders.star", ORDERS_PROJECTOR)])
+    orders_project_with(&[("projectors/orders.hk", ORDERS_PROJECTOR)])
 }
 
 /// The orders project with the [`NOTIFY_EFFECT`] instead of a projector.
 pub fn orders_with_notify_effect() -> TempDir {
-    orders_project_with(&[("effects/notify.star", NOTIFY_EFFECT)])
+    orders_project_with(&[("effects/notify.hk", NOTIFY_EFFECT)])
 }
 
-/// Place an order through `place-order` and return the response body.
+/// Place an order through `PlaceOrder` and return the response body.
 pub fn place_order(rt: &Runtime, order_id: &str, customer_id: u64, email: &str) -> Value {
     let body = json!({ "order_id": order_id, "customer_id": customer_id, "email": email });
-    let result = rt.execute("place-order", body, &ctx(), None).unwrap();
-    assert_eq!(result.status, 200, "place-order failed: {:?}", result.body);
+    let result = rt.execute("PlaceOrder", body, &ctx(), None).unwrap();
+    assert_eq!(result.status, 200, "PlaceOrder failed: {:?}", result.body);
     result.body
 }
 
 // --- the accounts project -------------------------------------------------
 
-/// `email` is scoped to the account (for erasure) and `unique`, so a global-key tag
-/// enforces uniqueness across accounts.
+/// `email` is scoped to the account, so it can be erased.
+///
+/// The Starlark suite also marked it `unique`, for a global-key tag that made one
+/// email match across every account. heklang rejects an equality on sealed content
+/// (rule 12), so that boundary cannot be written and the tag is gone with it. What
+/// stays is a plaintext handle beside the sealed address, which is what a program can
+/// actually fold on.
 pub const ACCOUNT_EVENTS: &str = r#"
-account_registered = event(
-    type = "account.registered",
-    fields = {
-        "account_id": uuid(),
-        "email": str(subject = "account_id", unique = True, max_length = 100),
-    },
-)
+event @account.registered {
+  account_id: Uuid,
+  handle: String @max(100),
+  email: String? @subject(account_id) @max(100),
+}
 "#;
 
-/// A boundary that queries the unique email, resolving to the global key.
+/// A boundary over the plaintext handle: one account per handle, across all accounts.
 pub const REGISTER_ACCOUNT: &str = r#"
-load("events/account.star", "account_registered")
+command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
+  state taken: Bool = fold false
+    on @account.registered(handle) => true
 
-input = schema(account_id = uuid(), email = str())
+  if taken {
+    return reject("handle_taken", "that handle is already registered")
+  }
 
-# Uniqueness across all accounts: constrain only the unique field, which resolves to
-# the global-key tag (a per-account scoped tag could not match across accounts).
-def query(input):
-    return account_registered(email = input.email)
-
-initial = {"taken": False}
-
-def fold_event(state, event):
-    return dict(state, taken = True)
-
-fold = {all_events(): fold_event}
-
-def handle(input, state):
-    if state["taken"]:
-        return reject("email_taken", "that email is already registered")
-    return account_registered(account_id = input.account_id, email = input.email)
+  emit @account.registered { account_id, handle, email }
+}
 "#;
 
 pub fn accounts_project() -> TempDir {
     write_project(&[
-        ("events/account.star", ACCOUNT_EVENTS),
-        ("commands/register-account.star", REGISTER_ACCOUNT),
+        ("events/account.hk", ACCOUNT_EVENTS),
+        ("commands/register-account.hk", REGISTER_ACCOUNT),
     ])
 }
 
@@ -401,13 +376,13 @@ pub fn register_body(user_id: &str, email: &str, name: &str) -> Value {
 pub fn register_user(rt: &Runtime, user_id: &str, email: &str, name: &str) -> u64 {
     let result = rt
         .execute(
-            "register-user",
+            "RegisterUser",
             register_body(user_id, email, name),
             &ctx(),
             None,
         )
         .unwrap();
-    assert_eq!(result.status, 200, "register failed: {:?}", result.body);
+    assert_eq!(result.status, 200, "RegisterUser failed: {:?}", result.body);
     result.body["positions"]["last"]
         .as_u64()
         .expect("a last position")
@@ -496,25 +471,36 @@ pub fn open_store(dir: &Path) -> (WriteCoordinator, WriteHandle) {
     WriteCoordinator::start(set, WriterConfig::default()).unwrap()
 }
 
-/// Append `emitted` through the same envelope seam a command uses, so the seeded
-/// event is byte-identical to one the runtime would write.
+/// Append one event through the same lowering a command uses, so a seeded event is
+/// byte for byte what the runtime would have written.
 pub fn seed_event(
     store: &WriteHandle,
     project: &LoadedProject,
     ctx: &CommandContext,
-    emitted: EmittedEvent,
+    event_type: &str,
+    data: Value,
 ) {
-    let event = build_event(
-        &emitted,
-        project.events.by_type.get(&emitted.event_type),
-        None,
-        ctx,
-        TEST_NOW,
-        None,
-        Uuid::new_v4(),
-    )
-    .unwrap();
-    store.append(vec![event], None).unwrap();
+    let event = event_from_json(&project.program, event_type, &data).expect("a declared event");
+    let mut host = HeklaHost {
+        program: Arc::new(project.program.clone()),
+        events: Arc::new(project.events.clone()),
+        store: store.clone(),
+        keystore: None,
+        ctx: *ctx,
+        now: TEST_NOW.to_owned(),
+        idem_tag: None,
+        // Only an effect's `invoke` keys an append on a journaled call.
+        call: None,
+        appended: None,
+        emitted: Vec::new(),
+        unavailable: None,
+        duplicated: false,
+        http: None,
+        retry_after: None,
+        last_transport: None,
+        minted: None,
+    };
+    hekla::heklang_host::append_one(&mut host, &event).expect("seeded");
 }
 
 // --- the loader and validation pass ---------------------------------------

@@ -1,0 +1,14 @@
+// A running count of registrations. The Starlark version read the row first and wrote
+// it back; there is no general read here, so the count is a `patch` that materializes
+// from zeros on the first event. Query it at `GET /read/UserStats/Totals/all`.
+
+projector UserStats {
+  entity Totals {
+    id: String @key @max(16),
+    count: Int,
+  }
+
+  on @user.registered {
+    patch Totals["all"] { count: .count + 1 }
+  }
+}

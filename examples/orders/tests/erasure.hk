@@ -1,0 +1,72 @@
+// What per-field subjects buy: each subject is erased independently, and the read model
+// shows it. These run against a real key store, so an erased column is unreadable
+// because its key is gone rather than because a flag says so.
+
+test "an order's personal columns read back" {
+  given @order.placed {
+    order_id: "11111111-1111-1111-1111-111111111111",
+    customer_id: 7,
+    shop_id: 1,
+    email: "ada@example.com",
+    shipping_address: "1 High St",
+    order_total: 25.99,
+    notes: "",
+  }
+  project CustomerOrders
+  expect Order["11111111-1111-1111-1111-111111111111"] {
+    customer_id: 7,
+    email: "ada@example.com",
+    shipping_address: "1 High St",
+  }
+}
+
+// Erasing the customer takes both columns scoped to them and nothing else. The row is
+// still there, and still says which customer it belonged to, because a subject id is
+// plaintext by necessity: it is how the key was found.
+test "erasing the customer takes their columns and leaves the order" {
+  given @order.placed {
+    order_id: "22222222-2222-2222-2222-222222222222",
+    customer_id: 7,
+    shop_id: 1,
+    email: "ada@example.com",
+    shipping_address: "1 High St",
+    order_total: 25.99,
+    notes: "",
+  }
+  erased customer_id "7"
+  project CustomerOrders
+  expect Order["22222222-2222-2222-2222-222222222222"] {
+    customer_id: 7,
+    email: none,
+    shipping_address: none,
+  }
+}
+
+// The other direction: erasing one customer does not touch another's order, which is
+// the whole point of a per-subject key rather than a per-event one.
+test "erasing one customer leaves another's order alone" {
+  given @order.placed {
+    order_id: "33333333-3333-3333-3333-333333333333",
+    customer_id: 7,
+    shop_id: 1,
+    email: "ada@example.com",
+    shipping_address: "1 High St",
+    order_total: 10.00,
+    notes: "",
+  }
+  given @order.placed {
+    order_id: "44444444-4444-4444-4444-444444444444",
+    customer_id: 8,
+    shop_id: 1,
+    email: "bob@example.com",
+    shipping_address: "2 Low St",
+    order_total: 10.00,
+    notes: "",
+  }
+  erased customer_id "7"
+  project CustomerOrders
+  expect Order["44444444-4444-4444-4444-444444444444"] {
+    email: "bob@example.com",
+    shipping_address: "2 Low St",
+  }
+}

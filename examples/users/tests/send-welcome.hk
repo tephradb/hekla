@@ -1,0 +1,35 @@
+// Events in, external calls out. `respond` queues the replies in the order the arm
+// makes its calls, and the expectations are the trace it should have produced.
+
+test "posts the welcome then records it" {
+  given @user.registered {
+    user_id: "11111111-1111-1111-1111-111111111111",
+    email: "alice@example.com",
+    name: "Alice",
+  }
+  respond "https://example.test/welcome" 200
+  deliver SendWelcome
+  expect http.post("https://example.test/welcome", { "email": "alice@example.com" })
+  expect invoke RecordWelcome { user_id: "11111111-1111-1111-1111-111111111111" }
+}
+
+test "a 4xx stops before the internal command" {
+  given @user.registered {
+    user_id: "22222222-2222-2222-2222-222222222222",
+    email: "bob@example.com",
+    name: "Bob",
+  }
+  respond "https://example.test/welcome" 422
+  deliver SendWelcome
+  expect http.post("https://example.test/welcome")
+  expect log("welcome email rejected with status 422")
+}
+
+test "an event no arm selects does nothing" {
+  given @user.renamed {
+    user_id: "33333333-3333-3333-3333-333333333333",
+    name: "Carol",
+  }
+  deliver SendWelcome
+  expect nothing
+}

@@ -5,35 +5,30 @@ that already exists, and each is shippable on its own except where noted. A cros
 phase keeps `hekla check` honest for whatever it introduces, so the static analysis never falls behind
 the language.
 
+**Phases 0 to 20 were built against embedded Starlark, and Phase 21 replaced it with heklang.** They
+are left as written, because a roadmap is a record of what was decided and why, not a description of
+the current code. Several describe machinery the port deleted outright: the `load()` graph (Phase 1),
+the per-type fold map and the clause key language (Phases 6 and 8), the incremental conflict carry
+(Phase 15), the chunked fold and its heap budget (Phase 16). Where a phase says "`fold`", "`query`",
+"`handle`" or "a clause", read it as the Starlark construct of the time. Phase 21 says what each
+became.
+
 ## Phase 0: command and projector core (done)
 
-The current single-crate code is the baseline:
+The single-crate code the phases below build on:
 
-- `src/starlark_builtins.rs`: field types (`str`, `int`, `uint`, `bool`, `uuid`, `timestamp`,
-- **Rebuild equivalence** builds a shadow model with `project_to` and compares `ReadModel::rows` per
-  entity, as a merge join over the two key-ordered row sets. The comparison is exact rather than
-  approximate because subject encryption is deterministic AES-SIV and a projector stores the event's
-  ciphertext verbatim, so a rebuild copies bytes. The shadow is bounded at the live model's own
-  checkpoint: an unbounded rebuild would report every event a lagging projector had not reached as
-  corruption.
-- **Replay equivalence** re-runs a completed invocation against a **sealed** host: a journal hit
-  replays, a journal miss records a violation and returns, and nothing is ever performed. That
-  property is the design, not an optimisation. The divergence being hunted is precisely the case
-  where a naive replay would fire a real side effect, so the check must be structurally incapable of
-  causing it. The visited call sequence is compared against the journal's as an ordered list, which
-  is the shape nothing else could catch: the journal is keyed by call *content*, so a handler that
-  merely reordered its calls hits every entry and a set comparison would call it faithful.
-  The invocation is completed *before* the check runs, so a violation cannot leave a `running` row
-  for the next boot to re-enter live, and the quarantine is recorded durably so a restart honours it.
-- **Fold determinism** folds twice and compares, with the second fold bounded at the position the
-  first reached (an unbounded re-fold would read a concurrent append as nondeterminism). States are
-  compared with Starlark equality rather than through JSON, since `check_fold_result` admits values
-  that `to_json_value` cannot represent. It is an error rather than a typed violation because there
-  is no safe way to continue: a command fails the request, an effect wedges.
-- **Checkpoint monotonicity** routes every position reached by *tailing* through one helper that
-  refuses to go backwards. A rebuild publishes through a separate, unguarded path: it replaces the
-  model, so its checkpoint is authoritative even when it lands behind.
-Toolchain only. This phase lands the loader, validation, and CLI checks, but nothing serves until
+- `src/schema.rs`: the language-agnostic schema model (field kinds, entity and event definitions,
+  input schemas), built from the compiled program and depended on by the read model, the read API,
+  OpenAPI and introspection alike.
+- `src/dispatch.rs`: binding a request body to a command's parameters, running it, and retrying a
+  conflict.
+- `src/read_model.rs`, `src/read_api.rs`: SQLite read models and the generated reads over them.
+- `src/crypto.rs`, `src/envelope.rs`, `src/opdb.rs`: subject keys, the host-stamped envelope, and
+  the operational database.
+
+## Phase 1: loader, validation and CLI (done)
+
+Toolchain only. This phase lands the loader, validation and the CLI checks, but nothing serves until
 Phase 2, so it is scoped honestly as "toolchain, no server" rather than a runnable milestone.
 
 - Directory-convention loader (`events/`, `lib/`, `commands/`, `commands/internal/`, `projectors/`,
@@ -1227,6 +1222,195 @@ Honest scope:
   makes the plan test report `SCAN effect_invocation` rather than a slower pass, and both scanning
   tests assert they found a plausible number of things before checking any of them.
 
+## Phase 21: port from Starlark to heklang (done)
+
+Starlark made determinism structural, which was the whole reason it was chosen. What it could not
+make structural is the *domain*: that a command may not call out, that a projector may not decrypt,
+that a fold may not read a clock, that sealed content may not be compared or interpolated, that an
+event is written whole. Every one of those was a rule in `src/validate.rs` or a check at the append
+seam, and a rule can only be as good as its own approximation. The most visible one: a boundary was
+validated by evaluating `query()` once against a stubbed input, so a branch the stub did not take
+shipped unchecked, and `dispatch` had a fail-closed lowering path to catch it at runtime.
+
+[heklang](../heklang) moves each into the grammar or the type system. `starlark`, `starlark_lsp` and
+`allocative` are gone from `Cargo.toml`.
+
+### What replaced what
+
+| Starlark | heklang |
+|---|---|
+| `input = schema(...)` | the command's parameter list |
+| `query(input)` + `initial` + `fold = {clause: fn}` | `state x: T = fold seed on @path(filters) => expr` |
+| `def handle(input, state)` | the command body |
+| `reject` / `invalid_input` | `reject` / `invalid` |
+| a projector's `handle = {clause: fn}` returning ops | `on @path { fields } { put / patch / update / delete }` |
+| `get(entity, key)` then `put` | `patch E[k] { n: .n + 1 }`, which reads the row it writes |
+| an effect's `handle = {clause: fn}`, every match running | `on @path as e { ... }`, one arm per event |
+| `invoke_command(name, dict)` | `invoke Command { field: value }`, checked against its parameters |
+| `uuid5(event.id, name)` | `Uuid.derive(e.id, name)` |
+| `str(subject = "x", max_length = 200)` | `String? @subject(x) @max(200)` |
+| `indexed = False` | `@no_index` |
+| an opaque subject handle | sealed content, a type with three legal operations |
+| `case(...)` in a `tests/*.star` `cases` list | `test "..." { given / run / project / deliver / expect }` |
+
+### Three seams added to heklang
+
+The port needed three things the language did not have, designed together because they are one cut:
+
+- **`Rows`**, so a projector can write into a *persistent* read model inside the transaction that
+  also advances a checkpoint. It reads as well as writes, because a stored `.field` load is filled
+  before any value expression runs. `Interpreter::project` became a wrapper over `project_into`.
+- **`World`**, so `hek test`'s runner is generic over the world it runs in. hekla supplies real
+  tephra, real SQLite, a real `KeyStore` and a stubbed network. One definition of `expect`, two
+  worlds; `docs/testing.md` rule 8 holds either way, because the only world-dependent assertion is a
+  row and it is read through `patch`'s own seam.
+- **`Value::from_json(&json, &ty, defs)`**, the inbound half of rule 8's conversion table. Every
+  stored record field, every read-model column and every command argument arrives as JSON and has to
+  become a value of a declared type, and whether `Money(2)` and `Money(3)` read differently out of
+  one string is a language question with one right answer rather than three host guesses.
+
+### What got smaller
+
+- **The chunked fold is gone**: about 180 lines, four tuning constants, `HEKLA_FOLD_HEAP_BUDGET`, the
+  freeze/thaw seam and `tests/fold_chunking.rs`. It existed because Starlark collects only at a
+  module's root and a fold loop never executes one, so a fold's live heap grew with the boundary.
+  heklang folds with ordinary Rust ownership.
+- **The instruction budget is gone.** heklang has no `while`, rejects recursion and iterates only
+  finite containers, so termination is structural.
+- **The incremental conflict carry is gone** (Phase 15). It was worth its complexity when a fold ran
+  in a Starlark heap that could not be re-entered cheaply; an attempt is now a function call.
+  *(Wrong, and Phase 22 puts it back. The heap was one of two costs a retry paid and the cheaper one:
+  re-reading the whole boundary out of the store was the other, and dropping the carry restored it.)*
+- **`load()` and its resolver are gone**, with the cycle check, the module cache and the alias-vs-
+  redeclaration identity trick.
+- **`src/starlark_builtins.rs` (4,039 lines) is gone**, replaced by `src/schema.rs` (plain data) and
+  `src/heklang_host.rs` (the host seam).
+- **`hekla check`'s sixteen rules became three lints** plus what a directory means. The rest are
+  parse errors with the offending field's own span.
+- **`fmt.rs`, `lsp.rs` and `lsp/` are gone** (~1,300 lines), with `tests/lsp.rs`.
+
+### What the port removed on purpose
+
+- **`unique = True`**, and the reserved global-uniqueness secret behind it. It required an equality
+  on sealed content, which leaks whether two ciphertexts hold the same value. `examples/orders`
+  replaces it with a per-shop launch allocation, which is a constraint that genuinely *must* be
+  enforced at append time and so gives the retry loop something real to do; the accounts fixture
+  keeps a plaintext handle beside the sealed address. Erasing a subject still does not reopen a
+  handle it claimed.
+- **`uint`**, which had no heklang counterpart and existed only to reject values above `i64::MAX`.
+- **Fold determinism as a verify invariant**, whose sources heklang removes by construction.
+- **Fan-out across effect arms.** Rule 1 makes an event select exactly one arm, because declaration
+  order was load-bearing for replay. Projectors keep the opposite rule and the reason is in
+  `docs/effects.md` rule 1.
+
+### Ten defects the port surfaced
+
+Each was found by a test that already existed, which is the argument for porting the suite rather
+than rewriting it:
+
+1. **The effect driver handed heklang a tephra position**, where heklang counts from zero. Every
+   effect wedged on "no event at position N".
+2. **An effect's `invoke` appended with no idempotency key.** A crash between the append and the
+   journal write would have appended the fact twice. The journal's own call identity now keys it.
+3. **The correlation chain broke across every effect**, because the invocation minted a fresh
+   correlation id instead of taking the triggering event's.
+4. **A sealed non-text field could not be read back.** Encryption takes a string, so a sealed `Int`,
+   `Bool` or `Timestamp` came back as text and failed the record read.
+5. **A sealed `Timestamp` column stored a different form than a plain one**, so the read API served
+   micros or RFC 3339 depending only on whether the field was personal.
+6. **`verify`'s replay check never passed**, because the sealed journal never recorded what it
+   visited; and a genuine miss reported the wrong reason, because the miss was detected at the write
+   rather than at the read.
+7. **`Retry-After` was dropped entirely.** Rule 5 moved the per-request retry into the language and
+   the header channel went with it.
+8. **An unknown request field was silently ignored**, because heklang binds only the parameters it
+   knows.
+9. **The `_hekla_` tag namespace was no longer enforced**, so a program could declare a field that
+   forges the tag an append condition is guarded against.
+10. **An unreadable subject field on the log path read as `none`**, collapsing absent into erased,
+    which is exactly what rule 12 exists to prevent. A placeholder keeps the value present so the
+    program reaches `reveal`, which consults the key store and fails terminally.
+
+### Two measurements, kept
+
+`tests/measure.rs` (ignored by default) answers the two questions the plan owed, on 20,000 events:
+
+- **A full projector rebuild takes 228ms**, over two entities and 40,000 writes of which 20,000 read
+  the row first. `patch` producing a whole row is not what a rebuild spends its time on, so
+  `apply_one`'s UPDATE arm stays dormant and adding a `Rows::update` fast path later is a seam
+  change and nothing else.
+- **A fold over an encrypted boundary takes 93ms, against 24ms over plaintext.** That is the eager
+  decryption above, and it is the motivating number for the ciphertext gap.
+
+## Phase 22: the conflict carry comes back (done)
+
+Phase 21 dropped the incremental carry (Phase 15) on the reasoning that "an attempt is now a function
+call". That is true and it was not the point. Two costs were being paid for a conflict and only one of
+them was Starlark's: re-entering a heap the language could not re-enter cheaply, and **re-reading the
+whole consistency boundary out of the event store**. The port removed the first and left the second
+in place, so every retry went back to `Position::ZERO` and folded a boundary of any depth from the
+start. The measurement in Phase 15 that put hekla 4x behind a plain tephra client under contention was
+about the second cost, and it came back with it.
+
+The fix is where the carry always belonged, which is not where Phase 15 put it. heklang's frame is the
+only place a folded `state` exists, so the attempt loop moved into `Interpreter::run_retrying`, and
+what stayed in `dispatch` is the policy: `Retry { max_attempts, backoff }` reaches heklang as an
+`again(attempt) -> bool` callback, so the budget and the wait are still the runtime's decision. Each
+attempt keeps the state it folded and the position that state covers; the next one reads strictly
+after it and folds what landed onto what it already has.
+
+Three things fell out of doing it there rather than in the runtime:
+
+- **`Query` gained a `from`**, so the delta read is a seek rather than a filter. tephra pushes an
+  exclusive `after` into planning, and heklang's inclusive `from` crosses as itself: heklang counts
+  positions from zero and tephra from one, so the two off-by-ones cancel.
+- **A command's fold now stops at the head it took `after` from**, where it used to read to whatever
+  the head had become by the time the read got there. Nothing observable changes (a slice event past
+  `after` was always going to be refused by the condition), but the carry needs an upper bound that
+  something other than the store knows, and "what you folded is what you conflict on" stopped needing
+  a footnote.
+- **The freeze is gone.** Phase 15 needed a frozen scratch heap so a `handle` could not mutate the
+  state the next attempt folded onto, and it cost about 0.6µs an attempt. heklang has no mutable
+  binding and the carry is taken before the body runs, so the hole that guard existed to close cannot
+  be written.
+
+The invariant work is hoisted with it, and it is more than Phase 15 hoisted: the pinned `now()`, the
+bound arguments, the hoisted prologue and the slices they resolve to are derived once per request,
+because all four read the arguments and each other and nothing else. Only the fold and the body see a
+log that moved.
+
+Measured by `tests/measure.rs::contention_against_a_deep_boundary`: a boundary seeded to 20,000
+events, 15 commands per writer, against a build with the carry ablated. Same machine, one run each.
+
+| writers | with the carry | re-folding from zero |
+| --- | --- | --- |
+| 4 | 315ms, **60/60** committed | 940ms, **46/60** |
+| 16 | 530ms, **238/240** committed | 2.07s, **93/240** |
+| 32 | 1.02s, **427/480** committed | 4.36s, **106/480** |
+
+The committed counts are the number that matters, exactly as in Phase 15. Under 32-way contention the
+re-folding build spent its whole retry budget reading the boundary and answered 409 to 78% of its
+callers; the carry answers 11%. The shallow measurement beside it (`contention_against_the_retry_budget`,
+a boundary that never passes a few hundred events) shows almost nothing, which is the honest shape of
+this: the carry buys nothing on a shallow boundary and buys everything on a deep one.
+
+**Honest scope:**
+
+- **The delta fold is now observable, and both halves are tested.** Phase 15 could only assert that
+  the carry stayed correct, since folding the delta and folding from zero give the same state.
+  `tests/host.rs` in heklang asserts the second attempt's read is `from = ` where the first stopped;
+  `tests/dispatch.rs` asserts the count each concurrent commit folded is exactly `0..committed`, which
+  fails loudly on a double-fold or a skipped one. The existing contention test passes either way,
+  which is why it was not enough on its own.
+- **A conflict inside an effect's `invoke` still gets one attempt.** Rule 4 replays a wedged
+  invocation from the journal, so the retry that matters is one level up and also re-reads what the
+  arm decided on. Giving `invoke` its own budget would nest two.
+- **The first fold is still untouched**, exactly as in Phase 15. A boundary 100k events deep costs
+  100k records on the first attempt, and caching folded state across requests is the fix for that.
+  The eager subject decryption below the language seam (Phase 21) is the larger constant on that path.
+- **The backoff policy is unchanged**, again deliberately, and for the same reason: measuring a
+  restored carry and a new retry cadence at once would attribute neither.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
@@ -1239,8 +1423,8 @@ warranted.
   checkpoint format (watermark plus completed-set) already supports it.
 - **Metrics and Prometheus**: when there is something to operate at scale.
 - **Fold library** (`event_counter`, `latest_event`, `toggle`): only after roughly fifteen real
-  commands exist, and only if it compiles down to the existing `query` / `fold` shape rather than
-  becoming a second execution path.
+  commands exist, and only if it compiles down to the existing `state` shape rather than becoming a
+  second execution path. This is now a language question rather than hekla's.
 - **Workspace crate split**: when hekla must be embeddable as a library, or when compile times
   actually hurt.
 - **Vendoring Scalar for `/docs`**: when hekla has to run somewhere with no outbound network. The
@@ -1254,16 +1438,18 @@ forward. Collected here so they are not lost in the prose of the phase that intr
 - **Admin read-only SQL endpoint** (Phase 3): a read-only query surface over the projector databases.
   Phase 19 delivered structured introspection over the same state, which lowers the pressure for it
   without answering the arbitrary-query case.
-- **`money` scale and decimal wire form** (Phase 3): read-API `money` is the raw stored integer minor
-  units; the decimal-string wire form waits on the scale decision, and no entity uses `money` yet.
 - **Multi-field (composite-prefix) scan filters** (Phase 3): a scan supports a single indexed filter
   field only.
 - **Automatic dead-lettering** (Phase 4): the manual `POST /effects/{name}/skip/{position}` is the only
   escape hatch; a wedged effect is never advanced automatically.
-- **Integers above `i64::MAX`** (Phase 3): both `i64` and `u64` land in a signed SQLite `INTEGER`, so
-  a `u64` past `i64::MAX` is rejected at the write boundary rather than stored. Widening it needs a
-  storage form that still orders correctly, since the read API's `ORDER BY` and `key > ?` cursor
-  depend on numeric order; a bit-reinterpretation would round-trip but sort those rows below zero.
+- **`hekla fmt` and `hekla lsp`** (Phase 21): both were Starlark tooling wrapped in hekla's project
+  knowledge, and were dropped rather than stubbed. They come back when heklang has a formatter and a
+  language server; its tree-sitter grammar is the start of one.
+- **Ciphertext below the language seam** (Phase 21): heklang's `Value::Sealed` holds plaintext and
+  its key seam answers only "is this subject erased", so hekla decrypts every subject-scoped field of
+  every record a fold reads. Measured at 3.5µs a record, four times the fold's own cost
+  (`tests/measure.rs`). Closing it means giving heklang a ciphertext-shaped seal, which is a language
+  change.
 
 Inherent design properties, listed for completeness (not future work): `invoke_command` is exactly-once
 only when the target is idempotent under replay, and raw `http.*` is at-least-once.
@@ -1289,21 +1475,20 @@ key language as Phase 8. The rest stand as written.
   hook, so the first schema change becomes a hand-written migration. A version tag plus an upcast
   function (old payload in, current shape out, applied on read) would keep the log append-only while
   letting the schema evolve.
-- **Derive command input from the event schema.** `input = schema(...)` restates the event's field
-  types and will drift from them. Let it derive, e.g. `input = schema(**order_placed.fields)` or a
-  partial selection, so the two cannot disagree.
-- **A record type for folded state.** The dot-syntax item shipped for `event.data` in Phase 7, which
-  left `state["taken"]` as the only subscript read of a host-threaded value. Closing that gap is not a
-  syntax change: starlark's struct supports attribute reads and nothing else, so state would need a
-  hekla-owned record with an update operation (`state.with(taken = True)`, or a `replace()` builtin)
-  before `state.taken` could work at all. Worth revisiting only if real commands accumulate enough
-  state for `dict(state, ...)` to feel heavy; a two-flag decision state does not.
-- **Type-shaped default tagging.** Auto-tagging currently indexes every field unless `indexed=False`. A
-  better default could key off the field type: identity-shaped fields (`uuid()`, integers, short
-  `str()`) are worth tagging, while `money()` almost never is. Refines the shipped auto-tagging default.
+- **Type-shaped default tagging.** Auto-tagging indexes every field unless it is marked `@no_index`. A
+  better default could key off the field type: identity-shaped fields (`Uuid`, integers, short bounded
+  strings) are worth tagging, while `Money` almost never is. Refines the shipped auto-tagging default,
+  and is a language question now.
 - **Projector rename detection.** Store the projector's source file path in its checkpoint record.
-  Moving `customer-orders.star` then produces an explicit "rename or new projector?" error instead of
+  Moving `customer-orders.hk` then produces an explicit "rename or new projector?" error instead of
   silently rebuilding from position zero. Refines the shipped definition-change auto-rebuild.
+
+Two items on this list were answered by Phase 21 rather than by a phase of their own:
+
+- **A record type for folded state** is heklang's `record`, and `state` is typed, so
+  `state["taken"]` has no counterpart to close.
+- **Deriving command input from the event schema** stays open, and stays double-edged for the same
+  reason: a command's parameters legitimately diverge from an event's fields.
 
 ### Suggested sequencing
 

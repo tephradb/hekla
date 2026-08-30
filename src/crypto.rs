@@ -508,6 +508,20 @@ fn unwrap_key(master: &[u8; MASTER_KEY_LEN], wrapped: &[u8]) -> anyhow::Result<Z
     Ok(Zeroizing::new(secret))
 }
 
+impl KeyStore {
+    /// Whether a subject's key is gone, which is the whole of what heklang models about
+    /// erasure (`heklang/docs/effects.md` rule 12).
+    ///
+    /// A subject that never had a key reads as erased, for the same reason a shredded
+    /// one does: nothing scoped to it can be read. Failing closed is the only safe
+    /// direction here, since the answer gates `reveal`.
+    pub fn erased(&self, subject_field: &str, subject_value: &str) -> anyhow::Result<bool> {
+        Ok(!self
+            .lock()
+            .subject_key_exists(subject_field, subject_value)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

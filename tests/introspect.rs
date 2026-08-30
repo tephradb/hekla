@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-use hekla::effect::{HttpClient, StubHttpClient};
+use hekla::effect::StubHttpClient;
+use hekla::http::HttpClient;
 use hekla::runtime::Runtime;
-use hekla::starlark_builtins::EmittedEvent;
 use serde_json::{Value, json};
 
 mod support;
@@ -41,7 +41,7 @@ async fn the_log_pages_newest_first_with_no_gap_or_duplicate_at_the_seam() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
     for id in [ALICE, BOB, CAROL] {
-        post_command(&app, "register-user", register(id), None).await;
+        post_command(&app, "RegisterUser", register(id), None).await;
     }
     wait_for_head(&harness.rt, 6);
 
@@ -71,7 +71,7 @@ async fn the_log_pages_newest_first_with_no_gap_or_duplicate_at_the_seam() {
 async fn walking_forward_reaches_the_same_events_in_the_other_order() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
     wait_for_head(&harness.rt, 2);
 
     let (_, forward) = get(&app, "/admin/events?direction=forward&limit=50").await;
@@ -99,8 +99,8 @@ async fn walking_forward_reaches_the_same_events_in_the_other_order() {
 async fn types_filter_as_an_or_and_tags_filter_as_an_and() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
-    post_command(&app, "register-user", register(BOB), None).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
+    post_command(&app, "RegisterUser", register(BOB), None).await;
     wait_for_head(&harness.rt, 4);
 
     let (_, one) = get(&app, "/admin/events?type=user.registered").await;
@@ -159,7 +159,7 @@ async fn a_malformed_control_parameter_is_a_400_and_an_oversized_limit_is_clampe
 async fn an_event_renders_its_envelope_its_payload_and_the_hosts_own_tags() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    let (_, accepted) = post_command(&app, "register-user", register(ALICE), Some("key-1")).await;
+    let (_, accepted) = post_command(&app, "RegisterUser", register(ALICE), Some("key-1")).await;
 
     let (status, event) = get(&app, "/admin/events/1").await;
     assert_eq!(status, 200);
@@ -206,9 +206,9 @@ async fn an_event_renders_its_envelope_its_payload_and_the_hosts_own_tags() {
 async fn a_trace_spans_the_command_the_effect_and_the_command_the_effect_invoked() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    let (_, accepted) = post_command(&app, "register-user", register(ALICE), None).await;
+    let (_, accepted) = post_command(&app, "RegisterUser", register(ALICE), None).await;
     let correlation = accepted["correlation_id"].as_str().unwrap().to_owned();
-    // `send-welcome` reacts to the registration and invokes `record-welcome`, which
+    // `SendWelcome` reacts to the registration and invokes `RecordWelcome`, which
     // appends a second event. Two events means the chain genuinely crossed the effect.
     wait_for_head(&harness.rt, 2);
 
@@ -231,7 +231,7 @@ async fn a_trace_spans_the_command_the_effect_and_the_command_the_effect_invoked
     assert_eq!(events[1]["triggering_event_id"], events[0]["event_id"]);
 
     // An unrelated flow does not bleed in.
-    let (_, other) = post_command(&app, "register-user", register(BOB), None).await;
+    let (_, other) = post_command(&app, "RegisterUser", register(BOB), None).await;
     let (_, again) = get(&app, &format!("/admin/traces/{correlation}")).await;
     assert_eq!(again["events"].as_array().unwrap().len(), 2);
     assert_ne!(other["correlation_id"], accepted["correlation_id"]);
@@ -243,7 +243,7 @@ async fn a_trace_spans_the_command_the_effect_and_the_command_the_effect_invoked
 async fn a_trace_cut_off_by_its_limit_says_so_rather_than_looking_whole() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    let (_, accepted) = post_command(&app, "register-user", register(ALICE), None).await;
+    let (_, accepted) = post_command(&app, "RegisterUser", register(ALICE), None).await;
     let correlation = accepted["correlation_id"].as_str().unwrap().to_owned();
     wait_for_head(&harness.rt, 2);
 
@@ -263,8 +263,8 @@ async fn the_correlation_tag_never_reaches_a_command_response() {
     let app = harness.app();
     let body = register(ALICE);
 
-    let (_, fresh) = post_command(&app, "register-user", body.clone(), Some("k")).await;
-    let (_, replayed) = post_command(&app, "register-user", body, Some("k")).await;
+    let (_, fresh) = post_command(&app, "RegisterUser", body.clone(), Some("k")).await;
+    let (_, replayed) = post_command(&app, "RegisterUser", body, Some("k")).await;
     assert_eq!(fresh, replayed, "the replay reproduces the first outcome");
 
     for response in [&fresh, &replayed] {
@@ -284,13 +284,13 @@ async fn the_correlation_tag_never_reaches_a_command_response() {
 async fn a_completed_invocation_lists_every_call_it_journaled() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
     wait_for_head(&harness.rt, 2);
     wait_until("the invocation completes", || {
-        harness.rt.effect("send-welcome").unwrap().position() >= 1
+        harness.rt.effect("SendWelcome").unwrap().position() >= 1
     });
 
-    let (status, page) = get(&app, "/admin/effects/send-welcome/invocations").await;
+    let (status, page) = get(&app, "/admin/effects/SendWelcome/invocations").await;
     assert_eq!(status, 200);
     let invocations = page["invocations"].as_array().unwrap();
     assert_eq!(invocations.len(), 1);
@@ -298,7 +298,7 @@ async fn a_completed_invocation_lists_every_call_it_journaled() {
     assert_eq!(invocations[0]["status"], "terminal");
     assert!(invocations[0]["completed_at"].is_string());
 
-    let (status, detail) = get(&app, "/admin/effects/send-welcome/invocations/1").await;
+    let (status, detail) = get(&app, "/admin/effects/SendWelcome/invocations/1").await;
     assert_eq!(status, 200);
     let calls = detail["calls"].as_array().unwrap();
     let kinds: Vec<&str> = calls
@@ -307,7 +307,7 @@ async fn a_completed_invocation_lists_every_call_it_journaled() {
         .collect();
     assert_eq!(
         kinds,
-        vec!["http", "invoke_command"],
+        vec!["http", "invoke"],
         "in the order the handler made them"
     );
     assert_eq!(calls[0]["seq"], 0);
@@ -315,7 +315,10 @@ async fn a_completed_invocation_lists_every_call_it_journaled() {
         calls[0]["result"]["status"], 200,
         "the recorded result is returned parsed, not as an escaped blob"
     );
-    assert!(calls[1]["result"]["status"].is_number());
+    // An `invoke` records an outcome rather than a status and a body: rule 6 cuts
+    // the retryable cases out of the type, so the three that reach a journal are `ok`
+    // and, when it refused, the code and message it refused with.
+    assert_eq!(calls[1]["result"]["ok"], true);
     assert!(
         calls[0]["call_hash"].as_str().unwrap().len() == 64,
         "the call is identified by its content hash; the arguments are not stored"
@@ -325,7 +328,7 @@ async fn a_completed_invocation_lists_every_call_it_journaled() {
         "a list that fits is the whole sequence"
     );
 
-    let (status, _) = get(&app, "/admin/effects/send-welcome/invocations/999").await;
+    let (status, _) = get(&app, "/admin/effects/SendWelcome/invocations/999").await;
     assert_eq!(status, 404);
     let (status, _) = get(&app, "/admin/effects/nope/invocations").await;
     assert_eq!(status, 404);
@@ -340,11 +343,11 @@ async fn a_wedged_effect_shows_a_running_invocation_and_a_failure_count() {
     // happens before the journal write, which is what lets a retry re-send.
     let harness = boot_with(Arc::new(StubHttpClient::status(500)));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
     wait_until("the effect wedges", || {
         harness
             .rt
-            .effect("send-welcome")
+            .effect("SendWelcome")
             .unwrap()
             .consecutive_failures()
             >= 2
@@ -353,7 +356,7 @@ async fn a_wedged_effect_shows_a_running_invocation_and_a_failure_count() {
     let (status, listed) = get(&app, "/admin/effects").await;
     assert_eq!(status, 200);
     let effect = &listed["effects"][0];
-    assert_eq!(effect["name"], "send-welcome");
+    assert_eq!(effect["name"], "SendWelcome");
     assert_eq!(effect["sources"][0], "user.registered");
     assert!(effect["consecutive_failures"].as_u64().unwrap() >= 2);
     assert!(effect["last_error"].is_string());
@@ -364,10 +367,10 @@ async fn a_wedged_effect_shows_a_running_invocation_and_a_failure_count() {
         "null is `never ran`, which the driver flattens to zero but an operator should not"
     );
 
-    let (_, one) = get(&app, "/admin/effects/send-welcome").await;
-    assert_eq!(one["name"], "send-welcome");
+    let (_, one) = get(&app, "/admin/effects/SendWelcome").await;
+    assert_eq!(one["name"], "SendWelcome");
 
-    let (_, detail) = get(&app, "/admin/effects/send-welcome/invocations/1").await;
+    let (_, detail) = get(&app, "/admin/effects/SendWelcome/invocations/1").await;
     assert_eq!(detail["status"], "running");
     assert_eq!(
         detail["calls"].as_array().unwrap().len(),
@@ -387,8 +390,8 @@ async fn a_wedged_effect_shows_a_running_invocation_and_a_failure_count() {
 async fn a_projector_reports_its_entities_and_counts_them_only_when_asked() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
-    support::wait_position_async(&harness.rt, "users", 1).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
+    support::wait_position_async(&harness.rt, "Users", 1).await;
 
     let (status, listed) = get(&app, "/admin/projectors").await;
     assert_eq!(status, 200);
@@ -398,14 +401,14 @@ async fn a_projector_reports_its_entities_and_counts_them_only_when_asked() {
         .iter()
         .map(|p| p["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["user-stats", "users"]);
+    assert_eq!(names, vec!["UserStats", "Users"]);
     assert!(
         listed["projectors"][0]["definition_hash"].is_null(),
         "the list endpoint opens no database"
     );
     assert!(listed["projectors"][0]["entities"][0]["rows"].is_null());
 
-    let (status, one) = get(&app, "/admin/projectors/users").await;
+    let (status, one) = get(&app, "/admin/projectors/Users").await;
     assert_eq!(status, 200);
     assert_eq!(one["readiness"], "ready");
     assert_eq!(one["sources"][0], "user.registered");
@@ -414,19 +417,19 @@ async fn a_projector_reports_its_entities_and_counts_them_only_when_asked() {
         "read out of the model itself, so it is what the rows were built from"
     );
     let entity = &one["entities"][0];
-    assert_eq!(entity["name"], "users");
+    assert_eq!(entity["name"], "User");
     assert_eq!(entity["key"], "user_id");
-    assert_eq!(entity["key_kind"], "uuid()");
+    assert_eq!(entity["key_kind"], "Uuid");
     assert_eq!(entity["indexes"][0]["name"], "by_email");
     assert_eq!(strings(&entity["filterable"]), vec!["email", "user_id"]);
     assert!(entity["rows"].is_null(), "counts are opt-in");
 
-    let (_, counted) = get(&app, "/admin/projectors/users?counts=true").await;
+    let (_, counted) = get(&app, "/admin/projectors/Users?counts=true").await;
     assert_eq!(counted["entities"][0]["rows"], 1);
 
     let (status, _) = get(&app, "/admin/projectors/nope").await;
     assert_eq!(status, 404);
-    let (status, _) = get(&app, "/admin/projectors/users?counts=perhaps").await;
+    let (status, _) = get(&app, "/admin/projectors/Users?counts=perhaps").await;
     assert_eq!(status, 400);
 
     harness.shutdown();
@@ -448,13 +451,13 @@ async fn the_schema_endpoint_reports_internal_commands_the_document_omits() {
         .collect();
     assert_eq!(
         internal,
-        vec!["record-welcome"],
+        vec!["RecordWelcome"],
         "an internal command is unrouted, not invisible: an effect can still invoke it"
     );
 
     let register = commands
         .iter()
-        .find(|c| c["name"] == json!("register-user"))
+        .find(|c| c["name"] == json!("RegisterUser"))
         .unwrap();
     assert!(register["source_hash"].as_str().unwrap().len() == 64);
     let input: Vec<&str> = register["input"]
@@ -464,7 +467,7 @@ async fn the_schema_endpoint_reports_internal_commands_the_document_omits() {
         .map(|f| f["name"].as_str().unwrap())
         .collect();
     assert_eq!(input, vec!["user_id", "email", "name"]);
-    assert_eq!(register["input"][0]["kind"], "uuid()");
+    assert_eq!(register["input"][0]["kind"], "Uuid");
 
     let events: Vec<&str> = schema["events"]
         .as_array()
@@ -490,8 +493,8 @@ async fn the_schema_endpoint_reports_internal_commands_the_document_omits() {
         .iter()
         .map(|m| (m["kind"].as_str().unwrap(), m["name"].as_str().unwrap()))
         .collect();
-    assert!(modules.contains(&("effect", "send-welcome")));
-    assert!(modules.contains(&("projector", "users")));
+    assert!(modules.contains(&("effect", "SendWelcome")));
+    assert!(modules.contains(&("projector", "Users")));
     assert!(modules.iter().all(|(_, name)| !name.is_empty()));
 
     harness.shutdown();
@@ -566,7 +569,7 @@ async fn a_subject_field_decrypts_by_default_and_stays_ciphertext_when_asked() {
         .http(Arc::new(StubHttpClient::ok()))
         .start();
     let app = harness.app();
-    let (status, _) = post_command(&app, "place-order", order_body(), None).await;
+    let (status, _) = post_command(&app, "PlaceOrder", order_body(), None).await;
     assert_eq!(status, 200);
 
     let (_, event) = get(&app, "/admin/events/1").await;
@@ -602,7 +605,7 @@ async fn an_erased_subject_is_marked_erased_rather_than_silently_vanishing() {
         .http(Arc::new(StubHttpClient::ok()))
         .start();
     let app = harness.app();
-    post_command(&app, "place-order", order_body(), None).await;
+    post_command(&app, "PlaceOrder", order_body(), None).await;
 
     let (_, before) = get(&app, "/admin/subjects/customer_id/42").await;
     assert_eq!(before["state"], "live");
@@ -645,7 +648,7 @@ async fn the_subject_inventory_counts_live_keys_without_exposing_key_material() 
         .http(Arc::new(StubHttpClient::ok()))
         .start();
     let app = harness.app();
-    post_command(&app, "place-order", order_body(), None).await;
+    post_command(&app, "PlaceOrder", order_body(), None).await;
 
     let (status, subjects) = get(&app, "/admin/subjects").await;
     assert_eq!(status, 200);
@@ -694,8 +697,8 @@ async fn the_subject_inventory_counts_live_keys_without_exposing_key_material() 
 /// Appended through the same envelope seam a command uses, so the events are
 /// byte-identical to real ones, including the correlation tag a trace is found by.
 ///
-/// Booted against a stub that always fails, so `send-welcome` wedges on the first
-/// seeded registration and never invokes `record-welcome`. Otherwise the effect would
+/// Booted against a stub that always fails, so `SendWelcome` wedges on the first
+/// seeded registration and never invokes `RecordWelcome`. Otherwise the effect would
 /// append `user.welcomed` events carrying the same propagated correlation, and the log
 /// these tests count would grow underneath them.
 fn boot_with_seeded_log(count: usize) -> (Harness, String) {
@@ -709,15 +712,12 @@ fn boot_with_seeded_log(count: usize) -> (Harness, String) {
                 &store,
                 &project,
                 &ctx,
-                EmittedEvent {
-                    event_type: "user.registered".to_owned(),
-                    data: json!({
-                        "user_id": ALICE,
-                        "email": format!("u{index}@example.com"),
-                        "name": "U",
-                    }),
-                    tags: vec![("user_id".to_owned(), Some(ALICE.to_owned()))],
-                },
+                "user.registered",
+                json!({
+                    "user_id": ALICE,
+                    "email": format!("u{index}@example.com"),
+                    "name": "U",
+                }),
             );
         }
         coordinator.shutdown();
@@ -791,18 +791,18 @@ async fn a_trace_truncated_at_the_maximum_limit_still_reports_itself_incomplete(
 
 #[tokio::test]
 async fn the_journaled_call_list_pages_rather_than_truncating_silently() {
-    // `send-welcome` journals two calls. Asking for one must not look like an
+    // `SendWelcome` journals two calls. Asking for one must not look like an
     // invocation that only ever made one, because this endpoint's whole use is
     // "the first call missing is the one it is stuck on".
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
     wait_for_head(&harness.rt, 2);
     wait_until("the invocation completes", || {
-        harness.rt.effect("send-welcome").unwrap().position() >= 1
+        harness.rt.effect("SendWelcome").unwrap().position() >= 1
     });
 
-    let (_, first) = get(&app, "/admin/effects/send-welcome/invocations/1?limit=1").await;
+    let (_, first) = get(&app, "/admin/effects/SendWelcome/invocations/1?limit=1").await;
     let calls = first["calls"].as_array().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["seq"], 0);
@@ -813,7 +813,7 @@ async fn the_journaled_call_list_pages_rather_than_truncating_silently() {
 
     let (_, second) = get(
         &app,
-        &format!("/admin/effects/send-welcome/invocations/1?limit=1&cursor={cursor}"),
+        &format!("/admin/effects/SendWelcome/invocations/1?limit=1&cursor={cursor}"),
     )
     .await;
     let calls = second["calls"].as_array().unwrap();
@@ -822,7 +822,7 @@ async fn the_journaled_call_list_pages_rather_than_truncating_silently() {
         calls[0]["seq"], 1,
         "seq counts the whole sequence, not the page"
     );
-    assert_eq!(calls[0]["kind"], "invoke_command");
+    assert_eq!(calls[0]["kind"], "invoke");
     assert!(second["next_cursor"].is_null());
 
     harness.shutdown();
@@ -873,7 +873,7 @@ async fn a_command_input_field_reports_only_what_an_input_schema_carries() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["name"] == json!("register-user"))
+        .find(|c| c["name"] == json!("RegisterUser"))
         .unwrap();
     for field in register["input"].as_array().unwrap() {
         let keys: Vec<&String> = field.as_object().unwrap().keys().collect();
@@ -892,7 +892,7 @@ async fn a_bad_typed_path_segment_is_the_plain_text_400_the_document_declares() 
 
     for uri in [
         "/admin/events/abc",
-        "/admin/effects/send-welcome/invocations/abc",
+        "/admin/effects/SendWelcome/invocations/abc",
     ] {
         let (status, content_type, body) = raw_get(&app, uri).await;
         assert_eq!(status, 400, "{uri}");
@@ -923,7 +923,7 @@ async fn a_key_that_cannot_be_unwrapped_marks_one_field_instead_of_failing_the_p
             .http(Arc::new(StubHttpClient::ok()))
             .start();
         let app = harness.app();
-        post_command(&app, "place-order", order_body(), None).await;
+        post_command(&app, "PlaceOrder", order_body(), None).await;
         harness.shutdown();
     }
 
@@ -970,7 +970,7 @@ async fn a_subject_erased_and_then_recreated_reports_stale_rather_than_erased() 
         .http(Arc::new(StubHttpClient::ok()))
         .start();
     let app = harness.app();
-    post_command(&app, "place-order", order_body(), None).await;
+    post_command(&app, "PlaceOrder", order_body(), None).await;
 
     harness
         .rt
@@ -984,7 +984,7 @@ async fn a_subject_erased_and_then_recreated_reports_stale_rather_than_erased() 
     let mut second = order_body();
     second["order_id"] = json!(support::UUID_B);
     second["email"] = json!("second@example.com");
-    let (status, _) = post_command(&app, "place-order", second, None).await;
+    let (status, _) = post_command(&app, "PlaceOrder", second, None).await;
     assert_eq!(status, 200);
 
     let (_, live) = get(&app, "/admin/subjects/customer_id/42").await;
@@ -1044,7 +1044,7 @@ async fn the_reserved_global_secret_is_not_a_subject_to_either_reader() {
         .start();
     let app = harness.app();
     // `email` is `unique`, so appending mints the global uniqueness secret.
-    post_command(&app, "place-order", order_body(), None).await;
+    post_command(&app, "PlaceOrder", order_body(), None).await;
 
     let (_, listed) = get(&app, "/admin/subjects").await;
     let fields: Vec<&str> = listed["counts"]
@@ -1149,7 +1149,7 @@ fn strings(value: &Value) -> Vec<String> {
 async fn a_wedged_effect_reports_the_state_and_when_the_next_attempt_is_due() {
     let harness = boot_with(Arc::new(StubHttpClient::status(500)));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
 
     // Wait for a backoff long enough that it is still pending when the request below
     // lands. The wedge backoff doubles from 200ms, so this is true from the third
@@ -1159,7 +1159,7 @@ async fn a_wedged_effect_reports_the_state_and_when_the_next_attempt_is_due() {
         || {
             harness
                 .rt
-                .effect("send-welcome")
+                .effect("SendWelcome")
                 .unwrap()
                 .retry_in_ms()
                 .is_some_and(|remaining| remaining > 1_000)
@@ -1169,7 +1169,7 @@ async fn a_wedged_effect_reports_the_state_and_when_the_next_attempt_is_due() {
     let (status, listed) = get(&app, "/admin/effects").await;
     assert_eq!(status, 200);
     let effect = &listed["effects"][0];
-    assert_eq!(effect["name"], "send-welcome");
+    assert_eq!(effect["name"], "SendWelcome");
     assert_eq!(
         effect["state"], "wedged",
         "a non-zero failure count is a wedge, not lag: a terminal skip never touches it"
@@ -1197,10 +1197,10 @@ async fn a_wedged_effect_reports_the_state_and_when_the_next_attempt_is_due() {
 async fn a_caught_up_effect_is_healthy_and_names_no_deadline() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
     wait_until("the effect catches up", || {
         let head = support::log_head(&harness.rt);
-        harness.rt.effect("send-welcome").unwrap().state(head) == "healthy"
+        harness.rt.effect("SendWelcome").unwrap().state(head) == "healthy"
     });
 
     let (status, listed) = get(&app, "/admin/effects").await;
@@ -1221,13 +1221,13 @@ async fn a_caught_up_effect_is_healthy_and_names_no_deadline() {
 async fn a_trace_names_the_effect_that_ran_on_each_of_its_events() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    let response = post_command(&app, "register-user", register(ALICE), None).await;
+    let response = post_command(&app, "RegisterUser", register(ALICE), None).await;
     let correlation = response.1["correlation_id"].as_str().unwrap().to_owned();
-    // The head reaching 2 only means the effect's `invoke_command` committed; the
+    // The head reaching 2 only means the effect's `invoke` committed; the
     // invocation is marked terminal after the handler returns. Waiting on the head
     // alone would sometimes read the row while it is still `running`.
     wait_until("the effect finishes the invocation", || {
-        harness.rt.effect("send-welcome").unwrap().position() >= 1
+        harness.rt.effect("SendWelcome").unwrap().position() >= 1
     });
 
     let (status, trace) = get(&app, &format!("/admin/traces/{correlation}")).await;
@@ -1239,7 +1239,7 @@ async fn a_trace_names_the_effect_that_ran_on_each_of_its_events() {
         "one effect subscribes to `user.registered`, so exactly one invocation ran \
          over this chain: {invocations:?}"
     );
-    assert_eq!(invocations[0]["effect"], "send-welcome");
+    assert_eq!(invocations[0]["effect"], "SendWelcome");
     assert_eq!(
         invocations[0]["position"], 1,
         "the invocation is keyed by the position of the event that triggered it, \
@@ -1256,13 +1256,13 @@ async fn a_trace_names_the_effect_that_ran_on_each_of_its_events() {
 async fn a_chain_no_effect_subscribes_to_joins_no_invocations() {
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
-    post_command(&app, "register-user", register(ALICE), None).await;
+    post_command(&app, "RegisterUser", register(ALICE), None).await;
     wait_for_head(&harness.rt, 2);
 
-    // `schedule-reminder` appends `reminder.scheduled`, which `send-welcome` does not
+    // `schedule-reminder` appends `reminder.scheduled`, which `SendWelcome` does not
     // subscribe to, so this second chain has no invocation over it even though the
     // journal now holds one from the first.
-    let response = post_command(&app, "schedule-reminder", json!({ "user_id": ALICE }), None).await;
+    let response = post_command(&app, "ScheduleReminder", json!({ "user_id": ALICE }), None).await;
     let correlation = response.1["correlation_id"].as_str().unwrap().to_owned();
 
     let (status, trace) = get(&app, &format!("/admin/traces/{correlation}")).await;

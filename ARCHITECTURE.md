@@ -4,21 +4,27 @@ hekla is a rewrite of [umari](https://github.com/tqwewe/umari), a Rust event-sou
 (Dynamic Consistency Boundary) runtime where you author **commands**, **projectors**, and
 **effects**. umari runs those as WASM component modules (Wasmtime, WIT, Rust/TS SDKs) on the
 [tephra](https://crates.io/crates/tephra) event log. hekla keeps umari's conceptual model and its
-tephra + SQLite substrate but replaces WASM with **embedded Starlark**.
+tephra + SQLite substrate but replaces WASM with **[heklang](../heklang)**, a language built for
+this shape of program and nothing else.
 
-The swap is not cosmetic. Starlark is pure and sandboxed: no clock, no randomness, no I/O except
-host-injected builtins. That makes command and projector determinism structural rather than
+The swap is not cosmetic. heklang has no clock, no randomness and no I/O except through a host seam
+it declares, and its three declaration kinds are the three module kinds: a command may not call out,
+a projector may not decrypt, only an effect journals. That makes determinism structural rather than
 policed, makes deployment source text (no build step, no compile cache), and enables a
 Temporal-style durable-execution model for effects that umari could not express.
+
+hekla was written against embedded Starlark first, and the port to heklang is finished. Where this
+document says what changed, it is because the difference is worth knowing rather than for history.
 
 This document describes the system as designed. Delivery is phased in [ROADMAP.md](./ROADMAP.md).
 
 ## 1. What hekla is
 
-A single-app, event-sourced runtime. Business logic is written as small Starlark files (commands,
-projectors, effects) over an immutable tephra event log. Commands are the only writers. Projectors
-build queryable SQLite read models. Effects react to events with durable, replay-safe side effects.
-Determinism and sandboxing come from Starlark itself, not from runtime policing.
+A single-app, event-sourced runtime. Business logic is written as small heklang files (`.hk`),
+declaring commands, projectors and effects over an immutable tephra event log. Commands are the only
+writers. Projectors build queryable SQLite read models. Effects react to events with durable,
+replay-safe side effects. Determinism and sandboxing come from the language, not from runtime
+policing: what a declaration may do is a property of what kind of declaration it is.
 
 ## 2. Concepts and vocabulary
 
@@ -30,40 +36,54 @@ One word per concept, no synonyms.
   stored and indexed on events. Authors never write tag strings: event definitions declare which
   fields are tags, emitting auto-tags them, and queries pass structured `tags = {...}` that the
   runtime encodes. There is no separate "domain ID" term; a tag is a tag.
-- **Consistency boundary**: the set of events a command reads, expressed as event types plus
-  structured tags. Optimistic concurrency is enforced by appending under a tephra `AppendCondition`
-  over the same boundary.
-- **Command, Projector, Effect**: the three module kinds (sections 5 to 7).
-- **Fold**: an in-handler reduction over the boundary's events that recovers decision state.
+- **Slice**: an event type plus the filters that narrow it, resolved to literal values. A slice is
+  what a `state` declares and what an append conditions on.
+- **Consistency boundary**: the set of events a command reads, which is exactly the slices its
+  `state` declarations name. Optimistic concurrency is enforced by appending under a tephra
+  `AppendCondition` over the same slices: **what you folded is what you conflict on**.
+- **Command, Projector, Effect**: the three declaration kinds (sections 5 to 7).
+- **Fold**: the reduction a `state` performs over its slices to recover decision state. The
+  declaration and the reduction are one construct, so a boundary and the state derived from it
+  cannot drift apart.
 - **Read model**: a projector's SQLite database. A rebuildable cache, never a source of truth.
 - **Journal**: an effect's durable record of its side-effect calls, keyed by content hash, used to
   replay the effect deterministically after a crash. Lives in the operational DB, never the log.
 - **Envelope**: host-stamped per-event metadata: an `event_id`, `correlation_id`, `causation_id`, an
   optional `triggering_event_id`, and an append `timestamp`. The `position` is tephra's; the id is
-  the envelope's, and a handler reads it as `event.id` (section 4). The client's idempotency key is
-  not on the event; a reserved tag derived from it is (section 5).
+  the envelope's, and a projector or effect arm reads both through its trigger binding (section 4).
+  The client's idempotency key is not on the event; a reserved tag derived from it is (section 5).
 
 ## 3. Module layout and deployment
 
-Kind comes from the directory, name from the file stem, and one file is one unit of behaviour.
+A project is one heklang program spread over files. **The directory decides what a declaration is
+allowed to be; the declaration decides its name.**
 
 ```
 project/
-  events/              # shared event definitions (importable)
-  lib/                 # shared pure helpers (importable)
+  events/              # event declarations
+  lib/                 # shared pure `fn`s and constants
   commands/            # public commands (HTTP-routed and invokable by effects)
   commands/internal/   # internal commands (invokable by effects, NOT HTTP-routed)
   projectors/
   effects/
+  tests/               # `hekla test` scenarios
   hekla.toml            # operational config (optional)
 ```
 
-- **`load()` is restricted to `events/` and `lib/`.** A command can never import another command,
-  so one file stays one unit. The host `load()` resolver builds a load graph, used for fast
-  incremental re-validation (editing an event file re-validates only its importers), and caches
-  evaluated modules (a shared events file evaluates once, not once per importer).
+- **There is no import.** Every `.hk` file in the project is compiled together, so a command names
+  an event declared three directories away without saying so, and file order is irrelevant. The
+  Starlark version had a `load()` graph with a restriction (only `events/` and `lib/` were
+  importable), a resolver, a module cache and a cycle check; all of it is gone, along with the
+  class of error where a file was valid but unreachable.
+- **A declaration is named by its declaration, not by its file.** `commands/place-order.hk`
+  declaring `command PlaceOrder(...)` is routed at `POST /commands/PlaceOrder`. The file name is a
+  convention this repository follows and the runtime does not read. Under Starlark the file stem
+  *was* the name, so this changed every URL the port touched.
+- **The directory is still load-bearing**, and it is hekla's rule rather than the language's:
+  heklang would accept a `projector` in `commands/`. `hekla check` refuses it, because the directory
+  is what makes a command routable and a projector a projector.
 - **Public vs internal is structural, not a flag.** `commands/internal/` keeps effect-completion
-  commands (for example `record-shipping-label`) off the HTTP surface, so nobody can POST a
+  commands (for example `RecordShippingLabel`) off the HTTP surface, so nobody can POST a
   fabricated `shipping.label_created` with a tracking number that was never issued. It also keeps
   generated OpenAPI honest. Retrofitting this later would be breaking, so it is in from v1.
 - **Deploy is restart.** v1 loads at startup; there is no hot reload. Reload raises the same
@@ -81,39 +101,110 @@ project/
 
 ## 4. Events and schema
 
-Event definitions live in `events/` and are imported with `load()`. An event declares its type and
-its typed fields; there is no `tags = [...]` list. **Every field is automatically indexed as a store
-tag** unless it opts out with `indexed = False`. Auto-tagging removes the old failure where a field
-forgotten from the tag list was unqueryable forever (and adding it later missed all prior events).
+An event declares its type and its typed fields; there is no `tags = [...]` list. **Every field is
+automatically indexed as a store tag** unless it opts out with `@no_index`. Auto-tagging removes the
+old failure where a field forgotten from the tag list was unqueryable forever (and adding it later
+missed all prior events).
 
-**Per-field policy** (named arguments on any field constructor):
+```
+event @order.placed {
+  order_id: Uuid,
+  customer_id: Int,
+  email: String? @subject(customer_id) @max(200),
+  // Free text nobody queries: opt out of tagging, and of being a huge tag.
+  notes: String @max(2000) @no_index,
+}
+```
 
-- `indexed = False` opts a field out of tagging (a large blob, or free text where a tag is useless).
-- `subject = "sibling_field"` encrypts the field under a key scoped to that sibling's value; see
-  section 15. `unique = True` (which requires `subject`) additionally emits a global-key tag for a
-  uniqueness check that survives erasure.
+**Per-field annotations**:
 
-**Field type system** (shared across event schemas, command input `schema()`, and entity schemas):
-`str`, `int`, `uint`, `bool`, `uuid`, `timestamp`, `money`, `json`, `one_of`, `optional`.
+- `@no_index` opts a field out of tagging (a large blob, or free text where a tag is useless).
+- `@max(n)` bounds a string. It is checked at the write, and an over-length value is a command's
+  `Invalid` rather than a crash.
+- `@subject(sibling_field)` encrypts the field under a key scoped to that sibling's value; see
+  section 15.
 
-The scalar types deliberately reuse Starlark's builtin names, shadowing the standard `str`, `int`
-and `bool` globals. One rule keeps both meanings reachable: **a positional argument means Starlark's
-conversion, and no positional argument means a field declaration.** So `str(response.status)`
-converts and `str(max_length = 200)` declares. This works because every standard conversion is
-positional-only while every field option (`indexed`, `subject`, `unique`, `max_length`) is
-named-only, and passing both at once is an error rather than a silent drop. The cost is one idiom:
-`int()` and `bool()` no longer produce `0` and `False`, so write the literals. (`str()` costs
-nothing, since the standard `str` requires its argument.) `uint` shadows nothing, and `one_of` keeps
-a distinct name because the rule cannot reach it: a variant list and starlark-rust's `enum(...)` are
-both positional, leaving nothing to tell them apart.
+**Field types** are heklang's, and the same set describes an event field, a command parameter and an
+entity column: `Bool`, `Int`, `Decimal(n)`, `String`, `Uuid`, `Timestamp`, `Money(n)`, an enum, a
+record, `Json`, `List(T)`, `Map(K, V)`, and `T?` for an optional.
 
-`float` and `bytes` are intentionally left as plain Starlark conversions, because **there is no float
-field type and there will not be one.** Binary-float rounding in an append-only log is permanent;
-auto-tagging a float needs an encoding that sorts lexicographically, the same problem that stops
-`money` from keying an ordered scan; and float equality under a `unique` index is a trap. Use
-`money` for currency and scaled integers for everything else. A float reaching a typed field is
-rejected at the write boundary. The one door left open is `json`, which validates nothing by design
-and so will store one.
+Two of these changed shape in the port and are worth naming:
+
+- **`Money(n)` carries its scale in the type.** `Money(2)` and `Money(3)` are different types that
+  read different values out of the same string, and the type is what says which. Money plus money is
+  fine, money plus a bare decimal is not.
+- **There is no unsigned type.** The Starlark version had `uint`, which landed in the same signed
+  SQLite `INTEGER` as `int` and so had to reject anything above `i64::MAX` at the write boundary.
+  `Int` is that range, with nothing left to fall off.
+
+**There is no float type and there will not be one.** Binary-float rounding in an append-only log is
+permanent, and auto-tagging a float needs an encoding that sorts lexicographically, the same problem
+that stops `Money` from keying an ordered scan. Use `Money` for currency and `Decimal(n)` or scaled
+integers for everything else. The one door left open is `Json`, which validates nothing by design.
+
+**`emit` writes an event whole.** Every field the event declares is given, each of them once. There
+is no partial event and no default: an event is a fact, and a fact with a hole in it is a different
+fact. The same rule holds for a `put` into a read model and for an `invoke`'s arguments, and it is
+checked in the same place each time, at the write against the declaration. Under Starlark the
+*runtime* held it, which meant a command that omitted a field checked clean and failed at the
+append.
+
+**A field is read by name, against its declaration.** A handler binds the fields it wants out of the
+triggering event (`on @order.placed { order_id, email }`), or binds the whole record with `as e` and
+reads `e.order_id`. Either way the name is checked at compile time against the declaration, so a
+typo is a parse error rather than a `None` that flows onward. There is no dynamic field access and
+no subscript: the Starlark version needed a rule about which values read with a dot and which with a
+subscript precisely because half of them had no declared shape.
+
+The one genuinely shapeless value is an HTTP response body, which is a `Json` read through fallible
+one-step accessors (`body.string("id")`, `body.int("count")`). Every read of an untyped body is a
+branch anyway, and making that visible is the point.
+
+**Envelope**: the tephra payload is a JSON envelope wrapping `data` with an `event_id`,
+`correlation_id`, `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The
+host stamps these at append; a program never sets them.
+
+Three envelope fields are exposed through a trigger binding, beside the event's own fields: **`e.id`**,
+**`e.at`** and **`e.position`**. All three are stamped once at append and never move, so a projector
+rebuild and an effect replay see what the original append wrote. That stability is what makes `id`
+the input to derive from, and what lets `at` be the source for a `created_at`-style read-model column.
+
+**A command fold cannot reach them**, and that is deliberate rather than an omission: a fold arm
+binds the event's declared fields and nothing else. A projector or effect arm has a trigger, so it
+has a record; a fold has a stream of events.
+
+**Prefer `e.at` over restating the clock.** A command using `now()` for a field that only records
+when the event was appended duplicates what the envelope already holds. `now()` remains right for
+time that is genuinely domain data and not the append instant (`expires_at`, `due_date`, a
+`purchased_at` an upstream system reported).
+
+The rest of the envelope (`correlation_id`, `causation_id`, `triggering_event_id`) stays host-side:
+each would need its own argument for why a handler should branch on it.
+
+**Deriving ids**: no declaration may mint a random one. Commands take new-entity ids from their
+parameters (see section 5), and an arm that needs an id with no such source derives one with
+`Uuid.derive(seed, name)`, RFC 4122 version 5, usually over `e.id`:
+
+```
+invoke RecordNotified {
+  order_id: e.order_id,
+  notification_id: Uuid.derive(e.id, "confirmation"),
+}
+```
+
+The `name` argument is what lets one arm derive several distinct ids from one event. Randomness here
+would not merely be unavailable, it would be wrong: a command retry and an effect replay both re-run
+the code that mints the id, so a fresh id per attempt would turn one intent into several entities,
+which is the same failure host-minted ids have. Deriving is the third choice, not the first: prefer
+an identity that already exists (the entity the fact is about) or one an external system returned in
+a journaled response.
+
+**Compile-time validation is the reason event declarations are shared, and it is now the language's
+rather than hekla's.** A slice that filters an event type on a field that type does not declare, or
+declares `@no_index`, is a parse error with the field's own span. So is a filter on sealed content,
+an `emit` missing a field, an `invoke` with an unknown argument, and an index over a column the
+entity does not have. The Starlark version re-derived each of these in a validation pass over a
+`query()` evaluated against a stub input, which could only see the branch the stub happened to take.
 
 **Two host tags sit in a reserved `_hekla_` namespace** an author can neither emit nor query: a keyed
 command's idempotency tag, and the correlation tag every event carries. The correlation id lives in
@@ -121,210 +212,115 @@ the envelope payload, but a store query filters on type and tags only, so withou
 chain could be found only by decoding every event in the log. Both are stripped from command
 responses, and `hekla check` rejects the prefix on both sides.
 
-Three representations are pinned so they are not decided inconsistently in two places:
+Two representations are pinned so they are not decided inconsistently in two places:
 
-- **`money`**: a decimal string on the wire (JSON event payloads and read-API responses), an integer
-  count of minor units in storage.
-- **`one_of`**: the runtime validates value membership only (a written value must be in the declared
-  set). It does not validate that a transition between values is legal; transition rules, if ever
-  needed, are the author's job in `handle`.
-- **`int` and `uint`**: both land in a SQLite `INTEGER` column, which is signed 64-bit, so the
-  storable range for either is `i64::MIN..=i64::MAX`. A `uint` above `i64::MAX` is rejected at the
-  write boundary (command input and event construction), not silently stored. Reinterpreting the
-  bits would round-trip the value but sort it below zero, which would quietly break `ORDER BY` and
-  the `key > ?` cursor for those rows: the same failure that keeps `money` from keying an ordered
-  scan. So `uint` means "non-negative, up to `i64::MAX`"; widening it would need a storage form that
-  still orders correctly.
-
-**Construct an event via its definition**: `user_registered(user_id = ..., email = ...)`. The
-runtime validates the payload against the field schema and derives a tag from every indexed field.
-Missing or extra fields fail fast. A command's `handle` returns the constructed event, or a list of
-them, to append. The same constructor called in query position (a command's `query`, or the keys of a
-`fold` or `handle` map) instead builds a filter clause; see section 5.
-
-**Only the registered definition may be emitted.** Each `event(...)` call mints a process-unique id,
-and a constructed event carries the id of the definition that built it, so the append seam can check
-identity rather than the type name. That closes the case where a handler builds its own
-`event(type = "user.registered", ...)` inside a function body: the name matches a declared type, so
-the event would be lowered against the registry's schema, and any field the real definition does not
-declare would ride into the immutable log verbatim, never validated and never encrypted. Referring
-to a loaded definition by a second name is the same definition and keeps working. The same identity
-check runs at load time, so a module-scope redeclaration outside `events/` is a `hekla check` error
-rather than a runtime one.
-
-**Payload access**: a host-built value with a fixed shape is read with **dot access**, and everything
-else is a dict read by subscript.
-
-Dot: `input` and `event.data`, built from a declared field schema (`input.email`,
-`event.data.email`), where a field the schema does not declare is a shape error and one the payload
-omits reads as `None`. `event.id` sits beside them, so an event that declares its own `id` field
-keeps it at `event.data.id`. Also the two fixed-shape wrappers an effect gets back: `http.*` returns
-`{status, body, headers}` and `invoke_command` returns `{status, body}`.
-
-Subscript: values a handler builds itself, a folded `state` (in a command or an effect) and a
-`put()` row, because there is no declared shape to check them against. Also the *contents* of the
-wrappers above, which the host cannot promise a shape for: a response `body` is parsed JSON when the
-bytes parse and a string otherwise, and `headers` is keyed by arbitrary header names.
-
-A read-model row from `get()` stays a dict for a second reason: `put()` takes a dict, so
-read-modify-write has to round-trip without a conversion in between.
-
-**Envelope**: the tephra payload is a JSON envelope wrapping `data` with an `event_id`,
-`correlation_id`, `causation_id`, an optional `triggering_event_id`, and the append `timestamp`. The
-host stamps these at append; Starlark never sets them.
-
-Two envelope fields are exposed to handlers, beside `event.type` and `event.data`: **`event.id`** and
-**`event.timestamp`**. Both are stamped once at append and never move, so a projector rebuild and an
-effect replay see what the original append wrote. That stability is what makes `id` the input to
-derive from, and what lets `timestamp` be the source for a `created_at`-style read-model column.
-
-**Prefer `event.timestamp` over restating the clock.** A command using `now()` for a field that only
-records when the event was appended duplicates what the envelope already holds; the rule in section 5
-stands, and this is what makes it followable. `now()` remains right for time that is genuinely domain
-data and not the append instant (`expires_at`, `due_date`, a `purchased_at` an upstream system
-reported).
-
-The rest of the envelope (`correlation_id`, `causation_id`, `triggering_event_id`) stays host-side:
-each would need its own argument for why a handler should branch on it.
-
-**Deriving ids**: no module may mint a random one. Commands take new-entity ids from their input
-(see section 5), and a handler that needs an id with no such source derives one with
-`uuid5(namespace, name)`, RFC 4122 version 5, usually over `event.id`:
-
-```starlark
-invoke_command("record-notified", {
-    "notification_id": uuid5(event.id, "confirmation"),
-    "order_id": event.data.order_id,
-})
-```
-
-The `name` argument is what lets one handler derive several distinct ids from one event. Randomness
-here would not merely be unavailable, it would be wrong: a command retry and an effect replay both
-re-run the code that mints the id, so a fresh id per attempt would turn one intent into several
-entities, which is the same failure host-minted ids have. Deriving is the third choice, not the
-first: prefer an identity that already exists (the entity the fact is about) or one an external
-system returned in a journaled response.
-
-**Deploy-time validation** is the reason event definitions are shared. A query that filters an event
-type on a field that type does not declare (or declares `indexed = False`) is a hard error, never a
-silent empty result. Value types are checked against the field's kind, event constructors against the
-field schema, and projector indexes against declared fields.
+- **`Money(n)` and `Decimal(n)`**: a string at scale `n` on the wire (JSON event payloads, request
+  bodies and read-API responses), an integer count of minor units in storage. A string rather than a
+  number so no precision is lost to a float on the far side, which is the same reason they are
+  scaled integers here.
+- **`Timestamp`**: epoch microseconds on the wire, RFC 3339 text in a SQLite column and in the
+  envelope. The column form is what the read API serves and what sorts lexicographically, and the
+  two are converted at exactly one seam. A sealed timestamp column holds the *column* form too,
+  so whether a field is personal never changes the shape a reader sees.
 
 ## 5. Commands
 
 A command validates input, checks invariants against replayed state, and appends events. It is the
 only writer.
 
-**Shape** (everything but `handle` is optional):
+**Shape**:
 
-- `query(input)` returns the boundary as **typed clauses**: an event definition called with the
-  fields to match, e.g. `user_registered(email = input.email)`, or a list of clauses OR-ed together.
-  Within a clause, fields AND; a bare `TaskCreated()` matches every event of that type; `all_events()`
-  matches everything. Constraining a field is a subset match, so over-constraining silently matches
-  nothing (which `hekla check` warns about). A subject-encrypted field can only be filtered when its
-  subject is also constrained (scoped) or it is `unique` (global); see section 15.
-- `initial` is a literal value producing the fold's starting state, never a function: it sees no
-  input, no clock and no randomness, so it can only be a constant, and a module-level expression
-  already covers everything a function could compute.
-- `fold` reduces the boundary's events into decision state, and **returns the new state rather than
-  mutating the one it was handed**. It is a dict mapping query clauses to functions, which dispatches
-  per clause instead of branching on `event.type`:
-  ```starlark
-  fold = {
-      order_placed(): lambda state, event: dict(state, taken = True),
-      shop_suspended(): lambda state, event: dict(state, suspended = True),
+```
+command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?, total: Money(2)) {
+  state open_orders: Int = fold 0
+    on @order.placed(customer_id) => open_orders + 1
+    on @order.cancelled(customer_id) => open_orders - 1
+
+  if open_orders >= 10 {
+    return reject("too_many_open", "too many open orders")
   }
-  ```
-  Keys are clauses built from the loaded definitions, not type strings, so a typo fails at `load()`
-  and the only-the-registered-definition rule reaches dispatch too. The key language is the same one
-  `query` uses and the same one a projector's or effect's `handle` uses: always a call, never a bare
-  definition, and a constraint is allowed (`order_placed(status = "cancelled")`). A `fold` key can
-  only filter on constants, since it is module-level, so this is worth reaching for on enum-shaped
-  fields and not much else. `all_events()` is the clause that folds every boundary event.
-  An event type with no entry leaves state
-  unchanged, but is still read into the boundary and still counts toward the append condition. That
-  is a normal shape rather than an oversight: **the boundary and the fold answer different
-  questions.** The boundary is the append condition, so a type belongs there whenever a concurrent
-  write of it should make this command fail; the fold is the decision state, so a type belongs there
-  only when `handle` needs to know about it. `commands/rename-user.star` in `examples/users` is the
-  case: renames are in the boundary so two concurrent renames conflict, and the fold has no arm for
-  them because `exists` is already settled by the registration. `hekla check` therefore does not
-  report a boundary type with no entry. It does report the other direction, an entry for a type the
-  boundary never returns, which is dead code. That cross-check is by type only: `query` is evaluated
-  against a placeholder input, so an arm made dead by its *constraint* rather than its type is not
-  visible to it.
 
-  Build the new state with `dict(state, taken = True)`, or `dict(state, **{key: value})` when the key
-  is computed. `initial` is a frozen module global, so a fold that assigns into `state` fails on the
-  first event it sees; once an arm has returned a dict it built, mutating that one *between arms* is
-  its own business, because the value is discarded at the end of the fold either way. What the fold
-  hands out is frozen before `handle` sees it. starlark-rust exposes no freezer mid-evaluation
-  (`Freezer::new` is crate-private and freezing rewrites the source heap), so freezing an arm's
-  intermediate result is not available; the contract between arms is carried by the first-event
-  failure, the `must return the updated state` error on a `None` return, and this paragraph.
-- `handle(input, state)` decides and returns one of three terminal outcomes. It is always a single
-  function: it decides from input and folded state rather than from one event, so per-type dispatch
-  belongs on `fold`.
-  - an event, or a list of events, appends them (an empty list means "nothing to append", valid for
-    an idempotent command).
-  - `reject(code, message)` is a state-dependent refusal: the input was well-formed but the current
-    state forbids it (for example, email already taken). Maps to HTTP 422, kept distinct from the 409
-    a concurrency conflict returns, so the status alone tells a client whether a retry can help.
-  - `invalid_input(message)` means the input is malformed regardless of state, a shape or parse-level
-    problem. Maps to HTTP 400.
+  emit @order.placed { order_id, customer_id, email, total }
+}
+```
 
-Commands with no invariants omit `query` and `fold` entirely.
+**`state` is a read declaration, not a binding**, and it is the one thing about a command worth
+understanding before anything else. A `state` declares a **slice** of the log (an event type plus
+the filters that narrow it) and folds it into a value. The slices are what the append conditions on,
+so **what you folded is what you conflict on**. A `let` produces no slice and contributes nothing.
 
-**Determinism**: `query` and `fold` are pure and clock-free, because `fold` replays history and a
-clock there would break determinism. `now()` is available only in `handle`, pinned once per request
-so repeated calls agree. It is for time as domain data (`expires_at`, `due_date`), not for restating
-the host-stamped append timestamp; putting the wall clock in the payload would duplicate what the
-envelope already holds.
+That collapses four Starlark constructs into one. `query` declared the boundary, `initial` seeded the
+fold, `fold` was a dict of clauses to reducer functions, and the three could disagree: a fold arm for
+a type the query never returned was dead code, a query with no fold read events nobody looked at, and
+`hekla check` had a rule for each. None of those states is representable now, so none of those rules
+exists.
 
-**Ids**: new-entity ids are client-supplied in the input. A retried request carries the same id, so
-the command's own boundary rejects the duplicate, and idempotency for creation falls out of DCB with
-no extra layer. Starlark mints no ids and has no randomness. Host-minted ids would mint a fresh one
-per retry, creating two entities from one intent.
+- **A slice comes back resolved.** `@order.placed(customer_id)` leaves as `@order.placed` narrowed to
+  `customer_id = 7`, because a filter is an expression the command evaluated and "which slice" means
+  nothing to a host that did not compile the program. Resolving is what makes the condition
+  answerable: it is the same shape a tag query has, so the host that appends against it can also
+  index on it.
+- **Filters are sorted by field name**, so one slice is one predicate however it was written.
+- **`guard` is a `state` that binds nothing**, for a decision that depends on a slice being empty
+  when there is no value to keep. It is rarely what you want: a `state` already contributes its
+  slice, so guarding what a fold already covers adds a duplicate predicate and no safety.
+- **A fold arm may not read the clock or call out**, because a fold is not journaled: every attempt
+  re-folds and must get the same answer.
+- **Execution order is fixed**: parameters bind, hoisted `let`s run, filters evaluate, seeds
+  evaluate, `after` is taken, the fold runs in **one pass over the log** applying every matching
+  slice per record, then the body runs. Ten folds over a million events read the log once.
+
+**Three outcomes.** `return` with no value, or falling off the end, is `Ok` with whatever was
+emitted; `reject(code, message)` is a state-dependent refusal (422); `invalid(message)` means the
+input is malformed regardless of state (400). The distinction is the caller's: a blank address is
+`invalid` whoever sends it and whenever, a blocked customer is `reject` because the same request
+would have succeeded yesterday. `reject` carries a code because there is something to branch on;
+`invalid` does not, because there is nothing to say when the answer is "you sent nonsense".
+
+`Conflict` and `Unavailable` have **no variant in the type at all**. Being beaten to the log is the
+runtime's to retry and an author who saw it could only retry worse, so "retryable outcomes never
+reach the handler" is unrepresentable rather than filtered. hekla still has both, because hekla is
+the thing that retries.
+
+**The append condition is returned with all three outcomes**, including the two refusals: a refusal
+still read the log, and a host that wants to cache or trace the decision needs to know what it
+depended on.
+
+**Determinism**: a filter and a fold see no clock and no network. `now()` is available in the body,
+pinned once per request so repeated calls agree. It is for time as domain data (`expires_at`,
+`due_date`), not for restating the host-stamped append timestamp.
+
+**Ids**: new-entity ids are client-supplied parameters. A retried request carries the same id, so the
+command's own boundary rejects the duplicate, and idempotency for creation falls out of DCB with no
+extra layer. The language mints no ids and has no randomness.
 
 **Append and DCB**: emitted events are appended under an `AppendCondition` over the boundary. A
-concurrent write inside the boundary fails the append, and the attempt is retried in place.
+concurrent write inside the boundary fails the append, and the attempt is retried in place. The
+attempt budget and the backoff are hekla's and reach the language as a callback; the decision, and
+the attempt loop that carries state between attempts, are the language's.
 
-**A retry costs the delta, not the boundary.** Each attempt keeps the state it folded and the last
-position that state covers; the next one reads strictly after that position and folds what landed
-onto the state it already has, rather than replaying the boundary from zero. The fold is a left fold
-over an append-only log, so folding `[0, a]` and then `(a, b]` gives the state folding `[0, b]`
-would. The attempt loop lives in `dispatch` rather than in the runtime so the work that does not vary
-between attempts (the input struct, the boundary, the lowered `fold` plan, whose clauses cost a
-keystore lookup and a deterministic encryption each when a field is subject-scoped) is done once per
-request. The runtime still owns the *policy*: how many attempts, and how long to wait between them.
+**A retry costs the delta, not the boundary.** Each attempt keeps the state it folded and the
+position that state covers, and the next one reads strictly after it, folding what landed onto what
+it already has: a fold is a left fold over an append-only log, so folding `[0, a)` then `[a, b)` is
+the state folding `[0, b)` would have given. Being beaten to the log on a boundary a hundred thousand
+events deep therefore costs the handful of events that beat you. The carry lives in heklang's frame
+because that is the only place a folded `state` exists; hekla could not do it from outside, and for
+one phase after the port it did not, so every retry re-read the whole boundary from position zero.
 
-**The carried state is frozen, so `handle` cannot mutate what the next attempt folds onto.** Each
-attempt folds in a scratch heap and freezes the result: an assignment into `state` inside `handle`
-fails with `Immutable` and a message naming the reason, exactly as it already did when the boundary
-was empty and `state` was the frozen `initial`. Without the freeze a mutating `handle` would corrupt
-every later attempt and commit straight past the boundary, silently and with a 200.
+What the port *did* remove for good is the machinery that made the carry safe under Starlark: a
+frozen scratch heap per attempt and the `Immutable` error that policed a `handle` writing into
+`state`. heklang has no mutable binding, and the carry is taken before the body runs, so there is no
+longer a way to write the bug they caught.
 
-**A fold's live heap does not grow with the boundary's depth, so per-event cost stays flat.**
-Starlark collects only when executing a statement at the root of a module, and a fold loop never
-executes one, so *nothing a fold allocates is released until its heap is dropped*: every event
-struct, every string, and every superseded state from `dict(state, ...)` survives to the end. One
-heap for the whole boundary therefore costs memory linear in its depth, and once that working set
-outgrows the cache the cost per event stops being flat, which turns a linear fold into a
-quadratic-looking one. So a fold is not one pass over one heap: it runs in chunks, freezing the
-state and dropping the scratch heap every `HEKLA_FOLD_HEAP_BUDGET` bytes (1 MiB by default), then
-thawing that state into the next chunk. The events die with each chunk. The seam is sound for the
-same reason the retry carry is, and the read is planned once before the first chunk, so the whole
-fold still runs against a single pinned watermark and reports one position for the append condition.
+**A fold's cost is flat in the boundary's depth**, which under Starlark it was not. Starlark collects
+only when executing a statement at the root of a module, and a fold loop never executes one, so
+nothing a fold allocated was released until its heap was dropped: every event struct, every string
+and every superseded state survived to the end, and once that working set outgrew the cache a linear
+fold started looking quadratic. hekla answered that with a chunked fold that froze and thawed its
+state every megabyte, four tuning constants and an environment variable. All of it is deleted.
 
-The per-chunk states are not free, and it is worth being exact rather than claiming a flat bound.
-Thawing the carry adds a reference to the previous chunk's frozen heap, and freezing keeps every
-referenced heap alive, so the states form a chain released only when the fold ends. What bounds it is
-a ratio rather than a constant: a chunk must be at least eight times the size of the state it
-carries, so the chain can never exceed an eighth of what folding the whole boundary in one heap would
-have held. A fold over a few scalars chunks at the configured budget; one accumulating a large dict
-chunks less often, which is the right trade, since that is exactly the fold whose per-chunk copy is
-expensive. Tuning the budget *down* to save memory therefore backfires, and it has a floor for that
-reason.
+**Termination is structural.** heklang has no `while`, rejects recursion, and iterates only finite
+containers, so there is nothing to meter. The per-handler instruction budget went with the chunking.
 
 **Built-in idempotency key** is distinct from id-based dedupe. It exists for commands where nothing
 in the input distinguishes intent (approving a claim twice with identical input could be one retry
@@ -334,58 +330,79 @@ every emitted event with that tag, and guards the append against the tag existin
 log. The guard is whole-log rather than scoped to the boundary, so a duplicate that committed
 anywhere is caught even once the boundary's `after` has moved past it, and it is asserted by the
 append itself, so there is no read-then-write window. When it fires, the runtime re-reads by the tag
-and returns the original commit's events and identity verbatim instead of re-running `handle`. A
+and returns the original commit's events and identity verbatim instead of re-running the command. A
 first attempt that rejected appended nothing and so left no tag, so a retry re-decides and returns
 the same rejection unless state moved; a reject that folded state is still checked against the tag,
 so a duplicate racing an in-flight commit recovers that commit rather than reporting a spurious
 refusal. Hashing the command name in keeps the same key on two commands from colliding, and keeps
 the tag fixed-length whatever the client sent. Nothing is stored outside the log, so nothing has to
 be swept: exactly-once is a property of the append. The client's raw key never reaches an event; the
-derived tag lives in the reserved `_hekla_` namespace, which no event definition can emit and no
-`query()` can name, so request plumbing never becomes domain vocabulary.
+derived tag lives in the reserved `_hekla_` namespace, which no event declaration can emit and no
+slice can name, so request plumbing never becomes domain vocabulary.
 
-**Commands never invoke commands.** Sharing a boundary would make the callee's query a lie, and
-separate appends give partial failure with no rollback. Chaining goes through the log: a command
-emits an event, an effect reacts, and the effect invokes the next command. That path is durable and
-independently retryable.
+**The clause is hekla's alone.** heklang has no idea a request has a key, so the append condition it
+returns carries only the slices; hekla adds the existence clause beside them. That split is why the
+tag survived the port at all: it is not a property of the program, and nothing in the language would
+have carried it.
+
+**Commands never invoke commands**, and that is now enforced by the grammar rather than by a rule:
+`invoke` is an effect construct and a command that writes one does not parse. Sharing a boundary
+would make the callee's slices a lie, and separate appends give partial failure with no rollback.
+Chaining goes through the log: a command emits an event, an effect reacts, and the effect invokes the
+next command. That path is durable and independently retryable.
 
 ## 6. Projectors
 
 A projector consumes events and builds a queryable read model.
 
-**Shape**: entities are declared with `entity(key, fields, indexes)` and collected implicitly from
-module scope. `handle` returns `put` / `patch` / `delete` ops, and may call `get(entity, key)` to read
-the current row first. It is a dict mapping query clauses to functions, and **the keys are the
-subscription**: they say which events to read and what to do with each, so there is no second list
-beside them to keep in step. Several clauses may name one event type, and **every arm whose clause
-matches runs, in declaration order**. No arm can be shadowed by an earlier one, so order fixes only
-the sequence of ops, never which arms run.
+**Shape**: a projector declares its entities and one handler per event it consumes. **The handlers
+are the subscription**: they say which events to read and what to do with each, so there is no
+second list beside them to keep in step.
 
-```starlark
-handle = {
-    order_placed(): lambda event: [put(orders, {...})],
-    order_placed(shop_id = 1): lambda event: [put(shop_one_orders, {...})],
-    order_cancelled(): lambda event: [delete(orders, event.data.order_id)],
+```
+projector CustomerOrders {
+  entity Order {
+    order_id: Uuid @key,
+    customer_id: Int @index,
+    email: String? @max(200),
+  }
+
+  on @order.placed { order_id, customer_id, email } {
+    put Order { order_id, customer_id, email }
+  }
+
+  on @order.cancelled { order_id } {
+    delete Order[order_id]
+  }
 }
 ```
 
-A key is always a call, never a bare definition: one spelling covers the unconstrained and the
-constrained arm, and it is the spelling `query` and `fold` already use. `all_events()` is the clause
-that selects everything, so `{all_events(): on_any}` is how one body handles every event. A
-multi-statement handler is a named `def` referenced from the map, which puts the subscription and the
-handler name on one line and costs no more than a separate subscription list did.
+Four write statements: `put` writes a row whole, `patch` materializes one from zeros if it is
+absent, `update` skips if it is absent, and `delete` removes it. `patch` and `update` read the row
+they write, and a stored `.field` load is filled before any value expression runs, so
+`patch Totals["all"] { count: .count + 1 }` is the running-total idiom.
 
-An arm's clause is matched by tephra's own `Matches` predicate, over the very `QueryItem` the
-subscription lowered it to, so an arm's filter and the subscription's filter are the same code and
-cannot drift apart. Matching happens before the payload is decoded, so an event no arm selects costs
-nothing.
+**Several handlers may name one event type, and every one of them runs**, in declaration order.
+Fanning one event out to several read models is a real pattern, and a projector has no journal, so
+nothing about ordering is dangerous: a rebuild replays every handler in the same order and reaches
+the same rows. **Effects take the opposite rule** (section 7), and the difference is deliberate.
 
-**`get()` reads through uncommitted writes in the current batch.** If a handler `put`s a row and a
-later event in the same batch reads it, it must see the write, or batching would silently change
-behaviour versus processing one event at a time. Read-modify-write (running totals, or reading a row
-for its foreign key before updating a summary) stays in Starlark. There is no arithmetic-op
-vocabulary: a projector is a single sequential writer owning its own database, so there are no
-concurrent writers for an atomic increment to protect against.
+**There is no general read.** A handler cannot ask for an arbitrary row; the only read is the one
+`patch` and `update` do of the row they are about to write. That is what makes rebuild determinism
+structural rather than a property an author has to preserve: a projector that could read anything
+could read something a rebuild has not written yet.
+
+The Starlark version had `get(entity, key)` for exactly the read-modify-write cases `patch` now
+covers, and it read through uncommitted writes in the current batch so that batching did not change
+behaviour. `patch` reads through the same open transaction, so that property survives; what does not
+survive is the ability to read a row this event is not about.
+
+**A column's subject is propagation, not declaration.** No column is authored `@subject`; a column
+that receives sealed content becomes sealed, which is why a projector can store a credential it may
+never `reveal`. That closes a whole family of errors the Starlark version had to catch at runtime: a
+handle filed under the wrong subject id, into a plaintext column, or into a column scoped to a
+different subject. None of the three is representable when the column's scope is computed from what
+is written into it.
 
 **Checkpoint format from day one** is a watermark plus a set of completed positions above it. The
 set is always empty under the sequential model, but building the format now means parallel lanes
@@ -406,7 +423,7 @@ and position move together atomically and a reader that opens the file mid-swap 
 
 **Definition reconcile and readiness**: a projector records the hash of its *definition* (its
 subscription and entity schema, not its handler bodies) inside its read model. At startup the recorded hash is
-compared with the current one before the projector's handle is published, because the read API builds
+compared with the current one before the projector is published, because the read API builds
 its `SELECT` from the current entity definitions while the database on disk still has the previous
 shape, and `CREATE TABLE IF NOT EXISTS` will not add a column to an existing table. Comparing is one
 small read; only the replay it may imply is slow, and that stays on the projector thread, so boot
@@ -416,13 +433,13 @@ never blocks on log length. Each projector therefore carries a readiness:
 - `rebuilding`: the definition changed and a rebuild is in flight. Reads of that projector answer
   `503` with a `Retry-After`; every other projector keeps serving.
 - `stale`: the same mismatch with `[projectors] auto_rebuild = false`, so only an operator resolves
-  it. Reads answer `503` naming `POST /projectors/{name}/replay`, and the thread idles rather than
+  it. Reads answer `503` naming `POST /projectors/{Name}/replay`, and the thread idles rather than
   applying batches, since a batch built from the current entities would fail on a missing column.
   The definition hash is deliberately left unrecorded, so the mismatch stays visible until a replay
   actually rebuilds the model.
 - `rebuild_failed`: a rebuild ran and failed. Like `stale` it needs an operator, but the cause is an
   error rather than a setting, so `last_error` names it and reads answer `503` pointing there. The
-  thread survives the failure and idles, so `POST /projectors/{name}/replay` retries in place once
+  thread survives the failure and idles, so `POST /projectors/{Name}/replay` retries in place once
   the cause is fixed; a rebuild that took the thread down instead left the read API promising a
   `rebuilding` retry that nothing would ever satisfy, recoverable only by restarting. A replay is
   attempted against whatever survived on disk, since the atomic swap is the rebuild's last step and
@@ -451,20 +468,61 @@ Effects are the crown jewel and the biggest departure from umari. They perform s
 and via commands, writes) in reaction to events, and they are durable: an effect that crashes
 mid-way resumes without re-firing side effects it already performed.
 
-**Model**: `handle` is straight-line blocking code that calls injected impure builtins, and takes the
-same shape a projector's does (section 6): a clause-keyed dict, whose keys are the subscription and
-where every matching arm runs in declaration order. Declaration order is what makes fan-out replay-safe: several arms in one invocation journal
-their calls in a fixed sequence, so a replay reproduces it exactly.
-Determinism under replay comes from a journal. Each builtin call looks itself up in the journal
-first: if a result is recorded, it returns that; otherwise it performs the real call and appends the
-result. After a crash, `handle` re-runs from the top, replays journaled calls until it passes the
-end of the journal, then resumes making live calls. There are no step functions and no yielding:
-blocking a thread keeps evaluation state on that thread's stack, and crashes are handled by replay.
+**Model**: an effect is one or more **arms**, each straight-line blocking code over one event type,
+and **the arms are the subscription**. Determinism under replay comes from a journal. Each impure
+call looks itself up in the journal first: if a result is recorded, it returns that; otherwise it
+performs the real call and appends the result. After a crash the arm re-runs from the top, replays
+journaled calls until it passes the end of the journal, then resumes making live calls. There are no
+step functions and no yielding: blocking a thread keeps evaluation state on that thread's stack, and
+crashes are handled by replay.
 
-**Journal key is the content hash of the call** (for HTTP, `(method, url, body)`), plus an optional
-disambiguator for legitimately-identical repeated calls. It is not a sequence number, so editing or
-reordering the script does not corrupt replay, which is what makes live editing safe later. The
-script hash is recorded in the journal. v1 does not pin to it, but on restart, if an in-flight
+```
+effect NotifyCustomer {
+  on @order.placed as e {
+    state orders: Int = fold 0
+      on @order.placed(customer_id: e.customer_id) => orders + 1
+
+    let response = http.post("https://mail.example/confirm", {
+      "to": reveal(e.email),
+      "order_id": e.order_id,
+      "first_order": orders == 1,
+    })
+
+    if response.status >= 400 {
+      fail("confirmation rejected")
+    }
+
+    invoke RecordNotified {
+      order_id: e.order_id,
+      notification_id: Uuid.derive(e.id, "confirmation"),
+    }
+  }
+}
+```
+
+**One event selects exactly one arm**, and two arms naming one event type is a parse error. This is
+the deliberate opposite of the projector rule, and of what hekla did under Starlark, where every arm
+whose clause matched ran in declaration order. Three things went wrong with that:
+
+- **Declaration order became load-bearing for replay.** Arms ran in the order they were written, so
+  moving one changed which side effects were journaled before which.
+- **The trigger binding became polymorphic.** An arm matched by two event types could only name
+  fields common to both. An arm may still list several types explicitly, and then the restriction is
+  visible where it is chosen rather than falling out of which clauses happened to match.
+- **Every cross-arm static rule had to reason about the matched set** rather than about one arm.
+
+A projector legitimately wants the other rule and keeps it: it has no journal, so nothing about
+ordering is dangerous there.
+
+**State lives inside the arm.** `as e` binds the trigger, and it is in scope for the arm's `state`
+filters and its body. There is no effect-level trigger and no effect-level state, which is what lets
+two arms of one effect fold different slices of the log.
+
+**Journal key is the call itself** (for HTTP, `http.post <url> <body>`), plus an ordinal separating
+legitimately-identical repeated calls. It is not a sequence number, so editing or reordering the
+arm does not corrupt replay, which is what makes live editing safe later. The language hands the
+host a readable key and an ordinal; hekla stores the sha256 of the key, which is what keeps the hash
+a host concern and the key the language's. The source hash is recorded in the journal. v1 does not pin to it, but on restart, if an in-flight
 invocation's recorded hash differs from the on-disk code, the runtime logs a warning naming the
 effect and invocation. That makes an otherwise invisible situation visible, and it is exactly the
 field the pinning implementation needs later, so writing it now avoids a journal-format migration.
@@ -489,15 +547,22 @@ the start of the log. The cost of the bound is retention: rows above the waterma
 belonging to a permanently wedged or removed effect, are kept past the window until the cursor moves
 over them.
 
-**Builtins (v1)**: journaled `http.{get,post,...}`; `invoke_command(name, input)` targeting a public
-or internal command; `now()`; `log()`; `reveal()` and `erase()` (section 15). Every one is a real
-side effect or an unrepeatable observation, which is what earns it a journal entry. There is no
-effect-local SQLite and no way to read a projector.
+**What an arm may do**: journaled `http.{get,post,put,patch,delete}`; `invoke Command { ... }`
+targeting a public or internal command; `now()`; `erase(...)` (section 15). `log(...)` and
+`reveal(...)` are not journaled, and each has a reason: a duplicated log line is the least harmful
+thing that can be duplicated, and a `reveal` that replayed stale plaintext against a destroyed key
+would defeat the erasure it is meant to respect. There is no effect-local SQLite and no way to read
+a projector.
 
-**State**: an effect declares `query` / `initial` / `fold` exactly as a command does, with `query`
-taking the triggering event where a command's takes `input`, and each `handle` arm receiving
-`(event, state)`. The fold is bounded at the effect's own position, inclusive, so `state` is a pure
-function of the log prefix and that position.
+**`invoke` takes a typed struct**, checked at compile time against the target command's declared
+parameters, and its literals are parsed with the parameter's type as their hint. The runtime check
+stays as well, because a journaled value can be read back by a build other than the one that wrote
+it: an invocation straddling a deploy hits its first not-yet-journaled `invoke` against a command
+that may have changed.
+
+**State**: an arm declares `state` exactly as a command does, with the trigger binding in scope for
+its filters. The fold is bounded at the arm's own position, inclusive, so `state` is a pure function
+of the log prefix and that position.
 
 That bound is the whole design. Because the state is derived rather than observed, it cannot race a
 projector, it is identical on every attempt and every replay, and it needs no journal entry: there
@@ -509,11 +574,12 @@ could clear. Folding the log has no such failure mode. Its cost is that a wide b
 per invocation, and effects are sequential, so that comes off throughput; a boundary keyed on an
 entity id is as important here as it is for a command.
 
-**Writing outcomes**: effects do not append events; they `invoke_command`, and that invoke is a
-journaled, idempotent side effect, so durable domain facts (tracking numbers, external ids) land
-exactly once across replays. The idempotency key an effect passes is deterministic, so the target
-command tags every event it emits with the tag derived from it and guards the append against that
-tag. A replay (or a crash between the command's append and the effect's journal write) finds the
+**Writing outcomes**: effects do not append events; they `invoke`, and that invoke is a journaled,
+idempotent side effect, so durable domain facts (tracking numbers, external ids) land exactly once
+across replays. The idempotency key is derived from the journal identity of the call itself (the
+effect, the position, the call key and its ordinal), so it is the same on every replay and different
+for every call; the target command tags every event it emits with it and guards the append against
+that tag. A replay (or a crash between the command's append and the effect's journal write) finds the
 prior commit by that tag and returns its recovered outcome without re-running the command:
 exactly-once is enforced by the event log itself, not by any op-DB reservation. This is the same
 mechanism, and the same guarantee, as for HTTP commands. A command rejection is a normal terminal
@@ -522,24 +588,37 @@ was already cancelled, the order already fulfilled), the runtime records the rej
 journal and completes the invocation. Treating rejection as retryable would loop forever on
 legitimately-stale completions.
 
-**Retry split**: the runtime absorbs transport errors and every retryable status (408, 425, 429 and
-any 5xx) with backoff, and those never reach the script. A result that reaches Starlark is therefore
-always terminal, so `status >= 400` in a handler is a real, decide-what-to-do failure rather than
-something every effect re-implements. The split has to fall there rather than in the script, because
-every response that reaches a handler is journaled: an effect that raised on a 429 would replay the
-recorded 429 on every retry, never re-send, and wedge until an operator skipped it and dropped the
-work. A `Retry-After` on a retryable response raises that attempt's backoff (delta-seconds only,
+**Retry split**: transport errors and every retryable status (408, 425, 429 and any 5xx) are
+absorbed and re-sent, and never reach an arm. A result that reaches one is therefore always
+terminal, so `status >= 400` is a real, decide-what-to-do failure rather than something every effect
+re-implements. The split has to fall there rather than in the arm, because every response that
+reaches one is journaled: an effect that failed on a 429 would replay the recorded 429 on every
+retry, never re-send, and wedge until an operator skipped it and dropped the work.
+
+**The re-send loop is the language's and the attempt is the host's.** heklang decides whether a
+status is retryable and how many times to try; hekla makes the request. Two hosts answering one
+program differently is exactly what that split rules out. When every attempt is absorbed, the call
+comes back as "the URL did not answer" and the invocation wedges.
+
+A `Retry-After` on a retryable response raises the *invocation's* backoff (delta-seconds only,
 capped at five minutes) so a limiter's own window is waited out rather than hammered; it never
 lowers the backoff, so a limiter repeating `Retry-After: 1` still gets exponentially rarer attempts.
+The header never reaches a program: rule 5 makes it the host's business precisely so an arm cannot
+see it, so hekla reads it off the response and hands it to its own driver. Where the wait happens
+moved with the port. It used to be the only wait there was, since a 429 wedged the invocation
+immediately; now the language re-sends a few times first, so a limiter that refuses once and then
+relents is absorbed inside the invocation and no wait is owed.
 
-**Wedging and the skip hatch**: transport errors, retryable statuses, and a raised handler all wedge
-the invocation.
+**Wedging and the skip hatch**: an exhausted re-send loop and a host error both wedge the
+invocation. An author's own `fail(...)` does not: it is a terminal outcome that completes the
+position and advances, because an author saying "this cannot be processed" is a decision rather than
+a fault.
 The runtime retries the whole invocation with capped exponential backoff, forever, replaying journaled
 calls each attempt so completed side effects never re-fire, and never skipping. Because a wedge is not
 the same as ordinary lag, the status endpoint reports each effect's consecutive-failure count and last
 error alongside its position. The only way past a genuinely unprocessable event is fixing the code and
 restarting (which replays the running invocation) or an explicit, manual operator skip
-(`POST /effects/{name}/skip/{position}`); nothing is skipped automatically. The durable resume point is
+(`POST /effects/{Name}/skip/{position}`); nothing is skipped automatically. The durable resume point is
 a per-effect watermark advanced only once a batch's invocations are all terminal, so a crash re-scans
 from the last completed batch and never skips an event; the journal rows and the terminal record commit
 call-by-call in autocommit, never in one per-invocation transaction, which is what lets journaled side
@@ -568,22 +647,27 @@ silent.
 ## 8. Runtime and concurrency
 
 - Lightweight tokio tasks with bespoke supervision. No actor framework in v1.
-- Commands run on `spawn_blocking`, because Starlark evaluation is synchronous.
+- Commands run on `spawn_blocking`, because evaluation is synchronous.
 - One sequential task per projector.
 - One dedicated thread per effect (the projector model), each running its invocations synchronously in
   strict position order. The configured blocking-pool size is validated but reserved for a real shared
   pool once partition-key parallel lanes land (section 7).
-- starlark-rust specifics: `FrozenModule` is `Send + Sync`, so a module is parsed and frozen once at
-  load and shared across tasks. A fresh `Evaluator` per invocation with a tick budget bounds runaway
-  scripts.
+- **The program is compiled once at load and shared.** A `heklang::Program` is `Send + Sync` and is
+  held behind an `Arc`, so every command attempt, projector batch and effect invocation runs against
+  the same compiled artefact. What is per-run is the *host*: one `HeklaHost` per request or
+  invocation, carrying that run's causation, its pinned append time and its idempotency identity,
+  which is exactly the scope tephra's writer is not.
+- **Nothing bounds a runaway program, because nothing can run away.** The tick budget the Starlark
+  evaluator needed has no counterpart: heklang has no `while`, rejects recursion, and iterates only
+  finite containers.
 
 ## 9. Storage layout
 
 ```
 data/
   events/                # tephra segments (immutable source of truth)
-  projectors/{name}.db   # read-model tables + checkpoint (one transaction)
-  hekla.db                # shared operational DB: effect journals, subject keys, module metadata
+  projectors/{Name}.db   # read-model tables + checkpoint (one transaction)
+  hekla.db               # shared operational DB: effect journals, subject keys, module metadata
 ```
 
 Backup is "copy the directory". Projector databases are rebuildable from the log regardless, so a
@@ -591,20 +675,21 @@ consistent copy is not required for them.
 
 ## 10. HTTP API surface (v1)
 
-- `POST /commands/{name}` executes a command (public commands only), accepting idempotency-key and
-  correlation-id headers, and echoes correlation and causation. The outcome maps to status: committed
-  to 200 (with the appended positions), `reject` to 422, `invalid_input` to 400, and a DCB
-  concurrency conflict that survives retries to 409. An idempotency key whose first attempt
+- `POST /commands/{Name}` executes a command (public commands only), accepting idempotency-key and
+  correlation-id headers, and echoes correlation and causation. `{Name}` is the declared name, so a
+  `command PlaceOrder` is at `/commands/PlaceOrder` whatever its file is called. The outcome maps to
+  status: committed to 200 (with the appended positions), `reject` to 422, `invalid` to 400, and a
+  DCB concurrency conflict that survives retries to 409. An idempotency key whose first attempt
   committed replays that commit's response, positions and original correlation and causation
   included; a key whose first attempt rejected has nothing in the log to replay, so it re-decides.
-- **Read API generated from entity schemas**: `GET /read/{projector}/{entity}/{key}` and an indexed
-  filter/scan endpoint. Only declared indexes are filterable; an unindexed filter is a 400 telling
+- **Read API generated from entity schemas**: `GET /read/{Projector}/{Entity}/{key}` and an indexed
+  filter/scan endpoint. Both names are declared names, so `GET /read/CustomerOrders/Order/{id}`. Only declared indexes are filterable; an unindexed filter is a 400 telling
   the author to declare the index, never a table scan. Pagination is cursor-based, not offset. Every
   read response includes the projector's log position, and an optional `?after=<pos>` waits for the
   projector to reach that position before reading (read-your-writes), failing closed with 503 on
   timeout (section 6).
-- `POST /projectors/{name}/replay`.
-- `POST /effects/{name}/skip/{position}`: an explicit, manual operator action to advance a wedged effect
+- `POST /projectors/{Name}/replay`.
+- `POST /effects/{Name}/skip/{position}`: an explicit, manual operator action to advance a wedged effect
   past a genuinely unprocessable event. Never automatic.
 - `GET /status` and health: per-module positions and lag (position vs log head), plus each effect's
   consecutive-failure count and last error, so a wedge is distinguishable from ordinary lag.
@@ -650,64 +735,44 @@ consistent copy is not required for them.
 ## 11. CLI and dev loop
 
 - `hekla serve <dir>`: run the runtime and HTTP API from a project directory, loading at startup.
-- `hekla check <dir>`: the only static analysis Starlark gets, so it is thorough. It parses,
-  resolves the load graph, verifies every query filters on tags the event type actually declares,
-  verifies event constructors match field schemas, and verifies projector indexes reference declared
-  fields. For CI and pre-commit.
-- `hekla test <dir>`: events in, assert what the module did, for all three kinds. Every case seeds a
-  throwaway store with `given` and then runs one module against it: a **command** produces events, a
-  rejection or invalid input; a **projector** produces the rows the read API reads back (subject
-  columns decrypted, as `GET /read/...` would return them); an **effect** produces the ordered
-  sequence of `http_call(...)`, `command_call(...)` and `erase_call(...)` it made, with `responds`
-  stubbing the HTTP replies (its state comes from folding the seeded `given` log, section 7).
-  Pure functions with declared inputs make the harness small, and it is what earns trust in an
-  untyped language. Everything a handler can observe is pinned so a case is reproducible: the clock,
-  the master key, each `given` event's `event.id` (counting from
-  `00000000-0000-0000-0000-000000000001`, so an id derived with `uuid5` is assertable), and its
-  `event.timestamp`, which is the same fixed clock. A case tests
-  the author's logic, not the runtime around it: batching, checkpoints, retry, the journal and
-  replay are covered elsewhere.
+- `hekla check <dir>`: parse the project and report every finding. Most of what this used to do is
+  the language's now (section 4), so what is left is what hekla alone knows: that a declaration sits
+  in the directory its kind requires, that a read model can be keyed and indexed the way the read API
+  needs, that no event field occupies the reserved `_hekla_` tag namespace, and three lints. For CI
+  and pre-commit.
+
+  The lints are warnings, never errors, because each is a judgement call and an error would stop a
+  valid project deploying over one: a personal-looking field with no `@subject` (it could never be
+  erased), a boundary with no filter on a high-cardinality field (it defeats the append's fast
+  reject), and a boundary pinning nearly every field of an event (a slice is a subset match, so
+  over-constraining matches nothing).
+- `hekla test <dir>`: events in, assert what the declaration did, for all three kinds. Every case
+  seeds a throwaway world with `given` and then runs one declaration against it: `run` a **command**
+  and expect its events or its refusal, `project` a **projector** and expect its rows, `deliver` an
+  **effect** and expect the ordered calls it made, with `respond` stubbing the HTTP replies and
+  `erased` destroying a subject key up front.
+
+  **The runner is the language's and the world is hekla's.** heklang defines what an expectation
+  means; hekla supplies real tephra, a real SQLite read model, a real `KeyStore` and a stubbed
+  network. One definition of `expect`, two worlds. That split is what makes an erasure case worth
+  running: in heklang's own harness a seal carries plaintext and "erased" is a flag, so
+  `erased customer_id "7"` then `project CustomerOrders` then `expect Order[...] { email: none }`
+  could not fail. Here the column holds AES-SIV ciphertext and the key is really deleted.
+
+  It also holds the rule that **a test cannot see anything a program cannot**. The only
+  world-dependent assertion is a row, and it is read through the same seam `patch` reads through, so
+  a case cannot assert on folded state, on an append condition, or on how many times something was
+  retried. Everything a handler can observe is pinned so a case is reproducible: the clock, the
+  master key, and each `given` event's id (counting from `…-000000000001`, so an id derived with
+  `Uuid.derive` is assertable) and timestamp.
 - `hekla verify <dir>`: the runtime invariant sweep over a data directory. Section 11.2.
-- `hekla fmt`: starlark-rust ships a formatter, and indentation is syntactically meaningful.
-- `hekla lsp`: the language server, over stdio. Section 11.1.
 
-### 11.1 The language server
-
-Hekla modules are Starlark, but not *generic* Starlark, and that is precisely why hekla has to serve
-them itself. Two things a general-purpose Starlark server cannot know: **which builtins are in scope
-depends on the directory** (a projector has `get` and no clock, an effect has `http` and a journaled
-one, a test file has `case`), and **`load()` resolves against the project root** under the
-`events/`-or-`lib/` restriction. Point a Bazel-flavoured server at a hekla project and every builtin
-reads as undefined and every import resolves to the wrong place. `hekla lsp` is built on
-[`starlark_lsp`](https://github.com/facebook/starlark-rust), which supplies the protocol; hekla
-supplies the language knowledge.
-
-What it does:
-
-- **Diagnostics**, in three tiers. Parse errors; then hekla's `load()` rules and name resolution
-  against the directory's own builtins; then, unless `--no-project-checks`, the file evaluated
-  against the project's `events/` and `lib/` modules with the same shape and clause checks
-  `hekla check` runs. The governing rule is that it never reports a problem `hekla check` would not,
-  which a test asserts against the shipped examples.
-- **Hover** on any builtin, from the same doc comments the runtime carries.
-- **Goto-definition** into a generated stub for a builtin, and into the real file for a `load()`.
-- **Completion** of the directory's builtins, and of `load()` paths, which offers exactly the
-  loadable modules, turning the restriction into a list rather than a rule to trip over.
-
-It does **not** do formatting, rename, document symbols, semantic tokens or code actions: the crate
-advertises none of them. Use `hekla fmt` (or buildifier) as an editor format-on-save task. It also
-does not re-diagnose a file's dependents when a shared module changes, and it has no file watching;
-on-disk changes are picked up by a short poll. Whole-project diagnostics remain `hekla check`'s job,
-since the protocol only publishes for open documents.
-
-Editor setup. The server takes no project directory: each open file is placed in its own project, so
-one session can span several (this repository's `examples/` holds two).
-
-- **Helix**: this repository carries `.helix/languages.toml`; copy it into a project to use it there.
-- **Neovim**: `vim.lsp.start({ name = "hekla", cmd = { "hekla", "lsp" }, root_dir = ... })`, or a
-  `configs.hekla` entry for `lspconfig` with `filetypes = { "starlark" }`.
-- **VS Code / Zed**: any generic LSP bridge extension, with the command `hekla lsp` for `.star` files.
-
+**`hekla fmt` and `hekla lsp` are gone.** Both were Starlark tooling: starlark-rust ships a formatter
+and a language server, and hekla wrapped them with its own project knowledge (which builtins are in
+scope depends on the directory, and `load()` resolves against the project root). heklang has a
+tree-sitter grammar and neither of those yet, so the subcommands were dropped rather than stubbed.
+The ~1,300 lines behind them, and the `starlark_lsp` / `lsp-server` / `lsp-types` dependencies that
+existed only to match it, went with them.
 
 ### 11.2 Invariant checks
 
@@ -716,8 +781,13 @@ faults worth spending verification on are the ones nothing can undo: an event th
 been appended, an effect that fired twice. A wrong read model, by contrast, is a rebuild. The checks
 follow that asymmetry.
 
-Four invariants. Three are reported as a `verify::Violation`; fold determinism is not,
-because there is no safe way to continue from it.
+Three invariants, each reported as a `verify::Violation`.
+
+There were four. **Fold determinism** checked that the same boundary at the same position folds to
+the same state, because section 7's claim that state can be derived rather than stored rested on it.
+It is gone, because heklang removes its sources by construction: ordered maps, a clock a fold cannot
+reach, no randomness, and no read of anything but the log. The check itself lived inside the chunked
+fold, comparing two Starlark states, so it had nowhere left to stand once the chunking went.
 
 - **Rebuild equivalence**: a projector rebuilt from position 0 matches the live one row for row.
   Compared exactly rather than approximately, because subject encryption is deterministic AES-SIV and
@@ -731,10 +801,6 @@ because there is no safe way to continue from it.
   tidy: the divergence being hunted is exactly the case where a naive replay would fire a real side
   effect, so the check must be incapable of causing it. The sequence is compared as an ordered list,
   which is the part the content-keyed journal cannot see for itself.
-- **Fold determinism**: the same boundary at the same position folds to the same state. Section 7's
-  claim that state can be derived rather than stored rests entirely on this. The second fold is
-  bounded at the position the first one reached, so a concurrent append reads as ordinary DCB
-  contention rather than as nondeterminism.
 - **Checkpoint monotonicity**: no position reached by *tailing* moves backwards. A rebuild replaces
   the model, so it publishes its checkpoint without that guard: a bounded rebuild legitimately lands
   behind, and treating that as a violation stopped the projector while leaving it readable.
@@ -742,8 +808,7 @@ because there is no safe way to continue from it.
 Two entry points over one set of checks. `hekla verify <dir>` sweeps offline and exits non-zero on a
 violation, for CI or a nightly job; it takes the data-directory lock, so the documented shape is to
 verify a copy of the directory, which exercises the backup at the same time. `serve --verify` (or
-`[verify] enabled` in `hekla.toml`) runs the per-operation half continuously. `hekla test` always
-checks folds: a scenario is cheap, and it is where a nondeterministic fold should surface first.
+`[verify] enabled` in `hekla.toml`) runs the per-operation half continuously.
 
 A violation **quarantines the component**: it stops advancing, `/status` names what broke, and the
 rest of the runtime keeps serving. A quarantined projector's reads return 503 rather than its rows,
@@ -752,13 +817,32 @@ read-your-writes wait against a position that moved backwards would resolve on a
 
 Rebuild equivalence is offline only: it costs a full log replay, and against a live projector the
 shadow model would race the one it is comparing to.
-## 12. Why Starlark (determinism and purity)
+## 12. Why heklang (determinism and purity)
 
 umari pins the wall clock and zeroes the monotonic clock to make commands deterministic, and polices
-nondeterminism with static analysis and linters. Starlark makes it structural: no clock, no
-randomness, and no I/O except injected builtins, so every nondeterministic input is either absent
-(commands and projectors) or journaled by construction (effects). Deployment is source text: no
-toolchain, no compile cache, parse-and-freeze in milliseconds.
+nondeterminism with static analysis and linters. A pure sandboxed language makes it structural: no
+clock, no randomness, and no I/O except through a declared host seam, so every nondeterministic
+input is either absent (commands and projectors) or journaled by construction (effects). Deployment
+is source text: no toolchain, no compile cache, parse in milliseconds.
+
+Starlark supplied that much, and hekla was built on it first. What it could not supply is the second
+half: **the rules of this domain are not expressible in a general-purpose language, so they had to be
+enforced by a validation pass instead.** That pass grew to sixteen checks over 4,039 lines of
+hand-built globals, value types and marshalling, and it could only ever be as good as its own
+approximations, most visibly in evaluating a boundary against a stubbed input and so seeing one
+branch of it.
+
+heklang moves each of those into the grammar or the type system. A command cannot call out because
+`invoke` does not parse in one. A projector cannot decrypt because `reveal` does not parse in one. A
+fold cannot read the clock. Sealed content cannot be compared, interpolated or sent. A read model
+column's subject is computed from what is written into it, so it cannot disagree with its content.
+An event is written whole or not at all. Each of those replaces a runtime failure, a validation rule,
+or in several cases a class of bug that had no check at all.
+
+The mechanical results are worth naming, because they are the argument in numbers: the four constructs
+a command's boundary needed became one, the chunked fold and its four tuning constants went, the
+instruction budget went, `load()` and its resolver went, and `hekla check`'s sixteen rules became
+three lints plus what a directory means.
 
 ## 13. Non-goals
 
@@ -766,35 +850,55 @@ toolchain, no compile cache, parse-and-freeze in milliseconds.
 effect lanes; an upload API with versioning, pinning, and retention, plus hot reload; a fold
 library; a workspace crate split.
 
-**Permanent commitments** (not deferrals, and not to be reopened): Starlark is the only authoring
-surface. There is no Rust, TypeScript, or WASM SDK path now or later. This is deliberate: a single
-pure, sandboxed authoring language is what makes determinism structural, deployment source text, and
-the durable-effect journal sound. Multi-language authoring is permanently out of scope.
+**Permanent commitments** (not deferrals, and not to be reopened): **there is exactly one authoring
+surface, and it is heklang.** There is no Rust, TypeScript, or WASM SDK path now or later. This is
+deliberate: a single pure, sandboxed authoring language is what makes determinism structural,
+deployment source text, and the durable-effect journal sound. Multi-language authoring is permanently
+out of scope.
+
+The language behind that surface was Starlark and is now heklang, which is the one thing this
+document has changed its mind about. The commitment was never to Starlark specifically; it was to
+there being exactly one authoring language, chosen for what it makes impossible rather than for what
+it makes convenient. That still holds, and heklang holds it harder.
 
 ## 14. Code layering
 
 hekla is a single crate. The dependency direction is documented and enforced by discipline,
 revisited only when a seam proves real (embeddability, or compile times that actually hurt):
-`starlark_builtins` and `schema` depend on nothing internal; `dispatch` depends on those; `runtime`
-(projectors, effects, journal, storage) depends on `dispatch`; `verify` and `introspect` sit above
-the runtime, reaching into the projector, effect and storage paths they read; `api` and `cli` sit on
-top. `lock` and `ui` depend on nothing internal: `ui` is the console's bytes plus the content
-negotiation over them, so the server depends on it and it depends on nothing.
+`schema`, `tags` and `http` depend on nothing internal; `heklang_host` depends on those and is the
+one file that knows both models, so every conversion between the language and the store lives in it
+and nowhere else; `dispatch` depends on `heklang_host`; `runtime` (projectors, effects, journal,
+storage) depends on `dispatch`; `verify` and `introspect` sit above the runtime, reaching into the
+projector, effect and storage paths they read; `api` and `cli` sit on top. `lock` and `ui` depend on
+nothing internal: `ui` is the console's bytes plus the content negotiation over them, so the server
+depends on it and it depends on nothing.
+
+**`heklang_host` is the seam and is meant to be the only one.** It implements heklang's five host
+traits (`Log`, `Clock`, `Keys`, `Http`, plus `Calls` per invocation and `Rows` per projector) against
+tephra, the key store, `ureq` and the operational DB. Everything in it is a conversion: positions
+(heklang counts from zero, tephra from one), JSON in both directions against a declared type, and
+crypto, which lives entirely *below* the seam because heklang models a seal logically and hekla
+really encrypts. The language never sees a ciphertext and the store never sees a plaintext.
 
 ## 15. Subject-scoped encryption and erasure
 
-A field marked `subject = "sibling_field"` is encrypted under a key scoped to that subject's identity
+A field marked `@subject(sibling_field)` is encrypted under a key scoped to that subject's identity
 `(subject_field, subject_value)`, in the tag index, the event payload, and any read-model column, all
 before it reaches tephra. **Erasing a subject is deleting its key**, one O(1) operation that makes
 every value scoped to it unmatchable and unreadable across the log and every read model at once, with
 no rewrite, compaction, or index rebuild.
 
 **Two ways to erase**, the same key delete either way. `hekla erase <field> <value>` is the operator
-path, for a one-off request handled by hand. `erase(subject_field, subject_value)` is the effect
-builtin, for erasure driven by an event: a provider webhook, a retention deadline, an
-`account.closed` your own command emitted. It is journaled like every other effect side effect, and
-idempotent besides, so a replay neither repeats the deletion nor reports a different answer than the
-first run saw.
+path, for a one-off request handled by hand. `erase(customer_id)` is the effect statement, for
+erasure driven by an event: a provider webhook, a retention deadline, an `account.closed` your own
+command emitted. It recovers the subject from the value, which must be a field of the triggering
+event and may not itself be sealed; `erase(subject, value)` names the subject explicitly where the
+inference does not apply. It is journaled like every other side effect, so a replay skips it.
+
+**`erase` returns nothing.** hekla's used to return whether a key was really deleted, and an author
+reading that was branching on whether someone else got there first: a race that is always already
+lost, since the key is gone by the time they read it. Dropping the result costs nothing and keeps
+`erase` out of expression position, which is what makes the erase-last analysis below exact.
 
 Erasure from a handler has two ordering rules, both consequences of `reveal()` deliberately not being
 journaled (it re-decrypts every attempt, which is what makes an erased subject fail rather than
@@ -810,9 +914,14 @@ replay stale plaintext):
 
 **Erasure is a point-in-time shred, not a tombstone.** A later event writing a subject-scoped field
 for the same subject mints a fresh key (`encrypt_subject` creates on first use), so values written
-after the erase are readable while everything before it stays shredded. A read path never resurrects
-a key: `encrypt_subject_existing` returns `None` for a missing subject and the clause is lowered to
-match nothing.
+after the erase are readable while everything before it stays shredded.
+
+**No read path ever resurrects a key**, and there are two of them. An append mints on first use; a
+*projection* must not, because re-projecting a log whose subject has been erased would otherwise
+create the very key the erasure destroyed and write readable content under it, undoing a shred by
+rebuilding a read model. So a projector writes through `encrypt_subject_existing`, which answers
+`None` for a missing subject, and the column is written NULL: absent, which is the same answer the
+read API gives a reader.
 
 **Mechanism.** Encryption is deterministic (AES-SIV): the same plaintext under the same key and field
 yields the same ciphertext, so it works as an equality-matchable tag while staying decryptable. Each
@@ -820,18 +929,39 @@ per-subject key is a random secret stored in `hekla.db`, wrapped with AES-256-GC
 from `HEKLA_MASTER_KEY` and tagged with the wrapping master's id so masters can rotate online:
 `hekla rotate` rewraps every row under a new `HEKLA_MASTER_KEY`, unwrapping with
 `HEKLA_MASTER_KEY_PREVIOUS` as needed, without touching any ciphertext. The global uniqueness key
-behind `unique = True` is a wrapped reserved secret, so rotation never changes global tags.
+The reserved uniqueness secret that used to sit beside these went with `unique` (below).
 
 **Information flow.** Plaintext of a subject field exists only at the HTTP command input (the client
-supplied it) and at read-API output or an effect's `reveal()` (the runtime decrypted it). Everywhere
-between (log, tag index, read-model columns, and every `fold`/projector `handle` body) it is
-ciphertext. A handler reads a subject field as an opaque handle: it can store it (`put`/`patch` keep
-the ciphertext) and compare it for equality, but not concatenate, slice, or otherwise derive a
-plaintext string from it. Because read models store ciphertext and the read API decrypts on the way
-out, deleting the key shreds the log and every read model together. A derivation a handler wants must
-be computed by the command and emitted as its own subject field. An effect crosses the boundary
-explicitly with `reveal(handle)`; a `reveal` of an already-erased subject fails terminally (no retry
-can recover the data).
+supplied it) and at read-API output or an effect's `reveal(...)` (the runtime decrypted it).
+Everywhere between (log, tag index, read-model columns) it is ciphertext.
+
+**A program sees sealed content, which is a type rather than an opaque value.** Exactly three things
+may be done to it, and everything else is a compile error:
+
+| | Why it is safe |
+| --- | --- |
+| **Move it** into a position sealed under the same subject: a `let`, a `state` fold, an entity column, another event field | the content is never read |
+| **Ask if it is there**: `.is_some()` / `.is_none()` | presence is not content |
+| **`reveal` it** | the boundary itself |
+
+So `log(email)`, `"{email}"`, `http.post(url, { "to": email })`, `invoke C { note: email }`,
+`email.trim()`, `email.unwrap_or("")` and `if email == "x"` are each refused where they are written.
+Writing *plain* content into a seal is free, because that is the encrypting direction: a command
+holding an ordinary `String` may emit it into a `@subject(...)` field with no ceremony.
+
+That is stricter than the Starlark handle in one direction and looser in another, and both matter.
+Stricter: a handle could be compared for equality, and an equality over two ciphertexts leaks whether
+they hold the same value, so it is gone. Looser: a handle could not be carried into an `emit` at all,
+so a command could not move a customer's own address forward; moving sealed content into a field
+sealed under the *same* subject is legal, because moving is not reading.
+
+Because read models store ciphertext and the read API decrypts on the way out, deleting the key
+shreds the log and every read model together. A derivation an author wants must be computed by the
+command and emitted as its own subject field. An effect crosses the boundary explicitly with
+`reveal(...)`, which is an optional in and an optional out: absent stays `none` **without consulting
+the key store at all**, because a value that was never set was never encrypted. Only a *present*
+value under a shredded key fails, and it fails terminally, because no retry can recover it. "Never
+set" and "key destroyed" are different facts and must not collapse.
 
 **Per-field, not per-event.** An `order.placed` has both a customer and a shop, so scoping the whole
 event to one destroys the other's record on erasure. Per-field puts `email` under the customer key
@@ -845,15 +975,28 @@ and `order_total` under the shop key, and leaves the ids plaintext.
 - **Deterministic encryption is searchable encryption.** It leaks equality and frequency: an observer
   with index access learns which events share a value. Fine for high-cardinality ids; do not give a
   low-cardinality field (a status enum) a subject.
-- **`unique = True` keeps a global token past erasure.** After erasing a subject, a global-key tag
-  still proves "some subject once used this value" without revealing it, and the global index is
-  dictionary-attackable if the master key leaks. It is strictly weaker than the per-subject case, so
-  it is opt-in per field.
+- **There is no cross-subject uniqueness on a sealed field.** `unique = True` used to mint a tag
+  under a never-erased global key, so one email could be matched across every account and stayed
+  matched after erasure. It required an equality on sealed content, which is now refused for the
+  reason above, so the feature and its reserved secret are deleted. What replaces it is an ordinary
+  boundary on a plaintext field beside the sealed one: `examples/orders` keeps a per-shop allocation
+  cap, and `ACCOUNT_EVENTS` in the test suite keeps a plaintext `handle` beside a sealed `email`.
+  Erasing a subject does not reopen a handle it claimed, which is the property `unique` existed for,
+  and it holds with no key at all.
 - **A field appended without a subject cannot be erased** until a segment-rewrite tool exists (out of
   scope): its plaintext is already in the log payload and tag index, and replaying projectors just
   re-reads it. `hekla check` warns when a personal-looking field name has no subject.
+- **A fold decrypts eagerly**, which under Starlark it did not. heklang's seal holds plaintext and
+  its key seam answers only "is this subject erased", so the adapter decrypts every subject-scoped
+  field of every record a fold reads, where a handle used to keep ciphertext opaque all the way
+  through. Measured at 3.5µs a record, which makes a fold over an encrypted boundary about four times
+  the cost of the same fold over plaintext (`tests/measure.rs`). It is forced rather than chosen, and
+  it is the motivating number for closing heklang's ciphertext gap.
 - **Range predicates over encrypted tags are foreclosed** (tags are equality-only anyway).
-- **One subject per field**; genuinely joint data (a message between two people) is deferred.
+- **One subject per field**, and **one subject per variable**: two fold arms writing values sealed
+  under different subjects into one variable is an error naming both, because `reveal` names the key
+  by the subject and a runtime answer would make the terminal message unpredictable. Genuinely joint
+  data (a message between two people) is deferred.
 - **Effect external sinks are outside the boundary.** Erasure shreds hekla's own store; it cannot
   un-send an email an effect already delivered. The effect journal holds revealed plaintext only
   transiently, until the retention sweeper reclaims the completed invocation.

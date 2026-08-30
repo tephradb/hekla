@@ -1,0 +1,23 @@
+// A read model of users by id, with a secondary index on email. Read one by key at
+// `GET /read/Users/User/{user_id}`, or filter the indexed email at
+// `GET /read/Users/User?email=alice@example.com`.
+
+projector Users {
+  entity User {
+    user_id: Uuid @key,
+    email: String @index @max(200),
+    name: String @max(120),
+  }
+
+  // The handlers are the subscription: they say which events to read and what to do
+  // with each, so there is no second list to keep in step with them.
+  on @user.registered { user_id, email, name } {
+    put User { user_id, email, name }
+  }
+
+  // `update` rather than `patch`: a rename for a user who was never registered is not
+  // a user with a zeroed email, it is nothing at all.
+  on @user.renamed { user_id, name } {
+    update User[user_id] { name }
+  }
+}

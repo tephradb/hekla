@@ -1,17 +1,18 @@
 # 🌋 hekla
 
-A single-app event-sourcing runtime you write in Starlark, over the Dynamic Consistency Boundary.
+A single-app event-sourcing runtime you write in [heklang](../heklang), over the Dynamic Consistency
+Boundary.
 
 Business logic is plain source text: **commands** validate input, replay the history a decision
 depends on, and append events; **projectors** consume events into queryable SQLite read models;
 **effects** react to events with durable, replay-safe side effects. There is no build step, because
 there is nothing to compile. Deploy is restart.
 
-Starlark is pure and sandboxed, so determinism is structural rather than policed: a handler has no
-clock, no randomness and no I/O beyond the builtins hekla injects. That is what lets a projector
-rebuild and an effect replay reproduce exactly what they did the first time, and what lets the
-runtime give effects a Temporal-style journal so a crash mid-handler resumes without re-firing what
-already happened.
+heklang is pure and sandboxed, so determinism is structural rather than policed: a command cannot
+call out, a projector cannot decrypt, and a fold cannot read a clock, each because of what kind of
+declaration it is rather than because something checks. That is what lets a projector rebuild and an
+effect replay reproduce exactly what they did the first time, and what lets the runtime give effects
+a Temporal-style journal so a crash mid-arm resumes without re-firing what already happened.
 
 hekla runs on [tephra] for the event log and SQLite for read models. It is a rewrite of [umari],
 which expressed the same model as WASM component modules.
@@ -21,46 +22,46 @@ which expressed the same model as WASM component modules.
 
 ## What a project looks like
 
-```starlark
-# events/order.star
-order_placed = event(
-    type = "order.placed",
-    fields = {
-        "order_id": uuid(),
-        "customer_id": uint(),
-        # Encrypted under a key scoped to the customer, so erasing them is one
-        # key delete. `unique` keeps a global tag that survives that erasure.
-        "email": str(subject = "customer_id", unique = True, max_length = 200),
-    },
-)
+```hek
+// events/order.hk
+event @order.placed {
+  order_id: Uuid,
+  customer_id: Int,
+  shop_id: Int,
+  // Encrypted under a key scoped to the customer, so erasing them is one key delete.
+  // Optional because an erased column reads back absent, and a type that cannot be
+  // absent could not say so.
+  email: String? @subject(customer_id) @max(200),
+}
 
-# commands/place-order.star
-load("events/order.star", "order_placed")
+// commands/place-order.hk
+command PlaceOrder(order_id: Uuid, customer_id: Int, shop_id: Int, email: String?) {
+  // `state` is a read declaration, not a binding: it names a slice of the log, folds
+  // it, and that slice is what the append conditions on. What you folded is what you
+  // conflict on, so a concurrent write inside it loses rather than races.
+  //
+  // Narrow: this one order, so a retry of the same id is a no-op.
+  state placed: Bool = fold false
+    on @order.placed(order_id) => true
 
-input = schema(order_id = uuid(), customer_id = uint(), email = str())
+  // Wide on purpose: a launch allocation is a rule about every order in the shop.
+  state sold: Int = fold 0
+    on @order.placed(shop_id) => sold + 1
 
-# The consistency boundary: every order placed with this email. The same query
-# guards the append, so a concurrent duplicate loses rather than races.
-def query(input):
-    return order_placed(email = input.email)
+  if placed {
+    return
+  }
+  if sold >= 100 {
+    return reject("sold_out", "this shop's launch allocation is gone")
+  }
 
-initial = {"taken": False}
-
-fold = {order_placed(): lambda state, event: dict(state, taken = True)}
-
-def handle(input, state):
-    if state["taken"]:
-        return reject("email_taken", "that email has already ordered")
-    return order_placed(
-        order_id = input.order_id,
-        customer_id = input.customer_id,
-        email = input.email,
-    )
+  emit @order.placed { order_id, customer_id, shop_id, email }
+}
 ```
 
-`POST /commands/place-order` runs that. Add a projector and `GET /read/{projector}/{entity}/{key}`
-serves what it built. Both routes are generated from the schemas, with an OpenAPI document and a
-reference UI at `/docs`.
+`POST /commands/PlaceOrder` runs that: the route is the declared name, not the file. Add a projector
+and `GET /read/{Projector}/{Entity}/{key}` serves what it built. Both routes are generated from the
+declarations, with an OpenAPI document and a reference UI at `/docs`.
 
 ## Run it
 
@@ -72,10 +73,10 @@ HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
   cargo run -- serve examples/orders        # the API on 127.0.0.1:8080
 ```
 
-`check` is thorough on purpose: it resolves the load graph, verifies every clause filters on a field
-its event declares and indexes, and warns about a personal-looking field with no `subject`. Also
-`hekla fmt`, `hekla lsp` for editors, `hekla erase` / `hekla rotate` for key management, and
-`hekla verify` for the invariant sweep below.
+`check` reports the compiler's diagnostics plus what only hekla knows: that a declaration sits in
+the directory its kind requires, that a read model can be keyed and indexed the way the read API
+needs, and three warnings, including a personal-looking field with no `@subject`. Also `hekla erase`
+and `hekla rotate` for key management, and `hekla verify` for the invariant sweep below.
 
 ## Checking the invariants
 
@@ -97,19 +98,24 @@ every recorded effect invocation still replays without performing anything. The 
 a *sealed* host that can only read the journal and can never send, so verifying an invocation is
 structurally incapable of repeating it.
 
-`serve --verify` runs the per-operation half continuously: every fold is checked for determinism, and
-every completed invocation is replayed as it finishes. A component that breaks an invariant is
-quarantined (it stops advancing, its reads return 503, and `/status` names what broke) while the rest
-of the runtime keeps serving. Turn it on permanently with `[verify] enabled = true` in `hekla.toml`.
+`serve --verify` runs the per-operation half continuously: every completed invocation is replayed as
+it finishes. A component that breaks an invariant is quarantined (it stops advancing, its reads
+return 503, and `/status` names what broke) while the rest of the runtime keeps serving. Turn it
+on permanently with `[verify] enabled = true` in `hekla.toml`.
 
 One process at a time: a runtime takes an exclusive lock on its data directory, because tephra does
 not lock the segment directory itself.
 
 ## Learn more
 
-- [AUTHORING.md] is the complete reference for writing the Starlark: every builtin, every rule.
+- **[heklang/docs/]** is the language: commands, projectors, effects, folds, sealed content, tests.
+  hekla does not repeat it.
+- [AUTHORING.md] is everything hekla adds around it: the directory convention, the envelope, the
+  generated HTTP surface, the CLI, and how subject encryption really works underneath.
 - [ARCHITECTURE.md] covers the design and the alternatives that were rejected.
 - [ROADMAP.md] tracks what is done and what is next.
+
+[heklang/docs/]: ../heklang/docs/
 
 [AUTHORING.md]: AUTHORING.md
 [ARCHITECTURE.md]: ARCHITECTURE.md

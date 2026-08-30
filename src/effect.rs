@@ -30,41 +30,33 @@
 //!
 //! A *retryable* status is 408, 425, 429 or any 5xx: each names a condition that
 //! clears on its own, with the same request. Keeping 429 out of the script is not
-//! a convenience. A response that reaches Starlark is journaled, so an effect that
+//! a convenience. A response that reaches a handler is journaled, so an effect that
 //! raised on one would replay the recorded 429 on every attempt and wedge forever
 //! without ever re-sending. A `Retry-After` on such a response raises that
 //! attempt's backoff, so a rate limiter's own window is waited out, not hammered.
 
-use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use serde_json::{Value, json};
-use starlark::environment::Module;
-use tephra::{Event, Position, WaitOutcome, WriteHandle};
-use ureq::Agent;
-use ureq::typestate::{WithBody, WithoutBody};
+use heklang::host::{Calls, Recorded};
+use heklang::{Interpreter, Invocation as HekInvocation, Program};
+use tephra::{Position, WaitOutcome};
 
 use crate::config::Config;
-use crate::context::{CommandContext, EffectCtx, EffectHost};
-use crate::crypto::KeyStore;
-use crate::dispatch::{self, EventDefs, arm_selects, lower_dispatch};
-use crate::envelope::{self, Envelope};
+use crate::context::CommandContext;
+use crate::hash::sha256_hex;
+use crate::heklang_host::{HeklaHost, Journal, from_tephra, query_of_types};
+use crate::http::{HttpClient, HttpRequest, HttpResponse};
+use crate::invariant::Violation;
 use crate::loader::EffectUnit;
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
 use crate::runtime::{self, Runtime};
-use crate::starlark_builtins::{
-    EventSpec, LoadedModule, ModuleDef, alloc_event, call_handler_with_effect_ctx,
-    call_handler_with_query_ctx, initial_state, parse_event_dispatch, parse_event_specs, thaw,
-};
-use crate::verify::Violation;
+use crate::schema::ModuleDef;
 
-/// Per-handler instruction budget. Bounds a runaway script at dispatch time.
-const MAX_TICKS: u64 = 10_000_000;
 /// How long an idle, caught-up effect waits before polling again.
 const IDLE_POLL: Duration = Duration::from_millis(250);
 /// The ceiling on the wedge retry backoff, so a stuck effect keeps retrying at a
@@ -73,9 +65,8 @@ const BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// The base wedge retry backoff, doubled each attempt up to [`BACKOFF_CAP`].
 const BACKOFF_BASE: Duration = Duration::from_millis(200);
 /// The ceiling on a `Retry-After` a server asked for. The header is honored past
-/// [`BACKOFF_CAP`], because a rate limiter legitimately names a window longer than
-/// any backoff we would pick for ourselves, but not without bound: this stops a
-/// stray or hostile value from parking an effect for a day.
+/// [`BACKOFF_CAP`], because a limiter naming a long window means it, but not without
+/// bound: a hostile or broken peer must not be able to park an effect for a day.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(300);
 /// How long a graceful shutdown waits for effects to drain before abandoning a
 /// stuck one (its invocation stays `running` and replays next start).
@@ -390,14 +381,13 @@ fn spawn(
     runtime: Arc<Runtime>,
     http: Arc<dyn HttpClient>,
 ) -> anyhow::Result<(Arc<EffectShared>, JoinHandle<()>)> {
-    let ModuleDef::Effect { name, sources } = &unit.loaded.def else {
+    let ModuleDef::Effect { name, sources } = &unit.def else {
         anyhow::bail!("spawn called on a non-effect module");
     };
-    let sources = EventSpec::source_types(sources)
-        .map(|types| types.into_iter().map(str::to_owned).collect());
+    let sources = Some(sources.clone());
     let name = name.clone();
     let resume = runtime.effect_resume_after(&name)?;
-    for position in runtime.running_with_hash_mismatch(&name, &unit.loaded.source_hash)? {
+    for position in runtime.running_with_hash_mismatch(&name, &unit.source_hash)? {
         tracing::warn!(
             "effect `{name}` has an in-flight invocation at position {position} recorded under a \
              different script hash; replaying it against the current code"
@@ -432,43 +422,66 @@ fn run(
     runtime: Arc<Runtime>,
     http: Arc<dyn HttpClient>,
 ) {
-    // Supervise the driver: a transient store or op-DB error must not silently
-    // kill the effect. It surfaces as a wedge (so `/status` shows it) and the
-    // driver re-subscribes with capped backoff, matching the invocation-level
-    // "retry forever" promise. `run_inner` returns `Ok` only on a clean stop.
+    supervise(&shared, |subscribed| {
+        run_inner(&shared, &unit, &runtime, &http, subscribed)
+    });
+}
+
+/// Supervise the driver: a transient store or op-DB error must not silently kill the
+/// effect. It surfaces as a wedge (so `/status` shows it) and the driver re-subscribes
+/// with capped backoff, matching the invocation-level "retry forever" promise. `drive`
+/// returns `Ok` only on a clean stop.
+///
+/// It reports getting back on the log by calling the callback it is handed, rather than
+/// by returning, because the two facts that recovery carries land at different times:
+/// the wedge clears the moment the driver is reading events again, which can be hours
+/// before the run ends, while the retry ladder resets when it does. Taking the driver
+/// as a parameter is what lets both be tested without a store behind them.
+fn supervise(shared: &EffectShared, mut drive: impl FnMut(&mut dyn FnMut()) -> anyhow::Result<()>) {
     let mut attempt: u32 = 0;
     loop {
-        // Whether the driver got as far as re-subscribing. A run that did is a
-        // recovery however it ended: the ladder is for a driver that cannot start,
-        // and without this a few unrelated blips over a process's life park every
-        // later re-subscribe at the 60s cap, now published as a countdown.
-        let mut subscribed = false;
-        match run_inner(&shared, &unit, &runtime, http.as_ref(), &mut subscribed) {
-            Ok(()) => break,
-            Err(err) => {
-                if shared.shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                if subscribed {
-                    attempt = 0;
-                }
-                shared.record_failure(&format!("driver: {err:#}"));
-                tracing::error!(
-                    "effect `{}` driver error (attempt {}): {err:#}",
-                    shared.name,
-                    attempt + 1
-                );
-                let delay = backoff(attempt);
-                shared.set_retry_deadline(delay);
-                let stop = sleep_watching(&shared, None, delay);
-                shared.clear_retry_deadline();
-                if stop {
-                    break;
-                }
-                attempt = attempt.saturating_add(1);
-            }
+        let mut recovered = false;
+        let outcome = drive(&mut || {
+            // Back on the log, so whatever failure was recorded for the error that sent
+            // us round this loop is over. Nothing else clears it: on an idle effect
+            // there is no next invocation to, so a single transient store error left
+            // `state()` reporting `wedged` until an unrelated event happened to arrive.
+            // An invocation wedge is not lost here, since that position replays and
+            // records its own failure again.
+            shared.clear_failures();
+            recovered = true;
+        });
+        let Err(err) = outcome else { break };
+        if shared.shutdown.load(Ordering::Relaxed) {
+            break;
         }
+        let (delay, next) = next_backoff(attempt, recovered);
+        shared.record_failure(&format!("driver: {err:#}"));
+        tracing::error!(
+            "effect `{}` driver error (attempt {}): {err:#}",
+            shared.name,
+            next
+        );
+        shared.set_retry_deadline(delay);
+        let stop = sleep_watching(shared, None, delay);
+        shared.clear_retry_deadline();
+        if stop {
+            break;
+        }
+        attempt = next;
     }
+}
+
+/// How long to wait after a driver error, and what the attempt counter becomes.
+///
+/// A run that got back on the log starts the ladder over however it ended: the ladder
+/// is for a driver that cannot start at all. Carrying the count across a recovery meant
+/// a few unrelated blips over a process's life parked every later re-subscribe at the
+/// 60s cap, which `retry_in_ms` now publishes as a minute-long countdown for what was
+/// a single transient error.
+fn next_backoff(attempt: u32, recovered: bool) -> (Duration, u32) {
+    let attempt = if recovered { 0 } else { attempt };
+    (backoff(attempt), attempt.saturating_add(1))
 }
 
 /// Whether an invocation finished, or the driver should stop mid-wedge.
@@ -483,15 +496,16 @@ fn run_inner(
     shared: &EffectShared,
     unit: &EffectUnit,
     runtime: &Arc<Runtime>,
-    http: &dyn HttpClient,
-    subscribed: &mut bool,
+    http: &Arc<dyn HttpClient>,
+    subscribed: &mut dyn FnMut(),
 ) -> anyhow::Result<()> {
-    let ModuleDef::Effect { name, sources } = &unit.loaded.def else {
+    let ModuleDef::Effect { name, sources } = &unit.def else {
         anyhow::bail!("run called on a non-effect module");
     };
+    let program = runtime.program();
     // Sources filter on plaintext fields only (check-time rejects encrypted source
     // constraints), so no key store is needed to lower them.
-    let query = dispatch::to_query(sources, runtime.events_map(), None)?;
+    let query = query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
     // A recorded quarantine outlives the process that found it. Refusing to start is
     // the point: an effect stopped for a broken invariant must not resume because
     // someone restarted the server, which is the ordinary reaction to a stuck effect.
@@ -504,28 +518,22 @@ fn run_inner(
     }
     let resume = runtime.effect_resume_after(name)?;
     let mut sub = runtime.store().subscribe(query, Position::new(resume));
-    // Back on the log, so whatever failure the supervisor recorded for the error that
-    // sent us round its loop is over. Nothing else clears it: on an idle effect there
-    // is no next invocation to, so a single transient store error left `state()`
-    // reporting `wedged` until an unrelated event happened to arrive. An invocation
-    // wedge is not lost here, since that position replays below and records its own
-    // failure again.
-    *subscribed = true;
-    shared.clear_failures();
+    // Tell the supervisor the driver is back on the log; it owns what that means.
+    subscribed();
     loop {
         let batch = sub
             .poll_batch()
             .map_err(|err| anyhow::anyhow!("reading events: {err}"))?;
         if !batch.is_empty() {
-            for (position, event) in &batch {
+            for (position, _event) in &batch {
                 match run_invocation(
                     shared,
                     name,
-                    &unit.loaded,
+                    program,
+                    &unit.source_hash,
                     runtime,
                     http,
                     position.get(),
-                    event,
                 )? {
                     Progress::Advanced => {}
                     // Leave the watermark where it is: the running invocation
@@ -564,27 +572,20 @@ fn advance_watermark(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_invocation(
     shared: &EffectShared,
     effect: &str,
-    loaded: &LoadedModule,
+    program: &Program,
+    source_hash: &str,
     runtime: &Arc<Runtime>,
-    http: &dyn HttpClient,
+    http: &Arc<dyn HttpClient>,
     position: u64,
-    event: &Event,
 ) -> anyhow::Result<Progress> {
-    match runtime.begin_invocation(
-        effect,
-        position,
-        &loaded.source_hash,
-        &runtime::now_rfc3339(),
-    )? {
+    match runtime.begin_invocation(effect, position, source_hash, &runtime::now_rfc3339())? {
         InvocationState::AlreadyTerminal => return Ok(Progress::Advanced),
         InvocationState::Running => {}
     }
-    let (env, data) =
-        envelope::decode(event.data()).map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
-    let event_type = event.event_type().to_owned();
 
     let mut attempt: u32 = 0;
     loop {
@@ -600,17 +601,7 @@ fn run_invocation(
             );
             return Ok(Progress::Advanced);
         }
-        match try_invocation(
-            effect,
-            position,
-            &env,
-            event,
-            &event_type,
-            &data,
-            loaded,
-            runtime,
-            http,
-        ) {
+        match try_invocation(effect, position, program, runtime, http) {
             Ok(()) => {
                 // Complete first, then check. The live run has already performed and
                 // journaled its side effects, so this position's work is genuinely
@@ -621,16 +612,7 @@ fn run_invocation(
                 runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
                 shared.clear_failures();
                 if runtime.verify() {
-                    let violations = verify_replay(
-                        effect,
-                        position,
-                        &env,
-                        event,
-                        &event_type,
-                        &data,
-                        loaded,
-                        runtime,
-                    );
+                    let violations = verify_replay(effect, position, program, runtime);
                     if let Some(violation) = violations.first() {
                         // Durable, so the restart a wedged effect invites does not
                         // silently clear it. The watermark is deliberately left where
@@ -681,178 +663,147 @@ fn run_invocation(
     }
 }
 
-/// Run the effect's `handle` once against a fresh journaling host. Journaled
-/// calls replay from the journal; the unjournaled tail runs live.
-#[allow(clippy::too_many_arguments)]
+/// One invocation, against heklang's own effect machinery.
+///
+/// The durable half stays here (the journal, the retry, the completion) and the
+/// decidable half is the language's: `deliver` runs the arm the event selects, folds
+/// its boundary to this position inclusive, and journals every impure call. hekla no
+/// longer retries a single request, because `docs/effects.md` rule 5 puts that loop
+/// inside the language so only a decidable result reaches the handler.
 fn try_invocation(
     effect: &str,
     position: u64,
-    env: &Envelope,
-    event: &Event,
-    event_type: &str,
-    data: &Value,
-    loaded: &LoadedModule,
+    program: &Program,
     runtime: &Arc<Runtime>,
-    http: &dyn HttpClient,
+    http: &Arc<dyn HttpClient>,
 ) -> Result<(), InvocationFailure> {
-    let host = EffectHostImpl {
-        runtime,
-        http,
-        env: env.clone(),
-        effect: effect.to_owned(),
-        position,
-        disambiguators: RefCell::new(HashMap::new()),
-        terminal: Cell::new(false),
-        retry_after: Cell::new(None),
-        mode: HostMode::Live,
-        trace: RefCell::new(Vec::new()),
-        sealed_miss: RefCell::new(None),
+    let now = runtime::now_rfc3339();
+    let call = Arc::new(Mutex::new(None));
+    let host = HeklaHost {
+        program: Arc::clone(runtime.program_shared()),
+        events: Arc::clone(runtime.events_shared()),
+        store: runtime.store().clone(),
+        keystore: runtime.keystore_shared().cloned(),
+        // An effect's appends go through `invoke`, and they belong to the flow that
+        // triggered it: the correlation carries across command, event, effect and
+        // command, which is what makes a trace one chain rather than two.
+        ctx: trigger_context(runtime, position)?,
+        now: now.clone(),
+        idem_tag: None,
+        call: Some(Arc::clone(&call)),
+        appended: None,
+        emitted: Vec::new(),
+        unavailable: None,
+        duplicated: false,
+        retry_after: None,
+        last_transport: None,
+        minted: None,
+        http: Some(Arc::clone(http)),
     };
-    let inv = Invocation {
-        events: runtime.events_map(),
-        store: runtime.store(),
-        keystore: runtime.keystore(),
+    let mut journal = Journal {
+        opdb: runtime.opdb(),
+        effect,
         position,
-        event,
-        env,
-        event_type,
-        data,
-        verify: runtime.verify(),
+        now: &now,
+        call,
     };
-    run_handle(loaded, &inv, &host).map_err(|err| InvocationFailure {
-        message: format!("{err:#}"),
-        terminal: host.terminal.get(),
-        retry_after: host.retry_after.get(),
-    })
+    let mut interpreter = Interpreter::with_host(program, host);
+    // heklang counts from zero and tephra from one, so the trigger is one lower there.
+    // The journal key stays the tephra position: it is a row in hekla.db.
+    let outcome = interpreter.deliver(effect, from_tephra(Position::new(position)), &mut journal);
+    for line in interpreter.lines() {
+        tracing::info!("effect `{effect}` @ {position}: {line}");
+    }
+    // What the last retryable response asked for, if anything. Read off the host
+    // because the language never sees the header: rule 5 absorbed the response that
+    // carried it.
+    let retry_after = interpreter.host().retry_after;
+    let transport = interpreter.host().last_transport.clone();
+    match outcome {
+        // Rule 4: done and ignored both advance, and so do the two terminal answers.
+        // Only a wedge does not, and a wedge is the error case below.
+        Ok(HekInvocation::Done | HekInvocation::Ignored) => Ok(()),
+        Ok(HekInvocation::Failed(message)) => Err(InvocationFailure {
+            message,
+            terminal: true,
+            retry_after,
+        }),
+        Ok(HekInvocation::Skipped(message)) => Err(InvocationFailure {
+            message,
+            terminal: true,
+            retry_after,
+        }),
+        // The language says which call did not answer and this says why: rule 5
+        // absorbed the attempts that carried the reason, so nothing else still has it.
+        Err(err) => Err(InvocationFailure {
+            message: match transport {
+                Some(reason) => format!("{err} ({reason})"),
+                None => format!("{err}"),
+            },
+            terminal: false,
+            retry_after,
+        }),
+    }
 }
 
-/// One event to route through an effect, and everything the boundary needs to fold
-/// state for it. Bundled so [`run_handle`] stays under the argument limit.
-pub(crate) struct Invocation<'a> {
-    pub events: &'a EventDefs,
-    pub store: &'a WriteHandle,
-    pub keystore: Option<&'a KeyStore>,
-    /// The triggering event's position, and so the inclusive upper bound on the
-    /// fold. This is what makes the state deterministic: it is a function of the
-    /// log prefix and this position, not of how far the log had run by the time
-    /// the handler executed.
-    pub position: u64,
-    pub event: &'a Event,
-    pub env: &'a Envelope,
-    pub event_type: &'a str,
-    pub data: &'a Value,
-    /// Whether the boundary fold is checked for determinism on this run.
-    pub verify: bool,
-}
-
-/// Route one event through an effect's `handle` and run every arm whose clause selects
-/// it, in declaration order, each against the state its boundary folds.
+/// A failed invocation attempt: its message, and whether the failure is terminal (no
+/// retry can succeed) rather than a wedge.
 ///
-/// This is the dispatch half only. The durable half (journal, retry, completion) stays
-/// in [`try_invocation`], which is why the host arrives as a trait object: anything
-/// that can serve the impure builtins can drive a handler, including `hekla test`.
+/// The flow one triggering event belongs to.
 ///
-/// The fold is deliberately **not** journaled. It is derived from the log prefix and
-/// the triggering position, so every attempt and every replay reproduces it exactly;
-/// recording it would buy nothing and would freeze a point-in-time answer the way a
-/// journaled read once did.
-pub(crate) fn run_handle(
-    loaded: &LoadedModule,
-    inv: &Invocation<'_>,
-    host: &dyn EffectHost,
-) -> anyhow::Result<()> {
-    let events = inv.events;
-    Module::with_temp_heap(|module| {
-        let ctx = EffectCtx { host };
-        let frozen = &loaded.module;
-        let handle_owned = frozen
-            .get_option("handle")?
-            .ok_or_else(|| anyhow::anyhow!("effect has no handle map"))?;
-        let handle = parse_event_dispatch(thaw(&handle_owned, &module))
-            .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
-        // `None` matches how the subscription is lowered: filtering a
-        // subject-encrypted field in a `handle` key is a static error.
-        let lowered = lower_dispatch(&handle, events, None)
-            .map_err(|err| anyhow::anyhow!("`handle` {err}"))?;
-        let selected: Vec<usize> = lowered
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| arm_selects(item.as_ref(), inv.event.as_ref()))
-            .map(|(index, _)| index)
-            .collect();
-        // No arm selects this event, so the effect has decided it needs no side
-        // effect. The invocation still completes, so the cursor advances past it.
-        // Checked before the boundary, so an unselected event pays for no fold.
-        if selected.is_empty() {
-            return Ok(());
-        }
-        let value = alloc_event(
-            &module,
-            inv.env.event_id,
-            &inv.env.timestamp,
-            inv.event_type,
-            inv.data,
-            events.get(inv.event_type),
-        );
-
-        // The boundary is scoped by the triggering event, so `query` takes it where a
-        // command's takes `input`.
-        let boundary = match frozen.get_option("query")? {
-            Some(func) => {
-                let result =
-                    call_handler_with_query_ctx(&module, thaw(&func, &module), &[value], MAX_TICKS)
-                        .map_err(|err| anyhow::anyhow!("query() failed: {err}"))?;
-                let specs =
-                    parse_event_specs(result).map_err(|err| anyhow::anyhow!("query() {err}"))?;
-                Some(dispatch::to_query(&specs, events, inv.keystore)?)
-            }
-            None => None,
-        };
-        let state = match &boundary {
-            Some(query) => {
-                let plan = dispatch::FoldPlan::build(frozen, &module, events, inv.keystore)?;
-                dispatch::fold_boundary(
-                    &module,
-                    &dispatch::FoldInputs {
-                        frozen,
-                        store: inv.store,
-                        query,
-                        plan: &plan,
-                        events,
-                        resume_after: Position::ZERO,
-                        upto: Some(inv.position),
-                        verify: inv.verify,
-                    },
-                )?
-                .0
-            }
-            // Resolved only here: a boundaried effect's state comes from the fold,
-            // which builds its own `initial` in the heap it folds in.
-            None => initial_state(frozen, &module)
-                .map_err(|err| anyhow::anyhow!("initial failed: {err}"))?,
-        };
-
-        // Every selecting arm runs in declaration order, so a replay journals and
-        // replays the same call sequence. Each sees the same state: the fold is of
-        // the log, not of what an earlier arm did.
-        for index in selected {
-            let arm = &handle.arms()[index];
-            call_handler_with_effect_ctx(&module, arm.func, &[value, state], MAX_TICKS, &ctx)
-                .map_err(|err| {
-                    dispatch::effect_handle_error(&handle.label("handle", arm.spec.as_ref()), err)
-                })?;
-        }
-        Ok(())
-    })
+/// Read off the log rather than carried down from the batch, so a replay after a
+/// restart lands in the same flow as the original run: the correlation and the
+/// causation are properties of the event, not of the process that noticed it.
+fn trigger_context(
+    runtime: &Arc<Runtime>,
+    position: u64,
+) -> Result<CommandContext, InvocationFailure> {
+    let wedge = |why: String| InvocationFailure {
+        message: why,
+        terminal: false,
+        retry_after: None,
+    };
+    let at = Position::new(position);
+    let mut reads =
+        runtime
+            .store()
+            .read(&tephra::Query::all(), Position::new(position - 1), Some(1));
+    let seq = reads
+        .next()
+        .ok_or_else(|| wedge(format!("no event at position {position}")))?
+        .map_err(|err| wedge(format!("reading the triggering event: {err}")))?;
+    if seq.position != at {
+        return Err(wedge(format!("no event at position {position}")));
+    }
+    let (envelope, _) = crate::envelope::decode(seq.event.data())
+        .map_err(|err| wedge(format!("decoding the triggering event: {err}")))?;
+    Ok(CommandContext::from_effect(
+        envelope.correlation_id,
+        envelope.event_id,
+    ))
 }
 
-/// A failed invocation attempt: its message, whether the failure is terminal (no
-/// retry can succeed, e.g. a `reveal()` of an erased subject) rather than a wedge,
-/// and how long the peer asked us to wait before the next attempt.
+/// Rule 5 puts the per-request retry inside the language, so a retryable status is
+/// absorbed before an arm sees it and the only backoff left is the one between whole
+/// invocations. `retry_after` is what a limiter asked for on the last such status, so
+/// that wait is the one the server named rather than this driver's own ladder.
 struct InvocationFailure {
     message: String,
     terminal: bool,
     retry_after: Option<Duration>,
+}
+
+/// How long to wait before the next attempt: never sooner than the wedge backoff,
+/// and never sooner than a `Retry-After` asked for.
+///
+/// Taking the larger of the two rather than the header alone is what matters on a
+/// limiter that keeps answering `Retry-After: 1`. Obeying that literally would retry
+/// once a second forever, so the backoff still grows underneath it.
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    match retry_after {
+        Some(after) => backoff(attempt).max(after.min(RETRY_AFTER_CAP)),
+        None => backoff(attempt),
+    }
 }
 
 /// The wedge backoff for `attempt`, doubling from [`BACKOFF_BASE`] up to
@@ -861,46 +812,6 @@ fn backoff(attempt: u32) -> Duration {
     BACKOFF_BASE
         .saturating_mul(1u32 << attempt.min(10))
         .min(BACKOFF_CAP)
-}
-
-/// Whether an HTTP status means "send this same request again", in which case the
-/// runtime absorbs it into the wedge rather than handing it to the script.
-///
-/// 408 (request timeout), 425 (too early) and 429 (too many requests) join every
-/// 5xx: each names a condition that clears on its own, with the request unchanged.
-/// 429 especially cannot be left to the script, because a response that reaches
-/// Starlark is journaled: an effect that raised on one would replay the recorded
-/// 429 on every retry and wedge forever without re-sending, leaving an operator
-/// skip (which abandons the work) as the only way out.
-pub(crate) fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429) || status >= 500
-}
-
-/// The `Retry-After` a retryable response asked for, if it named one in seconds.
-///
-/// The header's other legal form is an HTTP-date (RFC 9110 10.2.3). Honoring that
-/// would mean taking on a date parser and turning the peer's clock into a duration
-/// against ours, so a date reads as absent and the wedge backoff applies unchanged.
-fn retry_after_hint(headers: &[(String, String)]) -> Option<Duration> {
-    let value = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-        .map(|(_, value)| value.trim())?;
-    // Rejects a date, a negative, and anything else non-numeric, all as "absent".
-    value.parse::<u64>().ok().map(Duration::from_secs)
-}
-
-/// How long to wait before the next attempt: never sooner than the wedge backoff,
-/// and never sooner than a `Retry-After` asked for.
-///
-/// Taking the larger of the two rather than the header alone is what matters on a
-/// limiter that keeps answering `Retry-After: 1`. Obeying that literally would
-/// retry once a second forever, so the backoff still grows underneath it.
-fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
-    match retry_after {
-        Some(after) => backoff(attempt).max(after.min(RETRY_AFTER_CAP)),
-        None => backoff(attempt),
-    }
 }
 
 /// Honor a pending operator skip by completing the wedged invocation. The request
@@ -934,415 +845,6 @@ fn sleep_watching(shared: &EffectShared, skip: Option<u64>, total: Duration) -> 
         waited += tick;
     }
     shared.shutdown.load(Ordering::Relaxed)
-}
-
-// --- the journaling host ---------------------------------------------------
-
-/// The [`EffectHost`] implementation: it journals every impure call against the
-/// operational DB and performs the real side effect only on a journal miss.
-struct EffectHostImpl<'a> {
-    runtime: &'a Arc<Runtime>,
-    http: &'a dyn HttpClient,
-    env: Envelope,
-    effect: String,
-    position: u64,
-    /// Per-call-hash counters, reset for each invocation run, so identical
-    /// repeated calls get 0, 1, 2 ... and a replay lines them up.
-    disambiguators: RefCell<HashMap<String, u64>>,
-    /// Set when a `reveal()` hit an erased subject: the failure is terminal (the
-    /// data is gone, no retry recovers it), so the driver completes rather than
-    /// wedges the invocation.
-    terminal: Cell<bool>,
-    /// The `Retry-After` a retryable HTTP status named, for the driver's backoff. A
-    /// `Cell` for the same reason as `terminal`: it has to reach the driver past the
-    /// starlark boundary, which flattens a host error down to its message.
-    retry_after: Cell<Option<Duration>>,
-    /// Whether a journal miss may perform the call. [`HostMode::Sealed`] is what
-    /// makes the replay check safe to run: it cannot fire the side effect it is
-    /// checking for.
-    mode: HostMode,
-    /// Every journaled call this run reached, in order. The replay check compares
-    /// it against what the journal holds, which is how a handler that changed the
-    /// *order* of its calls gets caught: the journal is keyed by call content, so
-    /// a reordered run still hits every entry and would otherwise look faithful.
-    trace: RefCell<Vec<CallKey>>,
-    /// The first call a sealed run found no journal entry for. Held separately from
-    /// the error it raises so the caller can report which call diverged rather than
-    /// parsing a message.
-    sealed_miss: RefCell<Option<CallKey>>,
-}
-
-/// The identity of one journaled call within an invocation: its content hash and
-/// which repeat of that content it is.
-pub(crate) type CallKey = (String, u64);
-
-/// Whether a host may perform side effects, or only replay recorded ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostMode {
-    /// A journal miss performs the call and records it. The live path.
-    Live,
-    /// A journal miss is a violation: nothing is performed, and the run stops.
-    /// Used by the replay check, so verifying an invocation can never repeat it.
-    Sealed,
-}
-
-impl EffectHostImpl<'_> {
-    /// The journal wrapper enforcing the op-DB lock discipline: look up (short
-    /// lock), run the side effect with no lock held, record (short lock). The
-    /// side effect closure receives the call's disambiguator (for a deterministic
-    /// idempotency key).
-    ///
-    /// `kind` is recorded alongside the result and is otherwise unrecoverable: it
-    /// only exists inside the pre-image of `call_hash`, so without the column a
-    /// stored row can say what a call returned but not what it was.
-    fn journaled<F>(&self, kind: &str, call_hash: &str, run: F) -> anyhow::Result<Value>
-    where
-        F: FnOnce(u64) -> anyhow::Result<Value>,
-    {
-        let disambiguator = self.next_disambiguator(call_hash);
-        self.trace
-            .borrow_mut()
-            .push((call_hash.to_owned(), disambiguator));
-        if let Some(recorded) =
-            self.runtime
-                .journal_get(&self.effect, self.position, call_hash, disambiguator)?
-        {
-            return serde_json::from_str(&recorded).context("decoding a journaled call result");
-        }
-        // A sealed run stops here rather than performing anything. The miss *is* the
-        // finding: the handler reached a call the recorded run did not make, which
-        // on a real retry is the double-fire this check exists to detect.
-        if self.mode == HostMode::Sealed {
-            *self.sealed_miss.borrow_mut() = Some((call_hash.to_owned(), disambiguator));
-            anyhow::bail!("sealed replay reached a call with no journal entry");
-        }
-        let result = run(disambiguator)?;
-        let encoded = serde_json::to_string(&result).context("encoding a call result")?;
-        self.runtime.journal_put(
-            &self.effect,
-            self.position,
-            call_hash,
-            disambiguator,
-            kind,
-            &encoded,
-            &runtime::now_rfc3339(),
-        )?;
-        Ok(result)
-    }
-
-    fn next_disambiguator(&self, call_hash: &str) -> u64 {
-        let mut map = self.disambiguators.borrow_mut();
-        let counter = map.entry(call_hash.to_owned()).or_insert(0);
-        let value = *counter;
-        *counter += 1;
-        value
-    }
-}
-
-/// The content-hash key of a journaled call: SHA-256 over a canonical JSON of the
-/// call kind and its arguments (`serde_json::Value` sorts object keys).
-fn call_hash(kind: &str, call: &Value) -> String {
-    let canonical = json!({ "kind": kind, "call": call });
-    crate::hash::sha256_hex(canonical.to_string().as_bytes())
-}
-
-/// Collapse an anyhow cause chain into a single flat message.
-///
-/// A host error leaves this module through a starlark builtin, where it becomes
-/// `starlark::ErrorKind::Native` and is rendered with plain `Display`: every cause
-/// under the outermost context is dropped long before the wedge records
-/// `last_error`. Rendering the chain here keeps the reason attached to the call
-/// that names it.
-fn flatten_chain(err: anyhow::Error) -> anyhow::Error {
-    anyhow::anyhow!("{err:#}")
-}
-
-impl EffectHost for EffectHostImpl<'_> {
-    fn http(
-        &self,
-        method: &str,
-        url: &str,
-        headers: Vec<(String, String)>,
-        body: Option<Value>,
-    ) -> anyhow::Result<Value> {
-        let headers_sorted: BTreeMap<&str, &str> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let hash = call_hash(
-            "http",
-            &json!({ "method": method, "url": url, "headers": headers_sorted, "body": body }),
-        );
-        self.journaled("http", &hash, |_| {
-            let body_bytes = match &body {
-                Some(value) => Some(serde_json::to_vec(value).context("serialising an http body")?),
-                None => None,
-            };
-            let mut request_headers = headers;
-            if body_bytes.is_some()
-                && !request_headers
-                    .iter()
-                    .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
-            {
-                request_headers.push(("content-type".to_owned(), "application/json".to_owned()));
-            }
-            let request = HttpRequest {
-                method: method.to_owned(),
-                url: url.to_owned(),
-                headers: request_headers,
-                body: body_bytes,
-            };
-            let response = self
-                .http
-                .send(&request)
-                .with_context(|| format!("http {method} {url}"))?;
-            // A retryable status never reaches the script: surface it as a retryable
-            // error so the wedge absorbs it, keeping any `Retry-After` for the
-            // driver. Bailing here is before the journal write, which is exactly what
-            // lets the next attempt re-send instead of replaying the refusal.
-            if is_retryable_status(response.status) {
-                self.retry_after.set(retry_after_hint(&response.headers));
-                anyhow::bail!("http {method} {url} returned {}", response.status);
-            }
-            Ok(http_response_to_json(response))
-        })
-        .map_err(flatten_chain)
-    }
-
-    fn invoke_command(&self, name: &str, input: Value) -> anyhow::Result<Value> {
-        let hash = call_hash(
-            "invoke_command",
-            &json!({ "command": name, "input": input }),
-        );
-        self.journaled("invoke_command", &hash, |disambiguator| {
-            let idempotency_key =
-                format!("{}:{}:{hash}:{disambiguator}", self.effect, self.position);
-            let ctx = CommandContext::from_effect(self.env.correlation_id, self.env.event_id);
-            let result =
-                self.runtime
-                    .execute_from_effect(name, input, &ctx, Some(&idempotency_key))?;
-            Ok(json!({ "status": result.status, "body": result.body }))
-        })
-        .map_err(flatten_chain)
-    }
-
-    fn now(&self) -> anyhow::Result<String> {
-        let hash = call_hash("now", &json!({}));
-        let value = self
-            .journaled("now", &hash, |_| Ok(Value::String(runtime::now_rfc3339())))
-            .map_err(flatten_chain)?;
-        value
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("journaled now() was not a string"))
-    }
-
-    fn log(&self, message: &str) {
-        // A sealed run is a verification pass over work that already happened, so
-        // repeating its log lines would double every effect's trace output for no
-        // information. The journaled calls are what the check reads.
-        if self.mode == HostMode::Sealed {
-            return;
-        }
-        tracing::info!("effect `{}` @ {}: {message}", self.effect, self.position);
-    }
-
-    fn erase(&self, subject_field: &str, subject_value: &str) -> anyhow::Result<bool> {
-        // Auditable like `reveal`, and for a stronger reason: this one is the
-        // irreversible half of the pair. Which is exactly why a sealed run stays
-        // silent: it performs nothing, and an audit line for an erasure that did not
-        // happen is worse than no line at all.
-        if self.mode == HostMode::Live {
-            tracing::info!(
-                "effect `{}` @ {}: erase {subject_field}={subject_value}",
-                self.effect,
-                self.position
-            );
-        }
-        let hash = call_hash(
-            "erase",
-            &json!({ "subject_field": subject_field, "subject_value": subject_value }),
-        );
-        let result = self.journaled("erase", &hash, |_| {
-            let keystore = self.runtime.keystore().ok_or_else(|| {
-                anyhow::anyhow!("erase() needs a master key, but none is configured")
-            })?;
-            Ok(json!(keystore.erase(subject_field, subject_value)?))
-        })?;
-        Ok(result.as_bool().unwrap_or(false))
-    }
-
-    fn reveal(
-        &self,
-        subject_field: &str,
-        subject_value: &str,
-        field: &str,
-        ciphertext: &str,
-    ) -> anyhow::Result<String> {
-        // Auditable: every crossing of the decrypt boundary is traced, for a live
-        // run. A sealed replay re-runs `reveal` (it is not journaled) but performs
-        // nothing outward, so tracing it would double the audit trail.
-        if self.mode == HostMode::Live {
-            tracing::debug!(
-                "effect `{}` @ {}: reveal {subject_field}={subject_value} field={field}",
-                self.effect,
-                self.position
-            );
-        }
-        let keystore = self.runtime.keystore().ok_or_else(|| {
-            anyhow::anyhow!("reveal() needs a master key, but none is configured")
-        })?;
-        match keystore
-            .decrypt_subject(subject_field, subject_value, field, ciphertext)
-            .map_err(flatten_chain)?
-        {
-            Some(plaintext) => Ok(plaintext),
-            None => {
-                // The subject was erased. No retry can recover the data, so mark this
-                // invocation terminal rather than let it wedge forever.
-                self.terminal.set(true);
-                anyhow::bail!(
-                    "reveal() cannot decrypt `{field}`: subject `{subject_field}` = `{subject_value}` has been erased"
-                )
-            }
-        }
-    }
-}
-
-fn http_response_to_json(response: HttpResponse) -> Value {
-    let body = serde_json::from_slice::<Value>(&response.body)
-        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&response.body).into_owned()));
-    // Headers are a multimap: each name maps to a list of values, so repeated
-    // headers (for example several `set-cookie`) all survive rather than the last
-    // silently winning.
-    let mut headers: serde_json::Map<String, Value> = serde_json::Map::new();
-    for (name, value) in response.headers {
-        match headers
-            .entry(name)
-            .or_insert_with(|| Value::Array(Vec::new()))
-        {
-            Value::Array(values) => values.push(Value::String(value)),
-            _ => unreachable!("header entries are always arrays"),
-        }
-    }
-    json!({ "status": response.status, "body": body, "headers": headers })
-}
-
-// --- the HTTP client seam --------------------------------------------------
-
-/// A raw HTTP request: what the effect host hands the transport.
-#[derive(Debug, Clone)]
-pub struct HttpRequest {
-    pub method: String,
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Option<Vec<u8>>,
-}
-
-/// A raw HTTP response.
-#[derive(Debug, Clone)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-/// The transport behind the journaled `http.*` builtins. Returns the response for
-/// any HTTP status (including 4xx and 5xx); only a transport-level failure is an
-/// `Err`. Split out so tests substitute a deterministic stub.
-pub trait HttpClient: Send + Sync {
-    fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse>;
-}
-
-/// The production transport, a blocking `ureq` agent with connect and overall
-/// timeouts so a hung request cannot stall shutdown.
-pub struct UreqClient {
-    agent: Agent,
-}
-
-impl UreqClient {
-    pub fn new() -> UreqClient {
-        let config = Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_global(Some(Duration::from_secs(30)))
-            // 4xx/5xx come back as responses to inspect, not transport errors.
-            .http_status_as_error(false)
-            .build();
-        UreqClient {
-            agent: Agent::new_with_config(config),
-        }
-    }
-
-    fn without_body(
-        &self,
-        mut builder: ureq::RequestBuilder<WithoutBody>,
-        request: &HttpRequest,
-    ) -> anyhow::Result<HttpResponse> {
-        for (key, value) in &request.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        let response = builder
-            .call()
-            .map_err(|err| anyhow::anyhow!("http transport error: {err}"))?;
-        read_response(response)
-    }
-
-    fn with_body(
-        &self,
-        mut builder: ureq::RequestBuilder<WithBody>,
-        request: &HttpRequest,
-    ) -> anyhow::Result<HttpResponse> {
-        for (key, value) in &request.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        let body = request.body.clone().unwrap_or_default();
-        let response = builder
-            .send(&body[..])
-            .map_err(|err| anyhow::anyhow!("http transport error: {err}"))?;
-        read_response(response)
-    }
-}
-
-impl Default for UreqClient {
-    fn default() -> UreqClient {
-        UreqClient::new()
-    }
-}
-
-impl HttpClient for UreqClient {
-    fn send(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
-        match request.method.as_str() {
-            "GET" => self.without_body(self.agent.get(&request.url), request),
-            "DELETE" => self.without_body(self.agent.delete(&request.url), request),
-            "POST" => self.with_body(self.agent.post(&request.url), request),
-            "PUT" => self.with_body(self.agent.put(&request.url), request),
-            "PATCH" => self.with_body(self.agent.patch(&request.url), request),
-            other => anyhow::bail!("unsupported http method `{other}`"),
-        }
-    }
-}
-
-fn read_response(mut response: ureq::http::Response<ureq::Body>) -> anyhow::Result<HttpResponse> {
-    let status = response.status().as_u16();
-    let headers = response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_owned(), value.to_owned()))
-        })
-        .collect();
-    let body = response
-        .body_mut()
-        .read_to_vec()
-        .map_err(|err| anyhow::anyhow!("reading http response body: {err}"))?;
-    Ok(HttpResponse {
-        status,
-        headers,
-        body,
-    })
 }
 
 // --- the retention sweeper -------------------------------------------------
@@ -1490,75 +992,77 @@ impl HttpClient for SealedHttp {
 pub(crate) fn verify_replay(
     effect: &str,
     position: u64,
-    env: &Envelope,
-    event: &Event,
-    event_type: &str,
-    data: &Value,
-    loaded: &LoadedModule,
+    program: &Program,
     runtime: &Arc<Runtime>,
 ) -> Vec<Violation> {
-    let sealed_http = SealedHttp;
-    let host = EffectHostImpl {
-        runtime,
-        http: &sealed_http,
-        env: env.clone(),
-        effect: effect.to_owned(),
-        position,
-        disambiguators: RefCell::new(HashMap::new()),
-        terminal: Cell::new(false),
-        retry_after: Cell::new(None),
-        mode: HostMode::Sealed,
-        trace: RefCell::new(Vec::new()),
-        sealed_miss: RefCell::new(None),
-    };
-    let inv = Invocation {
-        events: runtime.events_map(),
-        store: runtime.store(),
-        keystore: runtime.keystore(),
-        position,
-        event,
-        env,
-        event_type,
-        data,
-        // The replay check is already a second run; folding twice inside it would
-        // re-check determinism the live run already checked.
-        verify: false,
-    };
-
     let divergence = |detail: String| Violation::ReplayDivergence {
         effect: effect.to_owned(),
         position,
         detail,
     };
 
-    let outcome = run_handle(loaded, &inv, &host);
-    let visited = host.trace.borrow().clone();
+    let now = runtime::now_rfc3339();
+    let host = HeklaHost {
+        program: Arc::clone(runtime.program_shared()),
+        events: Arc::clone(runtime.events_shared()),
+        store: runtime.store().clone(),
+        keystore: runtime.keystore_shared().cloned(),
+        ctx: CommandContext::new(uuid::Uuid::new_v4()),
+        now: now.clone(),
+        idem_tag: None,
+        // A sealed replay reaches no unjournaled call, so nothing appends and there is
+        // no tag to key.
+        call: None,
+        appended: None,
+        emitted: Vec::new(),
+        unavailable: None,
+        duplicated: false,
+        retry_after: None,
+        last_transport: None,
+        minted: None,
+        http: Some(Arc::new(SealedHttp) as Arc<dyn HttpClient>),
+    };
+    let mut journal = SealedJournal {
+        inner: Journal {
+            opdb: runtime.opdb(),
+            effect,
+            position,
+            now: &now,
+            call: Arc::new(Mutex::new(None)),
+        },
+        visited: RefCell::new(Vec::new()),
+        missed: RefCell::new(None),
+    };
+    let mut interpreter = Interpreter::with_host(program, host);
+    // heklang counts from zero and tephra from one, so the trigger is one lower there.
+    // The journal key stays the tephra position: it is a row in hekla.db.
+    let outcome = interpreter.deliver(effect, from_tephra(Position::new(position)), &mut journal);
+    let visited = journal.visited.borrow().clone();
+    let missed = journal.missed.borrow().clone();
 
     if let Err(err) = outcome {
-        // A terminal failure is the documented cost of the `erase last` rule, not a
-        // divergence: the replay re-runs the unjournaled `reveal` against a key the
-        // invocation itself deleted, exactly as the live retry path already does.
-        // Reporting it would quarantine every effect written the recommended way.
-        if host.terminal.get() {
-            tracing::debug!(
-                "effect `{effect}` at {position} is not replayable by design (it erased a \
-                 subject it revealed); skipping the replay check"
-            );
-            return Vec::new();
-        }
-        let miss = host.sealed_miss.borrow().clone();
-        return vec![match miss {
-            Some((hash, disambiguator)) => divergence(format!(
-                "it reached a call with no journal entry (call {hash}, repeat {disambiguator}); \
-                 a real retry would have performed it a second time"
+        return vec![match missed {
+            Some(call) => divergence(format!(
+                "it reached a call with no journal entry ({call}); a real retry would \
+                 have performed it a second time"
             )),
-            // No miss recorded and not terminal, so the handler itself failed on a
-            // path the first run got through. That is a genuine surprise.
-            None => divergence(format!("it failed part-way through: {err:#}")),
+            None => divergence(format!("it failed part-way through: {err}")),
         }];
     }
+    // A terminal skip is the documented cost of the `erase last` rule rather than a
+    // divergence: the replay re-runs the unjournaled `reveal` against a key the
+    // invocation itself deleted, exactly as the live retry path already does.
+    if matches!(outcome, Ok(HekInvocation::Skipped(_))) {
+        return Vec::new();
+    }
+    if let Some(call) = missed {
+        return vec![divergence(format!(
+            "it reached a call with no journal entry ({call}); a real retry would have \
+             performed it a second time"
+        ))];
+    }
 
-    let recorded = match runtime.journal_keys(effect, position) {
+    let recorded: Vec<CallKey> = match runtime.journal_keys(effect, position) {
         Ok(recorded) => recorded,
         Err(err) => {
             return vec![divergence(format!(
@@ -1566,12 +1070,10 @@ pub(crate) fn verify_replay(
             ))];
         }
     };
-
     // Ordered comparison. A subset test would be blind to exactly the case the
-    // content-keyed journal cannot see on its own: `(call_hash, disambiguator)` pairs
-    // are unique within an invocation, and a sealed run can never visit a key the
-    // journal lacks (that path returned above), so equal-as-sets is guaranteed and
-    // only the sequence carries new information.
+    // content-keyed journal cannot see on its own: the pairs are unique within an
+    // invocation and a sealed run can never visit a key the journal lacks (that path
+    // returned above), so equal-as-sets is guaranteed and only the sequence is news.
     if visited != recorded {
         return vec![divergence(format!(
             "it made a different sequence of calls than the journal records \
@@ -1582,6 +1084,57 @@ pub(crate) fn verify_replay(
     }
     Vec::new()
 }
+
+/// A journal that reads but never writes, and remembers what it was asked for.
+///
+/// A miss is the thing the check exists to find: the replay reached a call the first
+/// run never journaled, which on a real retry would have performed it a second time.
+struct SealedJournal<'a> {
+    inner: Journal<'a>,
+    /// Every call the replay looked up, in the order it looked them up. `Calls` reads
+    /// through `&self`, so the record of what was asked for has to be behind a cell.
+    visited: RefCell<Vec<CallKey>>,
+    /// The first call the journal could not answer.
+    missed: RefCell<Option<String>>,
+}
+
+impl Calls for SealedJournal<'_> {
+    fn recorded(&self, call: &str, ordinal: u32) -> Result<Option<Recorded>, heklang::Error> {
+        let found = self.inner.recorded(call, ordinal)?;
+        match &found {
+            Some(_) => self
+                .visited
+                .borrow_mut()
+                .push((sha256_hex(call.as_bytes()), u64::from(ordinal))),
+            // The miss is caught here rather than at the write, because heklang asks
+            // this immediately before it performs a call: a `None` *is* the replay
+            // reaching something the first run never journaled, whatever the sealed
+            // host then refuses to do about it.
+            None => {
+                let mut missed = self.missed.borrow_mut();
+                if missed.is_none() {
+                    *missed = Some(format!("{call} #{ordinal}"));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn record(
+        &mut self,
+        _call: &str,
+        _ordinal: u32,
+        _recorded: Recorded,
+    ) -> Result<(), heklang::Error> {
+        // A sealed replay writes nothing: the miss was already reported above, and the
+        // journal belongs to the run that made the calls.
+        Ok(())
+    }
+}
+
+/// One journaled call, as the operational database keys it: the hash of heklang's
+/// readable key, plus the ordinal that separates repeats of an identical call.
+type CallKey = (String, u64);
 
 /// Render a call sequence compactly: each hash is truncated, since the full digest
 /// adds length without helping anyone reading the message.
@@ -1693,6 +1246,65 @@ mod tests {
         );
     }
 
+    /// The regression this guards is invisible on a busy effect and permanent on a
+    /// quiet one: nothing but an invocation used to clear a driver-level failure, so a
+    /// single transient store error left an idle effect reporting `wedged` until an
+    /// unrelated event happened to arrive. That state drives the console's red count,
+    /// the "needs attention" panel and `/status`, so it reads as a live incident.
+    #[test]
+    fn a_driver_back_on_the_log_clears_the_wedge_the_supervisor_recorded() {
+        let shared = test_shared();
+        shared.record_failure("driver: reading events: op-db is locked");
+        assert_eq!(shared.state(5), "wedged");
+
+        // Re-subscribes, then stops cleanly. No backoff is slept here: this is the
+        // recovery path rather than the retry one.
+        supervise(&shared, |subscribed| {
+            subscribed();
+            Ok(())
+        });
+
+        assert_eq!(shared.consecutive_failures(), 0);
+        assert_eq!(shared.last_error(), None);
+        assert_eq!(
+            shared.state(5),
+            "lagging",
+            "an effect reading the log again is behind, not wedged"
+        );
+    }
+
+    /// A quarantine is not a wedge and nothing clears it on its own, so a driver that
+    /// re-subscribes must not launder one away.
+    #[test]
+    fn getting_back_on_the_log_does_not_clear_a_quarantine() {
+        let shared = test_shared();
+        shared.restore_quarantine(4, "fold diverged from the read model");
+
+        supervise(&shared, |subscribed| {
+            subscribed();
+            Ok(())
+        });
+
+        assert!(shared.quarantined());
+        assert_eq!(shared.state(5), "quarantined");
+    }
+
+    /// The ladder is for a driver that cannot start at all. Carrying the count across a
+    /// recovery parked every later re-subscribe at the cap, which `retry_in_ms` then
+    /// publishes as a minute-long countdown for a one-off blip.
+    #[test]
+    fn the_retry_ladder_escalates_but_starts_over_after_a_recovery() {
+        assert_eq!(next_backoff(0, false), (BACKOFF_BASE, 1));
+        assert_eq!(next_backoff(1, false), (BACKOFF_BASE * 2, 2));
+        // Deep enough to be saturated, which is the state a long-lived process reaches.
+        assert_eq!(next_backoff(9, false), (BACKOFF_CAP, 10));
+        assert_eq!(
+            next_backoff(9, true),
+            (BACKOFF_BASE, 1),
+            "a run that got back on the log starts the ladder over"
+        );
+    }
+
     #[test]
     fn backoff_grows_then_caps() {
         assert_eq!(backoff(0), BACKOFF_BASE);
@@ -1700,103 +1312,10 @@ mod tests {
         assert_eq!(backoff(100), BACKOFF_CAP);
     }
 
-    /// The split between what the runtime absorbs and what the script decides on.
-    /// Every status here is one an effect author could plausibly branch on, so the
-    /// list is spelled out rather than left to the `matches!`.
-    #[test]
-    fn retryable_statuses_are_the_ones_that_clear_on_their_own() {
-        for status in [408, 425, 429, 500, 502, 503, 504, 599] {
-            assert!(is_retryable_status(status), "{status} must be absorbed");
-        }
-        for status in [200, 201, 204, 301, 400, 401, 403, 404, 409, 410, 418, 422] {
-            assert!(
-                !is_retryable_status(status),
-                "{status} is a real result the handler decides on"
-            );
-        }
-    }
-
-    #[test]
-    fn retry_after_is_read_only_in_its_delta_seconds_form() {
-        let header =
-            |value: &str| retry_after_hint(&[("Retry-After".to_owned(), value.to_owned())]);
-        assert_eq!(header("30"), Some(Duration::from_secs(30)));
-        assert_eq!(header("  30 "), Some(Duration::from_secs(30)));
-        assert_eq!(header("0"), Some(Duration::ZERO));
-        // The header's other legal form. Unparsed on purpose, so it reads as absent
-        // and the wedge backoff stands rather than the effect stalling on a guess.
-        assert_eq!(header("Wed, 21 Oct 2015 07:28:00 GMT"), None);
-        assert_eq!(header("-5"), None);
-        assert_eq!(header("soon"), None);
-        assert_eq!(header(""), None);
-        // A transport need not normalise the name, and the stub client does not.
-        assert_eq!(
-            retry_after_hint(&[("retry-after".to_owned(), "7".to_owned())]),
-            Some(Duration::from_secs(7))
-        );
-        assert_eq!(retry_after_hint(&[]), None);
-    }
-
-    #[test]
-    fn retry_after_raises_the_backoff_and_never_lowers_it() {
-        assert_eq!(retry_delay(0, None), backoff(0), "nothing was asked for");
-        // A window longer than our own backoff is honored, past `BACKOFF_CAP`.
-        assert_eq!(
-            retry_delay(0, Some(Duration::from_secs(120))),
-            Duration::from_secs(120)
-        );
-        // A limiter answering `Retry-After: 1` forever must not pin the effect to one
-        // attempt a second: the backoff keeps growing underneath the header.
-        assert_eq!(retry_delay(100, Some(Duration::from_secs(1))), BACKOFF_CAP);
-        // And a stray or hostile value cannot park the effect for a day.
-        assert_eq!(
-            retry_delay(0, Some(Duration::from_secs(86_400))),
-            RETRY_AFTER_CAP
-        );
-    }
-
-    #[test]
-    fn call_hash_is_stable_and_argument_sensitive() {
-        let a = call_hash("http", &json!({ "url": "x", "n": 1 }));
-        let b = call_hash("http", &json!({ "n": 1, "url": "x" }));
-        let c = call_hash("http", &json!({ "url": "y", "n": 1 }));
-        assert_eq!(a, b, "key order must not change the hash");
-        assert_ne!(a, c, "different arguments must hash differently");
-    }
-
-    #[test]
-    fn http_response_json_parses_body_or_falls_back_to_text() {
-        let json_body = http_response_to_json(HttpResponse {
-            status: 200,
-            headers: vec![("x".to_owned(), "y".to_owned())],
-            body: br#"{"ok":true}"#.to_vec(),
-        });
-        assert_eq!(json_body["status"], 200);
-        assert_eq!(json_body["body"]["ok"], true);
-
-        let text_body = http_response_to_json(HttpResponse {
-            status: 500,
-            headers: Vec::new(),
-            body: b"not json".to_vec(),
-        });
-        assert_eq!(text_body["body"], "not json");
-    }
-
-    #[test]
-    fn http_response_json_keeps_every_repeated_header() {
-        let value = http_response_to_json(HttpResponse {
-            status: 200,
-            headers: vec![
-                ("set-cookie".to_owned(), "a=1".to_owned()),
-                ("set-cookie".to_owned(), "b=2".to_owned()),
-                ("content-type".to_owned(), "text/plain".to_owned()),
-            ],
-            body: Vec::new(),
-        });
-        assert_eq!(value["headers"]["set-cookie"][0], "a=1");
-        assert_eq!(value["headers"]["set-cookie"][1], "b=2");
-        assert_eq!(value["headers"]["content-type"][0], "text/plain");
-    }
+    // The tests that stood here covered the per-request retry, the `Retry-After`
+    // hint, the journal's call hashing and the response-to-JSON shaping. Rule 5 moved
+    // every one of those into heklang, which has its own suite for them, so keeping
+    // copies here would assert on machinery hekla no longer owns.
 
     #[test]
     fn stub_records_calls_and_returns_programmed_responses() {
@@ -1816,24 +1335,5 @@ mod tests {
         assert_eq!(stub.send(&request).unwrap().status, 503);
         assert_eq!(stub.send(&request).unwrap().status, 200);
         assert_eq!(stub.call_count(), 2);
-    }
-
-    #[test]
-    fn flatten_chain_folds_every_cause_into_the_display() {
-        let err =
-            anyhow::anyhow!("connection refused").context("http POST https://example.test/welcome");
-        assert_eq!(
-            format!("{err}"),
-            "http POST https://example.test/welcome",
-            "plain Display drops the cause, which is what the starlark boundary sees"
-        );
-
-        let flat = flatten_chain(err);
-        assert_eq!(
-            format!("{flat}"),
-            "http POST https://example.test/welcome: connection refused"
-        );
-        // No cause left to render twice once the chain is folded in.
-        assert_eq!(format!("{flat:#}"), format!("{flat}"));
     }
 }

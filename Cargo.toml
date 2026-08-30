@@ -6,26 +6,20 @@ edition = "2024"
 [dependencies]
 aes-gcm = "0.11"
 aes-siv = "0.8"
-allocative = "0.3"
 anyhow = "1"
 axum = "0.8"
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
-# Both are pinned to what starlark_lsp 0.14 was built against rather than to the
-# newest release (lsp-server is at 0.10). A `Connection` is handed to it and a
-# `CompletionItemKind` comes back from it, so a skew would give two same-named
-# types that do not unify.
-lsp-server = "0.7"
-lsp-types = "=0.97"
+heklang = { path = "../heklang" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `arbitrary_precision` is load-bearing, not a preference: without it a
+# `Value::Number` is an `f64` and hekla hands heklang text that has already been
+# rounded, so `Json::Num`'s byte-for-byte guarantee would stop at this boundary.
+# `10.50` would reach the log as `10.5`.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.11"
-starlark = "0.14"
-# Must track `starlark` exactly: the LSP trait takes starlark's own `AstModule`,
-# `Globals` and `DocModule`, so a version skew would give two of each.
-starlark_lsp = "0.14"
 tempfile = "3"
 tephra = { version = "0.3.6", features = ["async", "tracing"] }
 time = { version = "0.3", features = ["formatting"] }

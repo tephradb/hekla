@@ -68,7 +68,7 @@ fn concrete(route: &str) -> String {
         .map(|segment| match segment {
             "{position}" => "1",
             "{correlation_id}" => "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
-            "{name}" => "send-welcome",
+            "{name}" => "SendWelcome",
             "{field}" => "user_id",
             "{value}" => "nobody",
             other if other.starts_with('{') => {
@@ -259,20 +259,38 @@ async fn a_client_that_accepts_anything_still_gets_json() {
     harness.shutdown();
 }
 
+/// The index lists every `/admin` route, derived from the router rather than counted.
+///
+/// A literal here would be a second hand-maintained copy of the route table, which is
+/// the thing `admin_index` already is: adding a route and forgetting the index entry
+/// has to fail with the route's own name, not with a number that moved.
 #[tokio::test]
-async fn the_json_index_is_unchanged_and_points_at_the_console() {
+async fn the_json_index_lists_every_admin_route_and_points_at_the_console() {
     let harness = boot();
     let app = harness.app();
 
     let (status, _, body) = fetch(&app, "/admin", Some("application/json")).await;
     assert_eq!(status, StatusCode::OK);
     let index: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        index["endpoints"].as_array().unwrap().len(),
-        13,
-        "the index a client already depended on must not change shape"
-    );
     assert_eq!(index["console"], "/admin");
+
+    let listed: BTreeSet<&str> = index["endpoints"]
+        .as_array()
+        .expect("endpoints is an array")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("every entry has a path"))
+        .collect();
+    // The index does not list itself, and the asset route is the console's own
+    // plumbing rather than an endpoint a client would call.
+    let expected: BTreeSet<&str> = server::routes()
+        .into_iter()
+        .filter(|route| route.starts_with(server::ADMIN_ROUTE))
+        .filter(|route| *route != server::ADMIN_ROUTE && *route != server::ADMIN_ASSETS_ROUTE)
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "the index and the router disagree about what is under /admin"
+    );
 
     harness.shutdown();
 }
@@ -436,12 +454,18 @@ async fn an_unknown_asset_is_a_404_and_a_traversal_is_not_a_file() {
         "/admin/assets/%2e%2e",
         "/admin/assets/Cargo.toml",
     ] {
-        let (status, _, _) = fetch(&app, uri, None).await;
+        let (status, content_type, body) = fetch(&app, uri, None).await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
             "{uri} resolved to something, but the asset table is the whole namespace"
         );
+        // The generated document declares this 404 as the shared `Error` envelope, so
+        // a client that deserializes what was promised must not receive an empty body.
+        assert!(content_type.starts_with("application/json"), "{uri}");
+        let error: Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|err| panic!("{uri} answered a body that is not json: {err}"));
+        assert_eq!(error["error"]["code"], "not_found", "{uri}");
     }
 
     harness.shutdown();
@@ -479,6 +503,115 @@ async fn the_console_is_served_with_a_revalidating_cache_header() {
     );
 
     harness.shutdown();
+}
+
+/// `no-cache` without a validator is a full re-download of the whole console on every
+/// page load, which is the opposite of what the header is there to arrange. This is
+/// the half that makes it true.
+#[tokio::test]
+async fn a_revalidated_asset_is_a_304_with_no_body() {
+    let harness = boot();
+    let app = harness.app();
+
+    let asset = ui::asset("app.js").unwrap();
+    let Some(etag) = ui::etag(asset) else {
+        // A development override deliberately has no validator: its bytes change under
+        // a fixed binary, which is what `no-store` says.
+        harness.shutdown();
+        return;
+    };
+
+    let (status, _, body) = fetch(&app, "/admin/assets/app.js", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty());
+
+    // Both spellings a cache may send back: the tag it was given, and the same tag
+    // weakened, which a shared cache is allowed to do.
+    for candidate in [etag.to_owned(), format!("W/{etag}"), "*".to_owned()] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/assets/app.js")
+                    .header(header::IF_NONE_MATCH, candidate.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "If-None-Match: {candidate} re-sent the body"
+        );
+        // A 304 updates the stored response's headers, so it has to carry both again.
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(etag)
+        );
+        assert!(response.headers().get(header::CACHE_CONTROL).is_some());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "a 304 must not carry a body");
+    }
+
+    // A stale validator is a miss, not a match.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/assets/app.js")
+                .header(header::IF_NONE_MATCH, "\"not-the-current-digest\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The validator is over the bytes, so two different files never share one.
+    let other = ui::etag(ui::asset("router.js").unwrap()).unwrap();
+    assert_ne!(etag, other);
+
+    harness.shutdown();
+}
+
+/// The shell sets the stored theme before the first paint, which a module script
+/// cannot do: `type="module"` is deferred, so it runs after the document is painted
+/// and an explicit choice that disagrees with the system one flashes.
+///
+/// The storage key is therefore spelled twice, once in each language. This is what
+/// keeps the two in step.
+#[test]
+fn the_shell_applies_the_stored_theme_before_the_first_paint() {
+    let shell = source("index.html");
+    let theme = source("theme.js");
+
+    let key = theme
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("const KEY = "))
+        .map(|value| value.trim().trim_matches(['\'', '"']))
+        .expect("theme.js declares its storage key as `const KEY = '...'`");
+
+    let inline = shell
+        .split("<script")
+        // The first chunk is everything before any script tag.
+        .skip(1)
+        .find(|block| !block.starts_with(" type=\"module\""))
+        .expect("the shell carries a non-module script");
+    assert!(
+        inline.contains(key),
+        "the shell's inline script does not read `{key}`, so an explicit theme flashes \
+         until app.js loads"
+    );
+    assert!(
+        inline.contains("data-theme") || inline.contains("dataset.theme"),
+        "the shell's inline script reads the key but never applies it"
+    );
 }
 
 // --- the document ----------------------------------------------------------

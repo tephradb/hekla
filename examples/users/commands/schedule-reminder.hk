@@ -1,0 +1,7 @@
+// No invariant, so no `state` and an empty boundary. Its point is `now()`, which is
+// pinned once per request and becomes domain data (`due_at`) rather than a restatement
+// of the envelope's append time.
+
+command ScheduleReminder(user_id: Uuid) {
+  emit @reminder.scheduled { user_id, due_at: now() }
+}

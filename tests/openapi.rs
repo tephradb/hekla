@@ -47,8 +47,8 @@ fn generated_document() -> Value {
 }
 
 /// Whether `documented` describes `route`, allowing for the concrete expansion the
-/// generator does: `/commands/{name}` becomes `/commands/register-user`, and
-/// `/read/{projector}/{entity}` becomes `/read/users/users`.
+/// generator does: `/commands/{name}` becomes `/commands/RegisterUser`, and
+/// `/read/{projector}/{entity}` becomes `/read/Users/User`.
 fn describes(documented: &str, route: &str) -> bool {
     let route_segments: Vec<&str> = route.split('/').collect();
     let documented_segments: Vec<&str> = documented.split('/').collect();
@@ -95,20 +95,20 @@ fn the_document_describes_the_projects_real_modules() {
     let paths = doc["paths"].as_object().unwrap();
 
     // Commands: public routed, internal absent.
-    assert!(paths.contains_key("/commands/register-user"));
-    assert!(paths.contains_key("/commands/rename-user"));
+    assert!(paths.contains_key("/commands/RegisterUser"));
+    assert!(paths.contains_key("/commands/RenameUser"));
     assert!(
-        !paths.keys().any(|path| path.contains("record-welcome")),
+        !paths.keys().any(|path| path.contains("RecordWelcome")),
         "an internal command is not routed, so it must not be documented: {:?}",
         paths.keys().collect::<Vec<_>>()
     );
 
     // Read models: both projectors, both operations each.
     for path in [
-        "/read/users/users",
-        "/read/users/users/{key}",
-        "/read/user-stats/totals",
-        "/read/user-stats/totals/{key}",
+        "/read/Users/User",
+        "/read/Users/User/{key}",
+        "/read/UserStats/Totals",
+        "/read/UserStats/Totals/{key}",
     ] {
         assert!(paths.contains_key(path), "missing read path {path}");
     }
@@ -124,8 +124,8 @@ fn the_document_describes_the_projects_real_modules() {
         tags,
         vec![
             "commands",
-            "read: user-stats",
-            "read: users",
+            "read: UserStats",
+            "read: Users",
             "operations",
             "introspection",
         ],
@@ -271,10 +271,13 @@ fn the_cli_refuses_a_path_that_is_not_a_project() {
 /// A project with errors gets no document at all, and says why on stderr.
 #[test]
 fn the_cli_refuses_to_generate_for_a_broken_project() {
-    let project = support::write_project(&[(
-        "commands/broken.star",
-        "input = schema(id = uuid())\n\ndef handle(input, state):\n    return no_such_event()\n",
-    )]);
+    let project = support::write_project(&[
+        ("events/e.hk", "event @thing.happened { id: Uuid }\n"),
+        (
+            "commands/broken.hk",
+            "command Broken(id: Uuid) {\n  emit @no.such.event { id }\n}\n",
+        ),
+    ]);
     let output = Command::new(env!("CARGO_BIN_EXE_hekla"))
         .arg("openapi")
         .arg(project.path())

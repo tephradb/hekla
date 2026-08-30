@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::crypto::{KeyStore, RowDecryptor};
 use crate::read_model::{ReadModel, coerce_value};
-use crate::starlark_builtins::{EntityDef, FieldKind, scalar_to_string};
+use crate::schema::{EntityDef, FieldKind, scalar_to_string};
 
 /// Default page size for a scan when the request does not set `limit`.
 pub const DEFAULT_LIMIT: usize = 50;
@@ -169,10 +169,6 @@ pub(crate) fn typed_from_string(kind: &FieldKind, text: String) -> Value {
             .parse::<i64>()
             .map(Value::from)
             .unwrap_or(Value::String(text)),
-        FieldKind::U64 => text
-            .parse::<u64>()
-            .map(Value::from)
-            .unwrap_or(Value::String(text)),
         FieldKind::Bool => match text.as_str() {
             "true" => Value::Bool(true),
             "false" => Value::Bool(false),
@@ -256,9 +252,8 @@ mod tests {
     use super::*;
 
     fn entity_with_index() -> EntityDef {
-        use crate::starlark_builtins::{FieldKind, FieldMeta, IndexDef};
+        use crate::schema::{FieldKind, FieldMeta, IndexDef};
         EntityDef {
-            id: 1,
             name: "users".to_owned(),
             key: "user_id".to_owned(),
             fields: vec![

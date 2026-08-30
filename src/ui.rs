@@ -20,17 +20,20 @@
 //! directory. Asset names are flat because the route captures one path segment.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
+
+use crate::hash;
 
 /// One file of the console, embedded at compile time.
 pub struct Asset {
@@ -332,20 +335,61 @@ fn quality(headers: &HeaderMap, media_type: &str, subtype: &str) -> f32 {
     best.map_or(0.0, |(_, weight)| weight)
 }
 
+/// The validator for an asset's bytes, or `None` while a development override is
+/// active.
+///
+/// `no-cache` is revalidate-every-time, and revalidation needs something to revalidate
+/// against: with no validator every conditional request degrades to a full 200, so a
+/// page load re-transfers the whole console. The digest is over the compiled-in bytes,
+/// which are fixed for the life of the binary and differ exactly when a deployed
+/// console does, so it is a strong validator without a build step to produce one.
+///
+/// An override has none on purpose. Its bytes change under a fixed binary, which is
+/// what `no-store` says, and a validator would be the one thing able to contradict it.
+pub fn etag(asset: &'static Asset) -> Option<&'static str> {
+    if override_dir().is_some() {
+        return None;
+    }
+    static ETAGS: OnceLock<HashMap<&'static str, String>> = OnceLock::new();
+    ETAGS
+        .get_or_init(|| {
+            ASSETS
+                .iter()
+                .map(|asset| (asset.name, format!("\"{}\"", hash::sha256_hex(asset.bytes))))
+                .collect()
+        })
+        .get(asset.name)
+        .map(String::as_str)
+}
+
+/// Whether `If-None-Match` already names `etag`.
+///
+/// The header is a comma list and may legally repeat, and a shared cache is allowed to
+/// weaken a strong validator with a `W/` prefix, so neither a compare against the whole
+/// header value nor an exact match on one entry is enough.
+fn revalidates(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == etag)
+}
+
 /// Serve the console's shell.
-pub fn shell() -> Response {
+pub fn shell(headers: &HeaderMap) -> Response {
     match asset(SHELL) {
-        Some(shell) => serve(shell),
+        Some(shell) => serve(shell, headers),
         // Unreachable: `SHELL` is in the table or the crate does not compile. Answered
         // rather than panicked because a request thread is the wrong place to abort.
         None => (StatusCode::INTERNAL_SERVER_ERROR, "no shell").into_response(),
     }
 }
 
-/// Serve one asset, honouring the development override.
-pub fn serve(asset: &'static Asset) -> Response {
+/// Serve one asset, honouring the development override and the caller's validator.
+pub fn serve(asset: &'static Asset, headers: &HeaderMap) -> Response {
     let dir = override_dir();
-    let body = bytes(asset, dir);
     let caching = match dir {
         // The bytes change under a fixed version while an override is active, so
         // nothing about them may be cached.
@@ -356,14 +400,40 @@ pub fn serve(asset: &'static Asset) -> Response {
         // kilobytes.
         None => "no-cache",
     };
-    (
+    let tag = etag(asset);
+    if let Some(tag) = tag
+        && revalidates(headers, tag)
+    {
+        // The transfer `no-cache` was always meant to save. A 304 repeats the validator
+        // and the caching rule because it updates the stored response's headers, and
+        // carries no body or content type because it replaces neither.
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        let out = response.headers_mut();
+        out.insert(header::CACHE_CONTROL, HeaderValue::from_static(caching));
+        out.insert(header::ETAG, HeaderValue::from_static(tag));
+        return response;
+    }
+    let body = match bytes(asset, dir) {
+        // The compiled-in slice goes to the body as-is. This is the path every
+        // deployment takes, ~25 assets per page load, and it used to copy each one on
+        // to the heap on its way out.
+        Cow::Borrowed(slice) => Bytes::from_static(slice),
+        Cow::Owned(owned) => Bytes::from(owned),
+    };
+    let mut response = (
         [
             (header::CONTENT_TYPE, asset.content_type),
             (header::CACHE_CONTROL, caching),
         ],
-        body.into_owned(),
+        body,
     )
-        .into_response()
+        .into_response();
+    if let Some(tag) = tag {
+        response
+            .headers_mut()
+            .insert(header::ETAG, HeaderValue::from_static(tag));
+    }
+    response
 }
 
 /// Serve the console to a browser and the JSON API to everything else.
@@ -375,10 +445,15 @@ pub fn serve(asset: &'static Asset) -> Response {
 /// error document.
 pub async fn negotiate(request: Request, next: Next) -> Response {
     if wants_html(request.headers()) {
-        // `shell()` reads from disk when a development override is configured, so it
-        // goes to a blocking thread for the same reason the asset handler does.
+        // Only a development override touches the disk. With none configured this is a
+        // table lookup and a refcount bump, so dispatching to the blocking pool would
+        // cost more than the work it moves off the runtime.
+        if override_dir().is_none() {
+            return vary(shell(request.headers()));
+        }
+        let headers = request.headers().clone();
         return vary(
-            tokio::task::spawn_blocking(shell)
+            tokio::task::spawn_blocking(move || shell(&headers))
                 .await
                 .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR)),
         );

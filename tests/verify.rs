@@ -10,8 +10,9 @@
 mod support;
 
 use hekla::effect::StubHttpClient;
+use hekla::invariant::{Mismatch, Violation};
 use hekla::lock::DataDirLock;
-use hekla::verify::{self, Mismatch, Violation};
+use hekla::verify;
 use rusqlite::Connection;
 use serde_json::json;
 use std::fs;
@@ -32,11 +33,11 @@ fn populated(data_dir: &Path) {
         .start();
     let position = register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
     register_user(&harness.rt, BOB, "bob@example.com", "Bob");
-    support::wait_position(&harness.rt, "users", position);
+    support::wait_position(&harness.rt, "Users", position);
     // The effect has to reach its position too, or there is no recorded invocation
     // for the replay check to sweep.
     support::wait_until("the effect to catch up", || {
-        harness.rt.effect("send-welcome").unwrap().position() >= position
+        harness.rt.effect("SendWelcome").unwrap().position() >= position
     });
     harness.shutdown();
 }
@@ -86,9 +87,9 @@ fn a_row_edited_behind_the_projector_is_caught() {
     let data = tempfile::tempdir().unwrap();
     populated(data.path());
 
-    open_model(data.path(), "users")
+    open_model(data.path(), "Users")
         .execute(
-            "UPDATE users SET name = 'Tampered' WHERE user_id = ?1",
+            "UPDATE \"User\" SET name = 'Tampered' WHERE user_id = ?1",
             [ALICE],
         )
         .unwrap();
@@ -115,8 +116,8 @@ fn a_row_deleted_behind_the_projector_is_caught() {
     let data = tempfile::tempdir().unwrap();
     populated(data.path());
 
-    open_model(data.path(), "users")
-        .execute("DELETE FROM users WHERE user_id = ?1", [BOB])
+    open_model(data.path(), "Users")
+        .execute("DELETE FROM \"User\" WHERE user_id = ?1", [BOB])
         .unwrap();
 
     let report = sweep(&example_dir("users"), data.path());
@@ -136,9 +137,9 @@ fn a_row_invented_behind_the_projector_is_caught() {
     let data = tempfile::tempdir().unwrap();
     populated(data.path());
 
-    open_model(data.path(), "users")
+    open_model(data.path(), "Users")
         .execute(
-            "INSERT INTO users (user_id, email, name) VALUES (?1, ?2, ?3)",
+            "INSERT INTO \"User\" (user_id, email, name) VALUES (?1, ?2, ?3)",
             [
                 "44444444-4444-4444-4444-444444444444",
                 "ghost@example.com",
@@ -171,8 +172,8 @@ fn a_missing_journal_entry_is_caught_without_performing_the_call() {
     let removed = Connection::open(data.path().join("hekla.db"))
         .unwrap()
         .execute(
-            "DELETE FROM effect_journal WHERE effect = 'send-welcome' AND rowid IN \
-             (SELECT MIN(rowid) FROM effect_journal WHERE effect = 'send-welcome')",
+            "DELETE FROM effect_journal WHERE effect = 'SendWelcome' AND rowid IN \
+             (SELECT MIN(rowid) FROM effect_journal WHERE effect = 'SendWelcome')",
             [],
         )
         .unwrap();
@@ -202,7 +203,7 @@ fn an_edited_effect_is_skipped_rather_than_reported() {
     // legitimate: the journal belongs to a program that no longer exists.
     let edited = tempfile::tempdir().unwrap();
     copy_dir(&example_dir("users"), edited.path());
-    let effect = edited.path().join("effects/send-welcome.star");
+    let effect = edited.path().join("effects/send-welcome.hk");
     let source = fs::read_to_string(&effect).unwrap();
     fs::write(
         &effect,
@@ -299,9 +300,9 @@ fn verify_mode_runs_a_normal_project_without_quarantining_anything() {
     assert!(harness.rt.verify(), "verify mode should be on");
 
     let position = register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
-    support::wait_position(&harness.rt, "users", position);
+    support::wait_position(&harness.rt, "Users", position);
     support::wait_until("the effect to catch up", || {
-        harness.rt.effect("send-welcome").unwrap().position() >= position
+        harness.rt.effect("SendWelcome").unwrap().position() >= position
     });
 
     let status = harness.rt.status();
@@ -336,7 +337,7 @@ fn subject_encrypted_columns_rebuild_identically() {
         .with_master_key()
         .start();
     let position = place_order(&harness.rt, UUID_A, 7, "buyer@example.com");
-    support::wait_position(&harness.rt, "customer-orders", position);
+    support::wait_position(&harness.rt, "CustomerOrders", position);
     harness.shutdown();
 
     let report = sweep(&example_dir("orders"), data.path());
@@ -346,6 +347,52 @@ fn subject_encrypted_columns_rebuild_identically() {
         report.violations
     );
     assert!(report.projectors_checked >= 1);
+}
+
+/// An erased subject must not make a projector look corrupt forever.
+///
+/// The rebuild check compares stored bytes, which is sound only while the two sides
+/// have the same bytes to hold. Erasure breaks that: a shred rewrites nothing, so the
+/// live row keeps the ciphertext it was written with, while a rebuild re-encrypts from
+/// the log, finds no key, and writes NULL rather than minting the key the erasure
+/// destroyed. Both read back absent, so they differ only at rest.
+///
+/// Found by erasing a subject on a real server and running `hekla verify`, which is
+/// the ordinary operational sequence: a GDPR request, then the nightly sweep.
+#[test]
+fn an_erased_subject_is_not_a_rebuild_mismatch() {
+    let data = tempfile::tempdir().unwrap();
+    let harness = Boot::new(example_dir("orders"))
+        .data_dir(data.path())
+        .with_master_key()
+        .start();
+    let position = place_order(&harness.rt, UUID_A, 7, "buyer@example.com");
+    support::wait_position(&harness.rt, "CustomerOrders", position);
+
+    harness.shutdown();
+
+    // Control: clean before the erasure, so the assertion below is about the shred and
+    // not about the fixture. The sweep takes the data-directory lock, so it runs with
+    // the runtime stopped.
+    assert!(sweep(&example_dir("orders"), data.path()).is_clean());
+
+    let opdb = std::sync::Arc::new(std::sync::Mutex::new(
+        hekla::opdb::OpDb::open(&data.path().join("hekla.db")).unwrap(),
+    ));
+    assert!(
+        hekla::crypto::KeyStore::new(opdb, master_keys())
+            .erase("customer_id", "7")
+            .unwrap(),
+        "the subject key must exist to be erased"
+    );
+
+    let report = sweep(&example_dir("orders"), data.path());
+    assert!(
+        report.is_clean(),
+        "an erased subject is a shred, not corruption: {:?}",
+        report.violations
+    );
+    assert!(report.projectors_checked >= 1, "the check really ran");
 }
 
 #[test]
@@ -358,11 +405,11 @@ fn a_tampered_subject_column_is_still_caught() {
         .with_master_key()
         .start();
     let position = place_order(&harness.rt, UUID_A, 7, "buyer@example.com");
-    support::wait_position(&harness.rt, "customer-orders", position);
+    support::wait_position(&harness.rt, "CustomerOrders", position);
     harness.shutdown();
 
-    open_model(data.path(), "customer-orders")
-        .execute("UPDATE orders SET email = 'not-ciphertext'", [])
+    open_model(data.path(), "CustomerOrders")
+        .execute("UPDATE \"Order\" SET email = 'not-ciphertext'", [])
         .unwrap();
 
     let report = sweep(&example_dir("orders"), data.path());
@@ -380,7 +427,7 @@ fn a_tampered_subject_column_is_still_caught() {
 fn place_order(rt: &hekla::runtime::Runtime, order_id: &str, customer_id: u64, email: &str) -> u64 {
     let result = rt
         .execute(
-            "place-order",
+            "PlaceOrder",
             json!({
                 "order_id": order_id,
                 "customer_id": customer_id,
@@ -424,39 +471,34 @@ fn an_effect_that_erases_what_it_revealed_is_not_reported_as_divergent() {
     let dir = support::write_project(&[
         ("hekla.toml", "[verify]\nenabled = true\n"),
         (
-            "events/customer.star",
+            "events/customer.hk",
             r#"
-customer_closed = event(
-    type = "customer.closed",
-    fields = {
-        "customer_id": uint(),
-        "email": str(subject = "customer_id", max_length = 200),
-    },
-)
+event @customer.closed {
+  customer_id: Int,
+  // Optional because an erased subject reads back absent, which is the whole point
+  // of the scenario below.
+  email: String? @subject(customer_id) @max(200),
+}
 "#,
         ),
         (
-            "commands/close-account.star",
+            "commands/close-account.hk",
             r#"
-load("events/customer.star", "customer_closed")
-
-input = schema(customer_id = uint(), email = str())
-
-def handle(input, state):
-    return customer_closed(customer_id = input.customer_id, email = input.email)
+command CloseAccount(customer_id: Int, email: String?) {
+  emit @customer.closed { customer_id, email }
+}
 "#,
         ),
         (
-            "effects/forget-customer.star",
+            "effects/forget-customer.hk",
             r#"
-load("events/customer.star", "customer_closed")
-
-def forget(event, state):
-    address = reveal(event.data.email)
-    http.post(url = "https://example.test/farewell", body = {"to": address})
-    erase("customer_id", str(event.data.customer_id))
-
-handle = {customer_closed(): forget}
+effect ForgetCustomer {
+  on @customer.closed { customer_id, email } {
+    let address = reveal(email)
+    http.post("https://example.test/farewell", { "to": address })
+    erase(customer_id)
+  }
+}
 "#,
         ),
     ]);
@@ -470,7 +512,7 @@ handle = {customer_closed(): forget}
     let result = harness
         .rt
         .execute(
-            "close-account",
+            "CloseAccount",
             json!({ "customer_id": 42, "email": "gone@example.com" }),
             &support::ctx(),
             None,
@@ -480,9 +522,9 @@ handle = {customer_closed(): forget}
     let position = result.body["positions"]["last"].as_u64().unwrap();
 
     support::wait_until("the effect to catch up", || {
-        harness.rt.effect("forget-customer").unwrap().position() >= position
+        harness.rt.effect("ForgetCustomer").unwrap().position() >= position
     });
-    let effect = harness.rt.effect("forget-customer").unwrap();
+    let effect = harness.rt.effect("ForgetCustomer").unwrap();
     assert!(
         !effect.quarantined(),
         "erase-last must not quarantine: {:?}",
@@ -509,42 +551,40 @@ fn a_projector_matching_nothing_survives_a_replay() {
     // read-your-writes wait resolved against it.
     let dir = support::write_project(&[
         (
-            "events/thing.star",
+            "events/thing.hk",
             r#"
-happened = event(type = "thing.happened", fields = {"id": uuid()})
-ignored = event(type = "thing.ignored", fields = {"id": uuid()})
+event @thing.happened { id: Uuid }
+event @thing.ignored { id: Uuid }
 "#,
         ),
         (
-            "commands/do-it.star",
+            "commands/do-it.hk",
             r#"
-load("events/thing.star", "ignored")
-
-input = schema(id = uuid())
-
-def handle(input, state):
-    return ignored(id = input.id)
+command DoIt(id: Uuid) {
+  emit @thing.ignored { id }
+}
 "#,
         ),
         (
-            "commands/note-it.star",
+            "commands/note-it.hk",
             r#"
-load("events/thing.star", "happened")
-
-input = schema(id = uuid())
-
-def handle(input, state):
-    return happened(id = input.id)
+command NoteIt(id: Uuid) {
+  emit @thing.happened { id }
+}
 "#,
         ),
         (
-            "projectors/tracker.star",
+            "projectors/tracker.hk",
             r#"
-load("events/thing.star", "happened")
+projector Tracker {
+  entity Thing {
+    id: Uuid @key,
+  }
 
-things = entity(key = "id", fields = {"id": uuid()})
-
-handle = {happened(): lambda event: [put(things, {"id": event.data.id})]}
+  on @thing.happened { id } {
+    put Thing { id }
+  }
+}
 "#,
         ),
     ]);
@@ -555,16 +595,16 @@ handle = {happened(): lambda event: [put(things, {"id": event.data.id})]}
     for id in [ALICE, BOB] {
         let result = harness
             .rt
-            .execute("do-it", json!({ "id": id }), &support::ctx(), None)
+            .execute("DoIt", json!({ "id": id }), &support::ctx(), None)
             .unwrap();
         assert_eq!(result.status, 200, "{:?}", result.body);
     }
     let tail = support::log_head(&harness.rt);
     support::wait_until("the projector to track the non-matching tail", || {
-        harness.rt.projector("tracker").unwrap().position() >= tail
+        harness.rt.projector("Tracker").unwrap().position() >= tail
     });
 
-    harness.rt.projector("tracker").unwrap().request_replay();
+    harness.rt.projector("Tracker").unwrap().request_replay();
     // The rebuild has to finish while the boundary is still empty, which is the whole
     // scenario: appending the matching event first would give it something to apply
     // and hide the bug. Nothing public signals "replay done", so this waits out the
@@ -576,20 +616,20 @@ handle = {happened(): lambda event: [put(things, {"id": event.data.id})]}
     // alone would pass against a dead thread, since neither moves when it dies.
     let result = harness
         .rt
-        .execute("note-it", json!({ "id": CAROL }), &support::ctx(), None)
+        .execute("NoteIt", json!({ "id": CAROL }), &support::ctx(), None)
         .unwrap();
     assert_eq!(result.status, 200, "{:?}", result.body);
     let head = support::log_head(&harness.rt);
     support::wait_until(
         "the projector to apply a matching event after the replay",
-        || harness.rt.projector("tracker").unwrap().position() >= head,
+        || harness.rt.projector("Tracker").unwrap().position() >= head,
     );
     assert!(
-        support::read_row(&harness, "tracker", "things", CAROL, head).is_some(),
+        support::read_row(&harness, "Tracker", "Thing", CAROL, head).is_some(),
         "the rebuilt model must hold the matching event"
     );
 
-    let shared = harness.rt.projector("tracker").unwrap();
+    let shared = harness.rt.projector("Tracker").unwrap();
     assert!(shared.running(), "the thread must survive a replay");
     assert_eq!(shared.readiness().label(), "ready");
     assert_eq!(shared.last_error(), None);
@@ -610,7 +650,7 @@ fn a_recorded_quarantine_stops_the_effect_at_the_next_boot() {
         .unwrap()
         .execute(
             "INSERT INTO effect_quarantine (effect, position, reason) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["send-welcome", 1i64, "planted for the restart test"],
+            rusqlite::params!["SendWelcome", 1i64, "planted for the restart test"],
         )
         .unwrap();
     // Rewind the cursor so the effect would happily re-process everything if the
@@ -633,7 +673,7 @@ fn a_recorded_quarantine_stops_the_effect_at_the_next_boot() {
         .start();
     thread::sleep(Duration::from_secs(1));
 
-    let effect = harness.rt.effect("send-welcome").unwrap();
+    let effect = harness.rt.effect("SendWelcome").unwrap();
     assert!(
         effect.quarantined(),
         "a recorded quarantine must be honoured at boot"
@@ -682,14 +722,14 @@ fn a_verified_invocation_is_completed_before_it_is_checked() {
         .start();
     let position = register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
     support::wait_until("the effect to catch up", || {
-        harness.rt.effect("send-welcome").unwrap().position() >= position
+        harness.rt.effect("SendWelcome").unwrap().position() >= position
     });
     harness.shutdown();
 
     let status: String = Connection::open(data.path().join("hekla.db"))
         .unwrap()
         .query_row(
-            "SELECT status FROM effect_invocation WHERE effect = 'send-welcome'",
+            "SELECT status FROM effect_invocation WHERE effect = 'SendWelcome'",
             [],
             |row| row.get(0),
         )

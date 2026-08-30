@@ -1,0 +1,17 @@
+// The boundary is the `state` fold: every prior registration for this email. What a
+// command folds is what it conflicts on, so declaring the read declares the append
+// condition too.
+
+command RegisterUser(user_id: Uuid, email: String, name: String) {
+  state taken: Bool = fold false
+    on @user.registered(email) => true
+
+  if is_blank(name) {
+    return reject("invalid_name", "name must not be blank")
+  }
+  if taken {
+    return reject("email_taken", "that email is already registered")
+  }
+
+  emit @user.registered { user_id, email, name }
+}

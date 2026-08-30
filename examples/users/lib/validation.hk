@@ -1,0 +1,6 @@
+// Shared pure helpers. A module is not a namespace, so this is in scope everywhere in
+// the program and the directory is for humans.
+
+fn is_blank(value: String) -> Bool {
+  return value.trim().is_empty()
+}

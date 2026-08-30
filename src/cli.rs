@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::effect::{HttpClient, UreqClient};
+use crate::http::{HttpClient, UreqClient};
 use crate::loader::{Finding, LoadedProject, Severity};
 use crate::opdb::OpDb;
-use crate::{crypto, fmt, runtime, server, testing, validate};
+use crate::{crypto, runtime, server, testing, validate};
 
 /// The default HTTP bind address when `--addr` is not given.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
@@ -26,7 +26,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 #[command(
     name = "hekla",
     version,
-    about = "event-sourced runtime with Starlark modules"
+    about = "event-sourced runtime with heklang modules"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,29 +40,6 @@ enum Command {
         /// The project directory.
         #[arg(default_value = ".")]
         dir: PathBuf,
-    },
-    /// Normalise whitespace in `.star` files.
-    Fmt {
-        /// The project directory.
-        #[arg(default_value = ".")]
-        dir: PathBuf,
-        /// Report files that need formatting instead of writing them.
-        #[arg(long)]
-        check: bool,
-    },
-    /// Run the Starlark language server over stdio, for editor integration.
-    ///
-    /// Takes no project directory: each open file is placed in its own project,
-    /// so one editor session can span several.
-    Lsp {
-        /// Accepted and ignored. Editors conventionally pass it, and stdio is the
-        /// only transport.
-        #[arg(long)]
-        stdio: bool,
-        /// Skip evaluating each file against its project, leaving parsing, load
-        /// rules and name resolution.
-        #[arg(long)]
-        no_project_checks: bool,
     },
     /// Run the runtime and HTTP API from a project directory.
     Serve {
@@ -151,11 +128,6 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Check { dir } => check(&dir),
-        Command::Fmt { dir, check } => run_fmt(&dir, check),
-        Command::Lsp {
-            stdio: _,
-            no_project_checks,
-        } => crate::lsp::run(!no_project_checks),
         Command::Serve {
             dir,
             addr,
@@ -202,7 +174,7 @@ fn openapi(dir: &Path) -> ExitCode {
     if project.commands.is_empty()
         && project.projectors.is_empty()
         && project.effects.is_empty()
-        && project.events.by_type.is_empty()
+        && project.events.is_empty()
     {
         eprintln!(
             "error: `{}` declares no commands, projectors, effects or events, so there is \
@@ -322,7 +294,7 @@ fn check(dir: &Path) -> ExitCode {
         project.commands.len(),
         project.projectors.len(),
         project.effects.len(),
-        project.events.by_type.len(),
+        project.events.len(),
     );
     if errors == 0 {
         println!("ok: no errors, {warnings} warning(s)");
@@ -436,48 +408,13 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) 
     }
 }
 
-fn run_fmt(dir: &Path, check_only: bool) -> ExitCode {
-    let outcome = fmt::run(dir, check_only);
-    for (path, err) in &outcome.errors {
-        eprintln!("error: {path}: {err}");
-    }
-    if check_only {
-        for path in &outcome.changed {
-            println!("would format: {path}");
-        }
-        if !outcome.errors.is_empty() {
-            ExitCode::FAILURE
-        } else if outcome.changed.is_empty() {
-            println!("ok: all files formatted");
-            ExitCode::SUCCESS
-        } else {
-            println!("{} file(s) need formatting", outcome.changed.len());
-            ExitCode::FAILURE
-        }
-    } else {
-        for path in &outcome.changed {
-            println!("formatted: {path}");
-        }
-        if outcome.errors.is_empty() {
-            println!("formatted {} file(s)", outcome.changed.len());
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        }
-    }
-}
-
 /// The loader findings plus the semantic checks, sorted by location. Shared with
 /// `hekla test` so every command reports the same findings in the same order.
 pub(crate) fn collect_findings(project: &LoadedProject) -> Vec<Finding> {
     let mut findings = project.findings.clone();
     findings.extend(validate::check(project));
     findings.sort_by(|left, right| {
-        let position = |finding: &Finding| {
-            finding
-                .span
-                .map(|span| (span.begin.line, span.begin.column))
-        };
+        let position = |finding: &Finding| finding.span.map(|span| (span.line, span.column));
         left.location
             .cmp(&right.location)
             .then_with(|| position(left).cmp(&position(right)))
@@ -516,14 +453,14 @@ fn print_findings(findings: &[Finding]) {
 
 /// One finding as a line. Shared with `hekla openapi`, which writes the same lines to
 /// stderr so its stdout stays parseable JSON.
-fn render_finding(finding: &Finding) -> String {
+pub(crate) fn render_finding(finding: &Finding) -> String {
     let severity = match finding.severity {
         Severity::Error => "error",
         Severity::Warning => "warning",
     };
     // Spans are 0-based; editors and humans count from one.
     let at = match finding.span {
-        Some(span) => format!(":{}:{}", span.begin.line + 1, span.begin.column + 1),
+        Some(span) => format!(":{}:{}", span.line + 1, span.column + 1),
         None => String::new(),
     };
     format!("{severity}: {}{at}: {}", finding.location, finding.message)

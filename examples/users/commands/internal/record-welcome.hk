@@ -1,0 +1,18 @@
+// An internal command: an effect may `invoke` it, and it is never routed over HTTP, so
+// nobody can post a fabricated `@user.welcomed`.
+//
+// The slice on this user's `@user.welcomed` is what makes it idempotent under replay.
+// An effect that crashes between the append and its journal entry re-invokes on
+// restart, and the boundary turns the second append into a reject rather than a
+// duplicate event.
+
+command RecordWelcome(user_id: Uuid) {
+  state welcomed: Bool = fold false
+    on @user.welcomed(user_id) => true
+
+  if welcomed {
+    return reject("already_welcomed", "a welcome was already recorded for this user")
+  }
+
+  emit @user.welcomed { user_id }
+}

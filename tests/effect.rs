@@ -14,7 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hekla::context::CommandContext;
-use hekla::effect::{HttpClient, HttpResponse, StubHttpClient};
+use hekla::effect::StubHttpClient;
+use hekla::http::{HttpClient, HttpResponse};
 use hekla::runtime::Runtime;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -24,7 +25,7 @@ mod support;
 
 use support::{ALICE, Boot, Harness, log_head, register_user, wait_until};
 
-const EFFECT: &str = "send-welcome";
+const EFFECT: &str = "SendWelcome";
 
 fn boot(data: &Path, http: Arc<dyn HttpClient>) -> Harness {
     Boot::example().data_dir(data).http(http).start()
@@ -147,13 +148,13 @@ fn invoke_commands_boundary_dedupes_a_replay_when_the_key_is_lost() {
     let input = json!({ "user_id": ALICE });
     let first = booted
         .rt
-        .execute_from_effect("record-welcome", input.clone(), &ctx, Some("key-a"))
+        .execute_from_effect("RecordWelcome", input.clone(), &ctx, Some("key-a"))
         .unwrap();
     assert_eq!(first.status, 200);
 
     let second = booted
         .rt
-        .execute_from_effect("record-welcome", input, &ctx, Some("key-b"))
+        .execute_from_effect("RecordWelcome", input, &ctx, Some("key-b"))
         .unwrap();
     assert_eq!(second.status, 422);
     assert_eq!(second.body["error"]["code"], "already_welcomed");
@@ -273,11 +274,13 @@ fn a_transport_error_wedges_the_effect_and_never_reaches_the_handler() {
     let effect = booted.rt.effect(EFFECT).unwrap();
     let last_error = effect.last_error().expect("a wedge records its last error");
     assert!(
-        last_error.contains("http POST https://example.test/welcome"),
+        last_error.contains("https://example.test/welcome"),
         "the wedge names the failed call: {last_error}"
     );
-    // The cause chain has to survive the starlark boundary: naming the call
-    // without the transport reason tells an operator which call failed but not why.
+    // Naming the call without the reason tells an operator which call failed but not
+    // why. Rule 5 absorbs every attempt before the language sees one, so the language
+    // reports only that the URL did not answer and the host is the only thing that
+    // still holds the reason.
     assert!(
         last_error.contains("connection refused"),
         "the wedge keeps the transport reason: {last_error}"
@@ -384,33 +387,52 @@ fn a_429_is_retried_by_the_runtime_and_never_reaches_the_handler() {
     );
 }
 
-/// A limiter that names its window gets that window waited out. Without this the
-/// runtime would come back on its own first backoff (200ms) and spend the whole
-/// window being refused.
+/// A limiter that names its window gets that window waited out.
+///
+/// Where the wait happens moved with rule 5. It used to be the only wait there was: a
+/// 429 never reached the script, so the invocation wedged on the first one and this
+/// driver's backoff honored the header. Now the language re-sends immediately a few
+/// times first, so a limiter that refuses once and then relents is absorbed inside the
+/// invocation and no wait is owed. What is still owed, and is what this pins, is the
+/// gap before the *next* invocation once those attempts are exhausted: 200ms on the
+/// driver's own ladder, and a full second when the server asked for one.
 #[test]
-fn a_retry_after_holds_the_next_attempt_for_the_window_the_server_named() {
+fn a_retry_after_holds_the_next_invocation_for_the_window_the_server_named() {
     let data = tempfile::tempdir().unwrap();
-    let stub = Arc::new(StubHttpClient::new(|index, _| {
+    // Refuses every time: the attempts rule 5 absorbs all fail, so the invocation
+    // wedges and the driver has to decide when to come back.
+    let stub = Arc::new(StubHttpClient::new(|_, _| {
         Ok(HttpResponse {
-            status: if index == 0 { 429 } else { 200 },
+            status: 429,
             headers: vec![("retry-after".to_owned(), "1".to_owned())],
             body: b"{}".to_vec(),
         })
     }));
     let booted = boot(data.path(), stub.clone());
 
-    let started = Instant::now();
     register(&booted.rt, ALICE); // user.registered at position 1
-    wait_until("the effect to get past the rate limit", || {
-        log_head(&booted.rt) >= 2
+    wait_until("the first invocation to wedge", || {
+        booted.rt.effect(EFFECT).unwrap().consecutive_failures() >= 1
     });
-    let elapsed = started.elapsed();
-
-    assert_eq!(stub.call_count(), 2, "one refusal, then the retry");
+    let after_first = stub.call_count();
     assert!(
-        elapsed >= Duration::from_millis(900),
-        "the retry landed after {elapsed:?}, so the 1s the server asked for was ignored"
+        after_first > 1,
+        "rule 5 re-sends within the invocation, so a wedge means several attempts: \
+         {after_first}"
     );
+
+    // The driver's own first backoff is 200ms, so anything still waiting well past
+    // that is waiting on the header rather than on the ladder.
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        stub.call_count(),
+        after_first,
+        "the next invocation started inside the 1s the server asked for"
+    );
+
+    wait_until("the window to expire and the effect to try again", || {
+        stub.call_count() > after_first
+    });
 
     booted.shutdown();
 }

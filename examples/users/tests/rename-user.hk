@@ -1,0 +1,59 @@
+// The rename boundary folds two event types over one user, so the decision and the
+// append condition are both exercised here.
+
+test "renames an existing user" {
+  given @user.registered {
+    user_id: "55555555-5555-5555-5555-555555555555",
+    email: "carol@example.com",
+    name: "Carol",
+  }
+  run RenameUser {
+    user_id: "55555555-5555-5555-5555-555555555555",
+    name: "Caroline",
+  }
+  expect @user.renamed {
+    user_id: "55555555-5555-5555-5555-555555555555",
+    name: "Caroline",
+  }
+}
+
+test "renames a user that was already renamed" {
+  given @user.registered {
+    user_id: "66666666-6666-6666-6666-666666666666",
+    email: "dave@example.com",
+    name: "Dave",
+  }
+  given @user.renamed {
+    user_id: "66666666-6666-6666-6666-666666666666",
+    name: "David",
+  }
+  run RenameUser {
+    user_id: "66666666-6666-6666-6666-666666666666",
+    name: "Dave Again",
+  }
+  expect @user.renamed {
+    user_id: "66666666-6666-6666-6666-666666666666",
+    name: "Dave Again",
+  }
+}
+
+test "refuses a rename for a user that does not exist" {
+  run RenameUser {
+    user_id: "77777777-7777-7777-7777-777777777777",
+    name: "Nobody",
+  }
+  expect reject("unknown_user", "no such user")
+}
+
+test "refuses a blank name" {
+  given @user.registered {
+    user_id: "88888888-8888-8888-8888-888888888888",
+    email: "erin@example.com",
+    name: "Erin",
+  }
+  run RenameUser {
+    user_id: "88888888-8888-8888-8888-888888888888",
+    name: "  ",
+  }
+  expect reject("invalid_name", "name must not be blank")
+}
