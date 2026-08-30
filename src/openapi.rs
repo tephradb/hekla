@@ -1795,29 +1795,10 @@ fn status_schema() -> Value {
                 "minimum": 0,
                 "description": "How many event types the project declares.",
             },
-            "folds": {
-                "type": "object",
-                "description": "Process-wide fold counters. `events_folded / commands` is \
-                    the mean boundary depth this deployment is paying for, which a \
-                    per-request API cannot report because the caller sees a decision \
-                    rather than the events behind it.",
-                "properties": {
-                    "events_folded": { "type": "integer", "minimum": 0 },
-                    "chunk_seams": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "How many times a fold froze its state and dropped \
-                            its heap. Chunking is invisible in the result, so this is what \
-                            makes it observable.",
-                    },
-                },
-                "required": ["events_folded", "chunk_seams"],
-                "additionalProperties": false,
-            },
         },
         "required": [
             "log_head", "uptime_seconds", "verify", "commands",
-            "projectors", "effects", "events", "folds",
+            "projectors", "effects", "events",
         ],
         "additionalProperties": false,
     })

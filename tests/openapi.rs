@@ -325,3 +325,63 @@ fn generating_the_document_touches_no_data_directory() {
         "generating the document created something"
     );
 }
+
+/// The `Status` schema against the body `GET /status` actually returns.
+///
+/// The document declares `additionalProperties: false` and a `required` list, so it
+/// makes two promises about that body and nothing was checking either. The port broke
+/// both at once: it deleted the fold-chunking machinery and `/status`'s `folds` counter
+/// with it, and left the schema declaring `folds` required, so the published contract
+/// promised a key the server had stopped sending and the admin console crashed reading
+/// it.
+#[tokio::test]
+async fn the_status_body_matches_the_schema_that_describes_it() {
+    let harness = boot_example();
+    let response = harness
+        .app()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    harness.shutdown();
+
+    let schema = &served_document()["components"]["schemas"]["Status"];
+    let declared: Vec<&str> = schema["properties"]
+        .as_object()
+        .expect("Status declares properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let returned: Vec<&str> = body
+        .as_object()
+        .expect("the status body is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    for name in schema["required"].as_array().unwrap() {
+        let name = name.as_str().unwrap();
+        assert!(
+            returned.contains(&name),
+            "the schema requires `{name}` and the body does not carry it: {returned:?}"
+        );
+    }
+    // `additionalProperties: false` is the other half of the promise, so a key the
+    // server grew without describing it fails here too.
+    for name in &returned {
+        assert!(
+            declared.contains(name),
+            "the body carries `{name}` and the schema does not describe it: {declared:?}"
+        );
+    }
+}

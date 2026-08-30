@@ -43,8 +43,8 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
     findings
 }
 
-/// Two things about an event's fields: that none of them occupies hekla's tag
-/// namespace, and that a personal-looking one can be erased.
+/// One thing about an event's fields: that none of them occupies hekla's tag
+/// namespace.
 fn check_events(events: &crate::schema::EventDefs, findings: &mut Vec<Finding>) {
     let mut sorted: Vec<(&String, &EventDef)> = events.iter().collect();
     sorted.sort_by_key(|(event_type, _)| *event_type);

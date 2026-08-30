@@ -163,10 +163,6 @@ export function OverviewView() {
             <dd>${status.events}</dd>
             <dt>verify</dt>
             <dd>${status.verify ? 'on' : 'off'}</dd>
-            <dt>events folded</dt>
-            <dd title="read amplification: events folded per command is the mean boundary depth this deployment pays for">
-              ${count(status.folds.events_folded)}
-            </dd>
           </dl>
         </div>
       </section>
