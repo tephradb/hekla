@@ -46,7 +46,6 @@ use crate::loader::{EffectUnit, LoadedProject, ProjectorUnit};
 use crate::projector;
 use crate::read_model::ReadModel;
 use crate::runtime::Runtime;
-use crate::schema::EventDefs;
 use crate::schema::{EntityDef, ModuleDef, scalar_to_string};
 
 /// What a run of the checks found, and how much it covered.
@@ -114,7 +113,6 @@ pub fn rebuild_equivalence(
     program: &Program,
     keystore: Option<&KeyStore>,
     live_db: &Path,
-    events: &EventDefs,
     scratch: &Path,
 ) -> anyhow::Result<Vec<Violation>> {
     let ModuleDef::Projector { name, entities, .. } = &unit.def else {
@@ -126,7 +124,7 @@ pub fn rebuild_equivalence(
 
     let rebuilt_path = scratch.join(format!("{name}.verify.db"));
     let rebuilt = ReadModel::open(&rebuilt_path, entities.as_slice())?;
-    projector::project_to(store, unit, program, keystore, &rebuilt, events, Some(upto))?;
+    projector::project_to(store, unit, program, keystore, &rebuilt, Some(upto))?;
 
     let mut violations = Vec::new();
     for entity in entities {
@@ -308,7 +306,6 @@ fn run_checks(
             runtime.program(),
             runtime.keystore(),
             &live_db,
-            runtime.events_map(),
             scratch.path(),
         )?);
     }

@@ -43,15 +43,7 @@ fn projector_reads_through_the_envelope() {
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("users.db"), entities).unwrap();
-    let seen = project_to_head(
-        &store,
-        projector,
-        &project.program,
-        None,
-        &model,
-        &project.events,
-    )
-    .unwrap();
+    let seen = project_to_head(&store, projector, &project.program, None, &model).unwrap();
     assert_eq!(seen, 1);
     assert_eq!(model.read_checkpoint().unwrap().get(), 1);
 
@@ -118,15 +110,7 @@ projector Counter {
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("counter.db"), entities).unwrap();
-    let seen = project_to_head(
-        &store,
-        projector,
-        &project.program,
-        None,
-        &model,
-        &project.events,
-    )
-    .unwrap();
+    let seen = project_to_head(&store, projector, &project.program, None, &model).unwrap();
     assert_eq!(seen, 2);
 
     let entity = entities.iter().find(|e| e.name == "Totals").unwrap();
@@ -178,15 +162,8 @@ projector Rows {
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("things.db"), &[stale]).unwrap();
 
-    let err = project_to_head(
-        &store,
-        projector,
-        &project.program,
-        None,
-        &model,
-        &project.events,
-    )
-    .expect_err("the insert names a column the stale table does not have");
+    let err = project_to_head(&store, projector, &project.program, None, &model)
+        .expect_err("the insert names a column the stale table does not have");
     let rendered = format!("{err:#}");
     assert!(
         rendered.contains("applying a write to entity `Row`"),
@@ -231,15 +208,7 @@ fn project_one_u64(n: u64) -> serde_json::Value {
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("big.db"), entities).unwrap();
-    let seen = project_to_head(
-        &store,
-        projector,
-        &project.program,
-        None,
-        &model,
-        &project.events,
-    )
-    .unwrap();
+    let seen = project_to_head(&store, projector, &project.program, None, &model).unwrap();
     assert_eq!(seen, 1);
     let entity = entities.iter().find(|e| e.name == "Num").unwrap();
     let read_back = model.get(entity, UUID_A).unwrap().expect("the row landed");
@@ -302,15 +271,7 @@ fn a_delete_op_removes_the_row_and_is_a_no_op_for_a_missing_key() {
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("things.db"), entities).unwrap();
-    let seen = project_to_head(
-        &store,
-        projector,
-        &project.program,
-        None,
-        &model,
-        &project.events,
-    )
-    .unwrap();
+    let seen = project_to_head(&store, projector, &project.program, None, &model).unwrap();
     assert_eq!(seen, 4);
 
     let entity = entities.iter().find(|e| e.name == "Thing").unwrap();
@@ -375,15 +336,7 @@ fn a_patch_for_a_missing_row_is_a_silent_no_op() {
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("people.db"), entities).unwrap();
-    let seen = project_to_head(
-        &store,
-        projector,
-        &project.program,
-        None,
-        &model,
-        &project.events,
-    )
-    .unwrap();
+    let seen = project_to_head(&store, projector, &project.program, None, &model).unwrap();
     assert_eq!(seen, 3);
 
     let entity = entities.iter().find(|e| e.name == "Person").unwrap();
@@ -494,15 +447,7 @@ fn a_clause_keyed_projector_handle_fans_out_and_subscribes_to_its_arms() {
 
     let model_dir = tempfile::tempdir().unwrap();
     let model = ReadModel::open(&model_dir.path().join("things.db"), entities).unwrap();
-    let seen = project_to_head(
-        &store,
-        projector,
-        &project.program,
-        None,
-        &model,
-        &project.events,
-    )
-    .unwrap();
+    let seen = project_to_head(&store, projector, &project.program, None, &model).unwrap();
     assert_eq!(seen, 3, "the unsubscribed type is never read");
 
     let things = entities.iter().find(|e| e.name == "Thing").unwrap();
@@ -571,15 +516,7 @@ fn the_envelope_fields_are_readable_and_survive_a_rebuild() {
     let project_once = || {
         let model_dir = tempfile::tempdir().unwrap();
         let model = ReadModel::open(&model_dir.path().join("things.db"), entities).unwrap();
-        project_to_head(
-            &store,
-            projector,
-            &project.program,
-            None,
-            &model,
-            &project.events,
-        )
-        .unwrap();
+        project_to_head(&store, projector, &project.program, None, &model).unwrap();
         let things = entities.iter().find(|e| e.name == "Thing").unwrap();
         model.get(things, UUID_A).unwrap().expect("the row")
     };

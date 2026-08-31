@@ -1445,11 +1445,12 @@ forward. Collected here so they are not lost in the prose of the phase that intr
 - **`hekla fmt` and `hekla lsp`** (Phase 21): both were Starlark tooling wrapped in hekla's project
   knowledge, and were dropped rather than stubbed. They come back when heklang has a formatter and a
   language server; its tree-sitter grammar is the start of one.
-- **Ciphertext below the language seam** (Phase 21): heklang's `Value::Sealed` holds plaintext and
-  its key seam answers only "is this subject erased", so hekla decrypts every subject-scoped field of
-  every record a fold reads. Measured at 3.5µs a record, four times the fold's own cost
-  (`tests/measure.rs`). Closing it means giving heklang a ciphertext-shaped seal, which is a language
-  change.
+- **Ciphertext below the language seam** (Phase 21): **closed.** heklang's `Value::Sealed` carries
+  the stored form and its key seam is now `Keys::decrypt`, so `Log::read` hands a ciphertext through
+  and a key is used once per `reveal` rather than once per record. The fold that cost 93ms against
+  24ms for the same fold over plaintext now costs 25ms against 25ms (`tests/measure.rs`). It also
+  deleted the placeholder a shredded key needed on the read path, and `record_of` no longer takes a
+  key store: reading the log is not a place key material has to reach.
 
 Inherent design properties, listed for completeness (not future work): `invoke_command` is exactly-once
 only when the target is idempotent under replay, and raw `http.*` is at-least-once.

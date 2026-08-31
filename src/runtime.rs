@@ -283,7 +283,6 @@ impl Runtime {
             &projectors_dir,
             Arc::clone(&program),
             keystore.clone(),
-            events.clone(),
             auto_rebuild,
         )?;
         let projectors: HashMap<String, Arc<ProjectorShared>> = shared

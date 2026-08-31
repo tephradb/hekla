@@ -311,8 +311,14 @@ async fn status_reports_projector_position_and_lag() {
 ///
 /// A projector has no `fail`: it cannot refuse, because a rebuild has to reach the
 /// same rows every time. What it can still do is hit a real store error, and the one
-/// an author actually meets is a read model narrower than the event feeding it. The
+/// an author actually meets is a read model narrower than the value reaching it. The
 /// column below takes three characters and the event field takes fifty.
+///
+/// The write is an interpolation rather than the field itself, because heklang's `@max`
+/// invariant now rejects the plain form statically (`heklang/docs/projectors.md`): a
+/// column bounding an event field tighter than the event declares it is a schema bug it
+/// catches at `hek check`. An interpolation has no second declaration to compare
+/// against, so it is what the runtime error is still for, which is what this exercises.
 const BOOM_EVENTS: &str = r#"
 event @boom.happened { id: Uuid, label: String @max(50) }
 "#;
@@ -331,7 +337,7 @@ projector Watch {
   }
 
   on @boom.happened { id, label } {
-    put Thing { id, label }
+    put Thing { id, label: "{label}" }
   }
 }
 "#;

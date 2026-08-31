@@ -29,7 +29,7 @@ use crate::heklang_host::{self, RowWriter};
 use crate::invariant::Violation;
 use crate::loader::ProjectorUnit;
 use crate::read_model::ReadModel;
-use crate::schema::{EntityDef, EventDefs, ModuleDef};
+use crate::schema::{EntityDef, ModuleDef};
 
 /// How long a caught-up projector blocks before re-checking its shutdown flag.
 const IDLE_POLL: Duration = Duration::from_millis(250);
@@ -279,7 +279,6 @@ pub fn start_all(
     projectors_dir: &Path,
     program: Arc<Program>,
     keystore: Option<Arc<KeyStore>>,
-    events: Arc<EventDefs>,
     auto_rebuild: bool,
 ) -> anyhow::Result<(Vec<Arc<ProjectorShared>>, ProjectorSet)> {
     let mut shared = Vec::with_capacity(projectors.len());
@@ -291,7 +290,6 @@ pub fn start_all(
             projectors_dir,
             Arc::clone(&program),
             keystore.clone(),
-            events.clone(),
             auto_rebuild,
         )?;
         shared.push(Arc::clone(&handle));
@@ -307,7 +305,6 @@ fn spawn(
     projectors_dir: &Path,
     program: Arc<Program>,
     keystore: Option<Arc<KeyStore>>,
-    events: Arc<EventDefs>,
     auto_rebuild: bool,
 ) -> anyhow::Result<(Arc<ProjectorShared>, JoinHandle<()>)> {
     let ModuleDef::Projector {
@@ -357,7 +354,6 @@ fn spawn(
                 program,
                 keystore,
                 model,
-                events,
                 definition,
                 plan,
             )
@@ -432,7 +428,6 @@ fn run(
     program: Arc<Program>,
     keystore: Option<Arc<KeyStore>>,
     model: ReadModel,
-    events: Arc<EventDefs>,
     definition: String,
     plan: Reconcile,
 ) {
@@ -446,7 +441,6 @@ fn run(
         &program,
         keystore.as_deref(),
         model,
-        &events,
         &definition,
         plan,
     ) {
@@ -464,7 +458,6 @@ fn run_inner(
     program: &Program,
     keystore: Option<&KeyStore>,
     mut model: ReadModel,
-    events: &EventDefs,
     definition: &str,
     plan: Reconcile,
 ) -> anyhow::Result<()> {
@@ -487,9 +480,7 @@ fn run_inner(
                 "projector `{}` definition changed; rebuilding its read model",
                 shared.name
             );
-            model = rebuild_or_degrade(
-                shared, unit, store, program, keystore, model, events, definition,
-            )?;
+            model = rebuild_or_degrade(shared, unit, store, program, keystore, model, definition)?;
         }
         // Do not stamp the current definition onto a model we did not rebuild: that
         // would bless possibly-stale data at a possibly-old shape as current and
@@ -507,9 +498,7 @@ fn run_inner(
         if shared.replay.swap(false, Ordering::Relaxed) {
             // A replay is the only way out of `Stale` or `Failed`, and it is harmless
             // otherwise.
-            model = rebuild_or_degrade(
-                shared, unit, store, program, keystore, model, events, definition,
-            )?;
+            model = rebuild_or_degrade(shared, unit, store, program, keystore, model, definition)?;
             sub = store.subscribe(query.clone(), model.read_checkpoint()?);
             continue;
         }
@@ -536,7 +525,6 @@ fn run_inner(
                 &shared.name,
                 &entities_by_name,
                 keystore,
-                events,
                 &batch,
                 sub.position(),
             )?;
@@ -585,12 +573,9 @@ fn rebuild_or_degrade(
     program: &Program,
     keystore: Option<&KeyStore>,
     model: ReadModel,
-    events: &EventDefs,
     definition: &str,
 ) -> anyhow::Result<ReadModel> {
-    let err = match rebuild(
-        shared, unit, store, program, keystore, model, events, definition,
-    ) {
+    let err = match rebuild(shared, unit, store, program, keystore, model, definition) {
         Ok(fresh) => {
             shared.clear_failure();
             shared.set_readiness(Readiness::Ready);
@@ -638,7 +623,6 @@ pub fn project_to(
     program: &Program,
     keystore: Option<&KeyStore>,
     model: &ReadModel,
-    events: &EventDefs,
     upto: Option<Position>,
 ) -> anyhow::Result<usize> {
     let ModuleDef::Projector {
@@ -687,7 +671,6 @@ pub fn project_to(
             &name,
             &entities_by_name,
             keystore,
-            events,
             &batch,
             checkpoint,
         )?;
@@ -715,9 +698,8 @@ pub fn project_to_head(
     program: &Program,
     keystore: Option<&KeyStore>,
     model: &ReadModel,
-    events: &EventDefs,
 ) -> anyhow::Result<usize> {
-    project_to(store, unit, program, keystore, model, events, None)
+    project_to(store, unit, program, keystore, model, None)
 }
 
 /// Apply one batch of events and advance the checkpoint, in one transaction.
@@ -733,7 +715,6 @@ fn apply_batch(
     projector_name: &str,
     entities: &HashMap<String, EntityDef>,
     keystore: Option<&KeyStore>,
-    events: &EventDefs,
     batch: &[(Position, Event)],
     checkpoint: Position,
 ) -> anyhow::Result<()> {
@@ -753,9 +734,8 @@ fn apply_batch(
             keystore,
         };
         for (position, event) in batch {
-            let record =
-                heklang_host::record_of(program, events, keystore, *position, event.as_ref())
-                    .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
+            let record = heklang_host::record_of(program, *position, event.as_ref())
+                .map_err(|err| anyhow::anyhow!("reading event: {err}"))?;
             projection
                 .apply(&record, &mut rows)
                 .map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -778,7 +758,6 @@ fn rebuild(
     program: &Program,
     keystore: Option<&KeyStore>,
     model: ReadModel,
-    events: &EventDefs,
     definition: &str,
 ) -> anyhow::Result<ReadModel> {
     let db_path = &shared.db_path;
@@ -786,7 +765,7 @@ fn rebuild(
     remove_db_files(&rebuild_path)?;
 
     let fresh = ReadModel::open(&rebuild_path, &shared.entities)?;
-    let count = project_to_head(store, unit, program, keystore, &fresh, events)?;
+    let count = project_to_head(store, unit, program, keystore, &fresh)?;
     // Stamp the definition the fresh model was built under, so it swaps in atomically
     // with the data (and a crash before the swap leaves the old model and its old
     // definition intact).

@@ -8,12 +8,17 @@
 //!   event. `patch` producing a whole row, and every write therefore being a SELECT
 //!   then an INSERT OR REPLACE, is not what a rebuild is spending its time on, so
 //!   `apply_one`'s UPDATE arm stays dormant.
-//! - **A command fold over an encrypted boundary: 93ms, against 24ms for the same fold
-//!   over plaintext.** The adapter decrypts every subject-scoped field of every record
-//!   a fold reads, which Starlark never did (a handle kept ciphertext opaque). That is
-//!   3.5µs a record, and it makes the fold about four times its own cost. It is forced
-//!   rather than chosen: heklang's `Value::Sealed` holds plaintext, so this is the
-//!   motivating number for closing the ciphertext gap `heklang/docs/host.md` records.
+//! - **A command fold over an encrypted boundary: 25ms, against 25ms for the same fold
+//!   over plaintext.** There is no difference left to measure, which is what this number
+//!   is now for rather than a failure of it.
+//!
+//!   It was **93ms against 24ms**. The adapter decrypted every subject-scoped field of
+//!   every record a fold read, 3.5µs a record, which made a fold four times its own cost
+//!   for content the fold never looked at. Starlark never did that (a handle kept
+//!   ciphertext opaque) and the heklang port regressed it, because `Value::Sealed` held
+//!   plaintext and something had to put it there. heklang now carries the stored form
+//!   and `Keys::decrypt` opens it at the one `reveal` that asks, so a fold pays for what
+//!   it reads and this fold reads none of it.
 
 use std::time::Instant;
 
@@ -103,8 +108,10 @@ projector Things {
     harness.shutdown();
 }
 
-/// The eager-decryption trade: the adapter decrypts every subject-scoped field of
-/// every record a fold reads, where Starlark kept ciphertext opaque and never did.
+/// What a boundary of encrypted records costs a fold that reads none of them. The
+/// answer is nothing, and the two halves below are here to keep it that way: a
+/// regression to eager decryption shows up as the second number pulling away from the
+/// first, which is exactly how this was found.
 #[test]
 #[ignore]
 fn a_command_fold_over_an_encrypted_boundary() {

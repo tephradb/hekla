@@ -5,12 +5,17 @@
 //! decides what that costs in storage, so the two models meet exactly once, at this
 //! seam, and neither reshapes itself to suit the other.
 //!
-//! **Crypto lives below this file.** heklang models a seal logically: a `Value::Sealed`
-//! wraps plaintext and only `reveal` can read it out, and `Keys` answers nothing but
-//! whether a subject is erased (`heklang/docs/host.md` section 10 records ciphertext as
-//! a gap). hekla really encrypts, so [`Log::read`] decrypts a subject-scoped field on
-//! the way in and [`Log::append`] encrypts it on the way out. The language never sees a
-//! ciphertext and the store never sees a plaintext.
+//! **Crypto lives below this file, and a ciphertext crosses it.** heklang's
+//! `Value::Sealed` carries what this stored rather than the plaintext, so [`Log::read`]
+//! decrypts nothing: it hands the ciphertext through and [`Keys::decrypt`] opens it at
+//! the one `reveal` that asks for it. [`Log::append`] still seals, because encrypting is
+//! the direction that has the content in hand.
+//!
+//! Reading used to decrypt every subject-scoped field of every record a fold walked,
+//! which cost 3.5µs a record and made a fold four times its own cost for content nothing
+//! read (`tests/measure.rs`). It also needed a placeholder for a shredded key, so that a
+//! field stayed *present* and heklang's rule 12 could keep absent and erased apart.
+//! Carrying the ciphertext deletes both.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -20,7 +25,7 @@ use heklang::host::{
     AppendCondition, Attempt, Calls, Clock, Http, Keys, Log, Predicate, Query, Recorded, Request,
 };
 use heklang::interp::{Error, ErrorKind};
-use heklang::ir::{EventPath, Type};
+use heklang::ir::EventPath;
 use heklang::value::{self, Defs};
 use heklang::{Event, Json, Program, Record, Value};
 use tephra::{Position, QueryItem, Tag, Tags, WriteHandle};
@@ -174,25 +179,19 @@ pub struct HeklaHost {
 impl HeklaHost {
     /// One stored event as heklang reads it.
     fn record_of(&self, position: Position, event: tephra::EventRef<'_>) -> Result<Record, Error> {
-        record_of(
-            &self.program,
-            &self.events,
-            self.keystore.as_deref(),
-            position,
-            event,
-        )
+        record_of(&self.program, position, event)
     }
 }
 
-/// One stored event as heklang reads it: subject fields decrypted, every field typed by
-/// its declaration.
+/// One stored event as heklang reads it: every field typed by its declaration, and a
+/// subject-scoped one still sealed.
 ///
 /// Free rather than a method because a projector thread reads the log without a
-/// [`HeklaHost`]: it has no clock, no network and nothing to append.
+/// [`HeklaHost`]: it has no clock, no network and nothing to append. **It no longer
+/// needs a key store either**, which is what closing the ciphertext gap bought: reading
+/// the log is not a place key material has to reach.
 pub fn record_of(
     program: &Program,
-    events: &EventDefs,
-    keystore: Option<&KeyStore>,
     position: Position,
     event: tephra::EventRef<'_>,
 ) -> Result<Record, Error> {
@@ -201,44 +200,26 @@ pub fn record_of(
     let declared = program
         .event(&path)
         .ok_or_else(|| host_error(format!("event type `{ty}` is not declared")))?;
-    let schema = events.get(ty);
     let (envelope, data) = envelope::decode(event.data()).map_err(host_error)?;
 
     let defs = Defs::of(program);
     let mut fields = BTreeMap::new();
     for field in &declared.fields {
-        let stored = data.get(&field.name);
-        let subject = schema
-            .and_then(|schema| schema.field(&field.name))
-            .and_then(|meta| meta.subject.clone());
-        let json = match (subject, stored) {
-            (Some(subject_field), Some(stored)) => decrypt_field(
-                keystore,
-                &data,
-                &subject_field,
-                &field.name,
-                stored,
-                &field.ty,
-            )?,
-            (_, Some(stored)) => Some(to_heklang_json(stored)),
-            (_, None) => Some(Json::Null),
-        };
-        let value = match json {
-            // The declared type, seal and all: `Value::from_json` reads a seal
-            // transparently and heklang re-seals the value as it binds it, so the
-            // content is behind `reveal` from the moment it enters a frame.
-            Some(json) => Value::from_json(&json, &field.ty, defs)
+        // **Nothing is decrypted here**, and that is the whole of what this read costs.
+        // A subject-scoped field crosses as the ciphertext it is stored as; heklang
+        // seals it as it binds it, and `Keys::decrypt` opens it at the one `reveal` that
+        // asks. Decrypting on the way in instead cost 3.5µs a record and made a fold
+        // four times its own cost, for content a fold does not read (`tests/measure.rs`).
+        //
+        // It also deletes a placeholder. When this decrypted eagerly, a shredded key
+        // left nothing to put in a present field, and rule 12 needs absent and erased to
+        // stay different rows. Carrying the ciphertext means there is always something
+        // to carry and nothing to stand in for it.
+        let value = match data.get(&field.name) {
+            Some(stored) => Value::from_json(&to_heklang_json(stored), &field.ty, defs)
                 .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?,
-            // Stored, and not readable: the subject's key is gone.
-            //
-            // This must not come back as `none`. Rule 12 turns on absent and erased
-            // being different rows, and an optional that read absent would let a
-            // handler take the "there was never an address here" branch for a customer
-            // who had one. A placeholder keeps the value present, so the program
-            // reaches `reveal`, and `reveal` is what consults `Keys::erased` and fails
-            // terminally. The content is unrecoverable either way; which branch runs is
-            // not.
-            None => unreadable(&field.ty, defs),
+            None => Value::from_json(&Json::Null, &field.ty, defs)
+                .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?,
         };
         fields.insert(field.name.clone(), value);
     }
@@ -255,83 +236,6 @@ pub fn record_of(
         at,
         Event { path, fields },
     ))
-}
-
-/// Decrypt one subject-scoped field, keyed on its sibling subject id.
-///
-/// An unreadable value is absent rather than an error, which is the same answer
-/// `read_api` gives a reader: the key is gone. heklang seals whatever it gets and
-/// `reveal` consults `Keys::erased` before it looks, so an erased subject can never be
-/// read out no matter what stands in for it here.
-fn decrypt_field(
-    keystore: Option<&KeyStore>,
-    data: &serde_json::Value,
-    subject_field: &str,
-    field: &str,
-    stored: &serde_json::Value,
-    ty: &Type,
-) -> Result<Option<Json>, Error> {
-    let Some(keystore) = keystore else {
-        return Err(host_error(format!(
-            "field `{field}` is scoped to `{subject_field}` but no master key is configured"
-        )));
-    };
-    let Some(ciphertext) = stored.as_str() else {
-        return Ok(Some(to_heklang_json(stored)));
-    };
-    let subject_value = data
-        .get(subject_field)
-        .and_then(schema::scalar_to_string)
-        .ok_or_else(|| host_error(format!("event has no subject id `{subject_field}`")))?;
-    match keystore
-        .decrypt_subject(subject_field, &subject_value, field, ciphertext)
-        .map_err(host_error)?
-    {
-        Some(plaintext) => Ok(Some(sealed_json(plaintext, ty))),
-        // Not an absence: the ciphertext is right there and the key is not.
-        None => Ok(None),
-    }
-}
-
-/// A decrypted plaintext back as rule 8's JSON, against the field's declared type.
-///
-/// Encryption takes a string, so [`lower`] seals [`schema::scalar_to_string`] of the
-/// rule 8 form and that flattens a number and a boolean into text. Only the
-/// declaration says which of the two it was, so only the declaration can read it back.
-fn sealed_json(text: String, ty: &Type) -> Json {
-    match ty {
-        Type::Opt(inner) | Type::Sealed(inner, _) => sealed_json(text, inner),
-        Type::Int | Type::Timestamp => text.parse::<i64>().map_or(Json::Str(text), Json::int),
-        Type::Bool => match text.as_str() {
-            "true" => Json::Bool(true),
-            "false" => Json::Bool(false),
-            _ => Json::Str(text),
-        },
-        Type::Json | Type::List(_) | Type::Map(_, _) | Type::Record(_) => {
-            serde_json::from_str::<serde_json::Value>(&text)
-                .map_or(Json::Str(text), |value| to_heklang_json(&value))
-        }
-        // A String, a Uuid, a Money or Decimal at its scale, and an enum variant are
-        // all text on the wire, so the seal held exactly what goes back.
-        _ => Json::Str(text),
-    }
-}
-
-/// What stands in for content whose key is gone, so the value stays *present*.
-///
-/// Never read: rule 12 lets sealed content be moved, asked whether it is there, and
-/// revealed, and `reveal` fails before this is looked at. It exists so the shape is
-/// right, not so the content is.
-fn unreadable(ty: &Type, defs: Defs<'_>) -> Value {
-    match ty {
-        // `Opt` is outermost, so a sealed optional keeps its `Some`.
-        Type::Opt(inner) => Value::Opt {
-            inner: inner.as_ref().clone(),
-            value: Some(Box::new(unreadable(inner, defs))),
-        },
-        Type::Sealed(inner, _) => unreadable(inner, defs),
-        other => value::zero(other, defs).unwrap_or_else(|| Value::str("")),
-    }
 }
 
 impl HeklaHost {
@@ -509,11 +413,28 @@ impl Clock for HeklaHost {
 }
 
 impl Keys for HeklaHost {
-    fn erased(&self, subject: &str, id: &str) -> Result<bool, Error> {
+    /// The one place a subject key is read, and it is reached once per `reveal` rather
+    /// than once per record: heklang carries the ciphertext and asks only for what a
+    /// handler actually reveals.
+    ///
+    /// `field` is the name the content was sealed under, which [`KeyStore`] binds into
+    /// the ciphertext, so content that was moved decrypts under the name it was sealed
+    /// with rather than under wherever it now sits.
+    fn decrypt(
+        &self,
+        subject: &str,
+        id: &str,
+        field: &str,
+        content: &str,
+    ) -> Result<Option<String>, Error> {
         let Some(keystore) = self.keystore.as_deref() else {
-            return Ok(false);
+            return Err(host_error(format!(
+                "field `{field}` is scoped to `{subject}` but no master key is configured"
+            )));
         };
-        keystore.erased(subject, id).map_err(host_error)
+        keystore
+            .decrypt_subject(subject, id, field, content)
+            .map_err(host_error)
     }
 
     fn erase(&mut self, subject: &str, id: &str) -> Result<(), Error> {
@@ -754,8 +675,7 @@ impl HeklaHost {
             let Some(value) = event.fields.get(name.as_str()) else {
                 continue;
             };
-            let bare = value.clone().unsealed();
-            let json = from_heklang_json(&Json::from_value(&bare));
+            let json = from_heklang_json(&Json::from_value(value));
             match &meta.subject {
                 Some(subject_field) => {
                     // Rule 12: an absent optional was never encrypted, so there is no
@@ -773,10 +693,8 @@ impl HeklaHost {
                     let subject_value = ids.get(subject_field.as_str()).ok_or_else(|| {
                         host_error(format!("event `{ty}` has no subject id `{subject_field}`"))
                     })?;
-                    let text = schema::scalar_to_string(&json).unwrap_or_else(|| json.to_string());
-                    let sealed = keystore
-                        .encrypt_subject(subject_field, subject_value, name, &text)
-                        .map_err(host_error)?;
+                    let sealed =
+                        stored_seal(keystore, subject_field, subject_value, name, value, &json)?;
                     if meta.indexed {
                         derived.push((name.clone(), Some(sealed.clone())));
                     }
@@ -827,11 +745,70 @@ impl HeklaHost {
     }
 }
 
-/// The plaintext scalar form of a value, or `None` for a container. A subject id has to
-/// be a scalar, which is the same rule `scalar_to_string` applies to a tag.
+/// The plaintext scalar form of a value, or `None` for a container or a seal. A subject
+/// id has to be a scalar, which is the same rule `scalar_to_string` applies to a tag,
+/// and heklang's rule 12 keeps it out from behind the boundary so there is never a seal
+/// here to open.
 fn plaintext_scalar(value: &Value) -> Option<String> {
-    let bare = value.clone().unsealed();
-    schema::scalar_to_string(&from_heklang_json(&Json::from_value(&bare)))
+    if matches!(peeled(value), Value::Sealed { .. }) {
+        return None;
+    }
+    schema::scalar_to_string(&from_heklang_json(&Json::from_value(value)))
+}
+
+/// The value inside an optional, since `Opt` is outermost around a seal.
+fn peeled(value: &Value) -> &Value {
+    match value {
+        Value::Opt {
+            value: Some(held), ..
+        } => peeled(held),
+        other => other,
+    }
+}
+
+/// The stored form of a subject-scoped field.
+///
+/// Two shapes reach a write for one field, and only one of them has content to seal.
+/// Fresh plaintext is sealed here, which is the encrypting direction. A `Value::Sealed`
+/// was moved from somewhere else and is already stored ciphertext: sealed under this
+/// same field and subject it passes through untouched, and under any other name it has
+/// to be opened and re-sealed, because [`KeyStore`] binds the field name into the
+/// ciphertext and the destination would not be able to read it otherwise.
+fn stored_seal(
+    keystore: &KeyStore,
+    subject_field: &str,
+    subject_value: &str,
+    name: &str,
+    value: &Value,
+    json: &serde_json::Value,
+) -> Result<String, Error> {
+    if let Value::Sealed {
+        field,
+        subject,
+        id,
+        content,
+    } = peeled(value)
+    {
+        if field == name && subject == subject_field && id == subject_value {
+            return Ok(content.to_string());
+        }
+        let plaintext = keystore
+            .decrypt_subject(subject, id, field, content)
+            .map_err(host_error)?
+            .ok_or_else(|| {
+                host_error(format!(
+                    "`{name}` holds content sealed under `{subject}` = `{id}`, whose key is gone, \
+                     so it cannot be re-sealed under `{subject_field}`"
+                ))
+            })?;
+        return keystore
+            .encrypt_subject(subject_field, subject_value, name, &plaintext)
+            .map_err(host_error);
+    }
+    let text = schema::scalar_to_string(json).unwrap_or_else(|| json.to_string());
+    keystore
+        .encrypt_subject(subject_field, subject_value, name, &text)
+        .map_err(host_error)
 }
 
 fn build_tags(pairs: &[(String, Option<String>)], extra: &[&str]) -> Result<Tags, Error> {
@@ -956,8 +933,7 @@ impl heklang::host::Rows for RowWriter<'_> {
             let Some(value) = row.0.get(name.as_str()) else {
                 continue;
             };
-            let bare = value.clone().unsealed();
-            let json = from_heklang_json(&Json::from_value(&bare));
+            let json = from_heklang_json(&Json::from_value(value));
             match &meta.subject {
                 Some(subject_field) if !json.is_null() => {
                     let keystore = self.keystore.ok_or_else(|| {
@@ -968,6 +944,32 @@ impl heklang::host::Rows for RowWriter<'_> {
                     let subject_value = ids.get(subject_field.as_str()).ok_or_else(|| {
                         host_error(format!("row has no subject id `{subject_field}`"))
                     })?;
+                    // A moved seal is opened here rather than passed through, which the
+                    // append path can do. The reason is `column_form` below: a column
+                    // stores a `Timestamp` in a different shape than an event does, so a
+                    // seal made from the event's form is the wrong text for the column
+                    // even when the field name matches. Opening it costs a key use on a
+                    // write, where the win of carrying ciphertext was on the read.
+                    let json = match peeled(value) {
+                        Value::Sealed {
+                            field,
+                            subject,
+                            id,
+                            content,
+                        } => match keystore
+                            .decrypt_subject(subject, id, field, content)
+                            .map_err(host_error)?
+                        {
+                            Some(plaintext) => unsealed_json(&meta.kind, plaintext),
+                            // The key is gone, so the column is too. Same answer as the
+                            // `_existing` miss below, reached one step earlier.
+                            None => {
+                                stored.insert(name.clone(), serde_json::Value::Null);
+                                continue;
+                            }
+                        },
+                        _ => json,
+                    };
                     // The column form, not the wire form: a sealed column and a plain
                     // one must hold the same shape, or `read_api` would serve a
                     // `Timestamp` as RFC 3339 from one and as epoch micros from the
@@ -1122,6 +1124,23 @@ pub fn append_one(host: &mut HeklaHost, event: &Event) -> Result<(), Error> {
 /// different question. A `Timestamp` is epoch microseconds on the wire and RFC 3339 in
 /// SQLite, because the read API serves that and the column sorts lexicographically on
 /// it. Everything else is already in the right shape.
+/// A decrypted plaintext back as the JSON shape its declaration says it had.
+///
+/// Sealing flattens everything to text, because that is what a key store takes, so
+/// nothing but the column's kind says whether that text was a number or a boolean.
+/// heklang's `Value::from_sealed` is the same table for the same reason, keyed on a
+/// `Type` where this is keyed on a `FieldKind`.
+fn unsealed_json(kind: &FieldKind, text: String) -> serde_json::Value {
+    match kind.base() {
+        FieldKind::I64 | FieldKind::Timestamp => text
+            .parse::<i64>()
+            .map_or_else(|_| serde_json::Value::String(text), Into::into),
+        FieldKind::Bool if text == "true" => serde_json::Value::Bool(true),
+        FieldKind::Bool if text == "false" => serde_json::Value::Bool(false),
+        _ => serde_json::Value::String(text),
+    }
+}
+
 fn column_form(kind: &FieldKind, json: serde_json::Value) -> serde_json::Value {
     match (kind.base(), &json) {
         (FieldKind::Timestamp, serde_json::Value::Number(micros)) => micros
