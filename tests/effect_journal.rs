@@ -511,12 +511,14 @@ fn an_invoke_outcome_reads_through_its_three_accessors() {
         (
             "commands/activate-user.hk",
             r#"
+refusal AlreadyActive "that user is already active"
+
 command ActivateUser(user_id: Uuid) {
   state activated: Bool = fold false
     on @user.activated(user_id) => true
 
   if activated {
-    return reject("already_active", "that user is already active")
+    return reject AlreadyActive
   }
 
   emit @user.activated { user_id }

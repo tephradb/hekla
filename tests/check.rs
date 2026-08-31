@@ -469,12 +469,14 @@ fn weak_boundaries_warn_without_failing_the_check() {
         (
             "commands/sign-up.hk",
             r#"
+refusal Busy "someone signed up already"
+
 command SignUp(person_id: Uuid) {
   state seen: Bool = fold false
     on @person.signed_up(active: true) => true
 
   if seen {
-    return reject("busy", "someone signed up already")
+    return reject Busy
   }
 
   emit @person.signed_up { person_id, active: true }
@@ -509,12 +511,14 @@ event @person.signed_up {
         (
             "commands/sign-up.hk",
             r#"
+refusal Dup "already signed up"
+
 command SignUp(person_id: Uuid, email: String, plan: String, region: String) {
   state seen: Bool = fold false
     on @person.signed_up(person_id, email, plan, region) => true
 
   if seen {
-    return reject("dup", "already signed up")
+    return reject Dup
   }
 
   emit @person.signed_up { person_id, email, plan, region }
@@ -542,12 +546,14 @@ fn a_selective_boundary_does_not_warn() {
         (
             "commands/do-thing.hk",
             r#"
+refusal Dup "that thing already happened"
+
 command DoThing(thing_id: Uuid) {
   state seen: Bool = fold false
     on @thing.happened(thing_id) => true
 
   if seen {
-    return reject("dup", "that thing already happened")
+    return reject Dup
   }
 
   emit @thing.happened { thing_id, note: "" }
@@ -588,12 +594,14 @@ event @account.registered {
 "#;
 
 const REGISTER_ACCOUNT: &str = r#"
+refusal HandleTaken "that handle is already registered"
+
 command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
   state taken: Bool = fold false
     on @account.registered(handle) => true
 
   if taken {
-    return reject("handle_taken", "that handle is already registered")
+    return reject HandleTaken
   }
 
   emit @account.registered { account_id, handle, email }
@@ -635,7 +643,7 @@ test "rejects a handle another account already took" {
     handle: "alice",
     email: "alice@example.com",
   }
-  expect reject("handle_taken", "that handle is already registered")
+  expect reject HandleTaken
 }
 "#,
             ),

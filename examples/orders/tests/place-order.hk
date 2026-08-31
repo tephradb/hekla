@@ -85,7 +85,7 @@ test "a shop's launch allocation runs out" {
     order_total: 10.00,
     notes: "",
   }
-  expect reject("sold_out", "this shop's launch allocation is gone")
+  expect reject SoldOut
 }
 
 // The allocation is per shop, so another shop is unaffected by the first one selling

@@ -3,6 +3,8 @@
 // registration. The boundary and the decision answer different questions, and a slice
 // serves both.
 
+refusal UnknownUser "no such user"
+
 command RenameUser(user_id: Uuid, name: String) {
   state exists: Bool = fold false
     on @user.registered(user_id) => true
@@ -11,10 +13,10 @@ command RenameUser(user_id: Uuid, name: String) {
     on @user.renamed(user_id) => renames + 1
 
   if is_blank(name) {
-    return reject("invalid_name", "name must not be blank")
+    return reject InvalidName
   }
   if !exists {
-    return reject("unknown_user", "no such user")
+    return reject UnknownUser
   }
 
   emit @user.renamed { user_id, name }

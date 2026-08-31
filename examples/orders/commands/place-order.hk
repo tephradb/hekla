@@ -10,6 +10,8 @@
 // at append time, because a read model would race it. That is the constraint a boundary
 // exists for, and it is what gives the conflict-retry loop something real to do.
 
+refusal SoldOut "this shop's launch allocation is gone"
+
 command PlaceOrder(
   order_id: Uuid,
   customer_id: Int,
@@ -34,7 +36,7 @@ command PlaceOrder(
     return
   }
   if sold >= LAUNCH_ALLOCATION {
-    return reject("sold_out", "this shop's launch allocation is gone")
+    return reject SoldOut
   }
 
   emit @order.placed {

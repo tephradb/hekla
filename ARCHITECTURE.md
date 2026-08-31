@@ -231,13 +231,15 @@ only writer.
 **Shape**:
 
 ```
+refusal TooManyOpen "too many open orders"
+
 command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?, total: Money(2)) {
   state open_orders: Int = fold 0
     on @order.placed(customer_id) => open_orders + 1
     on @order.cancelled(customer_id) => open_orders - 1
 
   if open_orders >= 10 {
-    return reject("too_many_open", "too many open orders")
+    return reject TooManyOpen
   }
 
   emit @order.placed { order_id, customer_id, email, total }
@@ -271,11 +273,15 @@ exists.
   slice per record, then the body runs. Ten folds over a million events read the log once.
 
 **Three outcomes.** `return` with no value, or falling off the end, is `Ok` with whatever was
-emitted; `reject(code, message)` is a state-dependent refusal (422); `invalid(message)` means the
-input is malformed regardless of state (400). The distinction is the caller's: a blank address is
+emitted; `reject <Refusal>` is a state-dependent refusal (422); `invalid(message)` means the input
+is malformed regardless of state (400). The distinction is the caller's: a blank address is
 `invalid` whoever sends it and whenever, a blocked customer is `reject` because the same request
 would have succeeded yesterday. `reject` carries a code because there is something to branch on;
 `invalid` does not, because there is nothing to say when the answer is "you sent nonsense".
+
+**The 422 code is derived from the refusal's name**, not written at the throw site: `TooManyOpen`
+becomes `too_many_open`. It is the one name in a heklang program whose spelling leaves the process,
+so declaring it once is what stops two sites disagreeing about a code a client switches on.
 
 `Conflict` and `Unavailable` have **no variant in the type at all**. Being beaten to the log is the
 runtime's to retry and an author who saw it could only retry worse, so "retryable outcomes never

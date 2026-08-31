@@ -335,6 +335,9 @@ event @t.noticed { id: Uuid, owner: String @max(50) }
 
 /// Two `state`s, one per type, each folding its own slice of one boundary.
 const PER_TYPE_FOLD: &str = r#"
+refusal Frozen "that owner is frozen"
+refusal AlreadyOpen "that owner already has an account"
+
 command Open(id: Uuid, owner: String) {
   state opened: Bool = fold false
     on @t.opened(owner) => true
@@ -343,10 +346,10 @@ command Open(id: Uuid, owner: String) {
     on @t.frozen(owner) => true
 
   if frozen {
-    return reject("frozen", "that owner is frozen")
+    return reject Frozen
   }
   if opened {
-    return reject("already_open", "that owner already has an account")
+    return reject AlreadyOpen
   }
 
   emit @t.opened { id, owner }
@@ -414,6 +417,10 @@ command Record(id: Uuid, owner: String, tier: String) {
 /// declared by this one command, so both are in its append condition, and a record
 /// matching the narrow one must be applied by both arms.
 const FAN_OUT_FOLD: &str = r#"
+refusal NarrowOnly "the narrow arm ran without the wide one"
+refusal WideOnly "only the wide arm ran"
+refusal BothRan "both arms ran"
+
 command Open(id: Uuid, owner: String, tier: String) {
   state seen: Int = fold 0
     on @t.opened(owner) => seen + 1
@@ -422,13 +429,13 @@ command Open(id: Uuid, owner: String, tier: String) {
     on @t.opened(owner, tier: "gold") => gold + 1
 
   if gold > seen {
-    return reject("narrow_only", "the narrow arm ran without the wide one")
+    return reject NarrowOnly
   }
   if seen > gold {
-    return reject("wide_only", "only the wide arm ran")
+    return reject WideOnly
   }
   if seen > 0 {
-    return reject("both_ran", "both arms ran")
+    return reject BothRan
   }
 
   emit @t.opened { id, owner, tier }
@@ -510,6 +517,8 @@ fn a_fold_fans_out_across_two_slices_of_one_type() {
 /// `@t.opened` is guarded, so it is in the append condition and is read, but nothing
 /// folds it. `@t.frozen` is folded.
 const GUARDED_AND_FOLDED: &str = r#"
+refusal Frozen(frozen: Int) "saw {frozen} frozen event(s)"
+
 command Open(id: Uuid, owner: String) {
   guard @t.opened(owner)
 
@@ -517,7 +526,7 @@ command Open(id: Uuid, owner: String) {
     on @t.frozen(owner) => frozen + 1
 
   if frozen > 0 {
-    return reject("frozen", "saw {frozen} frozen event(s)")
+    return reject Frozen { frozen }
   }
 
   emit @t.opened { id, owner }
@@ -568,12 +577,14 @@ fn an_event_type_in_the_boundary_with_no_fold_arm_is_read_but_not_folded() {
 // --- state accumulates ----------------------------------------------------
 
 const COUNTING_FOLD: &str = r#"
+refusal Enough(seen: Int) "seen {seen}"
+
 command Notice(id: Uuid, owner: String) {
   state seen: Int = fold 0
     on @t.noticed(owner) => seen + 1
 
   if seen >= 2 {
-    return reject("enough", "seen {seen}")
+    return reject Enough { seen }
   }
 
   emit @t.noticed { id, owner }
@@ -626,12 +637,14 @@ command Note(id: Uuid) {
 /// Folds the absent field. It has to read as `none` rather than raising: a record is
 /// built from the event's declared fields, not from whatever the payload carried.
 const READ_ABSENT_FIELD: &str = r#"
+refusal Absent "an omitted optional field reads as none"
+
 command Read(id: Uuid) {
   state seen: String? = fold "unset"
     on @t.noted(id) { body } => body
 
   if seen.is_none() {
-    return reject("absent", "an omitted optional field reads as none")
+    return reject Absent
   }
 
   emit @t.noted { id, body: seen }
@@ -677,12 +690,14 @@ event @t.taken { id: Uuid, room: String @max(20) }
 /// nothing new would decide on a stale count and conflict again until the budget ran
 /// out, while a retry that re-folds sees the seat go and rejects.
 const TAKE_SEAT: &str = r#"
+refusal Full "no seats left"
+
 command Take(id: Uuid, room: String) {
   state seats: Int = fold 0
     on @t.taken(room) => seats + 1
 
   if seats >= 2 {
-    return reject("full", "no seats left")
+    return reject Full
   }
 
   emit @t.taken { id, room }

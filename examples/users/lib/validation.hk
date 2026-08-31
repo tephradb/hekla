@@ -4,3 +4,7 @@
 fn is_blank(value: String) -> Bool {
   return value.trim().is_empty()
 }
+
+// Shared because two commands refuse the same way. Declared once is the point: the code
+// a client switches on is derived from the name, so the two cannot drift apart.
+refusal InvalidName "name must not be blank"

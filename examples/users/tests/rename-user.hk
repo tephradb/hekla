@@ -42,7 +42,7 @@ test "refuses a rename for a user that does not exist" {
     user_id: "77777777-7777-7777-7777-777777777777",
     name: "Nobody",
   }
-  expect reject("unknown_user", "no such user")
+  expect reject UnknownUser
 }
 
 test "refuses a blank name" {
@@ -55,5 +55,5 @@ test "refuses a blank name" {
     user_id: "88888888-8888-8888-8888-888888888888",
     name: "  ",
   }
-  expect reject("invalid_name", "name must not be blank")
+  expect reject InvalidName
 }

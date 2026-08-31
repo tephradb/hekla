@@ -137,12 +137,14 @@ command DoThing(id: Uuid, shop: Int, secret: String?) {
         (
             "commands/count-thing.hk",
             r#"
+refusal Counted(seen: Int) "{seen}"
+
 command CountThing(id: Uuid, shop: Int) {
   state seen: Int = fold 0
     on @thing.happened(shop) => seen + 1
 
   if seen >= 0 {
-    return reject("counted", "{seen}")
+    return reject Counted { seen }
   }
 
   emit @thing.happened { id, shop, secret: none }
@@ -197,12 +199,14 @@ command DoThing(id: Uuid, shop: Int, secret: String?) {
         (
             "commands/count-thing.hk",
             r#"
+refusal Counted(seen: Int) "{seen}"
+
 command CountThing(id: Uuid, shop: Int) {
   state seen: Int = fold 0
     on @thing.happened(shop) => seen + 1
 
   if seen >= 0 {
-    return reject("counted", "{seen}")
+    return reject Counted { seen }
   }
 
   emit @thing.happened { id, shop, secret: none }
@@ -269,6 +273,8 @@ fn contention_against_the_retry_budget() {
         (
             "commands/place-order.hk",
             r#"
+refusal SoldOut "gone"
+
 command PlaceOrder(order_id: Uuid, shop_id: Int) {
   state placed: Bool = fold false
     on @order.placed(order_id) => true
@@ -279,7 +285,7 @@ command PlaceOrder(order_id: Uuid, shop_id: Int) {
     return
   }
   if sold >= 100000 {
-    return reject("sold_out", "gone")
+    return reject SoldOut
   }
   emit @order.placed { order_id, shop_id }
 }

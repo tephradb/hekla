@@ -2,15 +2,17 @@
 // command folds is what it conflicts on, so declaring the read declares the append
 // condition too.
 
+refusal EmailTaken "that email is already registered"
+
 command RegisterUser(user_id: Uuid, email: String, name: String) {
   state taken: Bool = fold false
     on @user.registered(email) => true
 
   if is_blank(name) {
-    return reject("invalid_name", "name must not be blank")
+    return reject InvalidName
   }
   if taken {
-    return reject("email_taken", "that email is already registered")
+    return reject EmailTaken
   }
 
   emit @user.registered { user_id, email, name }

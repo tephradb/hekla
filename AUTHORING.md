@@ -431,6 +431,8 @@ event @order.placed {
 
 ```hek
 // commands/place-order.hk
+refusal SoldOut "this shop's launch allocation is gone"
+
 command PlaceOrder(
   order_id: Uuid,
   customer_id: Int,
@@ -455,7 +457,7 @@ command PlaceOrder(
     return
   }
   if sold >= LAUNCH_ALLOCATION {
-    return reject("sold_out", "this shop's launch allocation is gone")
+    return reject SoldOut
   }
 
   emit @order.placed {

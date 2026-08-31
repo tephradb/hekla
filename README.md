@@ -35,6 +35,8 @@ event @order.placed {
 }
 
 // commands/place-order.hk
+refusal SoldOut "this shop's launch allocation is gone"
+
 command PlaceOrder(order_id: Uuid, customer_id: Int, shop_id: Int, email: String?) {
   // `state` is a read declaration, not a binding: it names a slice of the log, folds
   // it, and that slice is what the append conditions on. What you folded is what you
@@ -52,7 +54,7 @@ command PlaceOrder(order_id: Uuid, customer_id: Int, shop_id: Int, email: String
     return
   }
   if sold >= 100 {
-    return reject("sold_out", "this shop's launch allocation is gone")
+    return reject SoldOut
   }
 
   emit @order.placed { order_id, customer_id, shop_id, email }

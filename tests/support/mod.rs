@@ -339,12 +339,14 @@ event @account.registered {
 
 /// A boundary over the plaintext handle: one account per handle, across all accounts.
 pub const REGISTER_ACCOUNT: &str = r#"
+refusal HandleTaken "that handle is already registered"
+
 command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
   state taken: Bool = fold false
     on @account.registered(handle) => true
 
   if taken {
-    return reject("handle_taken", "that handle is already registered")
+    return reject HandleTaken
   }
 
   emit @account.registered { account_id, handle, email }

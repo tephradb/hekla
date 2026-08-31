@@ -1648,8 +1648,8 @@ fn error_detail_schema() -> Value {
             "code": {
                 "type": "string",
                 "description": "A stable reason to branch on, e.g. `invalid_input`, \
-                    `not_found`, `unindexed_filter`, `concurrency_conflict`, or whatever \
-                    code the command's own `reject(...)` chose.",
+                    `not_found`, `unindexed_filter`, `concurrency_conflict`, or the code \
+                    derived from the name of a refusal the command declared.",
             },
             "message": {
                 "type": "string",
