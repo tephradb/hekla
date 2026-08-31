@@ -328,8 +328,6 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
         // flight right now: the driver clears the deadline before it retries. So null
         // alongside a non-zero `consecutive_failures` is an attempt in progress.
         "retry_in_ms": shared.retry_in_ms(),
-        // Null is `all_events()`, an empty array is a module subscribed to nothing.
-        // Collapsing the two would invert the meaning of the commonest subscription.
         "sources": shared.sources,
         // `None` is "has never run", which the driver's own resume path flattens to
         // zero because both mean "start from the beginning".
@@ -433,7 +431,6 @@ pub fn projector_detail(
         "running": shared.running(),
         "failed": shared.failed(),
         "last_error": shared.last_error(),
-        // Null is `all_events()`, as on an effect.
         "sources": shared.sources,
         "definition_hash": definition_hash,
         "entities": entities,

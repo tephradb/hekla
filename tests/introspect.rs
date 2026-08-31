@@ -5,6 +5,12 @@
 //! wedged effect's journaled calls are readable, and that a subject-scoped field
 //! renders as plaintext, ciphertext or an explicit `erased` marker depending on what
 //! is actually knowable rather than silently vanishing.
+//!
+//! One of the Starlark suite's cases is gone rather than ported. It pinned an
+//! `all_events()` subscription rendering as null rather than as `[]`, which heklang has
+//! no way to declare: a projector and an effect both select by named arm, so `sources`
+//! is what those arms name and an empty one is a module subscribed to nothing. The
+//! nullable wire shape went with the case.
 
 use std::sync::Arc;
 
@@ -831,36 +837,6 @@ async fn the_journaled_call_list_pages_rather_than_truncating_silently() {
 // --- contract shapes -------------------------------------------------------
 
 #[tokio::test]
-async fn an_all_events_subscription_renders_as_null_rather_than_an_empty_list() {
-    // Null is "every event" and `[]` is "nothing". Collapsing the two inverts the
-    // meaning of the broadest subscription there is.
-    let project = support::write_project(&[
-        ("events/thing.star", THING_EVENTS),
-        ("commands/do-thing.star", DO_THING),
-        ("projectors/audit.star", AUDIT_PROJECTOR),
-    ]);
-    let harness = Boot::new(project.path())
-        .http(Arc::new(StubHttpClient::ok()))
-        .start();
-    let app = harness.app();
-
-    let (_, listed) = get(&app, "/admin/projectors").await;
-    assert!(
-        listed["projectors"][0]["sources"].is_null(),
-        "an all_events() projector subscribes to everything, not to nothing"
-    );
-
-    // The two endpoints read the same handle, so they cannot disagree about it.
-    let (_, schema) = get(&app, "/admin/schema").await;
-    assert_eq!(
-        schema["projectors"][0]["sources"],
-        listed["projectors"][0]["sources"]
-    );
-
-    harness.shutdown();
-}
-
-#[tokio::test]
 async fn a_command_input_field_reports_only_what_an_input_schema_carries() {
     // `schema()` rejects `subject` and `unique` outright and carries no `indexed`, so
     // describing command input as a full field declaration would promise four
@@ -1064,29 +1040,6 @@ async fn the_reserved_global_secret_is_not_a_subject_to_either_reader() {
 
     harness.shutdown();
 }
-
-const THING_EVENTS: &str = r#"
-thing_happened = event(type = "thing.happened", fields = {"thing_id": uuid()})
-"#;
-
-const DO_THING: &str = r#"
-load("events/thing.star", "thing_happened")
-
-input = schema(thing_id = uuid())
-
-def handle(input, state):
-    return thing_happened(thing_id = input.thing_id)
-"#;
-
-/// A projector over `all_events()`, the case that has to render as null.
-const AUDIT_PROJECTOR: &str = r#"
-seen = entity(key = "id", fields = {"id": str(), "kind": str()})
-
-def on_event(event):
-    return [put(seen, {"id": event.id, "kind": event.type})]
-
-handle = {all_events(): on_event}
-"#;
 
 /// GET `uri` without assuming the body is JSON, for the responses that are not.
 async fn raw_get(app: &axum::Router, uri: &str) -> (axum::http::StatusCode, String, Vec<u8>) {

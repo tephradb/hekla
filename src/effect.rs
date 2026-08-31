@@ -78,9 +78,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 /// the skip endpoint. Holds no reference to the runtime, so nothing cycles.
 pub struct EffectShared {
     pub name: String,
-    /// The event types this effect subscribes to, or `None` for `all_events()`. On the
-    /// handle for the same reason a projector's is.
-    pub sources: Option<Vec<String>>,
+    /// The event types this effect subscribes to. On the handle for the same reason a
+    /// projector's is.
+    pub sources: Vec<String>,
     position: AtomicU64,
     shutdown: AtomicBool,
     /// How many times the *current* position has failed in a row while retrying.
@@ -384,7 +384,7 @@ fn spawn(
     let ModuleDef::Effect { name, sources } = &unit.def else {
         anyhow::bail!("spawn called on a non-effect module");
     };
-    let sources = Some(sources.clone());
+    let sources = sources.clone();
     let name = name.clone();
     let resume = runtime.effect_resume_after(&name)?;
     for position in runtime.running_with_hash_mismatch(&name, &unit.source_hash)? {
@@ -1154,7 +1154,7 @@ mod tests {
     fn test_shared() -> EffectShared {
         EffectShared {
             name: "test".to_owned(),
-            sources: None,
+            sources: Vec::new(),
             position: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             consecutive_failures: AtomicU64::new(0),

@@ -23,10 +23,10 @@ export function SchemaView() {
       ${(schema) => {
         const consumers = (type) => [
           ...schema.projectors
-            .filter((p) => p.sources === null || p.sources.includes(type))
+            .filter((p) => p.sources.includes(type))
             .map((p) => ({ kind: 'projector', name: p.name })),
           ...schema.effects
-            .filter((e) => e.sources === null || e.sources.includes(type))
+            .filter((e) => e.sources.includes(type))
             .map((e) => ({ kind: 'effect', name: e.name })),
         ]
         return html`

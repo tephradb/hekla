@@ -302,8 +302,9 @@ the request:
 | `stale` | The subject *has* a key, but this value was written under a superseded one (erased, then recreated by a later event) or is corrupt. Unreadable, but not the total loss `erased` reports. |
 | `unreadable` | The key could not be obtained at all: a corrupt wrapping, or a master that is not configured. The server log names it. |
 
-**A `sources` of `null` means a declaration that reads every event**, and an empty list means one
-that subscribed to nothing. The two are different answers and are reported differently.
+**A `sources` is the event types a declaration's arms name**, and it is always a list. There is no
+way to say "every event": a projector and an effect both select by named arm, so an empty `sources`
+is a module subscribed to nothing rather than one subscribed to everything.
 
 **A journaled call's arguments are not stored, only hashed**, so an invocation view reports what came
 back and not what was sent. Storing the arguments would let plaintext that came out of `reveal()`

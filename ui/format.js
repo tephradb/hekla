@@ -80,12 +80,11 @@ export function bytes(value) {
 /**
  * A module's subscription, in the author's own vocabulary.
  *
- * `null` is `all_events()` and `[]` is a module subscribed to nothing. Two different
- * facts, and collapsing them would invert the meaning of the commonest subscription,
- * so the server keeps them apart and so does this.
+ * A module selects by named arm, so an empty list is one subscribed to nothing rather
+ * than one subscribed to everything. Worth a word rather than an empty cell, because a
+ * module that reads no event is almost always a mistake.
  */
 export function sources(value) {
-  if (value === null || value === undefined) return 'all_events()'
-  if (value.length === 0) return 'nothing'
+  if (!value || value.length === 0) return 'nothing'
   return value.join(' · ')
 }

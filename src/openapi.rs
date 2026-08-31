@@ -55,14 +55,14 @@ pub struct Surface<'a> {
 pub struct ProjectorSurface<'a> {
     pub name: &'a str,
     pub entities: &'a [EntityDef],
-    /// The event types it subscribes to, or `None` for `all_events()`.
-    pub sources: Option<Vec<&'a str>>,
+    /// The event types it subscribes to.
+    pub sources: Vec<&'a str>,
 }
 
 pub struct EffectSurface<'a> {
     pub name: &'a str,
-    /// The event types it subscribes to, or `None` for `all_events()`.
-    pub sources: Option<Vec<&'a str>>,
+    /// The event types it subscribes to.
+    pub sources: Vec<&'a str>,
 }
 
 impl<'a> Surface<'a> {
@@ -89,7 +89,7 @@ impl<'a> Surface<'a> {
                 projectors.push(ProjectorSurface {
                     name: name.as_str(),
                     entities: entities.as_slice(),
-                    sources: Some(sources.iter().map(String::as_str).collect()),
+                    sources: sources.iter().map(String::as_str).collect(),
                 });
             }
         }
@@ -100,7 +100,7 @@ impl<'a> Surface<'a> {
             if let ModuleDef::Effect { name, sources } = &unit.def {
                 effects.push(EffectSurface {
                     name: name.as_str(),
-                    sources: Some(sources.iter().map(String::as_str).collect()),
+                    sources: sources.iter().map(String::as_str).collect(),
                 });
             }
         }
@@ -368,10 +368,10 @@ fn read_tag(projector: &str) -> String {
 }
 
 fn projector_tag_description(projector: &ProjectorSurface) -> String {
-    let built_from = match &projector.sources {
-        None => "every event".to_owned(),
-        Some(types) if types.is_empty() => "no declared source".to_owned(),
-        Some(types) => backticked(types),
+    let built_from = if projector.sources.is_empty() {
+        "no declared source".to_owned()
+    } else {
+        backticked(&projector.sources)
     };
     let entities: Vec<&str> = projector
         .entities
@@ -1578,13 +1578,13 @@ fn path_or_query_400(description: &str) -> Value {
     })
 }
 
-/// A module's declared subscription: the event types it selects, or null for
-/// `all_events()`.
+/// A module's declared subscription: the event types its arms select. Empty is a
+/// module subscribed to nothing, which is the only way to select none of them.
 fn sources_schema() -> Value {
     json!({
-        "type": ["array", "null"],
+        "type": "array",
         "items": { "type": "string" },
-        "description": "The event types this module subscribes to, or null for `all_events()`.",
+        "description": "The event types this module subscribes to.",
     })
 }
 
@@ -2797,11 +2797,11 @@ mod tests {
             projectors: vec![ProjectorSurface {
                 name: "users",
                 entities,
-                sources: Some(vec!["user.registered"]),
+                sources: vec!["user.registered"],
             }],
             effects: vec![EffectSurface {
                 name: "notify",
-                sources: None,
+                sources: Vec::new(),
             }],
             events: events
                 .iter()
@@ -2900,7 +2900,7 @@ mod tests {
         surface.projectors = vec![ProjectorSurface {
             name: "books",
             entities: &entities,
-            sources: None,
+            sources: Vec::new(),
         }];
         let doc = build(&surface);
         let props = &doc["components"]["schemas"]["entity.books.ledger"]["properties"];
@@ -3478,12 +3478,12 @@ mod tests {
             ProjectorSurface {
                 name: "read-side",
                 entities: &entities,
-                sources: None,
+                sources: Vec::new(),
             },
             ProjectorSurface {
                 name: "read_side",
                 entities: &entities,
-                sources: None,
+                sources: Vec::new(),
             },
         ];
         let doc = build(&surface);
