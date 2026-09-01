@@ -52,7 +52,7 @@ use tempfile::TempDir;
 mod support;
 
 use support::shadow::{Fields, Shadow, wire_row};
-use support::{Boot, Harness, ctx, fixture_dir, replay_and_wait, sweep, try_quiesce};
+use support::{Boot, Harness, ctx, example_dir, fixture_dir, replay_and_wait, sweep, try_quiesce};
 
 /// The status the stub answers with on both sides. A 2xx, so the tickets effect gets
 /// past its status guard and reaches the `invoke` that appends.
@@ -106,8 +106,18 @@ const GROUPS: u8 = 3;
 
 /// What one operation means to a scenario's world.
 pub enum Act {
-    Run { command: &'static str, body: Value },
-    Erase { subject: &'static str, id: String },
+    Run {
+        command: &'static str,
+        body: Value,
+    },
+    Erase {
+        subject: &'static str,
+        id: String,
+    },
+    /// The scenario has no such operation. `examples/orders` writes once and never
+    /// updates or deletes, so a `Relabel` there is nothing rather than a command, and
+    /// counting it says which shapes a project actually reaches.
+    Nothing,
 }
 
 /// A project, plus what the operations mean in it.
@@ -197,6 +207,60 @@ pub fn tickets() -> Scenario {
     }
 }
 
+/// `examples/orders`: the canonical example, run through the same machinery.
+///
+/// A deliberately different shape from `tickets`, which is the point of running it at
+/// all. One write statement instead of four, so `Relabel` and `Remove` are nothing here;
+/// a cap of three rather than six, so a sequence spends most of its time in the refusal
+/// branch; two subjects again, but the shop's sealed column is not projected at all,
+/// while both of the customer's are; and an effect that folds its own state and posts
+/// without invoking, so nothing cascades and the log length is exactly the successes.
+pub fn orders() -> Scenario {
+    Scenario {
+        name: "orders",
+        dir: example_dir("orders"),
+        model_dir: example_dir("orders"),
+        effect: Some("NotifyCustomer"),
+        projectors: &["CustomerOrders"],
+        entities: &[("CustomerOrders", "Order")],
+        act: |op| match *op {
+            Op::Create {
+                thing,
+                owner,
+                group,
+                contact,
+            } => {
+                let email = contact.then(|| format!("owner{owner}@example.com"));
+                let address = contact.then(|| format!("{owner} Test Street"));
+                Act::Run {
+                    command: "PlaceOrder",
+                    body: json!({
+                        "order_id": ticket_id(thing),
+                        "customer_id": owner_id(owner),
+                        "shop_id": org_id(group),
+                        "email": email,
+                        "shipping_address": address,
+                        "order_total": format!("{}.50", 10 + thing),
+                        "notes": format!("order {thing}"),
+                    }),
+                }
+            }
+            Op::EraseOwner(owner) => Act::Erase {
+                subject: "customer_id",
+                id: owner_id(owner).to_string(),
+            },
+            Op::EraseGroup(group) => Act::Erase {
+                subject: "shop_id",
+                id: org_id(group).to_string(),
+            },
+            // An order is placed once and never changed: there is no command to run.
+            Op::Relabel { .. } | Op::Remove { .. } => Act::Nothing,
+            Op::Restart | Op::Rebuild { .. } | Op::Verify => {
+                unreachable!("a world operation never reaches the scenario")
+            }
+        },
+    }
+}
 fn ticket_id(thing: u8) -> String {
     uuid::Uuid::from_u128(u128::from(thing % THINGS) + 1).to_string()
 }
@@ -470,6 +534,7 @@ impl Run<'_> {
                     self.shadow.erase(subject, &id);
                     self.coverage.bump(format!("erase:{subject}"));
                 }
+                Act::Nothing => self.coverage.bump(format!("{}:unsupported", class_of(&op))),
             },
         }
         self.settle()?;
@@ -1006,50 +1071,96 @@ fn the_generator_reaches_every_op_class() {
 /// outcome a scenario can produce was actually produced.
 ///
 /// Ignored by default because it is minutes rather than seconds. It is the test that
-/// says the universe is contended enough to be worth generating over: with twelve
-/// things, four owners, three groups and a cap of six, a long sequence has to reach the
-/// cap, the refusals and both erasures, and a fixture that stopped doing so would leave
-/// the always-on case above green and empty.
-#[test]
-#[ignore = "a deliberate soak, minutes rather than seconds"]
-fn a_soak_reaches_every_outcome() {
+/// says the universe is contended enough to be worth generating over: a fixture that
+/// stopped reaching its cap or its refusals would leave the always-on case above green
+/// and empty, and only a count of what fired can say so.
+///
+/// `HEKLA_SOAK_CASES` and `HEKLA_SOAK_OPS` widen it without an edit, which is what a
+/// deliberate long run wants: the defaults are what a developer will sit through, not
+/// what the question "have we stopped finding bugs" deserves.
+fn soak(scenario: &Scenario, required: &[&str]) {
+    let cases = env_or("HEKLA_SOAK_CASES", 64);
+    let ops = env_or("HEKLA_SOAK_OPS", 48);
     let seen = Mutex::new(Coverage::default());
     let config = ProptestConfig {
-        cases: 64,
+        cases,
         max_shrink_iters: 96,
         max_shrink_time: 120_000,
         failure_persistence: Some(Box::new(REGRESSIONS)),
         ..ProptestConfig::default()
     };
-    proptest!(config, |(ops in prop::collection::vec(op(), 24..48))| {
-        match run_case(&tickets(), &ops) {
+    proptest!(config, |(ops in prop::collection::vec(op(), (ops / 2) as usize..ops as usize))| {
+        match run_case(scenario, &ops) {
             Ok(coverage) => seen.lock().unwrap().absorb(&coverage),
             Err(why) => prop_assert!(false, "{why}"),
         }
     });
 
     let seen = seen.into_inner().unwrap();
-    for what in [
-        "create:ok[ticket.opened]",
-        "create:ok[]",
-        "create:reject:org_full",
-        "relabel:ok[ticket.retitled]",
-        "relabel:reject:no_such_ticket",
-        "remove:ok[ticket.closed]",
-        "remove:reject:no_such_ticket",
-        "erase:owner_id",
-        "erase:org_id",
-        "restart",
-        "rebuild",
-        "verify",
-    ] {
+    // Printed before the assertions, so a run that fails one of them still says what it
+    // reached. Someone who has just waited an hour for this wants the histogram either
+    // way, and a class that fired twice in ten thousand operations is worth noticing
+    // before it becomes a class that fires never.
+    println!("what the `{}` soak reached:\n{seen}", scenario.name);
+    for what in required {
         assert!(seen.count(what) > 0, "`{what}` never fired:\n{seen}");
     }
-    // Printed on success too, not only on failure. Someone who has just waited five
-    // minutes for this wants to see what it reached, and a class that is technically
-    // non-zero but fired twice in two thousand operations is worth noticing before it
-    // becomes a class that fires never.
-    println!("what the soak reached:\n{seen}");
+}
+
+fn env_or(name: &str, fallback: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
+}
+
+/// Four write statements, an `Int @key`, a cap of six, and an effect that invokes.
+#[test]
+#[ignore = "a deliberate soak, minutes rather than seconds"]
+fn a_soak_of_the_tickets_fixture_reaches_every_outcome() {
+    soak(
+        &tickets(),
+        &[
+            "create:ok[ticket.opened]",
+            "create:ok[]",
+            "create:reject:org_full",
+            "relabel:ok[ticket.retitled]",
+            "relabel:reject:no_such_ticket",
+            "remove:ok[ticket.closed]",
+            "remove:reject:no_such_ticket",
+            "erase:owner_id",
+            "erase:org_id",
+            "restart",
+            "rebuild",
+            "verify",
+        ],
+    );
+}
+
+/// The canonical example, whose shape is nothing like the fixture's.
+///
+/// One write statement, a cap of three so most of a sequence is refusals, a sealed
+/// column that no projector stores, and an effect that folds its own state and posts
+/// without invoking. Everything the machinery claims should hold here too, and until
+/// this existed every generated-sequence guarantee was a claim about one project.
+#[test]
+#[ignore = "a deliberate soak, minutes rather than seconds"]
+fn a_soak_of_the_orders_example_reaches_every_outcome() {
+    soak(
+        &orders(),
+        &[
+            "create:ok[order.placed]",
+            "create:ok[]",
+            "create:reject:sold_out",
+            "relabel:unsupported",
+            "remove:unsupported",
+            "erase:customer_id",
+            "erase:shop_id",
+            "restart",
+            "rebuild",
+            "verify",
+        ],
+    );
 }
 
 /// Which organisation an operation names, biased towards the first.
