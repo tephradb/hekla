@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 mod support;
 
-use support::{ALICE, BOB, Boot, CAROL, ctx, log_head, write_project};
+use support::{ALICE, BOB, Boot, CAROL, UUID_A, ctx, log_head, write_project};
 
 // --- multi-event recovery -------------------------------------------------
 
@@ -935,5 +935,102 @@ fn a_money_parameter_still_refuses_an_unquoted_number() {
         )
         .unwrap();
     assert_eq!(taken.status, 200, "{:?}", taken.body);
+    harness.shutdown();
+}
+
+// --- an append that read nothing ------------------------------------------
+
+const STAGED_EVENTS: &str = r#"
+event @note.made { note_id: Uuid, kind: String @max(20) }
+event @other.happened { n: Int }
+"#;
+
+/// A command whose early return sits *above* its first declaration run. heklang stages
+/// a command's reads, so this path resolves no slices at all and appends with an empty
+/// condition; the path below it folds and appends with a real one.
+const MAKE_NOTE: &str = r#"
+command MakeNote(note_id: Uuid, kind: String) {
+  if kind == "quick" {
+    emit @note.made { note_id, kind }
+    return
+  }
+
+  state made: Bool = fold false
+    on @note.made(note_id) => true
+
+  if made {
+    return
+  }
+  emit @note.made { note_id, kind }
+}
+"#;
+
+const CHURN: &str = "command Churn(n: Int) { emit @other.happened { n } }\n";
+
+/// `docs/host.md`: an `after` is half of a predicate, not an expected version, and a
+/// command that read nothing comes back with no slices and `after` at zero rather than
+/// at a head it never asked for. A host that mistook the pair for a version check would
+/// make every unboundaried append fail the moment anything else touched the log.
+///
+/// Staging is what makes this newly reachable: before, a command's reads were hoisted
+/// above its body, so a command holding a `state` always resolved its slices. Now an
+/// early return above the first declaration run skips them, and the same command
+/// appends under both conditions depending on the argument.
+#[test]
+fn a_command_that_returned_above_its_first_fold_appends_against_a_moving_log() {
+    let project = write_project(&[
+        ("events/t.hk", STAGED_EVENTS),
+        ("commands/make-note.hk", MAKE_NOTE),
+        ("commands/churn.hk", CHURN),
+    ]);
+    let harness = Boot::new(project.path()).start();
+
+    // Something else is writing the whole time, so a stale `after` would show.
+    for n in 0..5 {
+        let result = harness
+            .rt
+            .execute("Churn", json!({ "n": n }), &ctx(), None)
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+    }
+
+    for id in [ALICE, BOB, CAROL] {
+        let result = harness
+            .rt
+            .execute(
+                "MakeNote",
+                json!({ "note_id": id, "kind": "quick" }),
+                &ctx(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            result.status, 200,
+            "a command that read nothing cannot be beaten to the log: {:?}",
+            result.body
+        );
+    }
+    assert_eq!(log_head(&harness.rt), 8, "five churns and three notes");
+
+    // The other path through the same command does read, and its boundary still holds:
+    // the second write for one id folds into the no-op arm rather than appending.
+    for _ in 0..2 {
+        let result = harness
+            .rt
+            .execute(
+                "MakeNote",
+                json!({ "note_id": UUID_A, "kind": "slow" }),
+                &ctx(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+    }
+    assert_eq!(
+        log_head(&harness.rt),
+        9,
+        "the folded path appended once, not twice"
+    );
+
     harness.shutdown();
 }

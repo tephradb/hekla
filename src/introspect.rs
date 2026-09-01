@@ -32,9 +32,10 @@ use tephra::{Event, EventType, Position, Query, QueryItem, Tag, Tags, WriteHandl
 use crate::crypto::{KeyStore, RowDecryptor};
 use crate::effect::EffectShared;
 use crate::envelope;
+use crate::heklang_host::unsealed_json;
 use crate::opdb::{EffectState, InvocationAt, InvocationRow, JournalRow, ModuleRow, SubjectInfo};
 use crate::projector::ProjectorShared;
-use crate::read_api::{self, filterable_fields};
+use crate::read_api::filterable_fields;
 use crate::read_model::key_kind;
 use crate::schema::EventDefs;
 use crate::schema::{EntityDef, EventDef, FieldMeta, scalar_to_string};
@@ -247,7 +248,11 @@ impl<'a> Renderer<'a> {
                 (Some(decryptor), Some(subject_value)) => {
                     match decryptor.decrypt(subject_field, subject_value, name, &ciphertext) {
                         Ok(Some(text)) => {
-                            obj.insert(name.clone(), read_api::typed_from_string(&meta.kind, text));
+                            // The payload decoder, not the column one: this seal was made by
+                            // `stored_seal` out of the wire form, so a `Timestamp` in it is
+                            // micros. `typed_from_string` would type those digits as a string
+                            // and render personal fields differently from plain ones.
+                            obj.insert(name.clone(), unsealed_json(&meta.kind, text));
                             self.decrypted.set(self.decrypted.get() + 1);
                             "decrypted"
                         }
@@ -430,6 +435,8 @@ pub fn projector_detail(
         "readiness": shared.readiness().label(),
         "running": shared.running(),
         "failed": shared.failed(),
+        "replays_completed": shared.replays_completed(),
+        "replays_failed": shared.replays_failed(),
         "last_error": shared.last_error(),
         "sources": shared.sources,
         "definition_hash": definition_hash,

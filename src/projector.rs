@@ -132,6 +132,14 @@ pub struct ProjectorShared {
     /// A [`Readiness`] discriminant. Decided synchronously in [`spawn`], before the
     /// handle is published, so the read API never observes a shape it cannot serve.
     readiness: AtomicU8,
+    /// How many rebuilds this projector has finished since boot, and how many attempts
+    /// failed. Cumulative and never cleared, like `terminal_skips` on an effect.
+    ///
+    /// Stored Release and loaded Acquire, for the same reason `position` is: a reader
+    /// that observes a completed rebuild must also observe the model the rebuild swapped
+    /// in. That ordering is what lets a caller wait on the count instead of on a sleep.
+    replays_completed: AtomicU64,
+    replays_failed: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -139,6 +147,22 @@ impl ProjectorShared {
     /// The last checkpoint position the thread has committed.
     pub fn position(&self) -> u64 {
         self.position.load(Ordering::Acquire)
+    }
+
+    /// How many rebuilds have finished since boot. Cumulative, so a caller that read it
+    /// before asking for a replay knows the replay is done when the number moves.
+    ///
+    /// The alternative is timing, and there is nothing to time against: a rebuild
+    /// happens into a sibling file and is swapped in by rename, so the live position
+    /// never drops and no observable state says one is in flight.
+    pub fn replays_completed(&self) -> u64 {
+        self.replays_completed.load(Ordering::Acquire)
+    }
+
+    /// How many rebuild attempts failed since boot. A projector that keeps failing to
+    /// rebuild is serving a frozen model, which `failed` says and this counts.
+    pub fn replays_failed(&self) -> u64 {
+        self.replays_failed.load(Ordering::Acquire)
     }
 
     /// Whether the projector's last operation failed. Read alongside
@@ -340,6 +364,8 @@ fn spawn(
         running: AtomicBool::new(true),
         failed: AtomicBool::new(false),
         readiness: AtomicU8::new(plan.readiness().as_u8()),
+        replays_completed: AtomicU64::new(0),
+        replays_failed: AtomicU64::new(0),
         last_error: Mutex::new(None),
     });
 
@@ -579,6 +605,8 @@ fn rebuild_or_degrade(
         Ok(fresh) => {
             shared.clear_failure();
             shared.set_readiness(Readiness::Ready);
+            // Last, so a reader that sees the count has already seen everything above.
+            shared.replays_completed.fetch_add(1, Ordering::Release);
             return Ok(fresh);
         }
         Err(err) => err,
@@ -604,6 +632,7 @@ fn rebuild_or_degrade(
         shared.set_readiness(Readiness::Ready);
     }
     shared.reset_position(reopened.read_checkpoint()?.get());
+    shared.replays_failed.fetch_add(1, Ordering::Release);
     Ok(reopened)
 }
 
@@ -987,5 +1016,69 @@ mod tests {
         ] {
             assert_ne!(plan.readiness(), Readiness::Failed);
         }
+    }
+
+    /// A handle with no thread and no model behind it, for the checks that are about
+    /// the handle itself.
+    fn handle(at: u64) -> ProjectorShared {
+        ProjectorShared {
+            name: "p".to_owned(),
+            db_path: PathBuf::new(),
+            entities: Arc::new(vec![entity()]),
+            sources: Vec::new(),
+            position: AtomicU64::new(at),
+            shutdown: AtomicBool::new(false),
+            replay: AtomicBool::new(false),
+            running: AtomicBool::new(true),
+            failed: AtomicBool::new(false),
+            readiness: AtomicU8::new(Readiness::Ready.as_u8()),
+            replays_completed: AtomicU64::new(0),
+            replays_failed: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_moving_forward_is_published() {
+        let handle = handle(4);
+        assert!(handle.advance_position(9).is_ok());
+        assert_eq!(handle.position(), 9);
+    }
+
+    /// The only enforcement point for checkpoint monotonicity, tested where it lives.
+    ///
+    /// Nothing above this can reach it: a sweep runs after the fact and has only one of
+    /// the two numbers, and no sequence of commands, restarts or rebuilds makes the tail
+    /// loop hand back a lower position in the first place. So an end-to-end test that
+    /// sampled `position()` and asserted it never fell would pass against a projector
+    /// with no guard at all, which is exactly what `scripts/mutants.sh` found.
+    #[test]
+    fn a_checkpoint_moving_backwards_is_refused_and_leaves_the_position_alone() {
+        let handle = handle(9);
+        let violation = handle
+            .advance_position(4)
+            .expect_err("a checkpoint moving backwards is a violation");
+        assert!(
+            matches!(
+                violation,
+                Violation::CheckpointRegression { from: 9, to: 4, .. }
+            ),
+            "expected a checkpoint regression naming both positions, got {violation:?}"
+        );
+        assert_eq!(
+            handle.position(),
+            9,
+            "a refused move must not be published either"
+        );
+    }
+
+    /// And the exception, which is why the invariant cannot be stated end to end: a
+    /// rebuilt model *is* the state now, so its checkpoint replaces whatever the
+    /// projector had even when it lands behind.
+    #[test]
+    fn a_rebuild_may_publish_a_lower_checkpoint() {
+        let handle = handle(9);
+        handle.reset_position(4);
+        assert_eq!(handle.position(), 4);
     }
 }

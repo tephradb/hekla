@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 47a2c1e1f6f41ecfa5e2cc46bdc0277b79c5c9df5444e2ff8fa076c30de57ca3 # shrinks to (ty, value) = (Opt(Bool), Opt { inner: Bool, value: Some(Bool(false)) })
+cc 4a042005768b2a8f4e065c53c58a240a2496310f01479086ca8330e8f0e6db69 # shrinks to (ty, value) = (Opt(Timestamp), Opt { inner: Timestamp, value: Some(Timestamp(0)) })

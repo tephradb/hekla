@@ -84,26 +84,14 @@ projector Things {
     println!("appended {N} events in {appended:?}");
 
     // The live position never drops during a rebuild (it happens into a sibling file
-    // and is swapped in by rename), so the sibling appearing and vanishing is what
-    // brackets it.
-    let sibling = harness
-        .rt
-        .projector("Things")
-        .unwrap()
-        .db_path
-        .with_extension("rebuild.db");
+    // and is swapped in by rename), so the completion count is what brackets it. This
+    // used to spin on the sibling file existing, which could miss a rebuild that
+    // finished between two polls and then spin forever.
     let started = Instant::now();
-    harness.rt.projector("Things").unwrap().request_replay();
-    while !sibling.exists() {
-        std::hint::spin_loop();
-    }
-    let began = started.elapsed();
-    while sibling.exists() {
-        std::hint::spin_loop();
-    }
+    support::replay_and_wait(&harness.rt, "Things");
     println!(
-        "rebuilt {N} events in {:?} (picked up after {began:?})",
-        started.elapsed() - began
+        "rebuilt {N} events in {:?}, including the idle poll before it was picked up",
+        started.elapsed()
     );
     harness.shutdown();
 }

@@ -9,15 +9,17 @@
 
 mod support;
 
+use hekla::crypto::KeyStore;
 use hekla::effect::StubHttpClient;
 use hekla::invariant::{Mismatch, Violation};
 use hekla::lock::DataDirLock;
+use hekla::opdb::OpDb;
 use hekla::verify;
 use rusqlite::Connection;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use support::{ALICE, BOB, Boot, CAROL, UUID_A, example_dir, load_ok, master_keys, register_user};
@@ -51,6 +53,51 @@ fn sweep(project_dir: &Path, data_dir: &Path) -> verify::Report {
 /// Open a projector's read model directly, to plant a violation in it.
 fn open_model(data_dir: &Path, projector: &str) -> Connection {
     Connection::open(data_dir.join("projectors").join(format!("{projector}.db"))).unwrap()
+}
+
+/// A key store over a stopped data directory, for planting and inspecting subject keys.
+fn keystore(data_dir: &Path) -> KeyStore {
+    let opdb = Arc::new(Mutex::new(OpDb::open(&data_dir.join("hekla.db")).unwrap()));
+    KeyStore::new(opdb, master_keys())
+}
+
+/// The log head, read with a runtime up and shut down again, since a sweep needs the
+/// directory to itself. The default stub answers 400, so nothing an effect does on the
+/// way past can move the number this reads.
+fn log_head(project_dir: &Path, data_dir: &Path) -> u64 {
+    let harness = Boot::new(project_dir)
+        .data_dir(data_dir)
+        .with_master_key()
+        .start();
+    let head = harness.rt.log_head();
+    harness.shutdown();
+    head
+}
+
+/// Delete journal rows of one kind, and assert the fixture really had some to drop.
+fn drop_journal(data_dir: &Path, effect: &str, kind: &str) -> usize {
+    let removed = Connection::open(data_dir.join("hekla.db"))
+        .unwrap()
+        .execute(
+            "DELETE FROM effect_journal WHERE effect = ?1 AND kind = ?2",
+            rusqlite::params![effect, kind],
+        )
+        .unwrap();
+    assert!(
+        removed >= 1,
+        "the fixture should have a journaled `{kind}` call to drop"
+    );
+    removed
+}
+
+/// The one `ReplayDivergence` in a report, or a panic naming what was found instead.
+fn divergence(report: &verify::Report) -> String {
+    report
+        .violations
+        .iter()
+        .find(|violation| matches!(violation, Violation::ReplayDivergence { .. }))
+        .unwrap_or_else(|| panic!("expected a replay divergence, got {:?}", report.violations))
+        .to_string()
 }
 
 // --- the healthy case ------------------------------------------------------
@@ -132,6 +179,80 @@ fn a_row_deleted_behind_the_projector_is_caught() {
     );
 }
 
+/// An `Int @key` orders numerically in SQL and lexicographically in the merge join, and
+/// `10` before `2` is where the two part company. With the sides walked in different
+/// orders, deleting row 2 made the join report row 10 as both only-live and
+/// only-rebuilt: three violations for one deleted row, two of them about a row that is
+/// fine. Never a false clean, but an operator cannot act on a report that invents rows.
+#[test]
+fn an_int_keyed_entity_reports_one_deleted_row_and_not_three() {
+    let dir = support::write_project(&[
+        (
+            "events/tick.hk",
+            "event @tick.happened { group: Int, label: String @max(20) }\n",
+        ),
+        (
+            "commands/tick.hk",
+            "command Tick(group: Int, label: String) { emit @tick.happened { group, label } }\n",
+        ),
+        (
+            "projectors/groups.hk",
+            r#"
+projector Groups {
+  entity Group {
+    group: Int @key,
+    label: String @max(20),
+  }
+
+  on @tick.happened { group, label } { put Group { group, label } }
+}
+"#,
+        ),
+    ]);
+
+    let data = tempfile::tempdir().unwrap();
+    let harness = Boot::new(dir.path()).data_dir(data.path()).start();
+    // Two keys whose numeric and textual orders disagree, which is the whole fixture.
+    for group in [2, 10] {
+        let result = harness
+            .rt
+            .execute(
+                "Tick",
+                json!({ "group": group, "label": "keep" }),
+                &support::ctx(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+    }
+    support::wait_position(&harness.rt, "Groups", 2);
+    harness.shutdown();
+
+    let removed = open_model(data.path(), "Groups")
+        .execute("DELETE FROM \"Group\" WHERE \"group\" = 2", [])
+        .unwrap();
+    assert_eq!(removed, 1, "the fixture should have row 2 to delete");
+
+    let report = sweep(dir.path(), data.path());
+    assert_eq!(
+        report.violations.len(),
+        1,
+        "one deleted row is one violation, got {:?}",
+        report.violations
+    );
+    let Violation::RebuildMismatch { key, detail, .. } = &report.violations[0] else {
+        panic!(
+            "expected a rebuild mismatch, got {:?}",
+            report.violations[0]
+        );
+    };
+    assert_eq!(key, "2");
+    assert!(
+        matches!(detail, Mismatch::OnlyRebuilt(_)),
+        "the deleted row is only in the rebuild, got {detail:?}"
+    );
+}
+
 #[test]
 fn a_row_invented_behind_the_projector_is_caught() {
     let data = tempfile::tempdir().unwrap();
@@ -183,14 +304,171 @@ fn a_missing_journal_entry_is_caught_without_performing_the_call() {
     );
 
     let report = sweep(&example_dir("users"), data.path());
-    let found = report
-        .violations
-        .iter()
-        .find(|violation| matches!(violation, Violation::ReplayDivergence { .. }))
-        .unwrap_or_else(|| panic!("expected a replay divergence, got {:?}", report.violations));
-    let text = found.to_string();
+    let text = divergence(&report);
     assert!(text.contains("no journal entry"), "{text}");
     assert!(text.contains("performed it a second time"), "{text}");
+}
+
+/// The half of the seal that blocking the transport does not cover.
+///
+/// Dropping the `invoke` row rather than the `http.post` one sends the replay into
+/// heklang's `invoke`, which on a journal miss runs the target command and appends for
+/// real. A replay carries no journal identity, so `idempotency_tag` finds nothing and
+/// the append has no existence clause to suppress the duplicate either; the sweep opens
+/// a live write coordinator, so it lands. An audit that appends to the log it is
+/// auditing is worse than no audit.
+///
+/// `LogNote` folds nothing on purpose. `examples/users` cannot show this: its
+/// `RecordWelcome` has an idempotence fold, and that boundary absorbs the second append
+/// so the log never moves. That is the right design and the wrong fixture.
+#[test]
+fn a_missing_invoke_entry_is_caught_without_appending_to_the_log() {
+    let dir = support::write_project(&[
+        (
+            "events/note.hk",
+            r#"
+event @note.made { note_id: Uuid, body: String @max(100) }
+event @note.logged { note_id: Uuid }
+"#,
+        ),
+        (
+            "commands/make-note.hk",
+            r#"
+command MakeNote(note_id: Uuid, body: String) { emit @note.made { note_id, body } }
+"#,
+        ),
+        (
+            "commands/internal/log-note.hk",
+            r#"
+command LogNote(note_id: Uuid) { emit @note.logged { note_id } }
+"#,
+        ),
+        (
+            "effects/record-note.hk",
+            r#"
+effect RecordNote {
+  on @note.made { note_id } {
+    http.post("https://example.test/note", { "id": note_id })
+    invoke LogNote { note_id }
+  }
+}
+"#,
+        ),
+    ]);
+
+    let data = tempfile::tempdir().unwrap();
+    let harness = Boot::new(dir.path())
+        .data_dir(data.path())
+        .http_status(200)
+        .start();
+    let result = harness
+        .rt
+        .execute(
+            "MakeNote",
+            json!({ "note_id": UUID_A, "body": "a note" }),
+            &support::ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.status, 200, "{:?}", result.body);
+    // The effect's own `invoke` moves the head, so wait for the appended event rather
+    // than for the trigger's position.
+    support::wait_until("the invoked command to land", || harness.rt.log_head() >= 2);
+    support::wait_until("the effect to catch up", || {
+        harness.rt.effect("RecordNote").unwrap().position() >= 1
+    });
+    let before = harness.rt.log_head();
+    harness.shutdown();
+
+    drop_journal(data.path(), "RecordNote", "invoke");
+
+    let report = sweep(dir.path(), data.path());
+    let text = divergence(&report);
+    assert!(text.contains("no journal entry"), "{text}");
+    assert_eq!(
+        log_head(dir.path(), data.path()),
+        before,
+        "a sweep must not append to the log it audits"
+    );
+}
+
+/// The same hole, reached through `erase` instead of `invoke`.
+///
+/// The effect has no `reveal`, deliberately: an invocation whose plaintext is gone
+/// terminal-skips before it reaches the erase, which is the documented carve-out and
+/// would hide the case. The key is minted back by hand before the sweep, because the
+/// first run's own erase destroyed it and a sweep cannot shred what is already gone.
+#[test]
+fn a_missing_erase_entry_is_caught_without_shredding_a_key() {
+    let dir = support::write_project(&[
+        (
+            "events/account.hk",
+            r#"
+event @account.closed {
+  account_id: Int,
+  email: String? @subject(account_id) @max(200),
+}
+"#,
+        ),
+        (
+            "commands/close-account.hk",
+            r#"
+command CloseAccount(account_id: Int, email: String?) {
+  emit @account.closed { account_id, email }
+}
+"#,
+        ),
+        (
+            "effects/shred-account.hk",
+            r#"
+effect ShredAccount {
+  on @account.closed { account_id } {
+    http.post("https://example.test/farewell", { "id": account_id })
+    erase(account_id)
+  }
+}
+"#,
+        ),
+    ]);
+
+    let data = tempfile::tempdir().unwrap();
+    let harness = Boot::new(dir.path())
+        .data_dir(data.path())
+        .with_master_key()
+        .http_status(200)
+        .start();
+    let result = harness
+        .rt
+        .execute(
+            "CloseAccount",
+            json!({ "account_id": 42, "email": "gone@example.com" }),
+            &support::ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.status, 200, "{:?}", result.body);
+    let position = result.body["positions"]["last"].as_u64().unwrap();
+    support::wait_until("the effect to catch up", || {
+        harness.rt.effect("ShredAccount").unwrap().position() >= position
+    });
+    harness.shutdown();
+
+    let planted = keystore(data.path());
+    planted
+        .encrypt_subject("account_id", "42", "email", "x")
+        .unwrap();
+    drop_journal(data.path(), "ShredAccount", "erase");
+
+    let report = sweep(dir.path(), data.path());
+    let text = divergence(&report);
+    assert!(text.contains("no journal entry"), "{text}");
+    assert!(
+        keystore(data.path())
+            .encrypt_subject_existing("account_id", "42", "email", "x")
+            .unwrap()
+            .is_some(),
+        "a sweep must not shred a key in the store it audits"
+    );
 }
 
 #[test]
@@ -604,12 +882,10 @@ projector Tracker {
         harness.rt.projector("Tracker").unwrap().position() >= tail
     });
 
-    harness.rt.projector("Tracker").unwrap().request_replay();
     // The rebuild has to finish while the boundary is still empty, which is the whole
     // scenario: appending the matching event first would give it something to apply
-    // and hide the bug. Nothing public signals "replay done", so this waits out the
-    // idle poll plus the rebuild rather than racing them.
-    thread::sleep(Duration::from_secs(1));
+    // and hide the bug.
+    support::replay_and_wait(&harness.rt, "Tracker");
 
     // Prove the thread survived the replay by making it do work afterwards: a
     // matching event has to land in the model. Asserting on position or `failed`
@@ -738,4 +1014,76 @@ fn a_verified_invocation_is_completed_before_it_is_checked() {
         status, "terminal",
         "a checked invocation must be terminal, or a restart re-runs it live"
     );
+}
+
+/// An erasure followed by a write to the same subject must not make the sweep report a
+/// healthy projector as corrupt.
+///
+/// The narrowest composition of two features that are each fine alone. Erasing shreds
+/// the key and leaves the live row holding ciphertext nothing can read; writing to that
+/// subject again mints a fresh key, because the append path creates one on first use.
+/// Now the key *exists*, so the old `keystore.erased` question answered "no" and the
+/// stale ciphertext was compared byte for byte against a rebuild that could not decrypt
+/// it and wrote NULL instead.
+///
+/// Both sides read as absent through the read API, so nothing is wrong with the data.
+/// What was wrong was the question: an invariant sweep has to ask whether the stored
+/// bytes are *readable*, which is what a reader sees, not whether some key is filed
+/// under that subject.
+#[test]
+fn a_subject_erased_and_then_written_to_again_still_sweeps_clean() {
+    let data = tempfile::tempdir().unwrap();
+    {
+        let harness = Boot::new(support::fixture_dir("tickets"))
+            .data_dir(data.path())
+            .with_master_key()
+            .http_status(200)
+            .start();
+        open_ticket(&harness.rt, ALICE, 1, 10);
+        support::quiesce(&harness);
+
+        harness.rt.keystore().unwrap().erase("org_id", "1").unwrap();
+
+        // The same organisation opens another ticket, which mints a key under the
+        // subject the erasure destroyed. ALICE's `budget` stays sealed under the old
+        // one and is now unreadable, but it is still sitting in the live row.
+        open_ticket(&harness.rt, BOB, 1, 10);
+        support::quiesce(&harness);
+        harness.shutdown();
+    }
+
+    let report = sweep(&support::fixture_dir("tickets"), data.path());
+    assert!(
+        report.is_clean(),
+        "a shredded column that a later write re-keyed is not corruption: {:?}",
+        report.violations
+    );
+    assert_eq!(
+        report.projectors_checked, 1,
+        "and the projector really was checked"
+    );
+}
+
+/// Open a ticket through the `tickets` fixture.
+fn open_ticket(rt: &hekla::runtime::Runtime, ticket: &str, org: i64, owner: i64) {
+    let result = rt
+        .execute(
+            "OpenTicket",
+            json!({
+                "ticket_id": ticket,
+                "org_id": org,
+                "owner_id": owner,
+                "title": "the printer is on fire",
+                "priority": "Urgent",
+                "due_at": 1_700_000_000_000_000i64,
+                "fee": "12.50",
+                "budget": "900.00",
+                "contact": "ada@example.com",
+                "meta": {},
+            }),
+            &support::ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.status, 200, "OpenTicket failed: {:?}", result.body);
 }

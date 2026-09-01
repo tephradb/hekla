@@ -698,6 +698,7 @@ fn try_invocation(
         retry_after: None,
         last_transport: None,
         minted: None,
+        sealed: false,
         http: Some(Arc::clone(http)),
     };
     let mut journal = Journal {
@@ -980,8 +981,13 @@ impl HttpClient for SealedHttp {
 /// to reproduce itself.
 ///
 /// Safe against a live system by construction: the sealed host performs nothing, so
-/// the worst outcome is a report. `reveal` is re-run because it is not journaled,
-/// but it decrypts and returns without reaching anything outward.
+/// the worst outcome is a report. Sealing the transport alone is not enough, and that
+/// is the trap this walked into once. heklang performs a journal miss for real, so an
+/// unjournaled `invoke` would run its command and append (with no idempotency clause,
+/// since a replay holds no key), and an unjournaled `erase` would destroy the subject
+/// key. Both reach the store through [`HeklaHost`], which is why `sealed` is set here
+/// as well as `SealedHttp`. `reveal` is re-run because it is not journaled, but it
+/// decrypts and returns without reaching anything outward.
 ///
 /// Two shapes of divergence are caught, and the second is the one nothing else
 /// detects: a call the journal has no entry for, and a journal entry the handler no
@@ -1020,6 +1026,10 @@ pub(crate) fn verify_replay(
         retry_after: None,
         last_transport: None,
         minted: None,
+        // The other half of the seal. `SealedHttp` stops a send, and this stops the
+        // append an unjournaled `invoke` would make and the shred an unjournaled
+        // `erase` would perform, both of which reach the store through the host.
+        sealed: true,
         http: Some(Arc::new(SealedHttp) as Arc<dyn HttpClient>),
     };
     let mut journal = SealedJournal {

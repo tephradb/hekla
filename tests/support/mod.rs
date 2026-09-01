@@ -8,6 +8,8 @@
 //! driving the in-process router. A test that needs a genuinely bespoke setup
 //! should still build it inline rather than bending a helper here.
 
+pub mod shadow;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,6 +79,17 @@ pub fn master_keys() -> MasterKeys {
 pub fn example_dir(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
+        .join(name)
+}
+
+/// The absolute path of a `tests/fixtures/` project.
+///
+/// A real directory rather than a `write_project` string, so `hek check` and `hek test`
+/// run over it and a human can read it. The examples are what hekla teaches; a fixture
+/// is what it is tested against, and the two want different things from a project.
+pub fn fixture_dir(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
         .join(name)
 }
 
@@ -394,17 +407,24 @@ pub fn register_user(rt: &Runtime, user_id: &str, email: &str, name: &str) -> u6
 
 /// Poll `cond` every [`POLL_INTERVAL`], panicking with `label` once
 /// [`POLL_BUDGET`] of wall-clock time has elapsed.
-pub fn wait_until<F: Fn() -> bool>(label: &str, cond: F) {
+pub fn wait_until<F: FnMut() -> bool>(label: &str, cond: F) {
+    if !wait_for(cond) {
+        panic!("timed out waiting for {label} after {POLL_BUDGET:?}");
+    }
+}
+
+/// [`wait_until`] for a caller that has something better to do with a timeout than
+/// panic. The model test is the only one: it reports a stall as a divergence, so a
+/// planted violation that wedges a lane comes back as a result rather than a panic
+/// from inside a helper.
+pub fn wait_for<F: FnMut() -> bool>(mut cond: F) -> bool {
     let started = Instant::now();
     loop {
         if cond() {
-            return;
+            return true;
         }
         if started.elapsed() >= POLL_BUDGET {
-            panic!(
-                "timed out waiting for {label} after {:?}",
-                started.elapsed()
-            );
+            return false;
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -436,9 +456,74 @@ pub async fn wait_position_async(rt: &Runtime, projector: &str, target: u64) {
     }
 }
 
+/// Block until `effect` has processed everything up to `target`.
+pub fn wait_effect_position(rt: &Runtime, effect: &str, target: u64) {
+    wait_until(
+        &format!("effect `{effect}` to reach position {target}"),
+        || rt.effect(effect).unwrap().position() >= target,
+    );
+}
+
+/// Ask `projector` to rebuild and block until it has.
+///
+/// The count is read *before* the request, because a rebuild leaves no other trace: it
+/// happens into a sibling file and swaps in by rename, so the live position never drops
+/// and nothing else says one is in flight. Waiting on the count rather than on a sleep
+/// is the difference between a test that is slow and one that is occasionally wrong.
+pub fn replay_and_wait(rt: &Runtime, projector: &str) {
+    let shared = rt.projector(projector).unwrap();
+    let before = shared.replays_completed() + shared.replays_failed();
+    shared.request_replay();
+    wait_until(
+        &format!("projector `{projector}` to finish a replay"),
+        || shared.replays_completed() + shared.replays_failed() > before,
+    );
+}
+
+/// Block until every projector and every effect has caught up to the log head, and the
+/// head has stopped moving.
+///
+/// Two passes, because an effect's `invoke` appends: a single read of the head can be
+/// satisfied by components that are about to be handed more work. This is the barrier
+/// every assertion about settled state needs, and it panics rather than returning a
+/// bool, so a call site cannot quietly skip its assertions when the wait times out.
+pub fn quiesce(harness: &Harness) {
+    assert!(
+        try_quiesce(harness),
+        "timed out waiting for the runtime to settle"
+    );
+}
+
+/// [`quiesce`] that reports a timeout instead of panicking.
+pub fn try_quiesce(harness: &Harness) -> bool {
+    let rt = &harness.rt;
+    let mut previous = u64::MAX;
+    wait_for(|| {
+        let head = rt.log_head();
+        let caught_up = rt
+            .projector_handles()
+            .iter()
+            .all(|handle| handle.position() >= head)
+            && rt
+                .effect_handles()
+                .iter()
+                .all(|handle| handle.position() >= head && handle.retry_in_ms().is_none());
+        let settled = caught_up && head == previous;
+        previous = head;
+        settled
+    })
+}
+
 /// The runtime's current log head, from `/status`.
 pub fn log_head(rt: &Runtime) -> u64 {
     rt.status()["log_head"].as_u64().unwrap()
+}
+
+/// Run the offline invariant sweep over a stopped data directory, with the fixed master
+/// key. The runtime must already be shut down: the sweep takes the directory lock.
+pub fn sweep(project_dir: &Path, data_dir: &Path) -> hekla::verify::Report {
+    let project = load_ok(project_dir);
+    hekla::verify::sweep(&project, data_dir, Some(master_keys())).expect("the sweep should run")
 }
 
 // --- reading the read model ----------------------------------------------
@@ -501,6 +586,7 @@ pub fn seed_event(
         retry_after: None,
         last_transport: None,
         minted: None,
+        sealed: false,
     };
     hekla::heklang_host::append_one(&mut host, &event).expect("seeded");
 }

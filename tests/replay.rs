@@ -115,3 +115,46 @@ fn a_replay_discards_a_stale_rebuild_file() {
         "the rebuild sibling is renamed into place, never left behind"
     );
 }
+
+/// A rebuild happens into a sibling file and swaps in by rename, so the live position
+/// never drops and nothing else on the handle says one occurred. The counters are the
+/// only record, which is why they are on `/status` rather than test-only: an operator
+/// asking "has this projector been replayed" has nowhere else to look.
+#[test]
+fn a_replay_is_counted_and_reported() {
+    let harness = boot_example();
+    register(&harness.rt, UUID_A);
+    wait_position(&harness.rt, "Users", 1);
+
+    let handle = harness.rt.projector("Users").unwrap();
+    assert_eq!(handle.replays_completed(), 0, "nothing has replayed yet");
+    assert_eq!(handle.replays_failed(), 0);
+
+    support::replay_and_wait(&harness.rt, "Users");
+    assert_eq!(handle.replays_completed(), 1);
+    assert_eq!(handle.replays_failed(), 0, "the rebuild succeeded");
+
+    support::replay_and_wait(&harness.rt, "Users");
+    assert_eq!(handle.replays_completed(), 2, "the count is cumulative");
+
+    // The same numbers an operator reads, from the same handle.
+    let status = harness.rt.status();
+    let reported = status["projectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "Users")
+        .expect("the projector is in /status");
+    assert_eq!(reported["replays_completed"], 2);
+    assert_eq!(reported["replays_failed"], 0);
+    // Untouched by its neighbour's replays, so the counter is per projector.
+    let other = status["projectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "UserStats")
+        .expect("the other projector is in /status");
+    assert_eq!(other["replays_completed"], 0);
+
+    harness.shutdown();
+}

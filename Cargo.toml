@@ -37,5 +37,9 @@ zeroize = "1"
 
 [dev-dependencies]
 oas3 = { version = "0.22.0", default-features = false }
+# `fork` and `timeout` (and with them `rusty-fork` and `wait-timeout`) run each case in
+# a subprocess. Nothing here needs that: a case that hangs is caught by the harness's own
+# poll budget, which panics with a diagnostic rather than being killed by a signal.
+proptest = { version = "1.11", default-features = false, features = ["std", "bit-set"] }
 tokio = { version = "1", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }

@@ -55,14 +55,15 @@ pub struct Projectors {
     pub auto_rebuild: bool,
 }
 
-/// The continuous invariant checks. Off by default, and `serve --verify` turns them
-/// on without editing the file: they are not free (a second fold per command, a
-/// second handler run per invocation), so running them is a decision.
+/// The continuous invariant check. Off by default, and `serve --verify` turns it on
+/// without editing the file: it is not free (a second handler run per completed
+/// invocation), so running it is a decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Verify {
-    /// Check every fold and every completed effect invocation as it happens,
-    /// quarantining the component that breaks an invariant.
+    /// Replay every completed effect invocation as it happens, quarantining one that
+    /// does not reproduce itself. Rebuild equivalence is not checked here: it needs
+    /// the data directory to itself, so `hekla verify` is where that one lives.
     pub enabled: bool,
 }
 impl Default for Projectors {

@@ -1,0 +1,115 @@
+// Every write statement the language has, and what each one means when the row is not
+// there: `put` replaces, `update` declines an absent row, `patch` materialises from
+// zeros, `delete` removes.
+
+test "an opened ticket becomes a row" {
+  given @ticket.opened {
+    ticket_id: "11111111-1111-1111-1111-111111111111",
+    org_id: 1,
+    owner_id: 10,
+    title: "the printer is on fire",
+    priority: Urgent,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 12.50,
+    budget: 900.00,
+    contact: "ada@example.com",
+    meta: { "source": "email" },
+  }
+  project Tickets
+  expect Ticket["11111111-1111-1111-1111-111111111111"] {
+    org_id: 1,
+    owner_id: 10,
+    title: "the printer is on fire",
+    priority: Urgent,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 12.50,
+    contact: "ada@example.com",
+    meta: { "source": "email" },
+  }
+  expect OrgTotals[1] { opened: 1, closed: 0, spend: 12.50 }
+}
+
+test "a retitle updates the title and leaves everything else" {
+  given @ticket.opened {
+    ticket_id: "22222222-2222-2222-2222-222222222222",
+    org_id: 1,
+    owner_id: 10,
+    title: "first",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 2.00,
+    contact: none,
+    meta: {},
+  }
+  given @ticket.retitled {
+    ticket_id: "22222222-2222-2222-2222-222222222222",
+    title: "second",
+  }
+  project Tickets
+  expect Ticket["22222222-2222-2222-2222-222222222222"] { title: "second", fee: 1.00 }
+}
+
+// `update` declines an absent row, so a retitle with no ticket behind it writes nothing
+// rather than materialising one from zeros.
+test "a retitle with no ticket writes nothing" {
+  given @ticket.retitled {
+    ticket_id: "33333333-3333-3333-3333-333333333333",
+    title: "nobody",
+  }
+  project Tickets
+  expect no Ticket["33333333-3333-3333-3333-333333333333"]
+}
+
+test "closing removes the row and counts against the organisation" {
+  given @ticket.opened {
+    ticket_id: "44444444-4444-4444-4444-444444444444",
+    org_id: 2,
+    owner_id: 11,
+    title: "done",
+    priority: Normal,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 3.00,
+    budget: 4.00,
+    contact: none,
+    meta: {},
+  }
+  given @ticket.closed {
+    ticket_id: "44444444-4444-4444-4444-444444444444",
+    org_id: 2,
+  }
+  project Tickets
+  expect no Ticket["44444444-4444-4444-4444-444444444444"]
+  expect OrgTotals[2] { opened: 1, closed: 1, spend: 3.00 }
+}
+
+// `patch` materialises from zeros, so the first ticket in an organisation needs no row
+// written first, and the counter accumulates across events.
+test "an organisation's totals accumulate" {
+  given @ticket.opened {
+    ticket_id: "55555555-5555-5555-5555-555555555555",
+    org_id: 3,
+    owner_id: 12,
+    title: "one",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.25,
+    budget: 1.00,
+    contact: none,
+    meta: {},
+  }
+  given @ticket.opened {
+    ticket_id: "66666666-6666-6666-6666-666666666666",
+    org_id: 3,
+    owner_id: 13,
+    title: "two",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 2.75,
+    budget: 1.00,
+    contact: none,
+    meta: {},
+  }
+  project Tickets
+  expect OrgTotals[3] { opened: 2, closed: 0, spend: 4.00 }
+}

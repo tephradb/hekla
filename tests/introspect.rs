@@ -1229,3 +1229,71 @@ async fn a_chain_no_effect_subscribes_to_joins_no_invocations() {
 
     harness.shutdown();
 }
+
+/// A payload seal and a column seal hold different text for the same field, so the
+/// decoder has to match the producer. `stored_seal` seals the wire form, which makes a
+/// sealed `Timestamp` in the log a run of micros digits; the read-model column decoder
+/// types those as a string, and using it here rendered a personal timestamp as
+/// `"1700000000000000"` beside a plain one rendered as `1700000000000000`.
+#[tokio::test]
+async fn a_decrypted_field_reads_back_in_the_shape_a_plain_one_does() {
+    let dir = support::write_project(&[
+        (
+            "events/reminder.hk",
+            r#"
+event @reminder.set {
+  user_id: Int,
+  plain_at: Timestamp,
+  due_at: Timestamp @subject(user_id),
+  count: Int @subject(user_id),
+  flag: Bool @subject(user_id),
+}
+"#,
+        ),
+        (
+            "commands/set-reminder.hk",
+            r#"
+command SetReminder(
+  user_id: Int,
+  plain_at: Timestamp,
+  due_at: Timestamp,
+  count: Int,
+  flag: Bool,
+) {
+  emit @reminder.set { user_id, plain_at, due_at, count, flag }
+}
+"#,
+        ),
+    ]);
+
+    let harness = Boot::new(dir.path()).with_master_key().start();
+    let app = harness.app();
+    let at = 1_700_000_000_000_000i64;
+    let (status, _) = post_command(
+        &app,
+        "SetReminder",
+        json!({
+            "user_id": 7,
+            "plain_at": at,
+            "due_at": at,
+            "count": 42,
+            "flag": true,
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, event) = get(&app, "/admin/events/1").await;
+    assert_eq!(status, 200);
+    assert_eq!(event["subjects"]["due_at"]["state"], "decrypted");
+    assert_eq!(event["data"]["plain_at"], json!(at));
+    assert_eq!(
+        event["data"]["due_at"], event["data"]["plain_at"],
+        "a sealed timestamp reads back as the number a plain one does"
+    );
+    assert_eq!(event["data"]["count"], json!(42));
+    assert_eq!(event["data"]["flag"], json!(true));
+
+    harness.shutdown();
+}

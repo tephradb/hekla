@@ -1827,10 +1827,24 @@ fn projector_status_schema() -> Value {
                     serves its frozen model but will never advance or replay again.",
             },
             "failed": { "type": "boolean" },
+            "replays_completed": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Rebuilds finished since boot. A rebuild happens into a \
+                    sibling file and swaps in by rename, so this is the only thing that \
+                    says one happened at all.",
+            },
+            "replays_failed": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Rebuild attempts that failed since boot. A non-zero count \
+                    with `failed` set is a projector serving a frozen model.",
+            },
             "last_error": { "type": ["string", "null"] },
         },
         "required": [
-            "name", "position", "lag", "readiness", "running", "failed", "last_error",
+            "name", "position", "lag", "readiness", "running", "failed",
+            "replays_completed", "replays_failed", "last_error",
         ],
         "additionalProperties": false,
     })
@@ -2489,6 +2503,8 @@ fn projector_detail_schema() -> Value {
             },
             "running": { "type": "boolean" },
             "failed": { "type": "boolean" },
+            "replays_completed": { "type": "integer", "minimum": 0 },
+            "replays_failed": { "type": "integer", "minimum": 0 },
             "last_error": { "type": ["string", "null"] },
             "sources": sources_schema(),
             "definition_hash": {
@@ -2501,7 +2517,8 @@ fn projector_detail_schema() -> Value {
         },
         "required": [
             "name", "position", "lag", "readiness", "running", "failed",
-            "last_error", "sources", "definition_hash", "entities"
+            "replays_completed", "replays_failed", "last_error", "sources",
+            "definition_hash", "entities"
         ],
         "additionalProperties": false,
     })

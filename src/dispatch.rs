@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use heklang::interp::ErrorKind;
+use heklang::ir::Stage;
 use heklang::value::Defs;
 use heklang::{Interpreter, Outcome, Program, Value};
 use tephra::{Position, PositionRange, Query, QueryItem, Tag, Tags, WriteHandle};
@@ -167,8 +168,10 @@ pub fn run_command(
         Err(message) => return Ok(CommandOutcome::InvalidInput { message }),
     };
     // A command with no `state` reads nothing, so it can be beaten to the log by
-    // nobody: only a boundaried one can recover a duplicate commit.
-    let boundaried = !command.slices.is_empty();
+    // nobody: only a boundaried one can recover a duplicate commit. A command reads once
+    // per declaration run, so the question is whether *any* run reads, not whether the
+    // first one does.
+    let boundaried = command.stages.iter().any(Stage::reads);
 
     if retry.max_attempts == 0 {
         return Ok(CommandOutcome::Conflict);
@@ -194,6 +197,7 @@ pub fn run_command(
         retry_after: None,
         last_transport: None,
         minted: None,
+        sealed: false,
         // A command never reaches `http.*`: heklang's parser is what guarantees it,
         // so there is nothing to give one here.
         http: None,

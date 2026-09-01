@@ -1,29 +1,32 @@
 //! Invariant checks over a running or stopped project.
 //!
 //! The test suite covers cases someone thought of; these check the properties the
-//! design rests on, against whatever state the runtime actually reached. Each check
-//! is a function returning [`Violation`]s, so the same code backs `hekla verify`
-//! (offline, over a data directory) and `serve --verify` (continuous, per
-//! operation).
+//! design rests on, against whatever state the runtime actually reached.
 //!
 //! The checks correspond to the claims that cannot be recovered from if they are
 //! false:
 //!
 //! - **Rebuild equivalence**: a projector rebuilt from position 0 matches the live
-//!   one. Every "just replay it" recovery depends on this.
+//!   one. Every "just replay it" recovery depends on this. Offline only: it needs the
+//!   directory to itself, so [`sweep`] is the only thing that runs it.
 //! - **Replay equivalence**: an invocation re-run from its journal makes the same
-//!   calls and performs none of them again. This is the exactly-once promise.
-//! - **Fold determinism**: the same boundary at the same position folds to the same
-//!   state. This is what makes an effect's state safe to derive rather than store.
-//!   It is enforced inside the fold itself rather than reported as a [`Violation`],
-//!   because there is no safe way to continue from it: the caller's decision would
-//!   rest on a state that does not reproduce. A command fails the request; an effect
-//!   wedges the invocation.
-//! - **Checkpoint monotonicity**: no component's position moves backwards.
+//!   calls and performs none of them again. This is the exactly-once promise, and the
+//!   one check both entry points share: [`sweep`] runs it over a stopped directory and
+//!   `serve --verify` runs it after each completed invocation.
+//! - **Checkpoint monotonicity**: no component's position moves backwards. Enforced
+//!   where a position is written rather than reported here, because the write is the
+//!   only place that has both numbers: see `projector::advance_position`. Nothing in a
+//!   sweep can observe it after the fact.
 //!
-//! A check must never be able to cause the fault it looks for. That constraint
-//! shapes the replay check in particular: it runs against a sealed host that can
-//! only read the journal, so a divergence is *reported* rather than performed.
+//! Fold determinism used to be a fourth. It is gone with the Starlark port: heklang
+//! removes its sources by construction (ordered maps, a clock a fold cannot reach, no
+//! randomness, no read of anything but the log), and the check itself lived inside the
+//! chunked fold that went with it.
+//!
+//! **A check must never be able to cause the fault it looks for.** That constraint
+//! shapes the replay check in particular, and sealing it takes more than refusing to
+//! send: heklang performs a journal miss for real, so the host it replays against
+//! refuses to append and to erase as well.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -39,7 +42,7 @@ use tephra::{Event, Position, Query, WriteHandle};
 
 use heklang::Program;
 
-use crate::crypto::{KeyStore, MasterKeys};
+use crate::crypto::{KeyStore, MasterKeys, RowDecryptor};
 use crate::effect;
 use crate::envelope;
 use crate::loader::{EffectUnit, LoadedProject, ProjectorUnit};
@@ -141,8 +144,9 @@ pub fn rebuild_equivalence(
 
 /// Compare one entity's rows between the live and rebuilt models.
 ///
-/// Both sides come back ordered by key (`ReadModel::scan` orders by the key column),
-/// so this is a merge join rather than a nested scan: one pass, no lookups.
+/// A merge join rather than a nested scan: one pass, no lookups. [`keyed`] is what puts
+/// both sides in the order this walks them in, and its doc says why reading `scan`'s own
+/// ordering is not enough.
 fn compare_entity(
     projector: &str,
     entity: &EntityDef,
@@ -152,9 +156,13 @@ fn compare_entity(
 ) -> anyhow::Result<Vec<Violation>> {
     let mut live_rows = keyed(entity, live.rows(entity)?);
     let mut rebuilt_rows = keyed(entity, rebuilt.rows(entity)?);
+    // One decryptor for the whole entity: it caches the unwrapped secret per subject, so
+    // an entity whose rows share a handful of subjects pays the opdb lock and the key
+    // unwrap once each rather than twice per row.
+    let decryptor = keystore.map(KeyStore::row_decryptor);
     for rows in [&mut live_rows, &mut rebuilt_rows] {
         for (_, row) in rows.iter_mut() {
-            drop_shredded(entity, row, keystore);
+            drop_shredded(entity, row, decryptor.as_ref());
         }
     }
 
@@ -204,21 +212,31 @@ fn compare_entity(
     }
     Ok(violations)
 }
-/// Blank every sealed column whose subject key is gone, on both sides.
+/// Blank every sealed column that no longer reads back, on both sides.
 ///
 /// The comparison is over stored bytes, which is sound only while the two sides *have*
 /// the same bytes to hold. Erasure breaks that: the live row keeps the ciphertext it
 /// was written with, because a shred rewrites nothing, while a rebuild re-encrypts from
-/// the log and finds no key, so it writes NULL rather than minting the key the erasure
-/// destroyed. Neither is readable and the read API reports both as absent, so they are
-/// equivalent everywhere it matters and differ only at rest.
+/// the log and cannot read the payload, so it writes NULL rather than minting the key
+/// the erasure destroyed. Neither is readable and the read API reports both as absent,
+/// so they are equivalent everywhere it matters and differ only at rest.
 ///
 /// Without this every erasure makes `verify` report that projector as corrupt forever,
-/// which is the worst failure a tool whose value is being believed can have. Tampering
-/// stays caught: a subject whose key exists is compared byte for byte as before, and
-/// that is the case `a_tampered_subject_column_is_still_caught` pins.
-fn drop_shredded(entity: &EntityDef, row: &mut Value, keystore: Option<&KeyStore>) {
-    let Some(keystore) = keystore else { return };
+/// which is the worst failure a tool whose value is being believed can have.
+///
+/// **The question is whether the bytes decrypt, not whether a key exists**, and the
+/// difference is not pedantry: the append path mints a subject key on first use, so a
+/// subject written to again after an erasure has a key again, under which the rows
+/// written before the erasure still do not decrypt. Asking `KeyStore::erased` said "not
+/// erased" and compared the stale ciphertext against a rebuild that had written NULL.
+/// This is the same question [`read_api::decrypt_row`](crate::read_api) asks, which is
+/// what makes "equivalent everywhere it matters" true rather than nearly true.
+///
+/// Tampering stays caught, and by a sharper edge than before: a column that will not
+/// decrypt is dropped from the side holding it while the other side's readable one
+/// stays, so the two rows differ. `a_tampered_subject_column_is_still_caught` pins it.
+fn drop_shredded(entity: &EntityDef, row: &mut Value, decryptor: Option<&RowDecryptor<'_>>) {
+    let Some(decryptor) = decryptor else { return };
     let Some(object) = row.as_object().cloned() else {
         return;
     };
@@ -232,18 +250,33 @@ fn drop_shredded(entity: &EntityDef, row: &mut Value, keystore: Option<&KeyStore
         else {
             continue;
         };
-        if keystore.erased(subject_field, &id).unwrap_or(false)
-            && let Some(target) = row.as_object_mut()
-        {
+        // A column that is absent or not text was never ciphertext, so there is nothing
+        // to read back and nothing to drop.
+        let Some(ciphertext) = object.get(name.as_str()).and_then(Value::as_str) else {
+            continue;
+        };
+        let readable = decryptor
+            .decrypt(subject_field, &id, name, ciphertext)
+            .unwrap_or(None)
+            .is_some();
+        if !readable && let Some(target) = row.as_object_mut() {
             target.remove(name.as_str());
         }
     }
 }
 
 /// Pair each row with its key column, rendered as text so keys of any declared type
-/// compare the same way.
+/// compare the same way, and sorted by that text.
+///
+/// **The sort is what makes the merge join sound.** `ReadModel::scan` orders in SQL, so
+/// an `Int @key` comes back numerically while the join below compares with `String::cmp`.
+/// The two disagree the moment keys differ in digit count (`10` sorts before `2` as
+/// text), and a join walking two differently-ordered sequences reports keys present on
+/// both sides as missing from one. Sorting here means the ordering the join assumes is
+/// the ordering it was given, whatever the column's SQL type.
 fn keyed(entity: &EntityDef, rows: Vec<Value>) -> Vec<(String, Value)> {
-    rows.into_iter()
+    let mut keyed: Vec<(String, Value)> = rows
+        .into_iter()
         .map(|row| {
             let key = match row.get(&entity.key) {
                 Some(Value::String(text)) => text.clone(),
@@ -254,7 +287,9 @@ fn keyed(entity: &EntityDef, rows: Vec<Value>) -> Vec<(String, Value)> {
             };
             (key, row)
         })
-        .collect()
+        .collect();
+    keyed.sort_by(|(left, _), (right, _)| left.cmp(right));
+    keyed
 }
 
 /// Run every offline check against a project and its data directory.

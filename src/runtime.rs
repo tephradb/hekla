@@ -376,9 +376,8 @@ impl Runtime {
             config: project.config.clone(),
             data_dir: data_dir.to_path_buf(),
             _lock: lock,
-            // The checks call what they need directly; leaving this off keeps a
-            // sealed replay from folding twice for a determinism check the live run
-            // already made.
+            // The sweep calls the checks directly. Leaving this off keeps a replay it
+            // runs from scheduling a second replay of itself.
             verify: false,
         });
         Ok((runtime, coordinator))
@@ -544,6 +543,12 @@ impl Runtime {
                     "readiness": handle.readiness().label(),
                     "running": handle.running(),
                     "failed": handle.failed(),
+                    // Cumulative since boot. A rebuild leaves no other trace: it happens
+                    // into a sibling file and swaps in by rename, so without these an
+                    // operator cannot tell a projector that has replayed twice from one
+                    // that has never replayed at all.
+                    "replays_completed": handle.replays_completed(),
+                    "replays_failed": handle.replays_failed(),
                     "last_error": handle.last_error(),
                 })
             })

@@ -1,0 +1,57 @@
+// The command's two slices: the narrow one that makes a repeat a no-op, and the wide one
+// that enforces the organisation's allocation.
+
+test "opens a ticket" {
+  run OpenTicket {
+    ticket_id: "11111111-1111-1111-1111-111111111111",
+    org_id: 1,
+    owner_id: 10,
+    title: "the printer is on fire",
+    priority: Urgent,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 12.50,
+    budget: 900.00,
+    contact: "ada@example.com",
+    meta: { "source": "email" },
+  }
+  expect @ticket.opened {
+    ticket_id: "11111111-1111-1111-1111-111111111111",
+    org_id: 1,
+    owner_id: 10,
+    title: "the printer is on fire",
+    priority: Urgent,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 12.50,
+    budget: 900.00,
+    contact: "ada@example.com",
+    meta: { "source": "email" },
+  }
+}
+
+test "a repeat of the same ticket writes nothing" {
+  given @ticket.opened {
+    ticket_id: "11111111-1111-1111-1111-111111111111",
+    org_id: 1,
+    owner_id: 10,
+    title: "first",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 2.00,
+    contact: none,
+    meta: {},
+  }
+  run OpenTicket {
+    ticket_id: "11111111-1111-1111-1111-111111111111",
+    org_id: 1,
+    owner_id: 10,
+    title: "second",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 2.00,
+    contact: none,
+    meta: {},
+  }
+  expect nothing
+}

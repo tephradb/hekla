@@ -1,0 +1,81 @@
+// The effect crosses the decrypt boundary explicitly, then records delivery through the
+// internal command. Both halves matter: the call and the `invoke` are what a replay has
+// to reproduce exactly.
+
+test "notifies the owner then records it" {
+  given @ticket.opened {
+    ticket_id: "11111111-1111-1111-1111-111111111111",
+    org_id: 1,
+    owner_id: 10,
+    title: "the printer is on fire",
+    priority: Urgent,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 12.50,
+    budget: 900.00,
+    contact: "ada@example.com",
+    meta: {},
+  }
+  respond "https://notify.test/send" 200
+  deliver NotifyOwner
+  expect http.post("https://notify.test/send", {
+    "to": "ada@example.com",
+    "ticket": "11111111-1111-1111-1111-111111111111",
+  })
+  expect invoke RecordNotified { ticket_id: "11111111-1111-1111-1111-111111111111" }
+}
+
+test "a ticket with no contact is logged rather than sent" {
+  given @ticket.opened {
+    ticket_id: "22222222-2222-2222-2222-222222222222",
+    org_id: 1,
+    owner_id: 10,
+    title: "nobody to tell",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 1.00,
+    contact: none,
+    meta: {},
+  }
+  deliver NotifyOwner
+  expect log("ticket 22222222-2222-2222-2222-222222222222 has no contact to notify")
+}
+
+test "a rejected notification stops before the internal command" {
+  given @ticket.opened {
+    ticket_id: "33333333-3333-3333-3333-333333333333",
+    org_id: 1,
+    owner_id: 10,
+    title: "refused",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 1.00,
+    contact: "ada@example.com",
+    meta: {},
+  }
+  respond "https://notify.test/send" 422
+  deliver NotifyOwner
+  expect http.post("https://notify.test/send")
+  expect log("notification rejected with status 422")
+}
+
+// Rule 12's terminal skip: the address is gone, so no retry recovers it and the
+// invocation is skipped rather than wedging the lane.
+test "an erased owner skips rather than sending plaintext" {
+  given @ticket.opened {
+    ticket_id: "44444444-4444-4444-4444-444444444444",
+    org_id: 1,
+    owner_id: 10,
+    title: "too late",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 1.00,
+    contact: "ada@example.com",
+    meta: {},
+  }
+  erased owner_id "10"
+  deliver NotifyOwner
+  expect skipped
+}

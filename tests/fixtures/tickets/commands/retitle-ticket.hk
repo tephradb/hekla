@@ -1,0 +1,16 @@
+// `update` on the read model side, so a retitle of a ticket that never existed writes
+// nothing rather than materialising a row from zeros.
+
+command RetitleTicket(ticket_id: Uuid, title: String) {
+  state opened: Bool = fold false
+    on @ticket.opened(ticket_id) => true
+
+  state closed: Bool = fold false
+    on @ticket.closed(ticket_id) => true
+
+  if !opened || closed {
+    return reject NoSuchTicket
+  }
+
+  emit @ticket.retitled { ticket_id, title }
+}

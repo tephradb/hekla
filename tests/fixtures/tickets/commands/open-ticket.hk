@@ -1,0 +1,42 @@
+// Two slices, narrow and wide: this one ticket, and every ticket in the organisation.
+// The narrow one makes a retry a no-op; the wide one is a hard cap that has to be
+// enforced at append time, and is what gives the conflict-retry loop something to do.
+
+command OpenTicket(
+  ticket_id: Uuid,
+  org_id: Int,
+  owner_id: Int,
+  title: String,
+  priority: Priority,
+  due_at: Timestamp,
+  fee: Money(2),
+  budget: Money(2),
+  contact: String?,
+  meta: Json,
+) {
+  state opened: Bool = fold false
+    on @ticket.opened(ticket_id) => true
+
+  state in_org: Int = fold 0
+    on @ticket.opened(org_id) => in_org + 1
+
+  if opened {
+    return
+  }
+  if in_org >= ORG_CAP {
+    return reject OrgFull
+  }
+
+  emit @ticket.opened {
+    ticket_id,
+    org_id,
+    owner_id,
+    title,
+    priority,
+    due_at,
+    fee,
+    budget,
+    contact,
+    meta,
+  }
+}

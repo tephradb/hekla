@@ -174,6 +174,15 @@ pub struct HeklaHost {
     /// event appended gets `…-00000000000n`, so an id derived from `e.id` can be
     /// written down in a test. `None` mints a v4, which is what a live append does.
     pub minted: Option<u32>,
+    /// A replay that audits rather than acts: [`Log::append`] and [`Keys::erase`]
+    /// refuse, the way a sealed replay's HTTP client refuses a send.
+    ///
+    /// Blocking the transport is not enough on its own, because heklang performs a
+    /// journal miss for real: `invoke` runs the target command and appends, and `erase`
+    /// destroys the key. Both reach the store through this host, so this is where they
+    /// have to stop. A check that can cause the fault it looks for is worse than no
+    /// check.
+    pub sealed: bool,
 }
 
 impl HeklaHost {
@@ -333,6 +342,9 @@ impl Log for HeklaHost {
     }
 
     fn append(&mut self, events: &[Event], condition: &AppendCondition) -> Result<(), Error> {
+        if self.sealed {
+            return Err(host_error("a sealed replay tried to append to the log"));
+        }
         // A command that decided to do nothing still commits, and heklang appends its
         // (empty) outcome rather than special-casing it. There is nothing to write and
         // nothing a condition could guard, so this is where that stops.
@@ -438,6 +450,9 @@ impl Keys for HeklaHost {
     }
 
     fn erase(&mut self, subject: &str, id: &str) -> Result<(), Error> {
+        if self.sealed {
+            return Err(host_error("a sealed replay tried to erase a subject key"));
+        }
         let Some(keystore) = self.keystore.as_deref() else {
             return Err(host_error(
                 "erase needs a master key, but none is configured",
@@ -693,8 +708,15 @@ impl HeklaHost {
                     let subject_value = ids.get(subject_field.as_str()).ok_or_else(|| {
                         host_error(format!("event `{ty}` has no subject id `{subject_field}`"))
                     })?;
-                    let sealed =
-                        stored_seal(keystore, subject_field, subject_value, name, value, &json)?;
+                    let sealed = stored_seal(
+                        keystore,
+                        subject_field,
+                        subject_value,
+                        name,
+                        &meta.kind,
+                        value,
+                        &json,
+                    )?;
                     if meta.indexed {
                         derived.push((name.clone(), Some(sealed.clone())));
                     }
@@ -779,6 +801,7 @@ fn stored_seal(
     subject_field: &str,
     subject_value: &str,
     name: &str,
+    kind: &FieldKind,
     value: &Value,
     json: &serde_json::Value,
 ) -> Result<String, Error> {
@@ -805,10 +828,25 @@ fn stored_seal(
             .encrypt_subject(subject_field, subject_value, name, &plaintext)
             .map_err(host_error);
     }
-    let text = schema::scalar_to_string(json).unwrap_or_else(|| json.to_string());
+    let text = seal_text(kind, json);
     keystore
         .encrypt_subject(subject_field, subject_value, name, &text)
         .map_err(host_error)
+}
+
+/// The text a seal holds, for a value already in the form its store keeps.
+///
+/// A scalar flattens to its bare text, so the kind alone is enough to read it back as a
+/// number or a boolean. A `Json` field is written whole, quotes and all, because it is
+/// the one kind whose value can itself be a string that looks like another type:
+/// flattening `"42"` to `42` would read back as a number. Its inverse is
+/// [`unsealed_json`] for a payload and [`read_api::typed_from_string`] for a column, and
+/// both parse a `Json` field for exactly this reason.
+fn seal_text(kind: &FieldKind, json: &serde_json::Value) -> String {
+    if matches!(kind.base(), FieldKind::Json) {
+        return json.to_string();
+    }
+    schema::scalar_to_string(json).unwrap_or_else(|| json.to_string())
 }
 
 fn build_tags(pairs: &[(String, Option<String>)], extra: &[&str]) -> Result<Tags, Error> {
@@ -975,8 +1013,7 @@ impl heklang::host::Rows for RowWriter<'_> {
                     // `Timestamp` as RFC 3339 from one and as epoch micros from the
                     // other depending only on whether it happened to be personal.
                     let stored_json = column_form(&meta.kind, json);
-                    let text = crate::schema::scalar_to_string(&stored_json)
-                        .unwrap_or_else(|| stored_json.to_string());
+                    let text = seal_text(&meta.kind, &stored_json);
                     // `_existing`, never `encrypt_subject`: that one mints a key when
                     // there is none, and a projection is a read path. Re-projecting a
                     // log whose subject has been erased would otherwise create the very
@@ -1118,30 +1155,44 @@ pub fn append_one(host: &mut HeklaHost, event: &Event) -> Result<(), Error> {
     )
 }
 
-/// A value in the form its column stores it.
-///
-/// Rule 8's table is about what leaves the process over a socket; a column answers a
-/// different question. A `Timestamp` is epoch microseconds on the wire and RFC 3339 in
-/// SQLite, because the read API serves that and the column sorts lexicographically on
-/// it. Everything else is already in the right shape.
-/// A decrypted plaintext back as the JSON shape its declaration says it had.
+/// A decrypted **log payload** seal back as the JSON shape its declaration says it had.
 ///
 /// Sealing flattens everything to text, because that is what a key store takes, so
-/// nothing but the column's kind says whether that text was a number or a boolean.
+/// nothing but the field's kind says whether that text was a number or a boolean.
 /// heklang's `Value::from_sealed` is the same table for the same reason, keyed on a
 /// `Type` where this is keyed on a `FieldKind`.
-fn unsealed_json(kind: &FieldKind, text: String) -> serde_json::Value {
+///
+/// **Which producer a seal came from decides which table reads it**, and that is the
+/// whole difference between this and [`read_api::typed_from_string`]. A payload seal is
+/// made by [`stored_seal`] out of the wire form, so a `Timestamp` in it is micros; a
+/// read-model column seal runs through [`column_form`] first, so a `Timestamp` in that
+/// one is RFC 3339. Reading one with the other's table types a timestamp as a string.
+pub(crate) fn unsealed_json(kind: &FieldKind, text: String) -> serde_json::Value {
     match kind.base() {
         FieldKind::I64 | FieldKind::Timestamp => text
             .parse::<i64>()
             .map_or_else(|_| serde_json::Value::String(text), Into::into),
         FieldKind::Bool if text == "true" => serde_json::Value::Bool(true),
         FieldKind::Bool if text == "false" => serde_json::Value::Bool(false),
+        // A record, a list, a map and a `Json` all store as one kind, and [`stored_seal`]
+        // flattens a composite with `to_string`. Parsing is the inverse; a scalar that
+        // was flattened with `scalar_to_string` instead fails to parse and falls back to
+        // the text, which is the right answer for it.
+        FieldKind::Json => {
+            serde_json::from_str(&text).unwrap_or_else(|_| serde_json::Value::String(text.clone()))
+        }
         _ => serde_json::Value::String(text),
     }
 }
 
-fn column_form(kind: &FieldKind, json: serde_json::Value) -> serde_json::Value {
+/// A value in the form its column stores it. `pub(crate)` because `read_model` is the
+/// module that stores one, and its own round trip is stated against this form.
+///
+/// Rule 8's table is about what leaves the process over a socket; a column answers a
+/// different question. A `Timestamp` is epoch microseconds on the wire and RFC 3339 in
+/// SQLite, because the read API serves that and the column sorts lexicographically on
+/// it. Everything else is already in the right shape.
+pub(crate) fn column_form(kind: &FieldKind, json: serde_json::Value) -> serde_json::Value {
     match (kind.base(), &json) {
         (FieldKind::Timestamp, serde_json::Value::Number(micros)) => micros
             .as_i64()
@@ -1176,4 +1227,241 @@ fn wire_form(kind: &FieldKind, stored: serde_json::Value) -> serde_json::Value {
 fn idem_item(tag: &str) -> Result<QueryItem, Error> {
     let tag = Tag::new(tag.to_owned()).map_err(host_error)?;
     Ok(QueryItem::with_tags(Tags::new([tag]).map_err(host_error)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::propgen;
+    use proptest::prelude::*;
+
+    /// The wire form of a value: rule 8's table, which is what every conversion below
+    /// starts from and has to return to.
+    fn wire(value: &Value) -> serde_json::Value {
+        from_heklang_json(&Json::from_value(value))
+    }
+
+    /// `Json` is the kind whose value can be a string that looks like another type, and
+    /// the seal loop is where the quotes saying which would be dropped. Pinned by name
+    /// rather than left to the generator, which reaches it about a third of the time.
+    #[test]
+    fn a_sealed_json_string_that_looks_like_a_number_stays_a_string() {
+        let kind = FieldKind::Json;
+        let value = Value::Json(Json::Str("42".to_owned()));
+        let wire = wire(&value);
+        assert_eq!(seal_text(&kind, &wire), "\"42\"");
+        assert_eq!(unsealed_json(&kind, seal_text(&kind, &wire)), wire);
+        assert_eq!(
+            read_api::typed_from_string(&kind, seal_text(&kind, &wire)),
+            wire
+        );
+    }
+
+    /// A scalar of any other kind flattens bare, so its text is the value and not a
+    /// quoted one. This is the other half of the rule above, and it is what makes a
+    /// sealed integer read back as a number.
+    #[test]
+    fn a_sealed_scalar_flattens_without_quotes() {
+        assert_eq!(seal_text(&FieldKind::I64, &serde_json::json!(42)), "42");
+        assert_eq!(
+            seal_text(
+                &FieldKind::Text { max_length: None },
+                &serde_json::json!("42")
+            ),
+            "42"
+        );
+        assert_eq!(
+            seal_text(&FieldKind::Bool, &serde_json::json!(true)),
+            "true"
+        );
+    }
+
+    proptest! {
+        /// A column stores what a socket would send, in one of two shapes, and the pair
+        /// has to be a bijection or a `Timestamp` reads back as whatever it was stored
+        /// as. Only `Timestamp` differs between the two forms today; the property is
+        /// over every kind so that an arm added to one and not the other is caught.
+        #[test]
+        fn a_column_form_reads_back_as_the_wire_form_it_was_made_from(
+            (ty, value) in propgen::typed_value()
+        ) {
+            let kind = propgen::kind_of(&ty);
+            let wire = wire(&value);
+            let column = column_form(&kind, wire.clone());
+            prop_assert_eq!(wire_form(&kind, column), wire);
+        }
+
+        /// A seal flattens to text, so the kind is the only thing that says what the
+        /// text was. This is the log-payload half of the loop: `stored_seal` writes,
+        /// `unsealed_json` reads.
+        ///
+        /// Nulls are out of scope by rule 12: an absent optional is never sealed, so
+        /// there is no key behind it and nothing for this to invert.
+        #[test]
+        fn a_payload_seal_reads_back_as_the_wire_form_it_sealed(
+            (ty, value) in propgen::typed_value()
+        ) {
+            let kind = propgen::kind_of(&ty);
+            let wire = wire(&value);
+            prop_assume!(!wire.is_null());
+            prop_assert_eq!(unsealed_json(&kind, seal_text(&kind, &wire)), wire);
+        }
+
+        /// The column half of the same loop: `RowWriter::put` seals the column form and
+        /// `read_api` re-types it. A `Timestamp` is RFC 3339 on both sides here, which
+        /// is why this reads with a different table than the payload above.
+        #[test]
+        fn a_column_seal_reads_back_as_the_column_form_it_sealed(
+            (ty, value) in propgen::typed_value()
+        ) {
+            let kind = propgen::kind_of(&ty);
+            let column = column_form(&kind, wire(&value));
+            prop_assume!(!column.is_null());
+            prop_assert_eq!(
+                read_api::typed_from_string(&kind, seal_text(&kind, &column)),
+                column
+            );
+        }
+
+        /// serde is what the envelope and the socket speak, `Json` is what rule 8 is
+        /// written against, and a value crossing the two has to come back itself.
+        ///
+        /// Stated over values that have already been through `from_heklang_json`, which
+        /// is what a parser would have produced. That direction is an identity; the
+        /// other one normalises number text, and the cases below pin how.
+        #[test]
+        fn a_parsed_json_value_survives_the_heklang_bridge(json in propgen::json()) {
+            let parsed = from_heklang_json(&json);
+            prop_assert_eq!(from_heklang_json(&to_heklang_json(&parsed)), parsed);
+        }
+
+        /// The other direction of the same table. heklang holds a number as the text it
+        /// was written with, so this is idempotence rather than identity: anything
+        /// already in serde's normal form is unchanged, and anything else reaches it in
+        /// one pass and stays.
+        #[test]
+        fn the_heklang_bridge_normalises_a_number_once_and_then_leaves_it(
+            json in propgen::json()
+        ) {
+            let once = to_heklang_json(&from_heklang_json(&json));
+            let twice = to_heklang_json(&from_heklang_json(&once));
+            prop_assert_eq!(twice, once);
+        }
+
+        /// Rule 8's table met from both ends. The reader takes the declared type rather
+        /// than inferring one from the JSON, so this is the property that says the two
+        /// directions agree about what that type means.
+        #[test]
+        fn the_conversion_table_round_trips((ty, value) in propgen::typed_value()) {
+            let written = Json::from_value(&value);
+            let read = Value::from_json(&written, &ty, propgen::defs());
+            prop_assert_eq!(read, Ok(value));
+        }
+    }
+
+    /// What serde's parser does to a number's text, written down. `arbitrary_precision`
+    /// keeps the digits, so these are the whole of the normalisation and the reason the
+    /// property above is idempotence rather than identity.
+    #[test]
+    fn a_number_normalises_the_way_serde_parses_one() {
+        let round = |text: &str| from_heklang_json(&Json::num(text)).to_string();
+        // An unsigned exponent gains a sign, and `E` lowercases.
+        assert_eq!(round("1e2"), "1e+2");
+        assert_eq!(round("1E5"), "1e+5");
+        assert_eq!(round("1e-2"), "1e-2");
+        // Negative zero parses as an i64, and an i64 has one zero.
+        assert_eq!(round("-0"), "0");
+        // Not a float: the trailing zero and the extra digits are what
+        // `arbitrary_precision` is carried for, and they survive.
+        assert_eq!(round("10.50"), "10.50");
+        assert_eq!(round("-0.0"), "-0.0");
+        assert_eq!(
+            round("123456789012345678901234567890"),
+            "123456789012345678901234567890"
+        );
+    }
+
+    /// `Json::num` does not validate, so text that is not a number changes JSON *type*
+    /// on the way across rather than failing. Unreachable from hekla, which only builds
+    /// a `Num` out of a `serde_json::Number`; pinned so that stays true by test rather
+    /// than by comment.
+    #[test]
+    fn a_number_that_is_not_one_crosses_as_a_string() {
+        assert_eq!(
+            from_heklang_json(&Json::num("not a number")),
+            serde_json::Value::String("not a number".to_owned())
+        );
+    }
+
+    /// The generator stops at year 0000 and year 9999 because that is where
+    /// `column_form` stops being able to render a timestamp, and past it every table
+    /// keyed on `Timestamp` falls through to a different answer. Pinned here so the
+    /// bound is a documented behaviour rather than an unexplained constant in the
+    /// generator.
+    #[test]
+    fn a_timestamp_outside_the_renderable_range_stops_being_a_timestamp() {
+        let kind = FieldKind::Timestamp;
+        for micros in [
+            i64::MIN,
+            i64::MAX,
+            propgen::MIN_MICROS - 1,
+            propgen::MAX_MICROS + 1,
+        ] {
+            let wire = serde_json::json!(micros);
+            let column = column_form(&kind, wire.clone());
+            // `rfc3339` declines, so the column keeps a JSON number where its own SQL
+            // type is TEXT. `wire_form` leaves a number alone, so the pair still round
+            // trips; what breaks is everything downstream that expected text.
+            assert_eq!(column, wire, "{micros} should pass through unrendered");
+            assert_eq!(wire_form(&kind, column.clone()), wire);
+            // The seal loop is where it shows: the digits flatten and read back as text.
+            assert_eq!(
+                read_api::typed_from_string(&kind, seal_text(&kind, &column)),
+                serde_json::Value::String(micros.to_string()),
+                "an unrendered timestamp seals as digits and reads back as text"
+            );
+        }
+    }
+
+    /// Inside the range, both ends render and parse back exactly. Micros are exact in
+    /// nanoseconds and `value::timestamp` truncates to six digits, so nothing is lost
+    /// at the boundary itself.
+    #[test]
+    fn a_timestamp_at_either_end_of_the_range_round_trips() {
+        let kind = FieldKind::Timestamp;
+        for micros in [propgen::MIN_MICROS, propgen::MAX_MICROS] {
+            let wire = serde_json::json!(micros);
+            let column = column_form(&kind, wire.clone());
+            assert!(column.is_string(), "{micros} should render: {column}");
+            assert_eq!(wire_form(&kind, column), wire);
+        }
+    }
+
+    /// The one value an optional cannot tell from absence. A `Json?` holding a JSON
+    /// null writes `null`, which is also what `none` writes, and the reader has to pick
+    /// one. It picks `none`.
+    ///
+    /// Inherent rather than fixable: `null` is the only wire form either has. Worth
+    /// pinning because it is the single exception to the round trip above, and because
+    /// a `Json?` column that quietly reads back empty is otherwise a long afternoon.
+    #[test]
+    fn a_json_null_inside_an_optional_reads_back_as_absent() {
+        let ty = heklang::ir::Type::opt(heklang::ir::Type::Json);
+        let value = Value::some(Value::Json(Json::Null));
+        assert_eq!(Json::from_value(&value), Json::Null);
+        assert_eq!(
+            Value::from_json(&Json::Null, &ty, propgen::defs()),
+            Ok(Value::none(heklang::ir::Type::Json))
+        );
+    }
+
+    /// `serde_json::Map` is a `BTreeMap` here, and two things depend on it: an object
+    /// surviving the bridge above, and `verify::compare_entity` comparing rows as JSON
+    /// text. Turning on `preserve_order`, which feature unification could do from any
+    /// dependency, would break both quietly.
+    #[test]
+    fn a_json_object_is_ordered_by_key_and_not_by_insertion() {
+        let parsed: serde_json::Value = serde_json::from_str(r#"{"b":1,"a":2}"#).unwrap();
+        assert_eq!(parsed.to_string(), r#"{"a":2,"b":1}"#);
+    }
 }

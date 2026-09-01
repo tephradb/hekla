@@ -1,0 +1,9 @@
+// How many tickets one organisation may open. Small enough that a generated sequence
+// reaches it often, large enough that reaching it is not the only thing that happens.
+const ORG_CAP: Int = 6
+
+enum Priority { @default Low, Normal, Urgent }
+
+refusal OrgFull "this organisation has opened its allocation of tickets"
+refusal NoSuchTicket "no such ticket"
+refusal AlreadyNotified "that ticket's notification is already recorded"

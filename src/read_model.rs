@@ -833,4 +833,93 @@ mod tests {
         let row = model.get(&as_json, "d1").unwrap().unwrap();
         assert_eq!(row["body"], "not json");
     }
+
+    // --- the storage conversion table -------------------------------------
+
+    use crate::heklang_host::{column_form, from_heklang_json};
+    use crate::propgen;
+    use proptest::prelude::*;
+    use rusqlite::types::ValueRef;
+
+    proptest! {
+        /// A column takes the form its kind says a column holds, and hands the same
+        /// thing back. Every read model rests on this: a value that does not survive it
+        /// is a row that reads differently from the one that was written, with nothing
+        /// in between to notice.
+        #[test]
+        fn a_column_binds_and_reads_back_as_the_form_it_stored(
+            (ty, value) in propgen::typed_value()
+        ) {
+            let kind = propgen::kind_of(&ty);
+            let meta = FieldMeta::plain(kind.clone());
+            let column = column_form(&kind, from_heklang_json(&heklang::Json::from_value(&value)));
+            let bound = to_sql(&meta, &column).map_err(|err| {
+                TestCaseError::fail(format!("binding {column} as {kind:?}: {err}"))
+            })?;
+            let read = from_sql(&meta, ValueRef::from(&bound)).map_err(|err| {
+                TestCaseError::fail(format!("reading {column} back as {kind:?}: {err}"))
+            })?;
+            prop_assert_eq!(read, column);
+        }
+
+        /// A subject-scoped column holds opaque ciphertext whatever its kind, so its
+        /// storage answer must not depend on the kind at all. That is what lets
+        /// `read_api` decrypt and re-type on the way out instead of guessing.
+        #[test]
+        fn a_sealed_column_stores_its_ciphertext_verbatim(
+            ty in propgen::field_type(),
+            ciphertext in "[A-Za-z0-9_-]{0,64}",
+        ) {
+            let meta = FieldMeta {
+                kind: propgen::kind_of(&ty),
+                indexed: false,
+                subject: Some("owner".to_owned()),
+            };
+            let stored = serde_json::Value::String(ciphertext);
+            let bound = to_sql(&meta, &stored).unwrap();
+            prop_assert_eq!(from_sql(&meta, ValueRef::from(&bound)).unwrap(), stored);
+        }
+    }
+
+    /// The asymmetries in the pair above, written down. Each is deliberate, and each
+    /// would read as a bug to anyone who assumed the round trip was total.
+    #[test]
+    fn a_stored_column_has_three_answers_that_are_not_round_trips() {
+        let bool_meta = FieldMeta::plain(FieldKind::Bool);
+        // A boolean column accepts an integer, because SQLite has no boolean and a row
+        // written by hand or by an older deploy holds one.
+        let bound = to_sql(&bool_meta, &json!(5)).unwrap();
+        assert_eq!(
+            from_sql(&bool_meta, ValueRef::from(&bound)).unwrap(),
+            json!(true),
+            "any non-zero integer is true on the way out"
+        );
+
+        // NULL reads back as *absence*, not as null: `row_to_json` drops the key. So an
+        // optional column that was never set and one explicitly cleared are one row.
+        let mut optional = users_entity();
+        optional.fields[1].1 = FieldMeta::plain(FieldKind::Optional(Box::new(FieldKind::Text {
+            max_length: None,
+        })));
+        let (model, _dir) = open_temp(slice::from_ref(&optional));
+        model
+            .apply_one(
+                &optional,
+                EntityOpKind::Put(json!({ "user_id": "u1", "email": null }).to_string()),
+            )
+            .unwrap();
+        let row = model.get(&optional, "u1").unwrap().unwrap();
+        assert!(
+            !row.as_object().unwrap().contains_key("email"),
+            "a null column is absent rather than null: {row}"
+        );
+
+        // A blob is not a shape any kind produces, and it reads as null rather than as
+        // an error, so a hand-written row cannot make a read fail.
+        let text_meta = FieldMeta::plain(FieldKind::Text { max_length: None });
+        assert_eq!(
+            from_sql(&text_meta, ValueRef::Blob(b"raw")).unwrap(),
+            serde_json::Value::Null
+        );
+    }
 }

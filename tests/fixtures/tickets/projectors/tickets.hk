@@ -1,0 +1,73 @@
+// One projector reaching every write statement the language has, and every column kind
+// a read model can hold.
+//
+// `budget` and `contact` arrive sealed under different subjects, so the seal propagates
+// onto their columns and the projector stores ciphertext without ever seeing plaintext.
+// Both columns are optional, because an erased subject's column reads back absent and a
+// type that cannot be absent could not say so. Erasing the owner takes `contact` and
+// leaves `budget`, which is what a per-field subject buys.
+
+projector Tickets {
+  entity Ticket {
+    ticket_id: Uuid @key,
+    org_id: Int @index,
+    owner_id: Int @index,
+    title: String @max(80),
+    priority: Priority,
+    due_at: Timestamp,
+    fee: Money(2),
+    budget: Money(2)?,
+    contact: String? @max(120),
+    meta: Json,
+  }
+
+  // An `Int @key`, which orders numerically in SQL and lexicographically as text. The
+  // two disagree once the keys differ in digit count, and a comparison that walks both
+  // orders at once is what `verify::keyed` had to be fixed for.
+  entity OrgTotals {
+    org_id: Int @key,
+    opened: Int,
+    closed: Int,
+    spend: Money(2),
+  }
+
+  on @ticket.opened {
+    ticket_id,
+    org_id,
+    owner_id,
+    title,
+    priority,
+    due_at,
+    fee,
+    budget,
+    contact,
+    meta,
+  } {
+    put Ticket {
+      ticket_id,
+      org_id,
+      owner_id,
+      title,
+      priority,
+      due_at,
+      fee,
+      budget,
+      contact,
+      meta,
+    }
+    // `patch`, so the first ticket in an organisation materialises the row from zeros
+    // rather than needing one written first.
+    patch OrgTotals[org_id] { opened: .opened + 1, spend: .spend + fee }
+  }
+
+  // `update`, not `patch`: a retitle of a ticket that never existed is nothing at all,
+  // not a ticket with a zeroed everything else.
+  on @ticket.retitled { ticket_id, title } {
+    update Ticket[ticket_id] { title }
+  }
+
+  on @ticket.closed { ticket_id, org_id } {
+    delete Ticket[ticket_id]
+    patch OrgTotals[org_id] { closed: .closed + 1 }
+  }
+}

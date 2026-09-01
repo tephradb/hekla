@@ -107,7 +107,9 @@ fn check_boundary(
     location: &str,
     findings: &mut Vec<Finding>,
 ) {
-    for slice in &command.slices {
+    // Every slice the command declares, whichever run declared it. A lint about the
+    // shape of a boundary does not care which read resolved it.
+    for slice in command.stages.iter().flat_map(|stage| &stage.slices) {
         let Some(declared) = program.event(&slice.event) else {
             continue;
         };

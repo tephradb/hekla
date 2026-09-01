@@ -1,0 +1,25 @@
+// One event carrying two subjects, so each can be erased without touching the other:
+// `budget` is the organisation's commercial figure and `contact` is the owner's personal
+// address. Everything else is plaintext, including both subject ids, which is how the
+// runtime finds the keys.
+
+event @ticket.opened {
+  ticket_id: Uuid,
+  org_id: Int,
+  owner_id: Int,
+  title: String @max(80),
+  priority: Priority,
+  due_at: Timestamp,
+  fee: Money(2),
+  budget: Money(2) @subject(org_id),
+  // Optional because an erased subject's column reads back absent, and a type that
+  // cannot be absent could not say so.
+  contact: String? @subject(owner_id) @max(120),
+  meta: Json @no_index,
+}
+
+event @ticket.retitled { ticket_id: Uuid, title: String @max(80) }
+
+event @ticket.closed { ticket_id: Uuid, org_id: Int }
+
+event @ticket.notified { ticket_id: Uuid }

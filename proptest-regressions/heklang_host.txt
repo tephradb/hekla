@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# A seed is only meaningful while the strategy that consumed it is unchanged, so
+# prune this file whenever a generator changes rather than letting it accumulate
+# seeds that now replay something else. Two seeds recording a doubly-optional type
+# were dropped for exactly that reason: the generator no longer produces one.
+cc cb7701546c43623149a06721a0f5fde83a4fd534ed5b91bccc11d61b58f71d64 # a sealed list read back as the text "[]" rather than as an array
+cc 7b883a698badffeeec0e8b32458eca0d57e1714796c7318f91dfb201fecf9096 # shrinks to (ty, value) = (Opt(Json), Opt { inner: Json, value: Some(Json(Null)) })
+cc 24bd6da69d20108b15d22c9215b0b408b6bc5b248c1f2becd0716ed912391ea4 # shrinks to (ty, value) = (Timestamp, Timestamp(0))

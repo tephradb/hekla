@@ -1,0 +1,5 @@
+# Long enough that the retention sweeper cannot reclaim a journal mid-test. A reclaimed
+# journal is skipped by `verify`, and a test asserting on how much a sweep covered would
+# read that as coverage it did not get.
+[retention]
+effect_journal_days = 3650

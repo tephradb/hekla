@@ -170,6 +170,7 @@ impl HeklaWorld {
             retry_after: None,
             last_transport: None,
             minted: Some(0),
+            sealed: false,
         };
         Ok(HeklaWorld {
             rows: TestRows {

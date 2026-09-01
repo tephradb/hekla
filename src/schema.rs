@@ -123,8 +123,7 @@ impl FieldKind {
 /// A declared field: its type plus the per-field policy that governs tagging and
 /// subject-scoped encryption. `indexed` decides whether the field becomes a store
 /// tag; `subject` names a sibling field whose per-subject key encrypts this field's
-/// value (in the tag, the payload, and any read-model column); `unique` additionally
-/// emits a global-key tag so a global uniqueness check survives erasure.
+/// value (in the tag, the payload, and any read-model column).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldMeta {
     pub kind: FieldKind,

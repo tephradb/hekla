@@ -14,7 +14,6 @@ pub mod schema;
 pub mod tags;
 pub mod ui;
 
-// Being rewritten against heklang; re-enabled one at a time as each lands.
 pub mod cli;
 pub mod dispatch;
 pub mod effect;
@@ -27,3 +26,9 @@ pub mod server;
 pub mod testing;
 pub mod validate;
 pub mod verify;
+
+/// Generators for the conversion-table properties. Not compiled into the library: the
+/// tables they exercise are private to their own modules, so the properties live beside
+/// them rather than reaching in from `tests/`.
+#[cfg(test)]
+mod propgen;

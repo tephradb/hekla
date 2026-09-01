@@ -1,0 +1,14 @@
+// Internal: only the effect invokes it, so nobody can post a fabricated notification.
+// The slice is what makes it idempotent under replay, when an effect crashes between
+// the append and its journal write.
+
+command RecordNotified(ticket_id: Uuid) {
+  state notified: Bool = fold false
+    on @ticket.notified(ticket_id) => true
+
+  if notified {
+    return reject AlreadyNotified
+  }
+
+  emit @ticket.notified { ticket_id }
+}

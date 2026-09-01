@@ -555,6 +555,13 @@ effect Notify {
     assert_eq!(echoed["second_ok"], false);
     assert_eq!(echoed["code"], "already_active");
     assert_eq!(echoed["message"], "that user is already active");
+
+    // The invocation, not the call. A journal row is written *after* the call it
+    // records returns, so the stub sees the request while the third row is still in
+    // flight: waiting on the call and then reading the journal is a race that finds two
+    // rows on a loaded machine. Waiting on the position is waiting for the invocation to
+    // be over, which is when the count below is a fact.
+    support::wait_effect_position(&harness.rt, EFFECT, 1);
     // Two distinct `invoke` calls, so two journal rows even though the arguments
     // match: the outcomes differ and each replay must get its own back.
     assert_eq!(journal_rows(data.path(), 1).len(), 3);

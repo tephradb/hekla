@@ -53,9 +53,9 @@ enum Command {
         /// `<dir>/data`.
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Run the continuous invariant checks: every fold is checked for
-        /// determinism, and every completed effect invocation is replayed against a
-        /// sealed journal. A component that breaks an invariant is quarantined.
+        /// Run the continuous invariant check: every completed effect invocation is
+        /// replayed against a sealed journal. An effect that breaks the invariant is
+        /// quarantined.
         #[arg(long)]
         verify: bool,
     },
@@ -362,7 +362,7 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) 
         project.config.verify.enabled = true;
     }
     if project.config.verify.enabled {
-        tracing::info!("verify mode on: folds and effect replays are checked as they run");
+        tracing::info!("verify mode on: effect replays are checked as they run");
     }
     let addr: SocketAddr = match addr.unwrap_or(DEFAULT_ADDR).parse() {
         Ok(addr) => addr,

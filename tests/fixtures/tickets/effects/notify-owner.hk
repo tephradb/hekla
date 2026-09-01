@@ -1,0 +1,22 @@
+// Crosses the decrypt boundary explicitly, then records delivery through the internal
+// command. An owner erased before this runs makes `reveal` terminal (the address is
+// gone; no retry recovers it) rather than wedging the lane.
+
+effect NotifyOwner {
+  on @ticket.opened { ticket_id, contact } {
+    if contact.is_none() {
+      log("ticket {ticket_id} has no contact to notify")
+      return
+    }
+
+    let response = http.post(
+      "https://notify.test/send",
+      { "to": reveal(contact), "ticket": ticket_id },
+    )
+    if response.status >= 400 {
+      log("notification rejected with status {response.status}")
+      return
+    }
+    invoke RecordNotified { ticket_id }
+  }
+}

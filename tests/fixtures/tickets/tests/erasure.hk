@@ -1,0 +1,79 @@
+// Two subjects on one event, erased independently. The organisation's figure and the
+// owner's address are scoped to different keys, so shredding one leaves the other, and
+// the plaintext columns beside them are untouched either way.
+
+test "an erased owner loses their contact and keeps everything else" {
+  given @ticket.opened {
+    ticket_id: "11111111-1111-1111-1111-111111111111",
+    org_id: 1,
+    owner_id: 10,
+    title: "the printer is on fire",
+    priority: Urgent,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 12.50,
+    budget: 900.00,
+    contact: "ada@example.com",
+    meta: { "source": "email" },
+  }
+  erased owner_id "10"
+  project Tickets
+  expect Ticket["11111111-1111-1111-1111-111111111111"] {
+    owner_id: 10,
+    title: "the printer is on fire",
+    fee: 12.50,
+    contact: none,
+  }
+}
+
+// The other direction: erasing the organisation takes its figure and leaves the owner's
+// address, which is what a per-field subject buys over a per-event one.
+test "an erased organisation loses its budget and keeps the owner's contact" {
+  given @ticket.opened {
+    ticket_id: "22222222-2222-2222-2222-222222222222",
+    org_id: 1,
+    owner_id: 10,
+    title: "still here",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 900.00,
+    contact: "ada@example.com",
+    meta: {},
+  }
+  erased org_id "1"
+  project Tickets
+  expect Ticket["22222222-2222-2222-2222-222222222222"] {
+    budget: none,
+    contact: "ada@example.com",
+  }
+}
+
+test "erasing one owner leaves another's contact alone" {
+  given @ticket.opened {
+    ticket_id: "33333333-3333-3333-3333-333333333333",
+    org_id: 1,
+    owner_id: 10,
+    title: "theirs",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 1.00,
+    contact: "ada@example.com",
+    meta: {},
+  }
+  given @ticket.opened {
+    ticket_id: "44444444-4444-4444-4444-444444444444",
+    org_id: 1,
+    owner_id: 11,
+    title: "someone else's",
+    priority: Low,
+    due_at: "2023-11-14T22:13:20Z",
+    fee: 1.00,
+    budget: 1.00,
+    contact: "bob@example.com",
+    meta: {},
+  }
+  erased owner_id "10"
+  project Tickets
+  expect Ticket["44444444-4444-4444-4444-444444444444"] { contact: "bob@example.com" }
+}

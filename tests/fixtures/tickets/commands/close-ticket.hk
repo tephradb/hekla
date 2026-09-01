@@ -1,0 +1,19 @@
+// Closing twice is a no-op rather than a refusal, so a retry is safe; closing something
+// that was never opened is a refusal, because it is a different mistake.
+
+command CloseTicket(ticket_id: Uuid, org_id: Int) {
+  state opened: Bool = fold false
+    on @ticket.opened(ticket_id) => true
+
+  state closed: Bool = fold false
+    on @ticket.closed(ticket_id) => true
+
+  if closed {
+    return
+  }
+  if !opened {
+    return reject NoSuchTicket
+  }
+
+  emit @ticket.closed { ticket_id, org_id }
+}
