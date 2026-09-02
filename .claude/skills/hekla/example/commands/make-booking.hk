@@ -1,0 +1,37 @@
+// `commands/` is enforced: the directory is what routes this at
+// `POST /commands/MakeBooking`, under its declared name rather than its file name.
+//
+// Two slices, two jobs. The narrow one makes a retried request a no-op; the wide one
+// is the rule about the room-night, and it is what the append conditions on, so a
+// concurrent booking of the same room-night loses rather than races.
+
+command MakeBooking(
+  booking_id: Uuid,
+  room_id: Int,
+  guest_id: Int,
+  email: String?,
+  night: Timestamp,
+  rate: Money(2),
+  notes: String,
+) {
+  state made: Bool = fold false
+    on @booking.made(booking_id) => true
+
+  state booked: Int = fold 0
+    on @booking.made(room_id, night) => booked + 1
+    on @booking.cancelled(room_id, night) => booked - 1
+
+  // A rate that is not positive is wrong whoever sends it, so it is `invalid` (400)
+  // rather than a refusal (422). A booked room is a fact about the world, so it is.
+  if rate <= 0.00 {
+    return invalid("rate must be positive")
+  }
+  if made {
+    return
+  }
+  if booked >= ROOM_NIGHT_CAPACITY {
+    return reject RoomTaken
+  }
+
+  emit @booking.made { booking_id, room_id, guest_id, email, night, rate, notes }
+}

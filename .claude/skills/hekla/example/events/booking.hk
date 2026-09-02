@@ -1,0 +1,32 @@
+// Every `.hk` file in the project is one program, so nothing imports this and nothing
+// has to. `events/` is a convention: an event is read the same from any directory.
+//
+// A field becomes a store tag unless it opts out, and a tag is what a command's slice
+// and the log filters can match on. That is why the ids stay plaintext and the long
+// free text does not become a tag at all.
+
+event @booking.made {
+  booking_id: Uuid,
+  room_id: Int,
+  guest_id: Int,
+  // Encrypted under a key scoped to this guest, so erasing them is one key delete.
+  // Optional because an erased subject's value reads back absent, and a type that
+  // cannot be absent could not say so.
+  email: String? @subject(guest_id) @max(200),
+  // Domain time: the night being booked, which is not the instant the event was
+  // appended. The envelope already carries that, readable as `e.at`.
+  night: Timestamp,
+  rate: Money(2),
+  notes: String @max(500) @no_index,
+}
+
+event @booking.cancelled {
+  booking_id: Uuid,
+  room_id: Int,
+  night: Timestamp,
+}
+
+// Appended by the internal command an effect invokes, never by a client.
+event @booking.confirmed {
+  booking_id: Uuid,
+}

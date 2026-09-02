@@ -1,0 +1,60 @@
+// `deliver` runs the effect's arm against the seeded log with the network stubbed.
+// `respond` queues the replies in the order the arm makes its calls, and the
+// expectations are the ordered trace the arm should have produced.
+
+test "posts the confirmation then records it" {
+  given @booking.made {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "",
+  }
+  respond "https://concierge.example/confirmations" 200
+  deliver ConfirmBooking
+  expect http.post("https://concierge.example/confirmations", {
+    "booking_id": "11111111-1111-1111-1111-111111111111",
+    "to": "ada@example.com",
+    "first_stay": true,
+  })
+  expect invoke RecordConfirmation {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+  }
+}
+
+// A 4xx reaches the arm only because the runtime already absorbed everything
+// retryable, so deciding to log and stop is a decision about a real refusal.
+test "a refused confirmation is logged rather than recorded" {
+  given @booking.made {
+    booking_id: "22222222-2222-2222-2222-222222222222",
+    room_id: 12,
+    guest_id: 8,
+    email: "bo@example.com",
+    night: "2026-06-02T00:00:00Z",
+    rate: 130.00,
+    notes: "",
+  }
+  respond "https://concierge.example/confirmations" 422
+  deliver ConfirmBooking
+  expect http.post("https://concierge.example/confirmations")
+  expect log("confirmation refused with status 422")
+}
+
+// A `reveal` of a shredded key cannot be retried into working, so the invocation
+// fails terminally and the effect advances instead of wedging forever.
+test "an erased guest skips rather than sending plaintext" {
+  given @booking.made {
+    booking_id: "33333333-3333-3333-3333-333333333333",
+    room_id: 12,
+    guest_id: 9,
+    email: "cy@example.com",
+    night: "2026-06-03T00:00:00Z",
+    rate: 140.00,
+    notes: "",
+  }
+  erased guest_id "9"
+  deliver ConfirmBooking
+  expect skipped
+}

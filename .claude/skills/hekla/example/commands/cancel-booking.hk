@@ -1,0 +1,19 @@
+// The caller names the room-night it is cancelling and the boundary proves the
+// booking is that one, so the emit needs nothing the fold had to carry out.
+
+command CancelBooking(booking_id: Uuid, room_id: Int, night: Timestamp) {
+  state made: Bool = fold false
+    on @booking.made(booking_id, room_id, night) => true
+
+  state cancelled: Bool = fold false
+    on @booking.cancelled(booking_id) => true
+
+  if !made {
+    return reject NoSuchBooking
+  }
+  if cancelled {
+    return
+  }
+
+  emit @booking.cancelled { booking_id, room_id, night }
+}

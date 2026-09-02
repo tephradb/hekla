@@ -1,0 +1,22 @@
+# Operational config. Every value has a default, so this file is optional; it is here
+# to name the whole surface. An unknown key is a load error, not a warning.
+
+[effects]
+# Validated, and reserved: v1 runs one thread per effect.
+pool_size = 8
+
+[retention]
+# How long a completed invocation's journal is kept before the sweeper reclaims it.
+# Only rows at or below the effect's persisted watermark are ever swept.
+effect_journal_days = 14
+
+[projectors]
+# Rebuild a projector whose definition changed, rather than leaving it `stale` for an
+# operator to replay by hand.
+auto_rebuild = true
+
+[verify]
+# The continuous invariant check: replay every completed invocation against a sealed
+# journal and quarantine an effect that does not reproduce itself. `serve --verify`
+# turns it on without editing this file.
+enabled = false

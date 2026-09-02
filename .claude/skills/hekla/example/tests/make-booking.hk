@@ -1,0 +1,119 @@
+// `hekla test` runs these against hekla's own world: a real tephra log, a real SQLite
+// read model and a real key store, so the append condition below is genuinely
+// exercised rather than approximated.
+
+test "books a free room-night" {
+  run MakeBooking {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "late arrival",
+  }
+  expect @booking.made {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "late arrival",
+  }
+}
+
+// The narrow slice: a retried request appends nothing and says so by succeeding.
+test "a repeat of the same booking writes nothing" {
+  given @booking.made {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "",
+  }
+  run MakeBooking {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "",
+  }
+  expect nothing
+}
+
+test "the room-night is taken" {
+  given @booking.made {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "",
+  }
+  run MakeBooking {
+    booking_id: "22222222-2222-2222-2222-222222222222",
+    room_id: 12,
+    guest_id: 8,
+    email: "bo@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 130.00,
+    notes: "",
+  }
+  expect reject RoomTaken
+}
+
+test "a cancellation frees the night" {
+  given @booking.made {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "",
+  }
+  given @booking.cancelled {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    night: "2026-06-01T00:00:00Z",
+  }
+  run MakeBooking {
+    booking_id: "22222222-2222-2222-2222-222222222222",
+    room_id: 12,
+    guest_id: 8,
+    email: "bo@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 130.00,
+    notes: "",
+  }
+  expect @booking.made {
+    booking_id: "22222222-2222-2222-2222-222222222222",
+    room_id: 12,
+    guest_id: 8,
+    email: "bo@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 130.00,
+    notes: "",
+  }
+}
+
+// `invalid` is about the request and reaches a client as 400; `reject RoomTaken`
+// above is about the world and reaches one as 422 with the code `room_taken`.
+test "a rate that is not positive is invalid" {
+  run MakeBooking {
+    booking_id: "33333333-3333-3333-3333-333333333333",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 0.00,
+    notes: "",
+  }
+  expect invalid("rate must be positive")
+}

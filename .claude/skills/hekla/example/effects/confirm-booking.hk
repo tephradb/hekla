@@ -1,0 +1,30 @@
+// `effects/` is enforced, and an effect is the only declaration that reaches the
+// network or decrypts.
+//
+// The runtime absorbs transport errors and every retryable status (408, 425, 429 and
+// any 5xx) before the arm sees them, so a `status >= 400` here is a real decision.
+// Each `http.*` call is journaled, so a crash after the POST replays the recorded
+// response instead of sending twice, and the `invoke` below lands exactly once.
+
+effect ConfirmBooking {
+  on @booking.made as e {
+    // The fold is bounded at this event's own position, so the count is a function of
+    // the log prefix rather than of when the handler happened to run. An effect gets
+    // state this way, never by reading a projector.
+    state stays: Int = fold 0
+      on @booking.made(guest_id: e.guest_id) => stays + 1
+
+    let response = http.post("https://concierge.example/confirmations", {
+      "booking_id": e.booking_id,
+      "to": reveal(e.email),
+      "first_stay": stays == 1,
+    })
+
+    if response.status >= 400 {
+      log("confirmation refused with status {response.status}")
+      return
+    }
+
+    invoke RecordConfirmation { booking_id: e.booking_id }
+  }
+}

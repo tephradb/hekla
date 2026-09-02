@@ -74,6 +74,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo +1.95.0 check --workspace --all-features
 
+  # The worked example the hekla skill ships, run by the tool it documents. `openapi` is in
+  # here as well as `check` because `check` exits 0 on a directory it found nothing in, so it
+  # alone would not notice the example moving or disappearing.
+  skill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -- check .claude/skills/hekla/example
+      - run: cargo run -- test .claude/skills/hekla/example
+      - run: cargo run -- openapi .claude/skills/hekla/example > /dev/null
+
   # Dependency audit: security advisories, license policy, banned/duplicate crates, sources.
   deny:
     runs-on: ubuntu-latest

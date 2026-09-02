@@ -1,0 +1,42 @@
+// `projectors/` is enforced: the directory is what makes this a projector, and the
+// read API is generated from the entities below.
+//
+// What the read API needs from an entity, and what `hekla check` refuses without:
+// a present, orderable, plaintext key (it is the pagination cursor), an index on every
+// column a caller may filter by, no column named `limit`, `cursor`, `after` or
+// `timeout_ms`, and an optional type on any column that receives sealed content.
+
+projector Bookings {
+  entity Booking {
+    booking_id: Uuid @key,
+    room_id: Int @index,
+    guest_id: Int @index,
+    // No `@subject` here: the seal propagates from the event field written into it,
+    // and the read API decrypts it on the way out.
+    email: String? @max(200),
+    night: Timestamp,
+    rate: Money(2),
+    confirmed: Bool,
+  }
+
+  // A counter, so `patch`: it materialises the row from zeros the first time and the
+  // read API serves it at `GET /read/Bookings/RoomLoad/{room_id}`.
+  entity RoomLoad {
+    room_id: Int @key,
+    booked: Int,
+  }
+
+  on @booking.made { booking_id, room_id, guest_id, email, night, rate } {
+    put Booking { booking_id, room_id, guest_id, email, night, rate, confirmed: false }
+    patch RoomLoad[room_id] { booked: .booked + 1 }
+  }
+
+  on @booking.confirmed { booking_id } {
+    update Booking[booking_id] { confirmed: true }
+  }
+
+  on @booking.cancelled { booking_id, room_id } {
+    delete Booking[booking_id]
+    patch RoomLoad[room_id] { booked: .booked - 1 }
+  }
+}

@@ -1,0 +1,19 @@
+// `commands/internal/` is the other enforced prefix: an effect may `invoke` this and
+// no HTTP caller can reach it, so a confirmation cannot be forged over the port.
+//
+// The slice is what makes the invoke idempotent. An effect that crashed between the
+// append and its journal write re-invokes on restart, and this boundary turns the
+// second attempt into a rejection rather than a second `@booking.confirmed`.
+
+refusal AlreadyConfirmed "this booking was already confirmed"
+
+command RecordConfirmation(booking_id: Uuid) {
+  state confirmed: Bool = fold false
+    on @booking.confirmed(booking_id) => true
+
+  if confirmed {
+    return reject AlreadyConfirmed
+  }
+
+  emit @booking.confirmed { booking_id }
+}

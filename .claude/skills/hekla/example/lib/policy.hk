@@ -1,0 +1,11 @@
+// Refusals and constants shared by more than one command. `lib/` is a convention:
+// nothing in hekla reads this directory, and a refusal used by one command is at home
+// in that command's file.
+//
+// A refusal's code is its name in snake_case, and that code is what an HTTP caller
+// switches on: `RoomTaken` reaches a client as `room_taken` with a 422.
+
+const ROOM_NIGHT_CAPACITY: Int = 1
+
+refusal RoomTaken "that room is already booked for that night"
+refusal NoSuchBooking "no booking for that room and night"

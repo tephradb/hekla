@@ -1,0 +1,50 @@
+// The case worth running here rather than in heklang's own harness: the column really
+// holds AES-SIV ciphertext and `erased` really deletes the key, so `email: none` is
+// crypto-shredding rather than a flag.
+//
+// No read path ever mints a key, so re-projecting a log whose subject was erased
+// writes the column absent rather than recreating what the erasure destroyed.
+
+test "erasing the guest takes their column and leaves the booking" {
+  given @booking.made {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "",
+  }
+  erased guest_id "7"
+  project Bookings
+  expect Booking["11111111-1111-1111-1111-111111111111"] {
+    room_id: 12,
+    guest_id: 7,
+    email: none,
+  }
+}
+
+test "erasing one guest leaves another's booking readable" {
+  given @booking.made {
+    booking_id: "11111111-1111-1111-1111-111111111111",
+    room_id: 12,
+    guest_id: 7,
+    email: "ada@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 120.00,
+    notes: "",
+  }
+  given @booking.made {
+    booking_id: "22222222-2222-2222-2222-222222222222",
+    room_id: 14,
+    guest_id: 8,
+    email: "bo@example.com",
+    night: "2026-06-01T00:00:00Z",
+    rate: 130.00,
+    notes: "",
+  }
+  erased guest_id "7"
+  project Bookings
+  expect Booking["11111111-1111-1111-1111-111111111111"] { email: none }
+  expect Booking["22222222-2222-2222-2222-222222222222"] { email: "bo@example.com" }
+}
