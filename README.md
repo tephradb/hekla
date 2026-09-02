@@ -1,7 +1,6 @@
 # 🌋 hekla
 
-A single-app event-sourcing runtime you write in [heklang](https://github.com/tephradb/heklang), over the Dynamic Consistency
-Boundary.
+A single-app event-sourcing runtime you write in [heklang], over the Dynamic Consistency Boundary.
 
 Business logic is plain source text: **commands** validate input, replay the history a decision
 depends on, and append events; **projectors** consume events into queryable SQLite read models;
@@ -17,6 +16,7 @@ a Temporal-style journal so a crash mid-arm resumes without re-firing what alrea
 hekla runs on [tephra] for the event log and SQLite for read models. It is a rewrite of [umari],
 which expressed the same model as WASM component modules.
 
+[heklang]: https://github.com/tephradb/heklang
 [tephra]: https://github.com/tephradb/tephra
 [umari]: https://github.com/tqwewe/umari
 
@@ -65,20 +65,40 @@ command PlaceOrder(order_id: Uuid, customer_id: Int, shop_id: Int, email: String
 and `GET /read/{Projector}/{Entity}/{key}` serves what it built. Both routes are generated from the
 declarations, with an OpenAPI document and a reference UI at `/docs`.
 
+## Install
+
+```sh
+cargo install hekla
+```
+
+Or `nix run github:tephradb/hekla` to run it without installing anything, and `nix build
+github:tephradb/hekla` for the binary alone.
+
+One binary is the whole runtime: it serves the API, runs the scenarios, and does the key
+management. [tephra] is embedded as a library and SQLite is bundled, so there is no server to
+stand up beside it and nothing to point it at. A project is a directory of `.hk` files, and
+`examples/orders` in this repository is a working one.
+
+To drive the runtime from your own Rust rather than the CLI, `cargo add hekla`: the binary is a
+shim over the library, and everything it does is public.
+
 ## Run it
 
 ```sh
-cargo run -- check examples/orders          # static analysis, for CI and pre-commit
-cargo run -- test examples/orders           # scenarios under tests/
+hekla check examples/orders   # static analysis, for CI and pre-commit
+hekla test examples/orders    # scenarios under tests/
 
 HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
-  cargo run -- serve examples/orders        # the API on 127.0.0.1:8080
+  hekla serve examples/orders # the API on 127.0.0.1:8080
 ```
 
 `check` reports the compiler's diagnostics plus what only hekla knows: that a declaration sits in
 the directory its kind requires, that a read model can be keyed and indexed the way the read API
 needs, and two warnings about a boundary too broad or too narrow to do its job. Also `hekla erase`
 and `hekla rotate` for key management, and `hekla verify` for the invariant sweep below.
+
+From a checkout the same three are `cargo run -- check examples/orders` and so on. The repository
+is also a flake: `nix build` for the binary, `nix flake check` for the suite.
 
 ## Checking the invariants
 
