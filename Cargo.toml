@@ -29,7 +29,7 @@ axum = "0.8"
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
-heklang = "0.1"
+heklang = "0.1.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 # `arbitrary_precision` is load-bearing, not a preference: without it a
