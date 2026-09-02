@@ -871,8 +871,8 @@ fn build_tags(pairs: &[(String, Option<String>)], extra: &[&str]) -> Result<Tags
 /// One projector's read models, as heklang writes them.
 ///
 /// The crypto is symmetric with the log's: a subject-scoped column is stored as
-/// ciphertext and `read_api` decrypts it on the way out, so [`Rows::put`] encrypts and
-/// [`Rows::row`] decrypts. A stored load in a `patch` therefore sees the plaintext the
+/// ciphertext and `read_api` decrypts it on the way out, so [`heklang::Rows::put`] encrypts and
+/// [`heklang::Rows::row`] decrypts. A stored load in a `patch` therefore sees the plaintext the
 /// handler wrote, and a column whose key is gone reads back absent, which is what makes
 /// erasure observable through a projection rather than only through the log.
 pub struct RowWriter<'a> {

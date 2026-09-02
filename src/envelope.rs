@@ -36,7 +36,7 @@ pub struct Envelope {
     /// later phase). Absent for commands invoked directly over HTTP.
     ///
     /// Serialize is derived; Deserialize is not, and deliberately so: reading goes
-    /// through [`StoredVisitor`], which builds this struct field by field, so adding a
+    /// through `StoredVisitor`, which builds this struct field by field, so adding a
     /// field here fails to compile until the visitor reads it. A derived `Deserialize`
     /// sitting unused beside a hand-written reader is how the two sides drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
