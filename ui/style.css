@@ -640,6 +640,11 @@ dl.kv dd {
   color: var(--text-faint);
 }
 
+.json .sealed {
+  color: var(--text-faint);
+  letter-spacing: 2px;
+}
+
 .json .toggle {
   border: 0;
   background: none;

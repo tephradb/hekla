@@ -5,8 +5,8 @@
  * ciphertext, or ciphertext that can never be read again, and the server reports which
  * in a sibling `subjects` object precisely so the payload keeps the shape the author
  * declared. Rendering the two side by side is what turns that into something an
- * operator can act on: an `erased` badge next to a base64 blob says "this is gone",
- * where the blob alone says nothing. */
+ * operator can act on: an `erased` badge where a base64 blob would be says "this is
+ * gone", where the blob alone says nothing. */
 
 import { html, useState } from './vendor-preact.js'
 import { Badge } from './ui-badge.js'
@@ -29,17 +29,30 @@ function Scalar({ value }) {
   }
 }
 
+/* A subject field that was not decrypted arrives as the ciphertext the log stores.
+ * The badge beside it already says which of `encrypted`, `erased`, `stale` or
+ * `unreadable` it is, and the base64 adds nothing to that while pushing the fields
+ * around it off the line, so only its size shows. It is hidden, not dropped: the
+ * server sends it for a reason, and `Copy as JSON` still yields the stored payload. */
+function Sealed({ value }) {
+  const size = typeof value === 'string' ? value.length : String(value).length
+  const title = `${size} characters of stored ciphertext`
+  // `.line` is `white-space: pre`, so the placeholder cannot be wrapped onto its own line.
+  return html`<span class="sealed" title=${title}>•••</span>`
+}
+
 function Node({ name, value, depth, subjects }) {
   const container = value !== null && typeof value === 'object'
   const [open, setOpen] = useState(depth < AUTO_OPEN_DEPTH)
   const subject = name && subjects?.[name]
 
   if (!container) {
+    const sealed = subject && subject.state !== 'decrypted'
     return html`
       <div class="line">
         <span class="toggle"></span>
         ${name !== undefined && html`<span class="key">${name}:</span>`}
-        <${Scalar} value=${value} />
+        ${sealed ? html`<${Sealed} value=${value} />` : html`<${Scalar} value=${value} />`}
         ${subject &&
         html`
           <${Badge}
