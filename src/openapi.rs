@@ -143,7 +143,7 @@ impl<'a> Surface<'a> {
 
 const INFO_DESCRIPTION: &str = "\
 Generated from the loaded project. Every path below is a route this server serves, \
-and every schema is derived from a declaration in the project's `.star` files.
+and every schema is derived from a declaration in the project's `.hk` files.
 
 Commands append events through a consistency boundary. Read models are materialised \
 by projectors and queried by key or by a declared index. The operator endpoints \
@@ -2385,7 +2385,7 @@ fn journal_call_schema() -> Value {
             },
             "kind": {
                 "type": ["string", "null"],
-                "enum": ["http", "invoke_command", "now", "erase", null],
+                "enum": ["http", "invoke", "now", "erase", null],
                 "description": "Which builtin made the call. Null for a row written before the \
                     runtime recorded it; the kind is otherwise unrecoverable, since it exists \
                     only inside the hash pre-image.",

@@ -2,7 +2,7 @@
  *
  * The entity shapes come from the read model itself rather than from the project
  * source, so this is what the rows were actually built under, not what the current
- * `.star` file declares. On a stale or rebuilding projector those two differ, which is
+ * `.hk` file declares. On a stale or rebuilding projector those two differ, which is
  * exactly when you want to know. */
 
 import { html, useState } from './vendor-preact.js'

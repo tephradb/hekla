@@ -42,7 +42,7 @@ const SUBJECT = {
 
 const CALL_KIND = {
   http: 'info',
-  invoke_command: 'ok',
+  invoke: 'ok',
   now: 'mute',
   erase: 'warn',
 }

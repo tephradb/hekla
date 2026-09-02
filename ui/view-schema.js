@@ -3,11 +3,10 @@
  * Commands append events; projectors and effects subscribe to them. Both halves are
  * declared, so both edges are drawn from `/admin/schema` and are exact.
  *
- * The edge that is *not* drawn is effect-invokes-command, and it cannot be. The
- * targets are chosen at runtime inside Starlark, so reading the project does not
- * reveal them, and the journal records each call's result rather than its arguments,
- * so a completed `invoke_command` does not carry the name either. The page says so
- * rather than drawing an edge it would have to guess at. */
+ * The edge that is *not* drawn is effect-invokes-command: `/admin/schema` reports each
+ * module's subscription and not its call targets, and the journal records each call's
+ * result rather than its arguments, so a completed `invoke` does not carry the name
+ * either. The page says so rather than drawing an edge it would have to guess at. */
 
 import { html } from './vendor-preact.js'
 import { api } from './api.js'
@@ -139,12 +138,10 @@ export function SchemaView() {
               ${schema.effects.length > 0 &&
               html`
                 <p class="tiny faint" style=${{ marginBottom: 0 }}>
-                  Which commands an effect invokes is not shown, because it is not
-                  knowable: the targets are chosen at runtime in Starlark, and the journal
-                  records each call's result rather than its arguments, so a completed
-                  <code>invoke_command</code> does not carry the name either. An
-                  invocation's journal shows <em>that</em> one happened and what came
-                  back.
+                  Which commands an effect invokes is not shown here: the journal records
+                  each call's result rather than its arguments, so a completed
+                  <code>invoke</code> does not carry the name either. An invocation's
+                  journal shows <em>that</em> one happened and what came back.
                 </p>
               `}
             </div>
