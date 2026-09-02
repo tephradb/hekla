@@ -1,6 +1,6 @@
 # 🌋 hekla
 
-A single-app event-sourcing runtime you write in [heklang](../heklang), over the Dynamic Consistency
+A single-app event-sourcing runtime you write in [heklang](https://github.com/tephradb/heklang), over the Dynamic Consistency
 Boundary.
 
 Business logic is plain source text: **commands** validate input, replay the history a decision
@@ -117,7 +117,7 @@ not lock the segment directory itself.
 - [ARCHITECTURE.md] covers the design and the alternatives that were rejected.
 - [ROADMAP.md] tracks what is done and what is next.
 
-[heklang/docs/]: ../heklang/docs/
+[heklang/docs/]: https://github.com/tephradb/heklang/tree/main/docs
 
 [AUTHORING.md]: AUTHORING.md
 [ARCHITECTURE.md]: ARCHITECTURE.md
@@ -125,6 +125,6 @@ not lock the segment directory itself.
 
 ## License
 
-Apache-2.0.
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
 
 hekla was built with AI use and careful review.

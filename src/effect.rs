@@ -210,7 +210,7 @@ impl EffectShared {
     /// and any dashboard cannot disagree about what "stuck" means.
     ///
     /// The order is load-bearing. A quarantine outranks everything because
-    /// [`EffectShared::restore_quarantine`] sets the flag and `last_error` but never
+    /// `restore_quarantine` sets the flag and `last_error` but never
     /// touches `consecutive_failures`, so an effect quarantined by an *earlier*
     /// process has a zero failure count and would otherwise read as merely lagging. A
     /// wedge outranks lag because a wedged effect lags precisely because it is
@@ -288,7 +288,7 @@ impl EffectRuntime {
     }
 
     /// Signal every effect and the sweeper to stop, then join them, abandoning
-    /// any thread that has not drained within [`SHUTDOWN_JOIN_TIMEOUT`] (a stuck
+    /// any thread that has not drained within `SHUTDOWN_JOIN_TIMEOUT` (a stuck
     /// invocation stays `running` and replays next start).
     pub fn shutdown_and_join(self) {
         let EffectRuntime {

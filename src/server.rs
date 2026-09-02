@@ -12,7 +12,7 @@
 //! Handlers are thin. They pull the correlation id and idempotency key from
 //! headers, mint a per-request [`CommandContext`], and run the (synchronous)
 //! command cycle on a blocking thread. The [`Runtime`] owns the outcome-to-status
-//! mapping, so the server only turns an [`ExecResult`] into a JSON response.
+//! mapping, so the server only turns an [`crate::runtime::ExecResult`] into a JSON response.
 
 use std::collections::HashMap;
 use std::future;

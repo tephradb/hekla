@@ -625,7 +625,7 @@ impl OpDb {
     /// loops and touches at most `effects x positions` rows, which is also the
     /// `LIMIT`. `effects` is fixed at boot and `positions` is one clamped page, so
     /// the bind count stays a few hundred, far under SQLite's parameter ceiling.
-    /// [`OpDb::explain_invocations_at`] pins the plan so this stays true.
+    /// `explain_invocations_at` pins the plan so this stays true.
     ///
     /// An invocation the retention sweeper has already reclaimed is simply absent,
     /// and is indistinguishable from one that never existed. That is deliberate: the

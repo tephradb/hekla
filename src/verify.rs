@@ -101,7 +101,7 @@ impl fmt::Display for Report {
 /// drawing one. A nonce-carrying cipher here would make every encrypted column differ
 /// between the live model and the rebuild, so that property is load-bearing rather
 /// than incidental. What it does *not* survive is erasure, which leaves the live row
-/// holding ciphertext and the rebuild writing NULL; [`drop_shredded`] is what reconciles
+/// holding ciphertext and the rebuild writing NULL; `drop_shredded` is what reconciles
 /// the two. Nothing here writes to the live model or the log.
 ///
 /// **The rebuild is bounded at the live model's own checkpoint.** Building to head
