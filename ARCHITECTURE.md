@@ -230,8 +230,11 @@ Two representations are pinned so they are not decided inconsistently in two pla
   scaled integers here.
 - **`Timestamp`**: epoch microseconds on the wire, RFC 3339 text in a SQLite column and in the
   envelope. The column form is what the read API serves and what sorts lexicographically, and the
-  two are converted at exactly one seam. A sealed timestamp column holds the *column* form too,
-  so whether a field is personal never changes the shape a reader sees.
+  two are converted at exactly one seam. A command's request body takes **either**, converted at
+  that same seam before heklang sees it: the form a client has in hand is the one a read handed it,
+  and a body it could not post back would make the generated document's `date-time` a lie. A sealed
+  timestamp column holds the *column* form too, so whether a field is personal never changes the
+  shape a reader sees.
 
 ## 5. Commands
 

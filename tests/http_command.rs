@@ -9,7 +9,7 @@ use tower::ServiceExt;
 
 mod support;
 
-use support::{ALICE, BOB, boot_example, post_command};
+use support::{ALICE, BOB, boot_example, boot_project, post_command, write_project};
 
 #[tokio::test]
 async fn blank_idempotency_key_is_not_a_shared_key() {
@@ -156,4 +156,84 @@ async fn a_non_object_or_malformed_body_is_a_400() {
     );
 
     harness.shutdown();
+}
+
+/// The wire form of a `Timestamp` parameter.
+///
+/// heklang reads epoch microseconds, and every hekla boundary that *writes* one writes
+/// RFC 3339: a read model's column, the read response built from it, and the
+/// `date-time` the generated document declares for this very field. So the value a
+/// client read out of a row has to post straight back, and both forms have to mean the
+/// same instant.
+#[tokio::test]
+async fn a_timestamp_parameter_takes_rfc_3339_and_epoch_micros() {
+    let project = write_project(&[
+        (
+            "events/slot.hk",
+            "event @slot.booked {\n  slot_id: Uuid,\n  at: Timestamp,\n  until: Timestamp?,\n}\n",
+        ),
+        (
+            "commands/book-slot.hk",
+            "command BookSlot(slot_id: Uuid, at: Timestamp, until: Timestamp?) {\n  \
+             state booked: Bool = fold false\n    on @slot.booked(slot_id) => true\n\n  \
+             if booked {\n    return\n  }\n\n  emit @slot.booked { slot_id, at, until }\n}\n",
+        ),
+    ]);
+    let harness = boot_project(project.path());
+    let app = harness.app();
+
+    let (status, text_body) = post_command(
+        &app,
+        "BookSlot",
+        json!({ "slot_id": ALICE, "at": "2026-06-01T00:00:00Z" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text_body:?}");
+
+    // An optional parameter takes the text form through its `Opt`, and an offset that
+    // is not `Z` is the same instant rather than a second one.
+    let (status, micros_body) = post_command(
+        &app,
+        "BookSlot",
+        json!({ "slot_id": BOB, "at": 1_780_272_000_000_000i64, "until": "2026-06-01T02:00:00+02:00" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{micros_body:?}");
+    assert_eq!(tag(&micros_body, "until:"), "until:1780272000000000");
+
+    // The derived tag is the value as the log holds it, so equal tags mean the two
+    // requests appended one instant rather than two that merely both parsed.
+    assert_eq!(tag(&text_body, "at:"), tag(&micros_body, "at:"));
+    assert_eq!(tag(&text_body, "at:"), "at:1780272000000000");
+
+    // Text that is not RFC 3339 says so, rather than reporting the string itself as
+    // the wrong kind of thing, which is what it used to be.
+    let (status, body) = post_command(
+        &app,
+        "BookSlot",
+        json!({ "slot_id": ALICE, "at": "2026-06-01T00:00:00" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    assert_eq!(body["error"]["code"], "invalid_input");
+    assert_eq!(
+        body["error"]["message"],
+        "`at`: expected Timestamp, stored text that is not RFC 3339"
+    );
+
+    harness.shutdown();
+}
+
+/// The tag starting with `prefix` on a command response's single emitted event.
+fn tag(body: &Value, prefix: &str) -> String {
+    body["events"][0]["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|found| found.as_str().unwrap().to_owned())
+        .find(|found| found.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}` tag in {body:?}"))
 }

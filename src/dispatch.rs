@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use heklang::interp::ErrorKind;
-use heklang::ir::Stage;
+use heklang::ir::{Stage, Type};
 use heklang::value::Defs;
 use heklang::{Interpreter, Outcome, Program, Value};
 use tephra::{Position, PositionRange, Query, QueryItem, Tag, Tags, WriteHandle};
@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::context::CommandContext;
 use crate::crypto::KeyStore;
 use crate::envelope;
-use crate::heklang_host::{HeklaHost, to_heklang_json};
+use crate::heklang_host::{HeklaHost, timestamp_wire, to_heklang_json};
 use crate::schema::{EmittedEvent, EventDefs};
 use crate::tags::RESERVED_TAG_PREFIX;
 
@@ -116,15 +116,42 @@ fn bind_args(
         // An absent key and a key holding the wrong thing are different mistakes, and
         // "missing required field" is the more useful of the two answers. An optional
         // parameter takes the absence as `none` and falls through to the conversion.
-        if found.is_none() && !matches!(param.ty, heklang::ir::Type::Opt(_)) {
+        if found.is_none() && !matches!(param.ty, Type::Opt(_)) {
             return Err(format!("missing required field `{}`", param.name));
         }
-        let json = found.map_or(heklang::Json::Null, to_heklang_json);
+        // A `Timestamp` reaches heklang as epoch microseconds and reaches this boundary
+        // as RFC 3339 as well: that is what a read model serves back, what the generated
+        // document declares, and so what a client that read a row has in hand. The host
+        // converts on the way in exactly as it converts a stored column on the way out.
+        let text_timestamp = match found {
+            Some(serde_json::Value::String(text)) if is_timestamp(&param.ty) => {
+                Some(timestamp_wire(text).ok_or_else(|| {
+                    format!(
+                        "`{}`: expected Timestamp, stored text that is not RFC 3339",
+                        param.name
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        let json = text_timestamp
+            .as_ref()
+            .or(found)
+            .map_or(heklang::Json::Null, to_heklang_json);
         let value = Value::from_json(&json, &param.ty, defs)
             .map_err(|why| format!("`{}`: {why}", param.name))?;
         args.push((param.name.clone(), value));
     }
     Ok(args)
+}
+
+/// Whether a declared parameter holds a `Timestamp`, through an optional.
+fn is_timestamp(ty: &Type) -> bool {
+    match ty {
+        Type::Timestamp => true,
+        Type::Opt(inner) => is_timestamp(inner),
+        _ => false,
+    }
 }
 
 /// Whether a body is well formed for a command, without running it. The runtime checks

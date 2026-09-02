@@ -459,11 +459,19 @@ fn input_schema(schema: &InputSchema) -> Value {
         // (`schema.rs`) accepts null before it looks at the inner kind. Absence
         // alone is what `required` encodes, so the null has to be in the type too, or a
         // validating client refuses a body the server accepts.
-        let property = if kind.is_nullable() {
+        let mut property = if kind.is_nullable() {
             nullable(field_schema(kind))
         } else {
             field_schema(kind)
         };
+        // RFC 3339 is what `field_schema` declares and what a read response holds, so it
+        // is the form to write against. The binder also takes rule 8's epoch
+        // microseconds, which is what a tag holds and what an older client sends, and a
+        // schema that hid that would make a documented request body a lie in the other
+        // direction.
+        if matches!(kind.base(), FieldKind::Timestamp) {
+            property["description"] = json!("RFC 3339, or epoch microseconds as an integer");
+        }
         properties.insert(field.clone(), property);
         if !kind.is_nullable() {
             required.push(Value::String(field.clone()));

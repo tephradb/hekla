@@ -1212,13 +1212,25 @@ fn rfc3339(micros: i64) -> Option<String> {
         .ok()
 }
 
+/// An RFC 3339 timestamp as rule 8's epoch microseconds, or `None` when the text is not
+/// one.
+///
+/// hekla writes a `Timestamp` as RFC 3339 wherever it owns the shape: a read model's
+/// column, the read response built from it, and the `date-time` the generated document
+/// declares. So it has to read one back wherever a value returns, which is a stored
+/// column and a command's own input.
+pub(crate) fn timestamp_wire(text: &str) -> Option<serde_json::Value> {
+    heklang::value::timestamp(text).map(|micros| serde_json::Value::Number(micros.into()))
+}
+
 /// A column's stored form back as rule 8's, which is what `Value::from_json` reads.
 ///
 /// The inverse of [`column_form`], and only a `Timestamp` differs between the two.
 fn wire_form(kind: &FieldKind, stored: serde_json::Value) -> serde_json::Value {
     match (kind.base(), &stored) {
-        (FieldKind::Timestamp, serde_json::Value::String(text)) => heklang::value::timestamp(text)
-            .map_or(stored, |micros| serde_json::Value::Number(micros.into())),
+        (FieldKind::Timestamp, serde_json::Value::String(text)) => {
+            timestamp_wire(text).unwrap_or(stored)
+        }
         _ => stored,
     }
 }
