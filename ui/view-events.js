@@ -64,6 +64,13 @@ export function EventsView({ params, search }) {
     ])
   }
 
+  /* Opening an event keeps the query for the same reason closing it does (see `close`):
+   * the cursor lives in the URL, so navigating without it walks the list silently back
+   * to the newest page while `trail` still says we are deep in the log, leaving "newer"
+   * enabled over page one. */
+  const openEvent = (event) =>
+    go(`/admin/events/${event.position}` + window.location.search)
+
   const columns = [
     {
       key: 'position',
@@ -179,7 +186,7 @@ export function EventsView({ params, search }) {
               columns=${columns}
               rows=${data.events}
               selected=${(event) => String(event.position) === open}
-              onOpen=${(event) => go(`/admin/events/${event.position}`)}
+              onOpen=${openEvent}
             />
             <${Pager}
               cursor=${data.next_cursor}
