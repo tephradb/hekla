@@ -172,6 +172,78 @@ command RecordThing(thing_id: Uuid) {
     assert_eq!(internal, vec!["RecordThing"]);
 }
 
+/// A guard, a refusal and an event are ruled on by nothing, so the only thing the loader
+/// owes them is to be read wherever they are. `guards/` here is a directory hekla has
+/// never heard of, which is the point: it loads for the same reason `lib/` does.
+#[test]
+fn a_declaration_under_no_rule_loads_from_any_directory() {
+    assert_clean(&[
+        ("events/thing.hk", EVENTS),
+        ("lib/refusals.hk", r#"refusal NoSuchThing "no such thing""#),
+        (
+            "guards/thing.hk",
+            r#"
+guard ThingExists(thing_id: Uuid) {
+  state seen: Bool = fold false
+    on @thing.happened(thing_id) => true
+
+  if !seen {
+    return reject NoSuchThing
+  }
+}
+"#,
+        ),
+        (
+            "commands/do-thing.hk",
+            r#"
+command DoThing(thing_id: Uuid) {
+  guard ThingExists { thing_id }
+
+  emit @thing.happened { thing_id, note: "" }
+}
+"#,
+        ),
+    ]);
+}
+
+/// The whole tree is the program, down to the parts of it no convention covers. A file
+/// at the root is read, and a directory nobody has a name for is read.
+#[test]
+fn a_file_no_convention_covers_is_still_part_of_the_program() {
+    let dir = write_project(&[
+        ("thing.hk", EVENTS),
+        ("policies/limits.hk", "const MAX_THINGS: Int = 3"),
+        ("commands/do-thing.hk", TRIVIAL_COMMAND),
+    ]);
+    let project = LoadedProject::load(dir.path());
+
+    assert!(errors(&project).is_empty(), "{:?}", errors(&project));
+    assert!(warnings(&project).is_empty(), "{:?}", warnings(&project));
+    // The command's `emit` resolved, which it could only do against an event declared in
+    // a root-level file nothing names.
+    assert_eq!(project.events.len(), 1);
+}
+
+/// Three directories are not the program. `data/` is the runtime's own and holds the
+/// whole event log once a project has been serving; the other two hold copies, and a
+/// copy of a module collides with the module it was copied from.
+#[test]
+fn the_data_build_and_hidden_directories_are_not_read() {
+    let dir = write_project(&[
+        ("events/thing.hk", EVENTS),
+        ("commands/do-thing.hk", TRIVIAL_COMMAND),
+        ("data/events/vendored.hk", TRIVIAL_COMMAND),
+        ("target/debug/copied.hk", TRIVIAL_COMMAND),
+        (".git/hooks/staged.hk", TRIVIAL_COMMAND),
+    ]);
+    let project = LoadedProject::load(dir.path());
+
+    // Every copy redeclares `DoThing`, so reading one would be an error here rather than
+    // a silently doubled command.
+    assert!(errors(&project).is_empty(), "{:?}", errors(&project));
+    assert_eq!(project.commands.len(), 1);
+}
+
 /// A project whose tree cannot be fully read must fail rather than report success on
 /// the part it managed to see: a silently missing command would deploy.
 #[cfg(unix)]

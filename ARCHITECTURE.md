@@ -55,18 +55,18 @@ One word per concept, no synonyms.
 
 ## 3. Module layout and deployment
 
-A project is one heklang program spread over files. **The directory decides what a declaration is
-allowed to be; the declaration decides its name.**
+A project is one heklang program spread over files. **Three directories decide what a declaration is
+allowed to be; the declaration decides its name; everywhere else is the author's.**
 
 ```
 project/
-  events/              # event declarations
-  lib/                 # shared pure `fn`s and constants
-  commands/            # public commands (HTTP-routed and invokable by effects)
-  commands/internal/   # internal commands (invokable by effects, NOT HTTP-routed)
-  projectors/
-  effects/
-  tests/               # `hekla test` scenarios
+  commands/            # enforced: public commands (HTTP-routed and invokable by effects)
+  commands/internal/   # enforced: invokable by effects, NOT HTTP-routed
+  projectors/          # enforced
+  effects/             # enforced
+  events/              # convention
+  lib/                 # convention: guards, refusals, `fn`s, constants
+  tests/               # convention: `hekla test` scenarios
   hekla.toml            # operational config (optional)
 ```
 
@@ -79,9 +79,19 @@ project/
   declaring `command PlaceOrder(...)` is routed at `POST /commands/PlaceOrder`. The file name is a
   convention this repository follows and the runtime does not read. Under Starlark the file stem
   *was* the name, so this changed every URL the port touched.
-- **The directory is still load-bearing**, and it is hekla's rule rather than the language's:
-  heklang would accept a `projector` in `commands/`. `hekla check` refuses it, because the directory
-  is what makes a command routable and a projector a projector.
+- **A directory is a rule only where being in the wrong one would change what the runtime does.**
+  That is true of three: a command's directory routes it and decides whether anything can POST it,
+  and a projector's and an effect's is what they are. It is not true of an event, a guard, a refusal
+  or a `fn`, so hekla has nothing to say about where those live, and `events/` and `lib/` are what
+  the examples do rather than what the loader checks. The earlier design had a directory whitelist
+  deciding which files were *read*, which enforced none of this and could only fail one way: a file
+  in an unlisted directory vanished, and what the author saw was every use of what it declared
+  failing to resolve in files that were themselves correct. The whole tree is read now, and the
+  convention is checked per declaration, where the diagnostic can name the file at fault.
+- **`hek` and hekla agree on what the program is.** heklang compiles every `.hk` file under a path
+  with no convention at all, and hekla now discovers the same set (less `.`-directories, `target/`
+  and the runtime's `data/`). The only thing the two can disagree about is the three placement
+  rules, which is the disagreement hekla means to have.
 - **Public vs internal is structural, not a flag.** `commands/internal/` keeps effect-completion
   commands (for example `RecordShippingLabel`) off the HTTP surface, so nobody can POST a
   fabricated `shipping.label_created` with a tracking number that was never issued. It also keeps

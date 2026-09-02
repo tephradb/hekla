@@ -2,9 +2,14 @@
 //!
 //! The convention is hekla's and the program is heklang's. Every `.hk` file under the
 //! project is one program with no import graph and no order, so what used to be a
-//! `load()` resolver is now a walk and a single `check_files`. What survives is the
-//! part heklang has no opinion about: which directory a declaration may live in, and
-//! that `commands/internal/` is not routed over HTTP.
+//! `load()` resolver is now a walk and a single `check_files`.
+//!
+//! What survives is the part heklang has no opinion about, and it is three directories
+//! rather than a layout: a directory is enforced when a declaration in the wrong one
+//! would change what the runtime does, and only `commands/` (routed, and
+//! `commands/internal/` not), `projectors/` and `effects/` clear that bar. Where an
+//! event, a guard, a refusal or a `fn` is declared is the author's business. `events/`,
+//! `lib/` and `tests/` are what the examples do, and nothing here checks them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -93,66 +98,56 @@ impl Finding {
     }
 }
 
-/// The directories a project's modules live in.
-pub const MODULE_DIRS: [&str; 6] = [
-    "events",
-    "lib",
-    "commands",
-    "projectors",
-    "effects",
-    "tests",
-];
-
-/// Which directory convention a file falls under.
+/// A directory that decides something, and what it decides.
+///
+/// There are three, and the test each one passes is that a declaration in the wrong
+/// place would change what the runtime does: a command's directory is what routes it and
+/// what keeps `commands/internal/` off the HTTP surface, and a projector's and an
+/// effect's is what they are. No other declaration has an answer to "and then what
+/// breaks", so no other directory is a rule. There is deliberately no variant for
+/// `events/`, `lib/` or `tests/`: naming them here would mean enforcing them, and
+/// enforcing where an event may be declared buys nothing a reader does not already get
+/// from the project checking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    Events,
-    Lib,
     Command { internal: bool },
     Projector,
     Effect,
-    Test,
 }
 
 impl Role {
     pub fn label(self) -> &'static str {
         match self {
-            Role::Events => "events",
-            Role::Lib => "lib",
             Role::Command { .. } => "command",
             Role::Projector => "projector",
             Role::Effect => "effect",
-            Role::Test => "test",
         }
     }
 
-    /// The declaration kind a file in this directory may define. `None` for the
-    /// directories that declare no handler.
-    pub fn module_kind(self) -> Option<ModuleKind> {
+    /// The declaration kind a file in this directory may define. Total rather than
+    /// optional, which is the whole of the distinction this type now draws.
+    pub fn module_kind(self) -> ModuleKind {
         match self {
-            Role::Command { .. } => Some(ModuleKind::Command),
-            Role::Projector => Some(ModuleKind::Projector),
-            Role::Effect => Some(ModuleKind::Effect),
-            Role::Events | Role::Lib | Role::Test => None,
+            Role::Command { .. } => ModuleKind::Command,
+            Role::Projector => ModuleKind::Projector,
+            Role::Effect => ModuleKind::Effect,
         }
     }
 }
 
-/// The single source of truth for the directory convention.
+/// The single source of truth for the directory convention. `None` is the ordinary
+/// answer: the file is read like every other and no rule applies to it.
 pub fn role_for(rel: &str) -> Option<Role> {
     let dir = rel.split('/').next()?;
     if !rel.ends_with(".hk") || rel.len() <= dir.len() + 1 {
         return None;
     }
     match dir {
-        "events" => Some(Role::Events),
-        "lib" => Some(Role::Lib),
         "commands" => Some(Role::Command {
             internal: rel.starts_with("commands/internal/"),
         }),
         "projectors" => Some(Role::Projector),
         "effects" => Some(Role::Effect),
-        "tests" => Some(Role::Test),
         _ => None,
     }
 }
@@ -374,24 +369,55 @@ fn event_types<'a>(paths: impl Iterator<Item = &'a heklang::ir::EventPath>) -> V
     seen
 }
 
-/// Every `.hk` file under a module directory, sorted.
+/// Every `.hk` file in the project, sorted.
+///
+/// The whole tree, not a list of directories. heklang has no import, so a file is either
+/// in the program or absent from it, and a whitelist of directories can only ever decide
+/// the second one silently: what the author sees is not the file that was dropped but
+/// every *use* of what it declared, failing to resolve in files that are themselves fine.
+/// The convention is enforced per declaration instead, in [`role_for`], where the file
+/// having been read is what makes the diagnostic possible at all.
+///
+/// Three directories are skipped. Hidden ones and `target` for the reason `hek` skips
+/// them, which is that a build directory holding a copied `.hk` is not a second module
+/// and would collide with the source it was copied from. `data/` because it is the
+/// runtime's own: it holds no `.hk` at all, and on a project that has been serving for a
+/// while it holds a great many other files.
 pub(crate) fn hek_files(root: &Path, findings: &mut Vec<Finding>) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for dir in MODULE_DIRS {
-        let start = root.join(dir);
-        if !start.is_dir() {
-            continue;
-        }
-        for entry in WalkDir::new(&start).sort_by_file_name() {
-            match entry {
-                Ok(entry) if entry.file_type().is_file() => {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "hk") {
-                        found.push(path.to_path_buf());
-                    }
+    // A root that is not a directory discovers nothing and says nothing, which is what
+    // every subcommand but `openapi` wants; that one checks the path itself first.
+    if !root.is_dir() {
+        return found;
+    }
+    let walk = WalkDir::new(root)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if name.starts_with('.') || name == "target" {
+                return false;
+            }
+            !(entry.depth() == 1 && name == "data" && entry.file_type().is_dir())
+        });
+    for entry in walk {
+        match entry {
+            Ok(entry) if entry.file_type().is_file() => {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "hk") {
+                    found.push(path.to_path_buf());
                 }
-                Ok(_) => {}
-                Err(err) => findings.push(Finding::error(dir, format!("walking: {err}"))),
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let location = err
+                    .path()
+                    .map(|path| rel_to_string(root, path))
+                    .unwrap_or_default();
+                findings.push(Finding::error(location, format!("walking: {err}")));
             }
         }
     }
@@ -410,9 +436,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_directory_convention_decides_a_files_role() {
-        assert_eq!(role_for("events/order.hk"), Some(Role::Events));
-        assert_eq!(role_for("lib/validation.hk"), Some(Role::Lib));
+    fn the_three_enforced_directories_decide_a_files_role() {
         assert_eq!(
             role_for("commands/place-order.hk"),
             Some(Role::Command { internal: false })
@@ -421,16 +445,31 @@ mod tests {
             role_for("commands/internal/record-welcome.hk"),
             Some(Role::Command { internal: true })
         );
+        assert_eq!(
+            role_for("commands/billing/refund.hk"),
+            Some(Role::Command { internal: false }),
+            "only the literal `internal/` prefix marks a command internal"
+        );
         assert_eq!(role_for("projectors/orders.hk"), Some(Role::Projector));
         assert_eq!(role_for("effects/notify.hk"), Some(Role::Effect));
-        assert_eq!(role_for("tests/place-order.hk"), Some(Role::Test));
     }
 
+    /// Every other directory is read the same and ruled on by nothing, which is what
+    /// leaves an author free to put a guard beside the one command that names it or in
+    /// a file of its own.
     #[test]
-    fn a_file_outside_the_convention_has_no_role() {
-        assert_eq!(role_for("README.md"), None);
-        assert_eq!(role_for("events/order.star"), None, "the language changed");
+    fn a_directory_that_decides_nothing_has_no_role() {
+        assert_eq!(role_for("events/order.hk"), None);
+        assert_eq!(role_for("lib/validation.hk"), None);
+        assert_eq!(role_for("guards/shop.hk"), None);
+        assert_eq!(role_for("tests/place-order.hk"), None);
         assert_eq!(role_for("scratch/thing.hk"), None);
-        assert_eq!(role_for("events"), None, "a directory is not a module");
+        assert_eq!(role_for("README.md"), None);
+        assert_eq!(
+            role_for("commands/place-order.star"),
+            None,
+            "the language changed"
+        );
+        assert_eq!(role_for("commands"), None, "a directory is not a module");
     }
 }

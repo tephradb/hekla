@@ -36,17 +36,17 @@ something checks. Deployment is source text; there is no build step.
 
 ## 1. Project layout
 
-**The directory decides what a declaration is allowed to be; the declaration decides its name.**
+**Three directories decide what a declaration is allowed to be. Everywhere else is yours.**
 
 ```
 project/
-  events/              # event declarations
-  lib/                 # shared pure `fn`s and constants
-  commands/            # public commands: HTTP-routed and invokable by effects
-  commands/internal/   # internal commands: invokable by effects, NOT HTTP-routed
-  projectors/
-  effects/
-  tests/               # hekla test scenarios
+  commands/            # enforced: public commands, HTTP-routed and invokable by effects
+  commands/internal/   # enforced: invokable by effects, NOT HTTP-routed
+  projectors/          # enforced
+  effects/             # enforced
+  events/              # convention
+  lib/                 # convention: guards, refusals, `fn`s, constants, records, enums
+  tests/               # convention: hekla test scenarios
   hekla.toml           # operational config, optional
   data/                # created by the runtime: event log, read models, operational DB
 ```
@@ -55,17 +55,28 @@ Rules:
 
 - **There is no import.** Every `.hk` file in the project is compiled together, so a command names an
   event declared three directories away without saying so, and file order is irrelevant.
+- **Every `.hk` file in the project is read**, wherever it sits, including one at the root and one in
+  a directory you invented. Three are skipped: anything beginning with `.`, `target/`, and the
+  runtime's `data/`. A file that does not parse fails the check from wherever it is, so a scratch
+  module that is not meant to compile belongs under a dot-directory.
+- **A directory is enforced when putting a declaration in the wrong one would change what the runtime
+  does**, which is true of exactly three. A command's directory routes it, and `commands/internal/`
+  is what keeps a command off the HTTP surface. A projector's and an effect's directory is what makes
+  them a projector and an effect. `hekla check` refuses a `command` in `lib/` for that reason, and
+  heklang would accept it anywhere.
+- **Nothing rules on the rest.** An event, a guard, a refusal, a `fn`, a constant or a `test` is
+  read the same from any directory, so `events/`, `lib/` and `tests/` are habits rather than rules.
+  A guard used by one command is at home in that command's file; the ones several commands share go
+  in `lib/`, next to the refusals they return.
 - **A declaration is named by its declaration.** `commands/place-order.hk` declaring
   `command PlaceOrder(...)` is routed at `POST /commands/PlaceOrder`. The file name is a convention
   this repository follows and the runtime does not read; kebab-case files with PascalCase
   declarations is what the examples do.
-- **The directory is hekla's rule, not the language's.** heklang would accept a `projector` in
-  `commands/`; `hekla check` refuses it, because the directory is what makes a command routable.
 - **Public vs internal is structural.** Only the literal `commands/internal/` prefix marks a command
   internal. Nesting elsewhere is free and stays public: `commands/billing/refund.hk` is public.
 - Names must be unique within a kind, which the compiler enforces for the whole program.
 - **Deploy is restart.** The project loads at startup; there is no hot reload.
-- Files outside these directories, and non-`.hk` files, are ignored.
+- Non-`.hk` files are ignored.
 
 ## 2. What the runtime adds to an event
 
