@@ -463,7 +463,13 @@ pub(crate) fn render_finding(finding: &Finding) -> String {
         Some(span) => format!(":{}:{}", span.line + 1, span.column + 1),
         None => String::new(),
     };
-    format!("{severity}: {}{at}: {}", finding.location, finding.message)
+    let line = format!("{severity}: {}{at}: {}", finding.location, finding.message);
+    // heklang carries the fix on a separate hint, and a diagnostic that names the
+    // problem without it is the worse half of the message.
+    match &finding.hint {
+        Some(hint) => format!("{line}\n  = {hint}"),
+        None => line,
+    }
 }
 
 #[cfg(test)]

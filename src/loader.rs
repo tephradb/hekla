@@ -200,7 +200,9 @@ impl LoadedProject {
         let config = match Config::load(root) {
             Ok(config) => config,
             Err(err) => {
-                findings.push(Finding::error("hekla.toml", err.to_string()));
+                // `{err:#}` rather than `{err}`: the context is "parsing <path>" and the
+                // cause is what is actually wrong with the file.
+                findings.push(Finding::error("hekla.toml", format!("{err:#}")));
                 Config::default()
             }
         };
