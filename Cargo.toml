@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = "1.95.0"
 authors = ["Ari Seyhun <dev@tqwewe.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tephradb/hekla"
+repository = "https://git.tqwewe.com/tephra/hekla"
 categories = ["database-implementations", "web-programming"]
 keywords = ["event-sourcing", "dcb", "event-store", "runtime", "sqlite"]
 
@@ -14,7 +14,7 @@ keywords = ["event-sourcing", "dcb", "event-store", "runtime", "sqlite"]
 # are read from `CARGO_MANIFEST_DIR` at run time, so this is an `exclude` and never an
 # `include`: a list that missed one of them would break the publish-verify build. What is
 # dropped is what only describes this checkout.
-exclude = ["scripts/", "proptest-regressions/", ".helix/", ".claude/", "devenv.*", "flake.*", ".github/", "deny.toml"]
+exclude = ["scripts/", "proptest-regressions/", ".helix/", ".claude/", "devenv.*", "flake.*", ".forgejo/", "deny.toml"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"

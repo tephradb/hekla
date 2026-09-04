@@ -12,12 +12,12 @@ durable journal so an effect that crashes mid-way resumes without re-firing what
 
 There is no build step and no artefact. **Deploy is restart.**
 
-[tephra]: https://github.com/tephradb/tephra
+[tephra]: https://git.tqwewe.com/tephra/tephra
 
 ## This skill assumes the heklang skill beside it
 
 The language is heklang's and is documented in the **heklang skill**
-(`github.com/tephradb/heklang`, at `.claude/skills/heklang/`). Events, commands, guards, refusals,
+(`git.tqwewe.com/tephra/heklang`, at `.claude/skills/heklang/`). Events, commands, guards, refusals,
 projectors, effects, folds, sealed content, `fn`, types and `test` scenarios are all there, and
 nothing here restates them: a second copy could only drift, and the two ship on different release
 cycles.
@@ -39,9 +39,9 @@ hekla erase <field> <value> <dir>    # delete one subject's key. Irreversible
 hekla rotate <dir>    # rewrap every subject key under the current master
 ```
 
-Install with `cargo install hekla`, or `nix run github:tephradb/hekla` to run it without installing
-anything. From a hekla checkout it is `cargo run -- check <dir>`. Every subcommand defaults `<dir>`
-to `.`.
+Install with `cargo install hekla`, or `nix run git+https://git.tqwewe.com/tephra/hekla` to run it
+without installing anything. From a hekla checkout it is `cargo run -- check <dir>`. Every
+subcommand defaults `<dir>` to `.`.
 
 **Workflow for every change:** edit the `.hk` files, `hekla check`, fix what it names, `hekla test`,
 then run it. `hekla check` is the gate for placement and read-model shape; `hekla test` is the gate

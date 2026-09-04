@@ -1,0 +1,69 @@
+name: ci
+
+# Checks on every push to main and every pull request: formatting, clippy, tests, rustdoc,
+# the declared MSRV, and the dependency audit. Green here means the tree is correct and
+# clean.
+#
+# One job rather than one per gate. The runner is a single host with capacity 1, so jobs run
+# in sequence anyway, and each one would start from an empty `target/`; sharing a job means
+# the tests reuse what clippy already built. Every gate is still its own step, so a failure
+# names itself.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes an in-progress run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # `native` is the runner on the desktop, running jobs directly on NixOS rather than in a
+  # container: the Rust toolchain, cargo-deny and the cross compilers all come from
+  # `hostPackages` in desktop/forgejo-runner.nix. There are no cache steps because CARGO_HOME
+  # and SCCACHE_DIR already point outside the job's working directory.
+  ci:
+    runs-on: native
+    steps:
+      - uses: actions/checkout@v4
+
+      # Canonical formatting.
+      - run: cargo fmt --all --check
+
+      # Everything compiles cleanly and lint-free: lib, bin, and tests. This is the primary
+      # "it builds" gate. rusqlite is bundled, so this compiles SQLite from C as well.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Unit, integration, and doctests. Not --all-targets, so doctests actually run. The
+      # integration tests read examples/ and tests/fixtures/ from the source tree.
+      - run: cargo test --workspace --all-features
+
+      # Rustdoc with warnings denied, catching broken intra-doc links and other doc warnings.
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # The worked example the hekla skill ships, run by the tool it documents. `openapi` is
+      # here as well as `check` because `check` exits 0 on a directory it found nothing in, so
+      # it alone would not notice the example moving or disappearing.
+      - run: cargo run -- check .claude/skills/hekla/example
+      - run: cargo run -- test .claude/skills/hekla/example
+      - run: cargo run -- openapi .claude/skills/hekla/example > /dev/null
+
+      # Dependency audit: security advisories, license policy, banned/duplicate crates, sources.
+      - run: cargo deny check
+
+  # Verify the declared minimum supported Rust version still builds. 1.95.0 is what tephra and
+  # seglog require, and they set the floor for the whole graph.
+  #
+  # $RUST_MSRV_BIN is a second toolchain the runner keeps off PATH so it cannot shadow the
+  # stable one; `services.forgejoRunner.msrvVersion` is what pins it. Its own job because a
+  # different rustc means a different target directory either way.
+  msrv:
+    runs-on: native
+    steps:
+      - uses: actions/checkout@v4
+      - run: PATH="$RUST_MSRV_BIN:$PATH" cargo check --workspace --all-features

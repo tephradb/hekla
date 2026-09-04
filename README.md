@@ -16,8 +16,8 @@ a Temporal-style journal so a crash mid-arm resumes without re-firing what alrea
 hekla runs on [tephra] for the event log and SQLite for read models. It is a rewrite of [umari],
 which expressed the same model as WASM component modules.
 
-[heklang]: https://github.com/tephradb/heklang
-[tephra]: https://github.com/tephradb/tephra
+[heklang]: https://git.tqwewe.com/tephra/heklang
+[tephra]: https://git.tqwewe.com/tephra/tephra
 [umari]: https://github.com/tqwewe/umari
 
 ## What a project looks like
@@ -71,8 +71,8 @@ declarations, with an OpenAPI document and a reference UI at `/docs`.
 cargo install hekla
 ```
 
-Or `nix run github:tephradb/hekla` to run it without installing anything, and `nix build
-github:tephradb/hekla` for the binary alone.
+Or `nix run git+https://git.tqwewe.com/tephra/hekla` to run it without installing anything, and
+`nix build git+https://git.tqwewe.com/tephra/hekla` for the binary alone.
 
 One binary is the whole runtime: it serves the API, runs the scenarios, and does the key
 management. [tephra] is embedded as a library and SQLite is bundled, so there is no server to
@@ -137,7 +137,7 @@ not lock the segment directory itself.
 - [ARCHITECTURE.md] covers the design and the alternatives that were rejected.
 - [ROADMAP.md] tracks what is done and what is next.
 
-[heklang/docs/]: https://github.com/tephradb/heklang/tree/main/docs
+[heklang/docs/]: https://git.tqwewe.com/tephra/heklang/src/branch/main/docs
 
 [AUTHORING.md]: AUTHORING.md
 [ARCHITECTURE.md]: ARCHITECTURE.md
