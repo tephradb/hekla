@@ -59,11 +59,11 @@ jobs:
   # Verify the declared minimum supported Rust version still builds. 1.95.0 is what tephra and
   # seglog require, and they set the floor for the whole graph.
   #
-  # $RUST_MSRV_BIN is a second toolchain the runner keeps off PATH so it cannot shadow the
-  # stable one; `services.forgejoRunner.msrvVersion` is what pins it. Its own job because a
-  # different rustc means a different target directory either way.
+  # $RUST_MSRV_DIR holds the pinned toolchains the runner keeps off PATH so they cannot shadow
+  # the stable one; `services.forgejoRunner.msrvVersions` is what lists them. Its own job
+  # because a different rustc means a different target directory either way.
   msrv:
     runs-on: native
     steps:
       - uses: actions/checkout@v4
-      - run: PATH="$RUST_MSRV_BIN:$PATH" cargo check --workspace --all-features
+      - run: PATH="$RUST_MSRV_DIR/1.95.0/bin:$PATH" cargo check --workspace --all-features
