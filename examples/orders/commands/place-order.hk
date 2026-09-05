@@ -23,13 +23,13 @@ command PlaceOrder(
 ) {
   // Narrow: this one order. A caller retrying the same `order_id` is a no-op rather
   // than a second order.
-  state placed: Bool = fold false
+  fold placed: Bool = false
     on @order.placed(order_id) => true
 
   // Wide on purpose: an allocation is a rule about every order in the shop, so every
   // order in a shop conflicts with every other. That is what a hard cap costs, and the
   // retry loop is what absorbs it.
-  state sold: Int = fold 0
+  fold sold: Int = 0
     on @order.placed(shop_id) => sold + 1
 
   if placed {

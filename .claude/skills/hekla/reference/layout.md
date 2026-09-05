@@ -106,10 +106,12 @@ write replays into the existence clause instead of appending twice.
 - One process per data directory, enforced by an exclusive lock.
 - The whole of the deployable artefact is the source tree plus `HEKLA_MASTER_KEY`. There is no build
   step, no compile cache and no schema migration for the log.
-- Changing an entity's shape or a projector's subscription changes its definition hash and triggers a
-  rebuild at the next start (`operations.md`). Changing a handler body does not.
-- Changing an effect's source changes its script hash, which is recorded per invocation and reported
-  by `/admin`, and makes `hekla verify` skip invocations recorded under the old code.
+- Changing what a projector does changes its definition hash and triggers a rebuild at the next start
+  (`operations.md`). That includes the handler bodies, and any `const` or `guard` they reach, because
+  those are inlined. Reformatting does not: the hash is over the lowered program, not the source.
+- Changing what an effect does changes its hash, which is recorded per invocation as its
+  `script_hash` and reported by `/admin`, and makes `hekla verify` skip invocations recorded under
+  the old behaviour. Reformatting an effect keeps that coverage.
 
 ## Embedding
 

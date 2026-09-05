@@ -230,6 +230,106 @@ fn an_unchanged_definition_does_not_rebuild() {
     b.shutdown();
 }
 
+/// The capability the digest reclaims.
+///
+/// The definition used to be a hand-rolled hash of the subscription and the entity
+/// shapes, with the handler bodies deliberately left out: including them meant hashing
+/// source text, and then every comment forced a full replay. So a corrected handler
+/// changed nothing, and the model kept serving rows the old logic had built while
+/// applying the new logic to everything after the checkpoint. The digest hashes what
+/// runs, so this now rebuilds.
+#[test]
+fn a_handler_body_edit_rebuilds() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    let counting = |body: &str| {
+        format!(
+            "\nprojector Counter {{\n  entity Totals {{ id: String @key @max(16), n: Int }}\n\n\
+             {}}}\n",
+            arms("@e.one", body)
+        )
+    };
+
+    write_project_with(
+        project.path(),
+        counting("patch Totals[\"all\"] { n: .n + 1 }"),
+        None,
+    );
+    let a = boot(project.path(), data.path());
+    emit(&a.rt, "EmitOne");
+    emit(&a.rt, "EmitOne");
+    assert!(wait_count(&a.rt, 2));
+    let stamped = recorded_definition(data.path());
+    a.shutdown();
+
+    // Same subscription, same entity, different arithmetic. Nothing the old definition
+    // hash could see moved.
+    write_project_with(
+        project.path(),
+        counting("patch Totals[\"all\"] { n: .n + 2 }"),
+        None,
+    );
+    let b = boot(project.path(), data.path());
+    assert!(
+        wait_count(&b.rt, 4),
+        "the two recorded events must be re-folded by the corrected handler, not left \
+         at what the old one wrote"
+    );
+    assert_ne!(
+        recorded_definition(data.path()),
+        stamped,
+        "and the rebuild must stamp the new definition"
+    );
+    b.shutdown();
+}
+
+/// The other half of the same claim, and the one every scheme this replaced got wrong:
+/// layout is not behaviour, so reformatting a projector must not cost a full replay.
+#[test]
+fn a_cosmetic_edit_does_not_rebuild() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    write_project(project.path(), "@e.one");
+    let a = boot(project.path(), data.path());
+    emit(&a.rt, "EmitOne");
+    assert!(wait_count(&a.rt, 1));
+    let stamped = recorded_definition(data.path());
+    a.shutdown();
+
+    // Reindented, commented, and with the handler's binding renamed. Every byte of the
+    // file moved; nothing it does did.
+    let reformatted = r#"
+// The running total, across every @e.one ever appended.
+projector Counter {
+  entity Totals {
+      id:    String @key @max(16),
+      n:     Int
+  }
+
+  on @e.one as appended {
+
+    // One more.
+    patch Totals["all"] { n: .n + 1 }
+  }
+}
+"#;
+    write_project_with(project.path(), reformatted.to_owned(), None);
+    let b = boot(project.path(), data.path());
+    assert_eq!(
+        recorded_definition(data.path()),
+        stamped,
+        "a reformat is not a definition change"
+    );
+    emit(&b.rt, "EmitOne");
+    assert!(
+        wait_count(&b.rt, 2),
+        "so the projector resumes from its checkpoint rather than replaying from 0"
+    );
+    b.shutdown();
+}
+
 #[test]
 fn an_added_entity_field_rebuilds_with_the_new_column() {
     let project = tempfile::tempdir().unwrap();

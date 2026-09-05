@@ -38,10 +38,10 @@ use crate::crypto::{KeyStore, MasterKeys};
 use crate::dispatch::{self, CommandOutcome};
 use crate::effect::{self, EffectRuntime, EffectShared};
 use crate::http::HttpClient;
-use crate::loader::{CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
+use crate::loader::{self, CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::lock::DataDirLock;
 use crate::opdb::{
-    EffectState, InvocationAt, InvocationRow, InvocationState, JournalRow, ModuleRow, OpDb,
+    DeclarationRow, EffectState, InvocationAt, InvocationRow, InvocationState, JournalRow, OpDb,
     SubjectInfo,
 };
 use crate::openapi;
@@ -146,6 +146,36 @@ fn jitter_roll() -> u64 {
     })
 }
 
+/// Every declaration this project deploys, as rows.
+///
+/// `Digest::entries` already holds back the `test` declarations, which is what hekla
+/// wants: a test runs nothing in production, so recording one as deployed would be a
+/// lie. The packed form is stored beside the hash because it reads back, so a hash
+/// recorded here can later be shown as the thing it stands for with no source tree in
+/// reach.
+fn declarations(project: &LoadedProject) -> Vec<DeclarationRow> {
+    let paths = loader::module_paths(&project.program);
+    project
+        .digest
+        .entries()
+        .iter()
+        .map(|entry| DeclarationRow {
+            kind: entry.kind.name().to_owned(),
+            name: entry.name.clone(),
+            hash: entry.hash.to_string(),
+            signature_hash: entry.signature_hash.map(|hash| hash.to_string()),
+            form: entry.form.packed(),
+            signature: entry.signature.as_ref().map(|sexp| sexp.packed()),
+            module: paths.get(&(entry.kind, entry.name.clone())).cloned(),
+            // Both timestamps and `current` are the writer's to set: an existing row
+            // keeps the `first_seen` it already has.
+            first_seen: String::new(),
+            last_seen: String::new(),
+            current: true,
+        })
+        .collect()
+}
+
 /// The final HTTP outcome of a command execution: the status and the response body.
 pub struct ExecResult {
     pub status: u16,
@@ -218,7 +248,7 @@ impl Runtime {
         let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default())
             .context("starting the write coordinator")?;
 
-        let opdb = OpDb::open(&data_dir.join("hekla.db"))?;
+        let mut opdb = OpDb::open(&data_dir.join("hekla.db"))?;
         let now = now_rfc3339();
 
         // Generated before the project is taken apart below: `Surface` borrows the whole
@@ -226,9 +256,13 @@ impl Runtime {
         // document and the dumped one cannot disagree.
         let openapi_json = openapi::build(&openapi::Surface::from_project(&project)).to_string();
 
+        // Recorded whole, and before the project is taken apart below: the digest covers
+        // every declaration, not just the three kinds that become units, so this is also
+        // where an event's shape is persisted. One write rather than one per module.
+        opdb.set_current_declarations(&declarations(&project), &now)?;
+
         let mut commands = HashMap::new();
         for unit in project.commands {
-            opdb.upsert_module_metadata(unit.def.name(), "command", &unit.source_hash, &now)?;
             let name = unit.def.name().to_owned();
             commands.insert(name, Arc::new(unit));
         }
@@ -241,9 +275,6 @@ impl Runtime {
         let auto_rebuild = project.config.projectors.auto_rebuild;
         let verify = project.config.verify.enabled;
         let config = project.config.clone();
-        for unit in &projector_units {
-            opdb.upsert_module_metadata(unit.def.name(), "projector", &unit.source_hash, &now)?;
-        }
         // Event field metadata, shared with the projector and effect runtimes so a
         // fold or a `handle` sees subject fields as opaque handles.
         let events = Arc::new(project.events.clone());
@@ -258,9 +289,6 @@ impl Runtime {
 
         let effect_units: Vec<Arc<EffectUnit>> =
             project.effects.into_iter().map(Arc::new).collect();
-        for unit in &effect_units {
-            opdb.upsert_module_metadata(unit.def.name(), "effect", &unit.source_hash, &now)?;
-        }
 
         let opdb = Arc::new(Mutex::new(opdb));
         let keystore = master.map(|master| KeyStore::new(opdb.clone(), master));
@@ -757,8 +785,8 @@ impl Runtime {
         self.lock_opdb().effect_states()
     }
 
-    pub(crate) fn module_metadata(&self) -> anyhow::Result<Vec<ModuleRow>> {
-        self.lock_opdb().module_metadata()
+    pub(crate) fn current_declarations(&self) -> anyhow::Result<Vec<DeclarationRow>> {
+        self.lock_opdb().current_declarations()
     }
 
     pub(crate) fn subject_key_counts(&self) -> anyhow::Result<Vec<(String, u64)>> {

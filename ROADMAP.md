@@ -1411,6 +1411,45 @@ this: the carry buys nothing on a shallow boundary and buys everything on a deep
 - **The backoff policy is unchanged**, again deliberately, and for the same reason: measuring a
   restored carry and a new retry cadence at once would attribute neither.
 
+## Phase 23: a meaningful change is one you can hash (done)
+
+hekla answered "did this code change?" three different ways, and all three hashed **source text**, so
+a reformat, a comment fix or a renamed local read as a rewrite. `loader.rs` hashed each `.hk` file's
+raw bytes, which also meant two declarations sharing a file shared a hash. `projector.rs` hand-rolled
+a `definition_hash` over the subscription and entity shapes, *deliberately excluding the handler
+bodies*, because including them meant a full replay on every comment. And `effect_invocation.script_hash`
+was the file hash, so `hekla verify` silently skipped every recorded invocation of an effect that had
+merely been reindented, and said nothing about why its coverage went to zero.
+
+heklang gained a digest: a deterministic per-declaration hash over the lowered IR, where sugar is gone
+by construction, local binders are slot numbers, contract names are kept verbatim, sequences stay
+ordered and sets are sorted. Adopting it deleted all three schemes.
+
+What shipped: a `declaration` table replacing `module_metadata`, keyed `(kind, name, hash)` so a boot
+that loads unchanged code writes no row and a restart loop costs nothing, retaining every version of
+every declaration with its packed form. `module_metadata`, the per-file `hashes` map and `hash_of`,
+and the forty lines of `definition_hash` all went.
+
+- **The projector rebuild reclaims a capability.** The definition is now the projector's entry hash,
+  which covers the handler bodies. The old binary choice was "rebuild on every comment" or "never
+  rebuild on a logic fix", and hekla had picked the second, so a corrected projector kept serving rows
+  the old logic built until an operator remembered to replay it. Both halves are now right. The blast
+  radius is wider than before in one direction: `const`, `refusal` and `guard` are inlined before a
+  program exists, so editing a shared `const` rebuilds every projector that reaches it. That is
+  correct, and worth knowing.
+- **`script_hash` resolves three ways, not two.** Because the table retains history, a recorded hash
+  is the current one, a known earlier version (whose form is on hand), or absent entirely, which means
+  it was written under some other scheme and nothing follows from comparing it. The restart warning
+  excludes the third case rather than blaming the code for it.
+- **The event registry exists now.** `Digest::entries` covers events, enums, records and `fn`s as well
+  as the three module kinds, and all of them are recorded. hekla previously persisted nothing about an
+  event's declared shape, so a `Money` scale change, a flipped `@no_index` or a newly added `@subject`
+  was undetectable. It is the prerequisite for a deploy-time diff.
+- **What it does not do.** `hekla plan` is not built. This phase is its foundation: the schema and
+  signature half of that diff is now a join over `declaration`, but nothing consumes it yet, and the
+  effect-replay half additionally needs a baseline that can be *executed*, which the packed form
+  cannot be (it is a rendering, not a serialisation).
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

@@ -14,10 +14,10 @@ command OpenTicket(
   contact: String?,
   meta: Json,
 ) {
-  state opened: Bool = fold false
+  fold opened: Bool = false
     on @ticket.opened(ticket_id) => true
 
-  state in_org: Int = fold 0
+  fold in_org: Int = 0
     on @ticket.opened(org_id) => in_org + 1
 
   if opened {

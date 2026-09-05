@@ -11,7 +11,7 @@ effect ConfirmBooking {
     // The fold is bounded at this event's own position, so the count is a function of
     // the log prefix rather than of when the handler happened to run. An effect gets
     // state this way, never by reading a projector.
-    state stays: Int = fold 0
+    fold stays: Int = 0
       on @booking.made(guest_id: e.guest_id) => stays + 1
 
     let response = http.post("https://concierge.example/confirmations", {

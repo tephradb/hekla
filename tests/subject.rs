@@ -231,7 +231,7 @@ command CopyOrder(order_id: Uuid, customer_id: Int) {
   // Folds this customer's own address. The variable is sealed under `customer_id`,
   // and the emit below writes it into a field sealed under the same subject, so it
   // moves without ever being read.
-  state email: String? = fold none
+  fold email: String? = none
     on @order.placed(customer_id) { email } => email
 
   emit @order.placed { order_id, customer_id, email }
@@ -278,7 +278,7 @@ event @order.placed {
                 "commands/copy-order.hk",
                 r#"
 command CopyOrder(order_id: Uuid, customer_id: Int, shop_id: Int) {
-  state email: String? = fold none
+  fold email: String? = none
     on @order.placed(customer_id) { email } => email
 
   emit @order.placed { order_id, customer_id, shop_id, email: none, contact: email }

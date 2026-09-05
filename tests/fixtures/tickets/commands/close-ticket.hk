@@ -2,10 +2,10 @@
 // that was never opened is a refusal, because it is a different mistake.
 
 command CloseTicket(ticket_id: Uuid, org_id: Int) {
-  state opened: Bool = fold false
+  fold opened: Bool = false
     on @ticket.opened(ticket_id) => true
 
-  state closed: Bool = fold false
+  fold closed: Bool = false
     on @ticket.closed(ticket_id) => true
 
   if closed {

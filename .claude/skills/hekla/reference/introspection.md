@@ -17,7 +17,7 @@ events without authentication, and one prefix is what a proxy can deny.
 | `/admin/effects/{name}/invocations` | invocations, newest first |
 | `/admin/effects/{name}/invocations/{position}` | one invocation and every call it journaled |
 | `/admin/projectors`, `/admin/projectors/{name}` | readiness, entity shapes, definition hash |
-| `/admin/schema` | the loaded project: events, commands (internal included), projectors, effects |
+| `/admin/schema` | the loaded project: every declaration with its hash and signature hash |
 | `/admin/system` | version, uptime, data directory, op-DB schema version, keystore, effective config |
 | `/admin/subjects`, `/admin/subjects/{field}/{value}` | which subjects still hold key material, never the material |
 | `/admin/assets/{file}` | the console's own files; the one path under the prefix that is not negotiated |
@@ -124,8 +124,9 @@ Readiness, lag, position, entity shapes and the `definition_hash` the read model
 ## `/admin/schema` and `/admin/system`
 
 `/admin/schema` is the project this process loaded, including internal commands, each command's input
-kinds, each module's file path and its `source_hash`. It is how to tell what a running server is
-actually executing.
+kinds, and every declaration with the file it came from, its `hash` (what it does) and its
+`signature_hash` (what of it is visible outside). Events, enums, records and `fn`s are in there too,
+not just the three module kinds. It is how to tell what a running server is actually executing.
 
 `/admin/system` reports `version`, `uptime_seconds`, `data_dir`, `opdb_schema_version`, `log_head`,
 `verify`, the keystore (`configured`, `master_key_ids`) and the **effective** `hekla.toml`.

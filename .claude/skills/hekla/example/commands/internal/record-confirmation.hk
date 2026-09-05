@@ -8,7 +8,7 @@
 refusal AlreadyConfirmed "this booking was already confirmed"
 
 command RecordConfirmation(booking_id: Uuid) {
-  state confirmed: Bool = fold false
+  fold confirmed: Bool = false
     on @booking.confirmed(booking_id) => true
 
   if confirmed {

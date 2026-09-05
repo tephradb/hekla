@@ -33,7 +33,9 @@ use crate::crypto::{KeyStore, RowDecryptor};
 use crate::effect::EffectShared;
 use crate::envelope;
 use crate::heklang_host::unsealed_json;
-use crate::opdb::{EffectState, InvocationAt, InvocationRow, JournalRow, ModuleRow, SubjectInfo};
+use crate::opdb::{
+    DeclarationRow, EffectState, InvocationAt, InvocationRow, JournalRow, SubjectInfo,
+};
 use crate::projector::ProjectorShared;
 use crate::read_api::filterable_fields;
 use crate::read_model::key_kind;
@@ -487,13 +489,22 @@ pub fn event_def(def: &EventDef) -> Value {
     })
 }
 
-/// One deployed module as recorded at boot.
-pub fn module(row: &ModuleRow) -> Value {
+/// One deployed declaration as recorded at boot.
+///
+/// `hash` is what the declaration does and `signature_hash` is what of it is visible
+/// from outside, so two builds that differ only in the first changed behaviour without
+/// changing a contract. The packed `form` is deliberately not served here: it is the
+/// bulkiest column by far and a reader wanting it is asking a different question than
+/// "what is deployed".
+pub fn declaration(row: &DeclarationRow) -> Value {
     json!({
-        "name": row.name,
         "kind": row.kind,
-        "source_hash": row.source_hash,
-        "loaded_at": row.loaded_at,
+        "name": row.name,
+        "hash": row.hash,
+        "signature_hash": row.signature_hash,
+        "module": row.module,
+        "first_seen": row.first_seen,
+        "last_seen": row.last_seen,
     })
 }
 

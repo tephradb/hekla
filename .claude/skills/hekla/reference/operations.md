@@ -6,7 +6,7 @@
 data/
   events/                tephra segments, the immutable source of truth
   projectors/{Name}.db   one SQLite database per projector: read-model tables and its checkpoint
-  hekla.db               the operational DB: effect journals, subject keys, module metadata
+  hekla.db               the operational DB: effect journals, subject keys, declarations
 ```
 
 Backup is copying the directory of a **stopped** process. A `cp -r` of a live one is not

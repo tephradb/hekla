@@ -49,9 +49,13 @@ pub struct Retention {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Projectors {
-    /// Whether a projector rebuilds automatically when its source set or entity
-    /// schema changes (the event set it was built from is now different). On by
-    /// default; a large deployment can turn it off to schedule rebuilds by hand.
+    /// Whether a projector rebuilds automatically when what it does changes: its
+    /// subscription, its entity shapes, or its handler bodies. On by default; a large
+    /// deployment can turn it off to schedule rebuilds by hand.
+    ///
+    /// The handler bodies count because the definition is heklang's digest hash, which
+    /// covers behaviour and ignores layout. A reformat therefore rebuilds nothing, and
+    /// a corrected handler no longer leaves rows the old logic built in place.
     pub auto_rebuild: bool,
 }
 

@@ -355,7 +355,7 @@ pub const REGISTER_ACCOUNT: &str = r#"
 refusal HandleTaken "that handle is already registered"
 
 command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
-  state taken: Bool = fold false
+  fold taken: Bool = false
     on @account.registered(handle) => true
 
   if taken {

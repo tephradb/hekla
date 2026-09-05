@@ -37,14 +37,15 @@ One word per concept, no synonyms.
   fields are tags, emitting auto-tags them, and queries pass structured `tags = {...}` that the
   runtime encodes. There is no separate "domain ID" term; a tag is a tag.
 - **Slice**: an event type plus the filters that narrow it, resolved to literal values. A slice is
-  what a `state` declares and what an append conditions on.
+  what a `fold` declares and what an append conditions on.
 - **Consistency boundary**: the set of events a command reads, which is exactly the slices its
-  `state` declarations name. Optimistic concurrency is enforced by appending under a tephra
+  `fold` declarations name. Optimistic concurrency is enforced by appending under a tephra
   `AppendCondition` over the same slices: **what you folded is what you conflict on**.
 - **Command, Projector, Effect**: the three declaration kinds (sections 5 to 7).
-- **Fold**: the reduction a `state` performs over its slices to recover decision state. The
-  declaration and the reduction are one construct, so a boundary and the state derived from it
-  cannot drift apart.
+- **Fold**: one keyword for both halves, because they are one construct: a `fold` declares the slices
+  it reads *and* the reduction it performs over them to recover decision state. A boundary and the
+  state derived from it therefore cannot drift apart. It was spelled `state` until heklang collapsed
+  the two words, which is why the state a fold produces has no keyword of its own.
 - **Read model**: a projector's SQLite database. A rebuildable cache, never a source of truth.
 - **Journal**: an effect's durable record of its side-effect calls, keyed by content hash, used to
   replay the effect deterministically after a crash. Lives in the operational DB, never the log.
@@ -247,7 +248,7 @@ only writer.
 refusal TooManyOpen "too many open orders"
 
 command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?, total: Money(2)) {
-  state open_orders: Int = fold 0
+  fold open_orders: Int = 0
     on @order.placed(customer_id) => open_orders + 1
     on @order.cancelled(customer_id) => open_orders - 1
 
@@ -259,8 +260,8 @@ command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?, total: Mone
 }
 ```
 
-**`state` is a read declaration, not a binding**, and it is the one thing about a command worth
-understanding before anything else. A `state` declares a **slice** of the log (an event type plus
+**`fold` is a read declaration, not a binding**, and it is the one thing about a command worth
+understanding before anything else. A `fold` declares a **slice** of the log (an event type plus
 the filters that narrow it) and folds it into a value. The slices are what the append conditions on,
 so **what you folded is what you conflict on**. A `let` produces no slice and contributes nothing.
 
@@ -276,8 +277,8 @@ exists.
   answerable: it is the same shape a tag query has, so the host that appends against it can also
   index on it.
 - **Filters are sorted by field name**, so one slice is one predicate however it was written.
-- **`guard` is a `state` that binds nothing**, for a decision that depends on a slice being empty
-  when there is no value to keep. It is rarely what you want: a `state` already contributes its
+- **`guard` is a `fold` that binds nothing**, for a decision that depends on a slice being empty
+  when there is no value to keep. It is rarely what you want: a `fold` already contributes its
   slice, so guarding what a fold already covers adds a duplicate predicate and no safety.
 - **A fold arm may not read the clock or call out**, because a fold is not journaled: every attempt
   re-folds and must get the same answer.
@@ -323,12 +324,12 @@ position that state covers, and the next one reads strictly after it, folding wh
 it already has: a fold is a left fold over an append-only log, so folding `[0, a)` then `[a, b)` is
 the state folding `[0, b)` would have given. Being beaten to the log on a boundary a hundred thousand
 events deep therefore costs the handful of events that beat you. The carry lives in heklang's frame
-because that is the only place a folded `state` exists; hekla could not do it from outside, and for
+because that is the only place folded state exists; hekla could not do it from outside, and for
 one phase after the port it did not, so every retry re-read the whole boundary from position zero.
 
 What the port *did* remove for good is the machinery that made the carry safe under Starlark: a
 frozen scratch heap per attempt and the `Immutable` error that policed a `handle` writing into
-`state`. heklang has no mutable binding, and the carry is taken before the body runs, so there is no
+folded state. heklang has no mutable binding, and the carry is taken before the body runs, so there is no
 longer a way to write the bug they caught.
 
 **A fold's cost is flat in the boundary's depth**, which under Starlark it was not. Starlark collects
@@ -440,13 +441,27 @@ concurrently. Replay is rebuild-and-swap: build a fresh database from position 0
 WAL back into the file and drop to rollback mode so it is self-contained), then rename it in, so state
 and position move together atomically and a reader that opens the file mid-swap never sees a torn one.
 
-**Definition reconcile and readiness**: a projector records the hash of its *definition* (its
-subscription and entity schema, not its handler bodies) inside its read model. At startup the recorded hash is
+**Definition reconcile and readiness**: a projector records the hash of its *definition* inside its
+read model. The definition is heklang's digest entry for that projector, which covers its
+subscription, its entity shapes **and** its handler bodies. At startup the recorded hash is
 compared with the current one before the projector is published, because the read API builds
 its `SELECT` from the current entity definitions while the database on disk still has the previous
 shape, and `CREATE TABLE IF NOT EXISTS` will not add a column to an existing table. Comparing is one
 small read; only the replay it may imply is slow, and that stays on the projector thread, so boot
-never blocks on log length. Each projector therefore carries a readiness:
+never blocks on log length.
+
+**The handler bodies are in it, and that is new.** hekla used to canonicalize the subscription and
+the entity shapes by hand and leave the bodies out, because the only way to include them was to hash
+source text and then every comment forced a full replay. The cost was that a *corrected* projector
+changed nothing: the model kept serving rows the old logic had built while applying the new logic to
+everything after the checkpoint, until an operator remembered `POST /projectors/{Name}/replay`. The
+digest hashes what runs rather than how it is written, so both halves are now right: a reformat
+rebuilds nothing and a fixed handler rebuilds. Because `const`, `refusal` and `guard` are inlined
+before a program exists, a projector's hash also covers every one it reaches, so editing a shared
+`const` rebuilds each projector that uses it. That is the correct blast radius and a wider one than
+before.
+
+Each projector therefore carries a readiness:
 
 - `ready`: the on-disk model matches the current definition, and reads are served normally.
 - `rebuilding`: the definition changed and a rebuild is in flight. Reads of that projector answer
@@ -498,7 +513,7 @@ crashes are handled by replay.
 ```
 effect NotifyCustomer {
   on @order.placed as e {
-    state orders: Int = fold 0
+    fold orders: Int = 0
       on @order.placed(customer_id: e.customer_id) => orders + 1
 
     let response = http.post("https://mail.example/confirm", {
@@ -533,7 +548,7 @@ whose clause matched ran in declaration order. Three things went wrong with that
 A projector legitimately wants the other rule and keeps it: it has no journal, so nothing about
 ordering is dangerous there.
 
-**State lives inside the arm.** `as e` binds the trigger, and it is in scope for the arm's `state`
+**State lives inside the arm.** `as e` binds the trigger, and it is in scope for the arm's `fold`
 filters and its body. There is no effect-level trigger and no effect-level state, which is what lets
 two arms of one effect fold different slices of the log.
 
@@ -541,10 +556,19 @@ two arms of one effect fold different slices of the log.
 legitimately-identical repeated calls. It is not a sequence number, so editing or reordering the
 arm does not corrupt replay, which is what makes live editing safe later. The language hands the
 host a readable key and an ordinal; hekla stores the sha256 of the key, which is what keeps the hash
-a host concern and the key the language's. The source hash is recorded in the journal. v1 does not pin to it, but on restart, if an in-flight
-invocation's recorded hash differs from the on-disk code, the runtime logs a warning naming the
+a host concern and the key the language's. The effect's **digest hash** is recorded on the
+invocation as its `script_hash`. v1 does not pin to it, but on restart, if an in-flight invocation's
+recorded hash names a *different known version* of the effect, the runtime logs a warning naming the
 effect and invocation. That makes an otherwise invisible situation visible, and it is exactly the
 field the pinning implementation needs later, so writing it now avoids a journal-format migration.
+
+Being a digest hash rather than a hash of the file is what makes both halves of that useful. A
+reformat no longer reads as a redeploy, so the warning fires on behaviour and not on layout, and
+`hekla verify`'s replay check keeps its coverage across one. And because the `declaration` table
+retains every version of every declaration, a recorded hash resolves three ways rather than two:
+equal to the current one, a known earlier version (whose packed form is on hand to show), or absent
+from the table entirely, which means it was written under some other scheme and nothing can be
+concluded by comparing it.
 
 **Journal storage** is the shared operational DB, never the event log. HTTP responses are
 operational scratch (tokens, PII), not domain facts; putting them in an immutable log would make
@@ -579,8 +603,8 @@ stays as well, because a journaled value can be read back by a build other than 
 it: an invocation straddling a deploy hits its first not-yet-journaled `invoke` against a command
 that may have changed.
 
-**State**: an arm declares `state` exactly as a command does, with the trigger binding in scope for
-its filters. The fold is bounded at the arm's own position, inclusive, so `state` is a pure function
+**State**: an arm declares `fold` exactly as a command does, with the trigger binding in scope for
+its filters. The fold is bounded at the arm's own position, inclusive, so its state is a pure function
 of the log prefix and that position.
 
 That bound is the whole design. Because the state is derived rather than observed, it cannot race a
@@ -686,7 +710,7 @@ silent.
 data/
   events/                # tephra segments (immutable source of truth)
   projectors/{Name}.db   # read-model tables + checkpoint (one transaction)
-  hekla.db               # shared operational DB: effect journals, subject keys, module metadata
+  hekla.db               # shared operational DB: effect journals, subject keys, declarations
 ```
 
 Backup is "copy the directory". Projector databases are rebuildable from the log regardless, so a
@@ -958,7 +982,7 @@ may be done to it, and everything else is a compile error:
 
 | | Why it is safe |
 | --- | --- |
-| **Move it** into a position sealed under the same subject: a `let`, a `state` fold, an entity column, another event field | the content is never read |
+| **Move it** into a position sealed under the same subject: a `let`, a `fold`, an entity column, another event field | the content is never read |
 | **Ask if it is there**: `.is_some()` / `.is_none()` | presence is not content |
 | **`reveal` it** | the boundary itself |
 

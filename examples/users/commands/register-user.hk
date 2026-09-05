@@ -5,7 +5,7 @@
 refusal EmailTaken "that email is already registered"
 
 command RegisterUser(user_id: Uuid, email: String, name: String) {
-  state taken: Bool = fold false
+  fold taken: Bool = false
     on @user.registered(email) => true
 
   if is_blank(name) {

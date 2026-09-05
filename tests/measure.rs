@@ -128,7 +128,7 @@ command DoThing(id: Uuid, shop: Int, secret: String?) {
 refusal Counted(seen: Int) "{seen}"
 
 command CountThing(id: Uuid, shop: Int) {
-  state seen: Int = fold 0
+  fold seen: Int = 0
     on @thing.happened(shop) => seen + 1
 
   if seen >= 0 {
@@ -190,7 +190,7 @@ command DoThing(id: Uuid, shop: Int, secret: String?) {
 refusal Counted(seen: Int) "{seen}"
 
 command CountThing(id: Uuid, shop: Int) {
-  state seen: Int = fold 0
+  fold seen: Int = 0
     on @thing.happened(shop) => seen + 1
 
   if seen >= 0 {
@@ -264,9 +264,9 @@ fn contention_against_the_retry_budget() {
 refusal SoldOut "gone"
 
 command PlaceOrder(order_id: Uuid, shop_id: Int) {
-  state placed: Bool = fold false
+  fold placed: Bool = false
     on @order.placed(order_id) => true
-  state sold: Int = fold 0
+  fold sold: Int = 0
     on @order.placed(shop_id) => sold + 1
 
   if placed {
@@ -370,7 +370,7 @@ command SeedOrder(order_id: Uuid, shop_id: Int) {
             "commands/place-order.hk",
             r#"
 command PlaceOrder(order_id: Uuid, shop_id: Int) {
-  state sold: Int = fold 0
+  fold sold: Int = 0
     on @order.placed(shop_id) => sold + 1
 
   emit @order.placed { order_id, shop_id }

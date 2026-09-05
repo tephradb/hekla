@@ -465,7 +465,7 @@ async fn the_schema_endpoint_reports_internal_commands_the_document_omits() {
         .iter()
         .find(|c| c["name"] == json!("RegisterUser"))
         .unwrap();
-    assert!(register["source_hash"].as_str().unwrap().len() == 64);
+    assert!(register["hash"].as_str().unwrap().len() == 64);
     let input: Vec<&str> = register["input"]
         .as_array()
         .unwrap()
@@ -491,17 +491,32 @@ async fn the_schema_endpoint_reports_internal_commands_the_document_omits() {
         ]
     );
 
-    // Every module is recorded at boot, which is the only place a projector's or
-    // effect's source hash survives the units moving into their threads.
-    let modules: Vec<(&str, &str)> = schema["modules"]
+    // Every declaration is recorded at boot, which is the only place a projector's or
+    // effect's hash survives the units moving into their threads. The digest covers
+    // more than the three module kinds, so an event's shape is recorded here too, which
+    // is the one durable record hekla keeps of what an event was declared as.
+    let declared: Vec<(&str, &str)> = schema["declarations"]
         .as_array()
         .unwrap()
         .iter()
         .map(|m| (m["kind"].as_str().unwrap(), m["name"].as_str().unwrap()))
         .collect();
-    assert!(modules.contains(&("effect", "SendWelcome")));
-    assert!(modules.contains(&("projector", "Users")));
-    assert!(modules.iter().all(|(_, name)| !name.is_empty()));
+    assert!(declared.contains(&("effect", "SendWelcome")));
+    assert!(declared.contains(&("projector", "Users")));
+    assert!(declared.contains(&("command", "RegisterUser")));
+    assert!(
+        declared.contains(&("event", "@user.registered")),
+        "an event is a declaration too, and it keeps the sigil heklang names it by: {declared:?}"
+    );
+    assert!(
+        declared.contains(&("function", "is_blank")),
+        "a `fn` in lib/ is deployed like anything else: {declared:?}"
+    );
+    assert!(declared.iter().all(|(_, name)| !name.is_empty()));
+    assert!(
+        !declared.iter().any(|(kind, _)| *kind == "test"),
+        "a test runs nothing in production, so recording it as deployed would be a lie"
+    );
 
     harness.shutdown();
 }

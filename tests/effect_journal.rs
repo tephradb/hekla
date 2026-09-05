@@ -514,7 +514,7 @@ fn an_invoke_outcome_reads_through_its_three_accessors() {
 refusal AlreadyActive "that user is already active"
 
 command ActivateUser(user_id: Uuid) {
-  state activated: Bool = fold false
+  fold activated: Bool = false
     on @user.activated(user_id) => true
 
   if activated {
@@ -719,7 +719,7 @@ fn an_effects_arms_are_exactly_its_subscription() {
 const FOLDING_EFFECT: &str = r#"
 effect Notify {
   on @user.registered { user_id } {
-    state activations: Int = fold 0
+    fold activations: Int = 0
       on @user.activated(user_id) => activations + 1
 
     http.post("https://a.test/seen", { "activations": activations })

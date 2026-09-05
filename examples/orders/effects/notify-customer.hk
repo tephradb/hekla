@@ -11,7 +11,7 @@
 effect NotifyCustomer {
   on @order.placed as e { order_id, customer_id, email } {
     // Inclusive of the triggering event, so a customer's first order leaves this at 1.
-    state orders: Int = fold 0
+    fold orders: Int = 0
       on @order.placed(customer_id) => orders + 1
 
     if email.is_none() {

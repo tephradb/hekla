@@ -3,7 +3,7 @@
 // the append and its journal write.
 
 command RecordNotified(ticket_id: Uuid) {
-  state notified: Bool = fold false
+  fold notified: Bool = false
     on @ticket.notified(ticket_id) => true
 
   if notified {

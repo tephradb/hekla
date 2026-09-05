@@ -38,16 +38,16 @@ event @order.placed {
 refusal SoldOut "this shop's launch allocation is gone"
 
 command PlaceOrder(order_id: Uuid, customer_id: Int, shop_id: Int, email: String?) {
-  // `state` is a read declaration, not a binding: it names a slice of the log, folds
+  // `fold` is a read declaration, not a binding: it names a slice of the log, folds
   // it, and that slice is what the append conditions on. What you folded is what you
   // conflict on, so a concurrent write inside it loses rather than races.
   //
   // Narrow: this one order, so a retry of the same id is a no-op.
-  state placed: Bool = fold false
+  fold placed: Bool = false
     on @order.placed(order_id) => true
 
   // Wide on purpose: a launch allocation is a rule about every order in the shop.
-  state sold: Int = fold 0
+  fold sold: Int = 0
     on @order.placed(shop_id) => sold + 1
 
   if placed {

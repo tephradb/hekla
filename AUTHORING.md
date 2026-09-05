@@ -25,7 +25,7 @@ something checks. Deployment is source text; there is no build step.
 
 | For | Read |
 |---|---|
-| Commands, `state`, slices, the append condition | `heklang/docs/commands.md` |
+| Commands, `fold`, slices, the append condition | `heklang/docs/commands.md` |
 | Projectors, `put` / `patch` / `update` / `delete`, subject propagation | `heklang/docs/projectors.md` |
 | Effects, arms, the journal, `reveal` and `erase`, the 14 numbered rules | `heklang/docs/effects.md` |
 | `test` scenarios: `given`, `run`, `project`, `deliver`, `expect` | `heklang/docs/testing.md` |
@@ -291,7 +291,7 @@ A read-only surface for looking at a running system. Every route is a `GET` and 
 | `GET /admin/effects` and `/{Name}` | Per effect: position, lag, durable watermark, failure count, last error, quarantine record. |
 | `GET /admin/effects/{Name}/invocations[/{position}]` | An effect's invocations, and for one of them the calls it journaled with what each returned. This is how you diagnose a wedge. The call list pages (`?cursor=` is the previous page's `next_cursor`), so a truncated list never reads as the whole sequence. |
 | `GET /admin/projectors` and `/{Name}` | Readiness, lag, entity shapes, and the definition hash the read model was built under. `?counts=true` adds row counts (a full scan, so opt-in). |
-| `GET /admin/schema` | The project this process loaded: events, commands (including internal ones), projectors, effects, and each module's source hash. |
+| `GET /admin/schema` | The project this process loaded: events, commands (including internal ones), projectors, effects, and every declaration with the hash of what it does and of what is visible outside it. |
 | `GET /admin/system` | Version, uptime, data directory, operational-DB schema version, keystore state, and the effective `hekla.toml`. |
 | `GET /admin/subjects` and `/{field}/{value}` | Which subjects still hold key material. Never the key material. |
 
@@ -398,8 +398,8 @@ rotation.
 
 ## 9. Rules of thumb
 
-- **`state` is a read declaration, not a binding.** What you fold is what you conflict on, so put an
-  event type in a `state` when a concurrent write of it should fail this command, and use `guard`
+- **`fold` is a read declaration, not a binding.** What you fold is what you conflict on, so put an
+  event type in a `fold` when a concurrent write of it should fail this command, and use `guard`
   when you need a slice in the boundary that nothing folds.
 - **Client-supplied ids.** There is no random uuid, and there will not be: a retry re-runs the code
   that would mint one. Have the caller send the id, take one from a journaled response, or derive one
@@ -455,13 +455,13 @@ command PlaceOrder(
 ) {
   // Narrow: this one order. A caller retrying the same `order_id` is a no-op rather
   // than a second order.
-  state placed: Bool = fold false
+  fold placed: Bool = false
     on @order.placed(order_id) => true
 
   // Wide on purpose: an allocation is a rule about every order in the shop, so every
   // order in a shop conflicts with every other. That is what a hard cap costs, and the
   // retry loop is what absorbs it.
-  state sold: Int = fold 0
+  fold sold: Int = 0
     on @order.placed(shop_id) => sold + 1
 
   if placed {
@@ -500,7 +500,7 @@ effect NotifyCustomer {
   on @order.placed as e {
     // The fold stops at this event's own position, so the count is a function of the
     // log prefix rather than of when the handler happened to run.
-    state orders: Int = fold 0
+    fold orders: Int = 0
       on @order.placed(customer_id: e.customer_id) => orders + 1
 
     // `reveal` is the explicit decrypt boundary; only an effect has it.

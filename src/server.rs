@@ -1183,7 +1183,7 @@ async fn admin_projector(
 /// tracing an effect's `invoke_command` needs to see them.
 async fn admin_schema(State(runtime): State<Shared>) -> Response {
     blocking_json(move || {
-        let modules = runtime.module_metadata()?;
+        let declarations = runtime.current_declarations()?;
         let mut events: Vec<&EventDef> = runtime.events_map().values().collect();
         events.sort_by(|a, b| a.event_type.cmp(&b.event_type));
         let commands: Vec<Value> = runtime
@@ -1208,7 +1208,7 @@ async fn admin_schema(State(runtime): State<Shared>) -> Response {
                     "name": unit.def.name(),
                     "internal": unit.internal,
                     "path": unit.rel_path,
-                    "source_hash": unit.source_hash,
+                    "hash": unit.digest_hash,
                     "input": input,
                 }))
             })
@@ -1239,7 +1239,7 @@ async fn admin_schema(State(runtime): State<Shared>) -> Response {
             "commands": commands,
             "projectors": projectors,
             "effects": effects,
-            "modules": modules.iter().map(introspect::module).collect::<Vec<_>>(),
+            "declarations": declarations.iter().map(introspect::declaration).collect::<Vec<_>>(),
         }))
     })
     .await

@@ -299,9 +299,25 @@ const FIXED_SCHEMAS: [&str; 22] = [
     "EventDetail",
     "EntityDetail",
     "ProjectorDetail",
-    "ModuleSummary",
+    "DeclarationSummary",
     "SystemInfo",
     "SubjectEntry",
+];
+
+/// Every kind a `declaration` row can carry: heklang's set minus `test`.
+///
+/// `Digest::entries` holds the tests back, so no recorded declaration can ever be one.
+/// A `const`, a `refusal` and a `guard` are absent for a different reason: heklang
+/// inlines all three before a program exists, so their content is already inside every
+/// declaration that names them and they have no entry to record.
+const DECLARATION_KINDS: [&str; 7] = [
+    "event",
+    "enum",
+    "record",
+    "function",
+    "command",
+    "projector",
+    "effect",
 ];
 
 /// Make every `operationId` unique, which OpenAPI requires and a client generator
@@ -1392,7 +1408,7 @@ fn schema_path() -> Value {
                                 an effect can invoke it.",
                         },
                         "path": { "type": "string", "description": "Project-relative source path." },
-                        "source_hash": { "type": "string" },
+                        "hash": { "type": "string", "description": "Its digest entry hash." },
                         // Not a `FieldDetail`: a command's `input = schema(...)` carries
                         // a name and a kind and nothing else. Tagging, subjects and
                         // uniqueness are event and entity policy, and `schema()` rejects
@@ -1415,7 +1431,7 @@ fn schema_path() -> Value {
                             },
                         },
                     },
-                    "required": ["name", "internal", "path", "source_hash", "input"],
+                    "required": ["name", "internal", "path", "hash", "input"],
                     "additionalProperties": false,
                 },
             },
@@ -1444,9 +1460,9 @@ fn schema_path() -> Value {
                     "additionalProperties": false,
                 },
             },
-            "modules": { "type": "array", "items": schema_ref("ModuleSummary") },
+            "declarations": { "type": "array", "items": schema_ref("DeclarationSummary") },
         },
-        "required": ["events", "commands", "projectors", "effects", "modules"],
+        "required": ["events", "commands", "projectors", "effects", "declarations"],
         "additionalProperties": false,
     });
     json!({
@@ -1454,7 +1470,7 @@ fn schema_path() -> Value {
             "tags": [INTROSPECTION_TAG],
             "operationId": "get_project_schema",
             "summary": "the project this process loaded",
-            "description": "The declared vocabulary and the modules serving it, with the source \
+            "description": "The declared vocabulary and the modules serving it, with the digest \
                 hash of each as recorded at boot. Answers \"is what is running what I \
                 deployed?\" without shelling into the host.",
             "responses": {
@@ -1624,7 +1640,10 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("EventDetail".to_owned(), event_detail_schema());
     out.insert("EntityDetail".to_owned(), entity_detail_schema());
     out.insert("ProjectorDetail".to_owned(), projector_detail_schema());
-    out.insert("ModuleSummary".to_owned(), module_summary_schema());
+    out.insert(
+        "DeclarationSummary".to_owned(),
+        declaration_summary_schema(),
+    );
     out.insert("SystemInfo".to_owned(), system_info_schema());
     out.insert("SubjectEntry".to_owned(), subject_entry_schema());
     for (event_type, def) in &surface.events {
@@ -2332,8 +2351,9 @@ fn effect_invocation_schema() -> Value {
             },
             "script_hash": {
                 "type": "string",
-                "description": "The effect module's source hash at the time the invocation ran. \
-                    A replay check skips an invocation whose module has since been edited.",
+                "description": "The effect's digest entry hash at the time the invocation ran. \
+                    A replay check skips an invocation whose effect has since changed behaviour; \
+                    a reformat is not such a change, so the check keeps its coverage across one.",
             },
             "created_at": { "type": "string" },
             "completed_at": { "type": ["string", "null"] },
@@ -2517,9 +2537,11 @@ fn projector_detail_schema() -> Value {
             "sources": sources_schema(),
             "definition_hash": {
                 "type": ["string", "null"],
-                "description": "The source set and entity schema the stored rows were built \
-                    under, read from the read model itself. Null on the list endpoint, which \
-                    opens no database.",
+                "description": "The projector's digest entry hash at the time the stored rows \
+                    were built, read from the read model itself. It covers the handler bodies as \
+                    well as the subscription and the entity shapes, so a corrected handler \
+                    rebuilds; it ignores layout, so a reformat does not. Null on the list \
+                    endpoint, which opens no database.",
             },
             "entities": { "type": "array", "items": schema_ref("EntityDetail") },
         },
@@ -2532,18 +2554,39 @@ fn projector_detail_schema() -> Value {
     })
 }
 
-fn module_summary_schema() -> Value {
+fn declaration_summary_schema() -> Value {
     json!({
         "type": "object",
-        "description": "A module as recorded at boot. The only place a projector's or effect's \
-            source hash survives: the units carrying it move into their threads.",
+        "description": "One declaration as recorded at boot, hashed by what it does rather than \
+            by how it was written, so a reformat leaves every hash where it was. The only place a \
+            projector's or effect's hash survives: the units carrying it move into their threads.",
         "properties": {
-            "name": { "type": "string" },
-            "kind": { "type": "string", "enum": ["command", "projector", "effect"] },
-            "source_hash": { "type": "string" },
-            "loaded_at": { "type": "string" },
+            "kind": { "type": "string", "enum": DECLARATION_KINDS },
+            "name": {
+                "type": "string",
+                "description": "As heklang names it, so an event keeps its `@` sigil.",
+            },
+            "hash": {
+                "type": "string",
+                "description": "What this declaration does. Two builds differing here behave \
+                    differently.",
+            },
+            "signature_hash": {
+                "type": ["string", "null"],
+                "description": "What of it is visible from outside: an event's fields, a \
+                    command's parameters and refusal codes, a projector's columns, an effect's \
+                    subscription. Null for a `fn`, which nothing outside can name.",
+            },
+            "module": {
+                "type": ["string", "null"],
+                "description": "The file it was declared in. Outside the hash on purpose, so \
+                    moving a declaration between files does not read as a change. Null for an \
+                    event and an enum, whose declarations carry no module.",
+            },
+            "first_seen": { "type": "string" },
+            "last_seen": { "type": "string" },
         },
-        "required": ["name", "kind", "source_hash", "loaded_at"],
+        "required": ["kind", "name", "hash", "signature_hash", "module", "first_seen", "last_seen"],
         "additionalProperties": false,
     })
 }
@@ -3414,6 +3457,39 @@ mod tests {
             declared,
             vec!["decrypted", "encrypted", "erased", "stale", "unreadable"]
         );
+    }
+
+    #[test]
+    fn the_declaration_kind_enum_is_spelled_the_way_heklang_spells_it() {
+        use heklang::Kind;
+        // Tied to `Kind::name` rather than to string literals, so a rename upstream
+        // fails here instead of silently making the document describe kinds no row can
+        // hold. `Test` is the one kind deliberately left out: `Digest::entries` holds
+        // tests back, so a declaration row can never carry it.
+        let expected: Vec<&str> = [
+            Kind::Event,
+            Kind::Enum,
+            Kind::Record,
+            Kind::Function,
+            Kind::Command,
+            Kind::Projector,
+            Kind::Effect,
+        ]
+        .iter()
+        .map(|kind| kind.name())
+        .collect();
+        assert_eq!(DECLARATION_KINDS.to_vec(), expected);
+        assert!(!DECLARATION_KINDS.contains(&Kind::Test.name()));
+
+        let doc = full_doc();
+        let declared: Vec<&str> = doc["components"]["schemas"]["DeclarationSummary"]["properties"]
+            ["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(declared, expected);
     }
 
     #[test]

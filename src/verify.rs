@@ -367,9 +367,12 @@ fn sweep_effect(
         crate::heklang_host::query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
 
     for (position, script_hash) in runtime.terminal_invocations(name)? {
-        // An edited effect diverges legitimately: the recorded run and the current
-        // code are different programs, and the journal is keyed to the old one.
-        if script_hash != unit.source_hash {
+        // An effect that now behaves differently diverges legitimately: the recorded run
+        // and the current code are different programs, and the journal is keyed to the
+        // old one. The hash is the digest's, so this asks whether the effect *does*
+        // something different rather than whether the file was touched: reindenting one,
+        // or renaming a local, keeps every invocation below in the check.
+        if script_hash != unit.digest_hash {
             report.invocations_skipped += 1;
             continue;
         }

@@ -115,7 +115,7 @@ export function SchemaView() {
                         ${command.input.map((field) => `${field.name}: ${field.kind}`).join(', ') ||
                         '-'}
                       </td>
-                      <td class="tiny dim mono">${shortHash(command.source_hash)}</td>
+                      <td class="tiny dim mono">${shortHash(command.hash)}</td>
                     </tr>
                   `,
                 )}
@@ -148,26 +148,44 @@ export function SchemaView() {
           </section>
 
           <section class="card">
-            <header>Modules</header>
+            <header>Declarations</header>
+            <p class="tiny faint">
+              Hashed by what each declaration does, not by how it is written, so a reformat
+              leaves every hash where it was. <em>Signature</em> is the part visible from
+              outside: change it and a client can tell.
+            </p>
             <table class="data">
               <thead>
                 <tr>
                   <th scope="col">Name</th>
                   <th scope="col" style=${{ width: '110px' }}>Kind</th>
-                  <th scope="col" style=${{ width: '140px' }}>Source hash</th>
-                  <th scope="col">Loaded</th>
+                  <th scope="col" style=${{ width: '140px' }}>Hash</th>
+                  <th scope="col" style=${{ width: '140px' }}>Signature</th>
+                  <th scope="col">Declared in</th>
+                  <th scope="col">Seen</th>
                 </tr>
               </thead>
               <tbody>
-                ${schema.modules.map(
-                  (module) => html`
-                    <tr key=${module.name}>
-                      <td><code>${module.name}</code></td>
-                      <td><span class="pill mute">${module.kind}</span></td>
+                ${schema.declarations.map(
+                  (declaration) => html`
+                    <tr key=${`${declaration.kind}/${declaration.name}`}>
+                      <td><code>${declaration.name}</code></td>
+                      <td><span class="pill mute">${declaration.kind}</span></td>
                       <td class="mono tiny row">
-                        ${shortHash(module.source_hash)}<${Copy} value=${module.source_hash} />
+                        ${shortHash(declaration.hash)}<${Copy} value=${declaration.hash} />
                       </td>
-                      <td class="tiny dim">${stamp(module.loaded_at)}</td>
+                      <td class="mono tiny row">
+                        ${declaration.signature_hash
+                          ? html`${shortHash(declaration.signature_hash)}
+                              <${Copy} value=${declaration.signature_hash} />`
+                          : html`<span
+                              class="dim"
+                              title="nothing outside the program can name a fn, so it has no signature"
+                              >-</span
+                            >`}
+                      </td>
+                      <td class="tiny dim mono">${declaration.module ?? '-'}</td>
+                      <td class="tiny dim">${stamp(declaration.last_seen)}</td>
                     </tr>
                   `,
                 )}

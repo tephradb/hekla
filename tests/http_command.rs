@@ -175,7 +175,7 @@ async fn a_timestamp_parameter_takes_rfc_3339_and_epoch_micros() {
         (
             "commands/book-slot.hk",
             "command BookSlot(slot_id: Uuid, at: Timestamp, until: Timestamp?) {\n  \
-             state booked: Bool = fold false\n    on @slot.booked(slot_id) => true\n\n  \
+             fold booked: Bool = false\n    on @slot.booked(slot_id) => true\n\n  \
              if booked {\n    return\n  }\n\n  emit @slot.booked { slot_id, at, until }\n}\n",
         ),
     ]);

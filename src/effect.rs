@@ -387,7 +387,7 @@ fn spawn(
     let sources = sources.clone();
     let name = name.clone();
     let resume = runtime.effect_resume_after(&name)?;
-    for position in runtime.running_with_hash_mismatch(&name, &unit.source_hash)? {
+    for position in runtime.running_with_hash_mismatch(&name, &unit.digest_hash)? {
         tracing::warn!(
             "effect `{name}` has an in-flight invocation at position {position} recorded under a \
              different script hash; replaying it against the current code"
@@ -530,7 +530,7 @@ fn run_inner(
                     shared,
                     name,
                     program,
-                    &unit.source_hash,
+                    &unit.digest_hash,
                     runtime,
                     http,
                     position.get(),

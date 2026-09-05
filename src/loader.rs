@@ -14,11 +14,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use heklang::{Diagnostic, Program, Severity as HekSeverity};
+use heklang::{Diagnostic, Digest, Entry, Kind, Program, Severity as HekSeverity};
 use walkdir::WalkDir;
 
 use crate::config::Config;
-use crate::hash;
 use crate::schema::{self, EntityDef, EventDef, EventDefs, InputSchema, ModuleDef, ModuleKind};
 
 /// How severe a [`Finding`] is. Only errors fail `hek check`.
@@ -156,7 +155,9 @@ pub fn role_for(rel: &str) -> Option<Role> {
 pub struct CommandUnit {
     pub def: ModuleDef,
     pub rel_path: String,
-    pub source_hash: String,
+    /// This declaration's [`heklang::Digest`] entry hash: what it *does*, not what it
+    /// was written as: a reformat leaves it where it was.
+    pub digest_hash: String,
     /// Internal commands (`commands/internal/`) are invokable by effects but not
     /// routed over HTTP.
     pub internal: bool,
@@ -165,7 +166,9 @@ pub struct CommandUnit {
 pub struct ProjectorUnit {
     pub def: ModuleDef,
     pub rel_path: String,
-    pub source_hash: String,
+    /// See [`CommandUnit::digest_hash`]. This is also what the read model records as
+    /// its definition, so a rebuild follows a change in behaviour rather than layout.
+    pub digest_hash: String,
     /// The entities this projector declares, as tables.
     pub entities: Vec<EntityDef>,
     /// The event types its handlers select, which is its subscription.
@@ -175,7 +178,9 @@ pub struct ProjectorUnit {
 pub struct EffectUnit {
     pub def: ModuleDef,
     pub rel_path: String,
-    pub source_hash: String,
+    /// See [`CommandUnit::digest_hash`]. This is also what an invocation records as its
+    /// `script_hash`, so a reformat no longer costs the replay check its coverage.
+    pub digest_hash: String,
     /// The event types its arms select.
     pub sources: Vec<String>,
 }
@@ -187,11 +192,62 @@ pub struct LoadedProject {
     /// The one program every declaration lives in. Parsed once and shared: heklang's
     /// `Program` is `Send + Sync`, so every thread reads this one.
     pub program: Program,
+    /// What the program does, per declaration, as heklang renders it. The one source of
+    /// every hash hekla records: a module hash, a projector's definition and an
+    /// invocation's `script_hash` are all an entry hash out of here.
+    pub digest: Digest,
     pub events: EventDefs,
     pub commands: Vec<CommandUnit>,
     pub projectors: Vec<ProjectorUnit>,
     pub effects: Vec<EffectUnit>,
     pub findings: Vec<Finding>,
+}
+
+/// Every declaration's entry hash, keyed by kind and the name heklang knows it by.
+///
+/// Only the three module kinds are looked up through this; the rest of the digest is
+/// recorded whole. `Hash` renders as hex and does not read back, so a hash is a
+/// `String` from here on and every comparison against one is a string comparison.
+/// Where each declaration was written, keyed the way the digest names it.
+///
+/// A digest has no per-module identity on purpose: heklang treats a module as a label
+/// for a diagnostic, so moving a declaration between files must not move its hash.
+/// hekla still wants to show an author where something is declared, so the path rides
+/// alongside the entry rather than inside it.
+///
+/// An event and an enum are absent because their declarations carry no module at all,
+/// which is why the column this feeds is nullable.
+pub fn module_paths(program: &Program) -> HashMap<(Kind, String), String> {
+    let mut out = HashMap::new();
+    let mut add = |kind: Kind, name: &str, module: &Option<String>| {
+        if let Some(module) = module {
+            out.insert((kind, name.to_owned()), module.clone());
+        }
+    };
+    for def in &program.records {
+        add(Kind::Record, &def.name, &def.module);
+    }
+    for def in &program.functions {
+        add(Kind::Function, &def.name, &def.module);
+    }
+    for def in &program.commands {
+        add(Kind::Command, &def.name, &def.module);
+    }
+    for def in &program.projectors {
+        add(Kind::Projector, &def.name, &def.module);
+    }
+    for def in &program.effects {
+        add(Kind::Effect, &def.name, &def.module);
+    }
+    out
+}
+
+fn digest_hashes(digest: &Digest) -> HashMap<(Kind, &str), String> {
+    digest
+        .entries()
+        .iter()
+        .map(|entry: &Entry| ((entry.kind, entry.name.as_str()), entry.hash.to_string()))
+        .collect()
 }
 
 impl LoadedProject {
@@ -217,11 +273,6 @@ impl LoadedProject {
         }
         sources.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let hashes: HashMap<String, String> = sources
-            .iter()
-            .map(|(rel, text)| (rel.clone(), hash::sha256_hex(text.as_bytes())))
-            .collect();
-
         let borrowed: Vec<(&str, &str)> = sources
             .iter()
             .map(|(rel, text)| (rel.as_str(), text.as_str()))
@@ -237,6 +288,10 @@ impl LoadedProject {
                     root: root.to_path_buf(),
                     config,
                     program: Program::default(),
+                    // A program that did not check has no digest form, so there is
+                    // nothing to take one of. `Digest` has no `Default`; an empty
+                    // program's digest is the same empty answer.
+                    digest: Digest::of(&Program::default()),
                     events: EventDefs::new(),
                     commands: Vec::new(),
                     projectors: Vec::new(),
@@ -252,12 +307,13 @@ impl LoadedProject {
             .collect();
 
         let defs = heklang::Defs::of(&program);
-        let hash_of = |module: &Option<String>| {
-            module
-                .as_ref()
-                .and_then(|rel| hashes.get(rel))
+        let digest = Digest::of(&program);
+        let hashes = digest_hashes(&digest);
+        let hash_of = |kind: Kind, name: &str| {
+            hashes
+                .get(&(kind, name))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_else(|| unreachable!("`{name}` checked but has no digest entry"))
         };
 
         let mut commands = Vec::new();
@@ -280,7 +336,7 @@ impl LoadedProject {
                     input: InputSchema::of(command, defs),
                 },
                 internal: matches!(role, Some(Role::Command { internal: true })),
-                source_hash: hash_of(&command.module),
+                digest_hash: hash_of(Kind::Command, &command.name),
                 rel_path: rel,
             });
         }
@@ -311,7 +367,7 @@ impl LoadedProject {
                     entities: entities.clone(),
                     sources: sources.clone(),
                 },
-                source_hash: hash_of(&projector.module),
+                digest_hash: hash_of(Kind::Projector, &projector.name),
                 rel_path: rel,
                 entities,
                 sources,
@@ -334,7 +390,7 @@ impl LoadedProject {
                     name: effect.name.clone(),
                     sources: sources.clone(),
                 },
-                source_hash: hash_of(&effect.module),
+                digest_hash: hash_of(Kind::Effect, &effect.name),
                 rel_path: rel,
                 sources,
             });
@@ -344,6 +400,7 @@ impl LoadedProject {
             root: root.to_path_buf(),
             config,
             program,
+            digest,
             events,
             commands,
             projectors,
@@ -473,5 +530,135 @@ mod tests {
             "the language changed"
         );
         assert_eq!(role_for("commands"), None, "a directory is not a module");
+    }
+
+    /// Two effects in one file, so a per-file hash could not tell them apart.
+    const TWO_EFFECTS: &str = r#"
+effect Alpha {
+  on @e.one as one {
+    let reply = http.post("https://example.test/alpha", { "id": one.id })
+    if reply.status >= 400 { fail("alpha rejected") }
+  }
+}
+
+effect Beta {
+  on @e.two as two {
+    let reply = http.post("https://example.test/beta", { "id": two.id })
+    if reply.status >= 400 { fail("beta rejected") }
+  }
+}
+"#;
+
+    fn write_project(dir: &Path, effects: &str) -> LoadedProject {
+        for (rel, text) in [
+            (
+                "events/e.hk",
+                "event @e.one { id: Uuid }\nevent @e.two { id: Uuid }\n",
+            ),
+            (
+                "commands/emit-one.hk",
+                "command EmitOne(id: Uuid) {\n  emit @e.one { id }\n}\n",
+            ),
+            ("effects/both.hk", effects),
+        ] {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let project = LoadedProject::load(dir);
+        assert!(!project.has_errors(), "{:?}", project.findings);
+        project
+    }
+
+    fn effect_hash(project: &LoadedProject, name: &str) -> String {
+        project
+            .effects
+            .iter()
+            .find(|unit| unit.def.name() == name)
+            .unwrap()
+            .digest_hash
+            .clone()
+    }
+
+    /// The two properties the digest buys, in one test because they are one claim:
+    /// a hash tracks what a declaration does, and it does so per declaration.
+    ///
+    /// Under the per-file source hash this replaced, both halves failed. Reformatting
+    /// the file moved both effects' hashes, and editing `Alpha` moved `Beta`'s too,
+    /// because the hash was of the bytes the two happened to share a file with.
+    #[test]
+    fn a_hash_follows_one_declaration_and_only_what_it_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = write_project(dir.path(), TWO_EFFECTS);
+        let (alpha, beta) = (effect_hash(&before, "Alpha"), effect_hash(&before, "Beta"));
+
+        // Reindented, commented, and with `Alpha`'s bindings renamed. A binder's name
+        // never leaves the program, so none of this is observable.
+        let cosmetic = r#"
+// Two unrelated effects that happen to share a file.
+effect Alpha {
+
+  on @e.one as triggering {
+    // Tell the alpha service.
+    let response  =  http.post("https://example.test/alpha", { "id": triggering.id })
+    if response.status >= 400 {
+      fail("alpha rejected")
+    }
+  }
+}
+
+effect Beta {
+  on @e.two as two {
+    let reply = http.post("https://example.test/beta", { "id": two.id })
+    if reply.status >= 400 { fail("beta rejected") }
+  }
+}
+"#;
+        let after = write_project(dir.path(), cosmetic);
+        assert_eq!(
+            effect_hash(&after, "Alpha"),
+            alpha,
+            "a reformat is not a change"
+        );
+        assert_eq!(effect_hash(&after, "Beta"), beta);
+
+        // Now a real one, to `Alpha` only: a different URL is a different call, and the
+        // journal is keyed on it.
+        let edited = write_project(
+            dir.path(),
+            &TWO_EFFECTS.replace("example.test/alpha", "example.test/alpha-v2"),
+        );
+        assert_ne!(
+            effect_hash(&edited, "Alpha"),
+            alpha,
+            "a changed call is a change"
+        );
+        assert_eq!(
+            effect_hash(&edited, "Beta"),
+            beta,
+            "and it belongs to the declaration that made it, not to the file it sits in"
+        );
+    }
+
+    /// An event has no unit of its own, so before the digest hekla recorded nothing
+    /// about one. Its entry is what makes a later schema-drift check possible at all.
+    #[test]
+    fn every_declaration_has_an_entry_and_a_test_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_project(dir.path(), TWO_EFFECTS);
+        let named: Vec<(Kind, &str)> = project
+            .digest
+            .entries()
+            .iter()
+            .map(|entry| (entry.kind, entry.name.as_str()))
+            .collect();
+
+        assert!(named.contains(&(Kind::Event, "@e.one")));
+        assert!(named.contains(&(Kind::Command, "EmitOne")));
+        assert!(named.contains(&(Kind::Effect, "Alpha")));
+        assert!(
+            !named.iter().any(|(kind, _)| *kind == Kind::Test),
+            "`entries` holds tests back, which is why nothing filters them downstream"
+        );
     }
 }

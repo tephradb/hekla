@@ -184,7 +184,7 @@ fn a_declaration_under_no_rule_loads_from_any_directory() {
             "guards/thing.hk",
             r#"
 guard ThingExists(thing_id: Uuid) {
-  state seen: Bool = fold false
+  fold seen: Bool = false
     on @thing.happened(thing_id) => true
 
   if !seen {
@@ -544,7 +544,7 @@ fn weak_boundaries_warn_without_failing_the_check() {
 refusal Busy "someone signed up already"
 
 command SignUp(person_id: Uuid) {
-  state seen: Bool = fold false
+  fold seen: Bool = false
     on @person.signed_up(active: true) => true
 
   if seen {
@@ -586,7 +586,7 @@ event @person.signed_up {
 refusal Dup "already signed up"
 
 command SignUp(person_id: Uuid, email: String, plan: String, region: String) {
-  state seen: Bool = fold false
+  fold seen: Bool = false
     on @person.signed_up(person_id, email, plan, region) => true
 
   if seen {
@@ -621,7 +621,7 @@ fn a_selective_boundary_does_not_warn() {
 refusal Dup "that thing already happened"
 
 command DoThing(thing_id: Uuid) {
-  state seen: Bool = fold false
+  fold seen: Bool = false
     on @thing.happened(thing_id) => true
 
   if seen {
@@ -669,7 +669,7 @@ const REGISTER_ACCOUNT: &str = r#"
 refusal HandleTaken "that handle is already registered"
 
 command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
-  state taken: Bool = fold false
+  fold taken: Bool = false
     on @account.registered(handle) => true
 
   if taken {

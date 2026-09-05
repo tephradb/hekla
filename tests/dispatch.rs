@@ -339,10 +339,10 @@ refusal Frozen "that owner is frozen"
 refusal AlreadyOpen "that owner already has an account"
 
 command Open(id: Uuid, owner: String) {
-  state opened: Bool = fold false
+  fold opened: Bool = false
     on @t.opened(owner) => true
 
-  state frozen: Bool = fold false
+  fold frozen: Bool = false
     on @t.frozen(owner) => true
 
   if frozen {
@@ -422,10 +422,10 @@ refusal WideOnly "only the wide arm ran"
 refusal BothRan "both arms ran"
 
 command Open(id: Uuid, owner: String, tier: String) {
-  state seen: Int = fold 0
+  fold seen: Int = 0
     on @t.opened(owner) => seen + 1
 
-  state gold: Int = fold 0
+  fold gold: Int = 0
     on @t.opened(owner, tier: "gold") => gold + 1
 
   if gold > seen {
@@ -522,7 +522,7 @@ refusal Frozen(frozen: Int) "saw {frozen} frozen event(s)"
 command Open(id: Uuid, owner: String) {
   guard @t.opened(owner)
 
-  state frozen: Int = fold 0
+  fold frozen: Int = 0
     on @t.frozen(owner) => frozen + 1
 
   if frozen > 0 {
@@ -580,7 +580,7 @@ const COUNTING_FOLD: &str = r#"
 refusal Enough(seen: Int) "seen {seen}"
 
 command Notice(id: Uuid, owner: String) {
-  state seen: Int = fold 0
+  fold seen: Int = 0
     on @t.noticed(owner) => seen + 1
 
   if seen >= 2 {
@@ -640,7 +640,7 @@ const READ_ABSENT_FIELD: &str = r#"
 refusal Absent "an omitted optional field reads as none"
 
 command Read(id: Uuid) {
-  state seen: String? = fold "unset"
+  fold seen: String? = "unset"
     on @t.noted(id) { body } => body
 
   if seen.is_none() {
@@ -693,7 +693,7 @@ const TAKE_SEAT: &str = r#"
 refusal Full "no seats left"
 
 command Take(id: Uuid, room: String) {
-  state seats: Int = fold 0
+  fold seats: Int = 0
     on @t.taken(room) => seats + 1
 
   if seats >= 2 {
@@ -771,7 +771,7 @@ fn one_id_submitted_concurrently_appends_exactly_once() {
             "commands/open.hk",
             r#"
 command Open(id: Uuid, who: String) {
-  state opened: Bool = fold false
+  fold opened: Bool = false
     on @t.opened(id) => true
 
   if opened {
@@ -955,7 +955,7 @@ command MakeNote(note_id: Uuid, kind: String) {
     return
   }
 
-  state made: Bool = fold false
+  fold made: Bool = false
     on @note.made(note_id) => true
 
   if made {

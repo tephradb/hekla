@@ -317,7 +317,7 @@ event @account.closed { account_id: Uuid }
 
 const CLOSE_ACCOUNT: &str = r#"
 command CloseAccount(account_id: Uuid) {
-  state closed: Bool = fold false
+  fold closed: Bool = false
     on @account.closed(account_id) => true
 
   // Emitting nothing on the second call is what makes the replay interesting: no

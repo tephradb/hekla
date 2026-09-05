@@ -6,10 +6,10 @@
 refusal UnknownUser "no such user"
 
 command RenameUser(user_id: Uuid, name: String) {
-  state exists: Bool = fold false
+  fold exists: Bool = false
     on @user.registered(user_id) => true
 
-  state renames: Int = fold 0
+  fold renames: Int = 0
     on @user.renamed(user_id) => renames + 1
 
   if is_blank(name) {

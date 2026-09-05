@@ -22,7 +22,7 @@ use crate::crypto;
 
 /// The current schema version, tracked in SQLite's `user_version`. Bump it and
 /// add a migration arm when the schema changes.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// How many rows a single sweep statement deletes, so a retention sweep never
 /// holds the connection across a long scan. The sweeper loops until a call
@@ -60,6 +60,27 @@ fn invocations_at_sql(effects: usize, positions: usize) -> String {
         "SELECT effect, position, status FROM effect_invocation \
          WHERE effect IN ({effect_list}) AND position IN ({position_list}) LIMIT {limit}"
     )
+}
+
+/// The column list every [`DeclarationRow`] read selects, written once so the two
+/// queries over this table cannot drift into reading different columns in the same
+/// positions.
+const DECLARATION_COLUMNS: &str = "SELECT kind, name, hash, signature_hash, form, signature, \
+                                   module, first_seen, last_seen, current FROM declaration";
+
+fn row_to_declaration(row: &rusqlite::Row) -> rusqlite::Result<DeclarationRow> {
+    Ok(DeclarationRow {
+        kind: row.get(0)?,
+        name: row.get(1)?,
+        hash: row.get(2)?,
+        signature_hash: row.get(3)?,
+        form: row.get(4)?,
+        signature: row.get(5)?,
+        module: row.get(6)?,
+        first_seen: row.get(7)?,
+        last_seen: row.get(8)?,
+        current: row.get::<_, i64>(9)? != 0,
+    })
 }
 
 fn row_to_invocation(row: &rusqlite::Row) -> rusqlite::Result<InvocationRow> {
@@ -359,8 +380,14 @@ impl OpDb {
         Ok(())
     }
 
-    /// Positions of this effect's still-`running` invocations whose recorded
-    /// script hash differs from `current_hash`, for the restart warning.
+    /// Positions of this effect's still-`running` invocations that were recorded under
+    /// a *known* other version of it, for the restart warning.
+    ///
+    /// A hash `declaration` has never held is excluded rather than reported. Those exist
+    /// only from before the digest, when `script_hash` was a hash of a file's bytes, and
+    /// nothing can be concluded by comparing one to an entry hash: they are not the same
+    /// measurement. Warning about them would name every in-flight invocation on the first
+    /// boot after that migration and say "the code changed", which is not what happened.
     pub fn running_with_hash_mismatch(
         &self,
         effect: &str,
@@ -370,7 +397,10 @@ impl OpDb {
             .conn
             .prepare(
                 "SELECT position FROM effect_invocation \
-                 WHERE effect = ?1 AND status = 'running' AND script_hash <> ?2 ORDER BY position",
+                 WHERE effect = ?1 AND status = 'running' AND script_hash <> ?2 \
+                 AND EXISTS (SELECT 1 FROM declaration \
+                             WHERE kind = 'effect' AND name = ?1 AND hash = script_hash) \
+                 ORDER BY position",
             )
             .context("preparing effect hash-mismatch query")?;
         let rows = stmt
@@ -383,24 +413,90 @@ impl OpDb {
             .context("collecting running invocation positions")
     }
 
-    /// Record what is deployed: one row per loaded module, keyed by name and kind.
-    pub fn upsert_module_metadata(
-        &self,
-        name: &str,
-        kind: &str,
-        source_hash: &str,
+    /// Record what this boot loaded: clear the previous `current` set, then upsert one
+    /// row per declaration.
+    ///
+    /// The insert conflicts on `(kind, name, hash)`, so re-loading a declaration hekla
+    /// has seen before touches `last_seen` and writes no new row. That is what makes the
+    /// table grow with edits rather than with boots, and what keeps a restart loop from
+    /// filling it. Both halves run in one transaction: a crash between them would leave
+    /// no version marked current and the inventory empty.
+    pub fn set_current_declarations(
+        &mut self,
+        declarations: &[DeclarationRow],
         now: &str,
     ) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO module_metadata (name, kind, source_hash, loaded_at) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(name, kind) DO UPDATE SET \
-                 source_hash = excluded.source_hash, loaded_at = excluded.loaded_at",
-                params![name, kind, source_hash, now],
-            )
-            .context("recording module metadata")?;
+        let tx = self
+            .conn
+            .transaction()
+            .context("beginning the declaration write")?;
+        tx.execute("UPDATE declaration SET current = 0 WHERE current = 1", [])
+            .context("clearing the previous current declarations")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO declaration \
+                     (kind, name, hash, signature_hash, form, signature, module, \
+                      first_seen, last_seen, current) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1) \
+                     ON CONFLICT(kind, name, hash) DO UPDATE SET \
+                     last_seen = excluded.last_seen, current = 1, module = excluded.module",
+                )
+                .context("preparing the declaration insert")?;
+            for row in declarations {
+                stmt.execute(params![
+                    row.kind,
+                    row.name,
+                    row.hash,
+                    row.signature_hash,
+                    row.form,
+                    row.signature,
+                    row.module,
+                    now,
+                ])
+                .with_context(|| format!("recording declaration `{}`", row.name))?;
+            }
+        }
+        tx.commit().context("committing the declaration write")?;
         Ok(())
+    }
+
+    /// The declarations this process loaded, in `(kind, name)` order.
+    pub fn current_declarations(&self) -> anyhow::Result<Vec<DeclarationRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "{DECLARATION_COLUMNS} WHERE current = 1 ORDER BY kind, name"
+            ))
+            .context("preparing the current declaration query")?;
+        let rows = stmt
+            .query_map([], row_to_declaration)
+            .context("querying current declarations")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting current declarations")
+    }
+
+    /// One recorded version of a declaration, by its hash.
+    ///
+    /// `None` means hekla has no record of that hash at all, which is a different fact
+    /// from "a different version is current": it says the hash was written under a
+    /// scheme this table never held, so nothing can be concluded by comparing it.
+    pub fn declaration_by_hash(
+        &self,
+        kind: &str,
+        name: &str,
+        hash: &str,
+    ) -> anyhow::Result<Option<DeclarationRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "{DECLARATION_COLUMNS} WHERE kind = ?1 AND name = ?2 AND hash = ?3"
+            ))
+            .context("preparing the declaration lookup")?;
+        let mut rows = stmt
+            .query_map(params![kind, name, hash], row_to_declaration)
+            .context("looking up a declaration")?;
+        rows.next().transpose().context("reading a declaration row")
     }
 
     /// Delete up to `limit` `terminal` effect invocations completed before
@@ -581,9 +677,15 @@ impl OpDb {
     // These share one mutex with every effect's hot path, so an unbounded scan would
     // stall live work; the retention sweeper chunks for the same reason. Every reader
     // over a table that grows with traffic takes a caller-supplied limit. Two do not,
-    // and say why: [`OpDb::module_metadata`] is bounded by the module count, which is
-    // fixed at boot, and [`OpDb::subject_key_counts`] is an aggregate that cannot be
-    // paged, so its caller runs it once per listing rather than once per page.
+    // and say why: [`OpDb::current_declarations`] is bounded by the declaration count,
+    // which is fixed at boot, and [`OpDb::subject_key_counts`] is an aggregate that
+    // cannot be paged, so its caller runs it once per listing rather than once per page.
+    //
+    // `declaration` itself is *not* bounded that way: it keeps every version of every
+    // declaration and nothing sweeps it. That is why the reader filters on `current`
+    // rather than selecting the table, and why the index leads with that column. It
+    // grows with edits rather than with traffic or with boots, so it stays small enough
+    // to want no pagination, but the predicate is load-bearing rather than incidental.
 
     /// One effect's invocations, newest first, strictly below `before`. Pass
     /// `u64::MAX` for the first page and the oldest position seen for the next.
@@ -811,34 +913,6 @@ impl OpDb {
         Ok(states)
     }
 
-    /// Every deployed module recorded at boot, ordered so the result is stable.
-    ///
-    /// The write side ([`OpDb::upsert_module_metadata`]) shipped with the first
-    /// schema and had no reader until introspection needed one: a projector's and an
-    /// effect's `source_hash` are dropped from `Runtime` once their threads start, so
-    /// this table is the only place they survive.
-    pub fn module_metadata(&self) -> anyhow::Result<Vec<ModuleRow>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT name, kind, source_hash, loaded_at FROM module_metadata \
-                 ORDER BY kind, name",
-            )
-            .context("preparing the module metadata query")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(ModuleRow {
-                    name: row.get(0)?,
-                    kind: row.get(1)?,
-                    source_hash: row.get(2)?,
-                    loaded_at: row.get(3)?,
-                })
-            })
-            .context("querying module metadata")?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .context("collecting module metadata")
-    }
-
     /// Live subject-key counts per subject field. The reserved global uniqueness
     /// secret is excluded: it is not a subject, and it can never be erased.
     ///
@@ -961,6 +1035,7 @@ impl OpDb {
                 2 => tx.execute_batch(SCHEMA_V3).context("applying schema v3")?,
                 3 => tx.execute_batch(SCHEMA_V4).context("applying schema v4")?,
                 4 => tx.execute_batch(SCHEMA_V5).context("applying schema v5")?,
+                5 => tx.execute_batch(SCHEMA_V6).context("applying schema v6")?,
                 other => anyhow::bail!("no migration from schema version {other}"),
             }
             version += 1;
@@ -1079,6 +1154,41 @@ const SCHEMA_V5: &str = "
 ALTER TABLE effect_journal ADD COLUMN kind TEXT;
 ";
 
+/// Schema v6 replaces `module_metadata` with `declaration`, one row per heklang
+/// declaration rather than per `.hk` file, keyed by what the declaration *does*.
+///
+/// `module_metadata` recorded a hash of a file's raw bytes, which made a reformat
+/// indistinguishable from a rewrite and made two declarations sharing a file share a
+/// hash. heklang's digest hashes the lowered IR instead, so the identity here is
+/// `(kind, name, hash)`: a boot that loads unchanged code writes no new row, and a
+/// restart loop costs nothing. Every version a declaration has ever had is kept, which
+/// is what lets an invocation's `script_hash` be resolved back to the form that ran.
+///
+/// The old table is dropped rather than migrated. Its hashes are of a different thing
+/// and cannot be translated into these.
+const SCHEMA_V6: &str = "
+DROP TABLE module_metadata;
+
+CREATE TABLE declaration (
+    kind           TEXT    NOT NULL,  -- event|enum|record|function|command|projector|effect
+    name           TEXT    NOT NULL,  -- heklang's entry name, verbatim (an event keeps its `@`)
+    hash           TEXT    NOT NULL,  -- what this declaration does
+    signature_hash TEXT,              -- what of it is visible outside; NULL for a `fn`
+    form           TEXT    NOT NULL,  -- the packed digest line, which reads back
+    signature      TEXT,
+    -- The file it was declared in. Outside the digest's identity on purpose: heklang
+    -- treats a module as a label, so moving a declaration updates this and moves no hash.
+    module         TEXT,
+    first_seen     TEXT    NOT NULL,
+    last_seen      TEXT    NOT NULL,
+    -- Whether this is the version the running process loaded. Exactly one row per
+    -- (kind, name) carries it, and `WHERE current = 1` is the deployed inventory.
+    current        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, name, hash)
+);
+CREATE INDEX declaration_current ON declaration (current, kind, name);
+";
+
 /// One effect invocation, as an introspection reader sees it. `status` is `running`
 /// or `terminal`; nothing distinguishes an invocation completed by success from one
 /// completed by an operator skip or a terminal `reveal()`, because the runtime
@@ -1111,12 +1221,19 @@ pub struct JournalRow {
     pub created_at: String,
 }
 
-/// One deployed module, as recorded at boot.
-pub struct ModuleRow {
-    pub name: String,
+/// One declaration, as recorded at boot. A row is one *version* of a declaration, so
+/// several may share a `(kind, name)` and at most one of those carries `current`.
+pub struct DeclarationRow {
     pub kind: String,
-    pub source_hash: String,
-    pub loaded_at: String,
+    pub name: String,
+    pub hash: String,
+    pub signature_hash: Option<String>,
+    pub form: String,
+    pub signature: Option<String>,
+    pub module: Option<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub current: bool,
 }
 
 /// A durable effect quarantine, with the time it was recorded.
@@ -1160,7 +1277,7 @@ mod tests {
         for table in [
             "effect_invocation",
             "effect_journal",
-            "module_metadata",
+            "declaration",
             "effect_cursor",
             "subject_key",
         ] {
@@ -1235,12 +1352,48 @@ mod tests {
 
     #[test]
     fn running_with_hash_mismatch_lists_only_stale_running() {
-        let db = OpDb::open_in_memory().unwrap();
+        let mut db = OpDb::open_in_memory().unwrap();
+        // Both versions of `e` are on record, which is what makes "old" a *known* other
+        // version rather than an unrecognised hash.
+        db.set_current_declarations(&[decl("effect", "e", "old")], "t0")
+            .unwrap();
+        db.set_current_declarations(&[decl("effect", "e", "new")], "t1")
+            .unwrap();
+
         db.begin_invocation("e", 1, "old", "t0").unwrap(); // running, stale hash
         db.begin_invocation("e", 2, "new", "t0").unwrap(); // running, current hash
         db.begin_invocation("e", 3, "old", "t0").unwrap();
         db.complete_invocation("e", 3, "t1").unwrap(); // terminal, ignored
         assert_eq!(db.running_with_hash_mismatch("e", "new").unwrap(), vec![1]);
+    }
+
+    /// The third outcome, and the one the `EXISTS` clause exists for.
+    ///
+    /// `script_hash` used to hold a hash of the effect file's bytes. Those values are
+    /// still in the table and will never match an entry hash, but they are not evidence
+    /// that anything changed: they are a different measurement. Reporting them would
+    /// name every in-flight invocation on the first boot after the migration and blame
+    /// the code.
+    #[test]
+    fn an_unrecognised_script_hash_is_not_reported_as_a_change() {
+        let mut db = OpDb::open_in_memory().unwrap();
+        db.set_current_declarations(&[decl("effect", "e", "new")], "t0")
+            .unwrap();
+        db.begin_invocation("e", 1, "a-hash-of-some-file-bytes", "t0")
+            .unwrap();
+
+        assert!(
+            db.running_with_hash_mismatch("e", "new")
+                .unwrap()
+                .is_empty(),
+            "a hash this table never held says nothing about the code"
+        );
+        assert!(
+            db.declaration_by_hash("effect", "e", "a-hash-of-some-file-bytes")
+                .unwrap()
+                .is_none(),
+            "and it is distinguishable from a known older version by exactly that"
+        );
     }
 
     #[test]
@@ -1298,22 +1451,110 @@ mod tests {
         assert_eq!(ids, vec!["master-A".to_owned(), "master-B".to_owned()]);
     }
 
+    /// A declaration row with only the columns a test cares about set.
+    fn decl(kind: &str, name: &str, hash: &str) -> DeclarationRow {
+        DeclarationRow {
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+            hash: hash.to_owned(),
+            signature_hash: None,
+            form: format!("({kind} {name})"),
+            signature: None,
+            module: None,
+            first_seen: String::new(),
+            last_seen: String::new(),
+            current: true,
+        }
+    }
+
+    fn count_declarations(db: &OpDb) -> i64 {
+        db.connection()
+            .query_row("SELECT count(*) FROM declaration", [], |row| row.get(0))
+            .unwrap()
+    }
+
     #[test]
-    fn upsert_module_metadata_replaces_on_conflict() {
-        let db = OpDb::open_in_memory().unwrap();
-        db.upsert_module_metadata("m", "effect", "h1", "t0")
+    fn a_declaration_that_did_not_change_writes_no_new_row() {
+        let mut db = OpDb::open_in_memory().unwrap();
+        db.set_current_declarations(&[decl("effect", "m", "h1")], "t0")
             .unwrap();
-        db.upsert_module_metadata("m", "effect", "h2", "t1")
+        db.set_current_declarations(&[decl("effect", "m", "h1")], "t1")
             .unwrap();
-        let hash: String = db
-            .connection()
-            .query_row(
-                "SELECT source_hash FROM module_metadata WHERE name = 'm' AND kind = 'effect'",
-                [],
-                |row| row.get(0),
-            )
+
+        assert_eq!(
+            count_declarations(&db),
+            1,
+            "the same declaration re-loaded is the same row, so a restart costs nothing"
+        );
+        let row = db
+            .declaration_by_hash("effect", "m", "h1")
+            .unwrap()
             .unwrap();
-        assert_eq!(hash, "h2");
+        assert_eq!(
+            row.first_seen, "t0",
+            "the first sighting is not overwritten"
+        );
+        assert_eq!(row.last_seen, "t1", "the latest one is");
+    }
+
+    #[test]
+    fn a_changed_declaration_keeps_the_version_it_replaced() {
+        let mut db = OpDb::open_in_memory().unwrap();
+        db.set_current_declarations(&[decl("effect", "m", "h1")], "t0")
+            .unwrap();
+        db.set_current_declarations(&[decl("effect", "m", "h2")], "t1")
+            .unwrap();
+
+        assert_eq!(count_declarations(&db), 2, "both versions are kept");
+        let current = db.current_declarations().unwrap();
+        assert_eq!(
+            current
+                .iter()
+                .map(|row| row.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["h2"],
+            "only the version this boot loaded is current"
+        );
+        // The point of keeping the old row: an invocation recorded under `h1` can still
+        // be resolved to the form that ran, which is what tells "a known older version"
+        // apart from "a hash this table never held".
+        assert!(
+            db.declaration_by_hash("effect", "m", "h1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.declaration_by_hash("effect", "m", "h9")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_declaration_that_is_gone_stops_being_current() {
+        let mut db = OpDb::open_in_memory().unwrap();
+        db.set_current_declarations(
+            &[decl("effect", "kept", "h1"), decl("effect", "gone", "h2")],
+            "t0",
+        )
+        .unwrap();
+        db.set_current_declarations(&[decl("effect", "kept", "h1")], "t1")
+            .unwrap();
+
+        let current = db.current_declarations().unwrap();
+        assert_eq!(
+            current
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"],
+            "a declaration deleted from the project is no longer deployed"
+        );
+        assert_eq!(
+            count_declarations(&db),
+            2,
+            "but its row survives, so what it was is still answerable"
+        );
     }
 
     #[test]
@@ -1622,16 +1863,19 @@ mod tests {
     }
 
     #[test]
-    fn module_metadata_reads_back_in_a_stable_order() {
-        let db = OpDb::open_in_memory().unwrap();
-        db.upsert_module_metadata("zeta", "command", "h1", "t0")
-            .unwrap();
-        db.upsert_module_metadata("alpha", "projector", "h2", "t0")
-            .unwrap();
-        db.upsert_module_metadata("alpha", "command", "h3", "t0")
-            .unwrap();
+    fn current_declarations_read_back_in_a_stable_order() {
+        let mut db = OpDb::open_in_memory().unwrap();
+        db.set_current_declarations(
+            &[
+                decl("command", "zeta", "h1"),
+                decl("projector", "alpha", "h2"),
+                decl("command", "alpha", "h3"),
+            ],
+            "t0",
+        )
+        .unwrap();
 
-        let rows = db.module_metadata().unwrap();
+        let rows = db.current_declarations().unwrap();
         assert_eq!(
             rows.iter()
                 .map(|row| (row.kind.as_str(), row.name.as_str()))
@@ -1641,9 +1885,9 @@ mod tests {
                 ("command", "zeta"),
                 ("projector", "alpha")
             ],
-            "a module is identified by kind and name together"
+            "a declaration is identified by kind and name together"
         );
-        assert_eq!(rows[0].source_hash, "h3");
+        assert_eq!(rows[0].hash, "h3");
     }
 
     #[test]

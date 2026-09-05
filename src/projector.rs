@@ -11,7 +11,6 @@
 //! renamed into place, so a crash mid-rebuild leaves the live model untouched.
 
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -340,7 +339,12 @@ fn spawn(
         anyhow::bail!("spawn called on a non-projector module");
     };
     let name = name.clone();
-    let definition = definition_hash(sources, entities);
+    // The projector's digest entry hash, which covers its subscription, its entity
+    // shapes *and* its handler bodies. hekla used to hash the first two by hand and
+    // leave the third out, because the only alternative was hashing source text and
+    // rebuilding on every reformat. The digest draws the line at meaning instead, so a
+    // corrected handler now rebuilds rather than serving rows built by the old logic.
+    let definition = unit.digest_hash.clone();
     let entities = entities.clone();
 
     let db_path = projectors_dir.join(format!("{name}.db"));
@@ -814,45 +818,6 @@ fn rebuild(
     shared.reset_position(reopened.read_checkpoint()?.get());
     tracing::info!("projector `{}` replayed {count} events", shared.name);
     Ok(reopened)
-}
-
-/// A stable hash of a projector's *definition* (its source set and entity schema),
-/// not its handler logic, so a restart can tell when the event set it was built from
-/// has changed and rebuild it. The entity's process-unique `id` and the handler body
-/// are deliberately excluded: an id changes every run, and a handler fix is the
-/// author's call to replay, not an automatic one.
-fn definition_hash(sources: &[String], entities: &[EntityDef]) -> String {
-    let mut canonical = String::new();
-    for event_type in sources {
-        canonical.push_str(event_type);
-        canonical.push(';');
-    }
-    canonical.push('|');
-    for entity in entities {
-        canonical.push_str(&entity.name);
-        canonical.push(':');
-        canonical.push_str(&entity.key);
-        canonical.push('{');
-        for (name, meta) in &entity.fields {
-            canonical.push_str(name);
-            canonical.push('=');
-            let _ = write!(canonical, "{:?}", meta.kind);
-            if let Some(subject) = &meta.subject {
-                canonical.push('@');
-                canonical.push_str(subject);
-            }
-            canonical.push(',');
-        }
-        canonical.push('}');
-        for index in &entity.indexes {
-            canonical.push_str(&index.name);
-            canonical.push('(');
-            canonical.push_str(&index.columns.join(","));
-            canonical.push(')');
-        }
-        canonical.push(';');
-    }
-    crate::hash::sha256_hex(canonical.as_bytes())
 }
 
 /// The tables of one projector, by entity name, which is what a write names.

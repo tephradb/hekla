@@ -503,6 +503,54 @@ fn an_edited_effect_is_skipped_rather_than_reported() {
     assert_eq!(report.invocations_checked, 0);
 }
 
+/// The twin of the test above, and the reason the digest is worth adopting.
+///
+/// The skip gate compares an invocation's recorded hash against the effect's current
+/// one. When that was a hash of the file's bytes, reindenting an effect or adding a
+/// comment silently dropped every recorded invocation out of the replay check, and
+/// nothing said so: `hekla verify` just quietly stopped checking that effect until new
+/// invocations accumulated. The digest hashes what the effect does, so a reformat keeps
+/// the coverage.
+#[test]
+fn a_cosmetically_edited_effect_is_still_checked() {
+    let data = tempfile::tempdir().unwrap();
+    populated(data.path());
+
+    let reformatted = tempfile::tempdir().unwrap();
+    copy_dir(&example_dir("users"), reformatted.path());
+    let effect = reformatted.path().join("effects/send-welcome.hk");
+    let source = fs::read_to_string(&effect).unwrap();
+    // Every line moves and a comment appears; nothing the effect does changes.
+    let rewritten = format!(
+        "// Reformatted, and not otherwise touched.\n{}",
+        source
+            .lines()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    line.to_owned()
+                } else {
+                    format!("  {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    fs::write(&effect, rewritten).unwrap();
+
+    let report = sweep(reformatted.path(), data.path());
+    assert!(
+        report.is_clean(),
+        "a reformatted effect still replays identically, got {:?}",
+        report.violations
+    );
+    assert!(
+        report.invocations_checked >= 1,
+        "a reformat must not cost the replay check its coverage, got checked={} skipped={}",
+        report.invocations_checked,
+        report.invocations_skipped
+    );
+}
+
 // --- the data-directory lock ----------------------------------------------
 
 #[test]

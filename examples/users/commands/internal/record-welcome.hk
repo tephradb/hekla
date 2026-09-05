@@ -9,7 +9,7 @@
 refusal AlreadyWelcomed "a welcome was already recorded for this user"
 
 command RecordWelcome(user_id: Uuid) {
-  state welcomed: Bool = fold false
+  fold welcomed: Bool = false
     on @user.welcomed(user_id) => true
 
   if welcomed {

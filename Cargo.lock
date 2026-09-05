@@ -766,10 +766,11 @@ dependencies = [
 
 [[package]]
 name = "heklang"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0663ea0659d63b9e7076e1d933ecb990ad4370da35ff84ab7d7b8dc036ed43a5"
+checksum = "5298730a094a2c763d41b523cc0574890b6b757ee6682935d0e1a731e2fd7612"
 dependencies = [
+ "sha2",
  "uuid",
 ]
 
@@ -1750,7 +1751,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

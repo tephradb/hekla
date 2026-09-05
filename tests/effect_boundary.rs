@@ -66,7 +66,7 @@ fn an_effect_folds_its_boundary_and_its_arm_sees_the_state() {
     let effect = r#"
 effect Probe {
   on @t.placed { id, shop } {
-    state count: Int = fold 0
+    fold count: Int = 0
       on @t.placed(shop) => count + 1
 
     invoke Record { id, shop: count }
@@ -97,7 +97,7 @@ fn the_fold_is_inclusive_of_the_triggering_event() {
     let effect = r#"
 effect Probe {
   on @t.placed { id, shop } {
-    state count: Int = fold 0
+    fold count: Int = 0
       on @t.placed(shop) => count + 1
 
     invoke Record { id, shop: count }
@@ -134,13 +134,19 @@ test "the trigger counts itself" {{
     assert_eq!(run(effect, &wrong), failed());
 }
 
-/// An arm with no `state` reads nothing, and its seed is whatever it declares.
+/// An arm that folds nothing reads nothing, and still delivers.
+///
+/// This used to declare a seeded `fold` with no arms, which heklang now rejects
+/// outright: a fold with no arms declares no slice and adds nothing to the append
+/// condition, so it is a binding written in the wrong keyword and the checker says to
+/// write `let` instead. What is left for hekla to assert is the runtime half, which is
+/// unchanged: an arm that reads no log at all is still dispatched and still invokes.
 #[test]
-fn an_effect_without_a_boundary_uses_its_seed() {
+fn an_effect_without_a_boundary_reads_nothing_and_still_delivers() {
     let effect = r#"
 effect Probe {
   on @t.placed { id } {
-    state count: Int = fold 7
+    let count = 7
 
     invoke Record { id, shop: count }
   }
@@ -148,7 +154,7 @@ effect Probe {
 "#;
     let scenario = format!(
         r#"
-test "an unfolded state is its seed" {{
+test "an arm that folds nothing still delivers" {{
   given @t.placed {{ id: "{A}", shop: 1 }}
   deliver Probe
   expect invoke Record {{ id: "{A}", shop: 7 }}

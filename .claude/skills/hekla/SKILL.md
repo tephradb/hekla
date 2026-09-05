@@ -169,10 +169,12 @@ a client as `room_taken` with 422.
     retrying and fails terminally, which completes that position and advances.
 11. **One process per data directory.** The runtime takes an exclusive lock, and `hekla verify` takes
     it too, so the sweep runs against a stopped instance or a copy.
-12. **Changing an entity's shape changes the projector's definition hash**, and the read model on disk
-    no longer matches. With `auto_rebuild = true` (the default) it rebuilds at startup and reads
-    answer 503 meanwhile; with it off the projector goes `stale` and every read of it is a 503 until
-    someone posts a replay. Changing a *handler body* is not a definition change.
+12. **Changing what a projector does changes its definition hash**, and the read model on disk no
+    longer matches. That covers its entity shapes, its subscription and its handler bodies, plus any
+    `const`, `guard` or `refusal` it reaches, since those are inlined. With `auto_rebuild = true`
+    (the default) it rebuilds at startup and reads answer 503 meanwhile; with it off the projector
+    goes `stale` and every read of it is a 503 until someone posts a replay. Reformatting, adding a
+    comment or renaming a local is *not* a change: the hash is over what runs, not over the text.
 13. **Directory placement is checked per declaration, not per file.** `hekla check` reads every `.hk`
     file wherever it is, so a scratch module that is not meant to compile belongs under a
     dot-directory or it fails the whole project.

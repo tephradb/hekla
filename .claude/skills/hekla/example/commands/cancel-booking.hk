@@ -2,10 +2,10 @@
 // booking is that one, so the emit needs nothing the fold had to carry out.
 
 command CancelBooking(booking_id: Uuid, room_id: Int, night: Timestamp) {
-  state made: Bool = fold false
+  fold made: Bool = false
     on @booking.made(booking_id, room_id, night) => true
 
-  state cancelled: Bool = fold false
+  fold cancelled: Bool = false
     on @booking.cancelled(booking_id) => true
 
   if !made {

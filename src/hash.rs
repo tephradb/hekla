@@ -1,9 +1,13 @@
 //! Content hashing.
 //!
-//! One helper, shared by every place that needs a stable digest: a module's source
-//! hash (recorded in `module_metadata` and used as an effect's script hash), the
-//! content-hash key of an effect's journaled calls, the material behind an
-//! idempotency tag, a read model's schema hash, and a master key's fingerprint.
+//! One helper, shared by every place that needs a stable digest: the content-hash key
+//! of an effect's journaled calls, the material behind an idempotency tag, and a master
+//! key's fingerprint.
+//!
+//! It no longer hashes source. What a declaration *is* is heklang's question, answered
+//! by `heklang::Digest` and recorded in the `declaration` table, because hashing the
+//! bytes of a file could not tell a reformat from a rewrite and could not tell two
+//! declarations sharing a file apart.
 
 use std::fmt::Write as _;
 

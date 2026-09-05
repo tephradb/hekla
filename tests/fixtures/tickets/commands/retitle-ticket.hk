@@ -2,10 +2,10 @@
 // nothing rather than materialising a row from zeros.
 
 command RetitleTicket(ticket_id: Uuid, title: String) {
-  state opened: Bool = fold false
+  fold opened: Bool = false
     on @ticket.opened(ticket_id) => true
 
-  state closed: Bool = fold false
+  fold closed: Bool = false
     on @ticket.closed(ticket_id) => true
 
   if !opened || closed {

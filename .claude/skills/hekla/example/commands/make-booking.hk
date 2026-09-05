@@ -14,10 +14,10 @@ command MakeBooking(
   rate: Money(2),
   notes: String,
 ) {
-  state made: Bool = fold false
+  fold made: Bool = false
     on @booking.made(booking_id) => true
 
-  state booked: Int = fold 0
+  fold booked: Int = 0
     on @booking.made(room_id, night) => booked + 1
     on @booking.cancelled(room_id, night) => booked - 1
 
