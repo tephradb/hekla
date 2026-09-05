@@ -39,7 +39,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.11"
 tempfile = "3"
-tephra = { version = "0.3.6", features = ["async", "tracing"] }
+tephra = { version = "0.4.0", features = ["async", "tracing"] }
 time = { version = "0.3", features = ["formatting"] }
 # `full` pulled in fs, process, io-std and the rest; these four are what the code
 # actually reaches for. `macros` is test-only (`#[tokio::test]`), so it sits in

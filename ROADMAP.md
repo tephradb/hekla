@@ -1488,13 +1488,107 @@ a comparable entry, recomputing both hashes, so a deployment describes itself. h
 - **What it does not do.** No effect replay, so it cannot say an effect would now make different
   HTTP calls. That needs a baseline that can be *executed*, and a packed form is a rendering rather
   than a serialisation; the journal is where such a baseline lives, and reaching it means opening
-  the log and taking the lock. It would also be bounded by `retention.effect_journal_days`, which
-  defaults to 7, so the question of whether journals should be kept indefinitely belongs to that
-  phase rather than this one.
+  the log and taking the lock. Phase 25 closes this once tephra grows a read-only reader.
 - **One honest limit.** Opening a WAL database read-only still maps a shared-memory index, and a
   read-only connection cannot remove it on close, so planning against a directory whose server is
   down can leave an empty `-wal` and `-shm` pair behind. No database's contents change, and the next
   boot reclaims them.
+
+## Phase 25: what this deploy would do (done)
+
+Phase 24 stopped at "an effect changed", which is the half a diff can answer. The half that decides
+a deploy is whether the change would move a single call, and answering that needs a baseline that
+can be *executed*. The journal is that baseline. Reaching it meant opening the event log, and until
+tephra 0.4.0 opening the log meant becoming its writer: `ReadHandle` was reachable only through a
+`WriteCoordinator`, and `SegmentSet::open` created directories and dropped unwritten segments. So
+replay could only ever have run against a copy, which is not the question anyone was asking.
+
+tephra 0.4.0 added `Follower`: read-only descriptors, nothing created, nothing deleted, no lock, and
+what it sees is a committed prefix of the writer's log. `hekla plan --replay` spends it.
+
+- **The journal is the mock, and it is real.** Every recorded invocation of every affected effect is
+  re-run against the candidate code and the journal the original run left behind. The journal holds
+  the responses that run actually received, so a candidate that branches differently on a response
+  body reaches a call the journal has no entry for, and that miss *is* the finding. Nothing is sent,
+  appended or erased: it is the same sealed replay `verify` runs, and the only difference is which
+  program goes in. `verify` asks "did this reproduce itself"; `plan` asks "would this still do what
+  happened".
+- **The gate is inverted, deliberately.** `verify` skips an invocation whose recorded `script_hash`
+  no longer matches the *candidate*, because for an audit that divergence is legitimate. For a plan
+  that divergence is the answer, so the hash a row is kept for is the *deployed* one instead. It
+  cannot be the candidate's: an effect pulled in by a changed helper has an unmoved `script_hash` on
+  every row it owns, and gating on the candidate would drop the whole baseline. It cannot be nothing
+  either: retention outlives an edit, so rows written by a version already replaced are still on
+  disk, and replaying those reports a difference the running code already has.
+- **An entry's hash covers what is written inside it, not what it names.** A module-level `fn` is a
+  declaration of its own, so "its hash changed" alone would miss an edit to the helper that builds a
+  URL. So is an `event`, and an arm binds a field by name (`Frame::trigger` emits the name and the
+  slot, never the type), so it would also miss `@subject(...)` arriving on a field the handler posts.
+  The affected set is therefore the transitive closure of "names something that changed", over the
+  references the digest already spells out. Each of those is spelled two ways, and taking only one
+  of each pair is how a false negative gets back in: an event is `(events @p …)` in an arm's trigger
+  list and `(slice @p …)` in a fold, and a record or enum is `(Record N)`/`(Enum N)` in a type and
+  `(new N …)`/`(variant N C)` in a value, so an effect that only folds over an event, or only ever
+  constructs a record, names it exclusively through the second. Conservative on purpose, because an
+  effect pulled in needlessly costs one replay that reports `matched` and one left out costs the
+  finding.
+- **Who is asking is a parameter, because two readings turn on it and neither is in the outcome.**
+  An empty journal is unanswerable to a caller reading a row back and unambiguous to the driver that
+  watched the run complete. A terminal `fail` is rule 4's *outcome* rather than an error, leaving the
+  same `terminal` row a success leaves, so replaying the program that wrote the row learns nothing by
+  noticing while a candidate that would newly give up on recorded events is the whole point. One
+  `effect::Asked` (`Live`, `Sweep`, `Candidate`) covers both, and `replay` takes the program from the
+  runtime alone so the interpreter and the host can no longer disagree about which schema decodes the
+  log.
+- **It still runs against production.** The follower takes no lock, so `--replay` runs against a
+  directory a server has open, and `replay_changes_no_event_segment` pins that every byte under
+  `events/` (segments and the index beside them) is where it was.
+- **Coverage is reported, because a blind replay looks exactly like a clean one.** Four things the
+  replay cannot see, and none of them is fixable. An erased subject: the plaintext the handler
+  branched on is gone, and journaling it to make the invocation replayable would defeat the erasure
+  it was destroyed for. An invocation that journaled no call at all, where the candidate now reaches
+  one: an operator skip and a run that took a callless branch leave the same row, and
+  `opdb::InvocationRow` says outright that nothing distinguishes them, so a call the replay reaches
+  there is not evidence of a change. That last one turns on who is asking: the live check inside
+  `run_invocation` watched the invocation complete and took the operator-skip branch elsewhere, so
+  the same outcome there *is* a divergence, which `Replayed::violation` decides from a `Record` the
+  caller passes rather than from the outcome alone. An error is never one of these: a candidate that
+  crashes before it reaches any call would crash on this event whatever the record says. Retention:
+  `sweep_effect_journal` deletes the
+  `effect_invocation` row and the journal cascades off it, so a reclaimed invocation is *invisible*
+  rather than skipped, and nothing can count what is gone. And `--replay-limit`, because a busy
+  effect's week of history is unbounded in a way a deploy gate is not. The first two are counted,
+  the third is named as a horizon (the candidate's window, which bounds it rather than measures it,
+  since the deployed configuration is what actually swept and hekla does not record it), and the
+  fourth names every effect it bit. That settles the deferred retention question rather than
+  answering it with a longer default.
+- **The follower pins a prefix, and the replay respects it.** A server appending while a plan runs
+  completes invocations whose events are past the tip the reader pinned, so the invocation query is
+  bounded by that tip. Without it a busy effect would produce findings that are really a race, and
+  differ run to run.
+- **A missing master key degrades rather than refuses, per effect.** `verify` bails without one,
+  because a sweep without a key reports corruption that is not there. A plan without one cannot
+  replay a handler that reveals, and demanding a production key before it will diff two declaration
+  tables would be worse than saying so. Which effects that applies to is read off the form (`reveal`
+  is a node in it), so one sealed field somewhere does not blind nine effects that never touch a
+  key, and a `reveal` that fails for want of a key is never mistaken for a divergence. A key that is
+  *present* and cannot unwrap what is stored (a rotation with the previous master forgotten) degrades
+  identically and names the reason, because it costs exactly the same thing: a wrong key must not be
+  worse than no key, and throwing away a diff that is already computed and still true would make it
+  so.
+- **`--replay` is opt-in.** Without it the command keeps Phase 24's promise verbatim: no log, no key,
+  no cost beyond a declaration diff, and `coverage` is `None` rather than a zeroed struct, because a
+  replay that was never asked for must not read as one that covered nothing. The converse holds too:
+  a replay refused because the deployment was recorded under another digest version reports zero
+  coverage rather than none, so a gate keying on the field cannot read a refusal as a question it
+  never posed.
+- **What it cost elsewhere.** `Runtime` now holds a `Store` rather than a `WriteHandle`: the same
+  reads either way, and an `Option` for the two operations that are not reading. Appending needs a
+  writer, which a follower is not; subscribing needs a watermark that advances, which a fixed prefix
+  has not. Both ask rather than assume, and the writer is asked for before anything is minted so a
+  refusal cannot leave the id counter advanced for a request that wrote nothing. `verify::Report`
+  gained discriminated skip counters, since one number for four reasons said coverage was missing
+  without saying how much.
 
 ## Deferred, with triggers
 

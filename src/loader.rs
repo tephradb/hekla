@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use heklang::{Diagnostic, Digest, Entry, Kind, Program, Severity as HekSeverity};
 use walkdir::WalkDir;
@@ -190,13 +191,15 @@ pub struct LoadedProject {
     pub root: PathBuf,
     pub config: Config,
     /// The one program every declaration lives in. Parsed once and shared: heklang's
-    /// `Program` is `Send + Sync`, so every thread reads this one.
-    pub program: Program,
+    /// `Program` is `Send + Sync`, so every thread reads this one, and an `Arc` rather
+    /// than a `Program` so a `Runtime` built from this project shares it instead of
+    /// deep-copying the whole IR.
+    pub program: Arc<Program>,
     /// What the program does, per declaration, as heklang renders it. The one source of
     /// every hash hekla records: a module hash, a projector's definition and an
     /// invocation's `script_hash` are all an entry hash out of here.
     pub digest: Digest,
-    pub events: EventDefs,
+    pub events: Arc<EventDefs>,
     pub commands: Vec<CommandUnit>,
     pub projectors: Vec<ProjectorUnit>,
     pub effects: Vec<EffectUnit>,
@@ -287,12 +290,12 @@ impl LoadedProject {
                 return LoadedProject {
                     root: root.to_path_buf(),
                     config,
-                    program: Program::default(),
+                    program: Arc::new(Program::default()),
                     // A program that did not check has no digest form, so there is
                     // nothing to take one of. `Digest` has no `Default`; an empty
                     // program's digest is the same empty answer.
                     digest: Digest::of(&Program::default()),
-                    events: EventDefs::new(),
+                    events: Arc::new(EventDefs::new()),
                     commands: Vec::new(),
                     projectors: Vec::new(),
                     effects: Vec::new(),
@@ -301,11 +304,16 @@ impl LoadedProject {
             }
         };
 
-        let events: EventDefs = EventDef::all(&program)
-            .into_iter()
-            .map(|def| (def.event_type.clone(), def))
-            .collect();
+        let events = Arc::new(
+            EventDef::all(&program)
+                .into_iter()
+                .map(|def| (def.event_type.clone(), def))
+                .collect::<EventDefs>(),
+        );
 
+        // Shared from here on: a `Runtime` built from this project holds the same `Arc`
+        // rather than a second copy of the whole IR.
+        let program = Arc::new(program);
         let defs = heklang::Defs::of(&program);
         let digest = Digest::of(&program);
         let hashes = digest_hashes(&digest);

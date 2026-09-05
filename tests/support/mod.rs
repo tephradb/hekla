@@ -29,10 +29,11 @@ use hekla::projector::ProjectorSet;
 use hekla::read_api;
 use hekla::runtime::Runtime;
 use hekla::server;
+use hekla::store::Store;
 use hekla::validate;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tephra::{SegmentConfig, SegmentSet, WriteCoordinator, WriteHandle, WriterConfig};
+use tephra::{SegmentConfig, SegmentSet, WriteCoordinator, WriterConfig};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -553,15 +554,16 @@ pub fn read_row(
 
 /// Open a throwaway event store under `dir`. The caller keeps `dir` alive, so the
 /// store outlives it.
-pub fn open_store(dir: &Path) -> (WriteCoordinator, WriteHandle) {
+pub fn open_store(dir: &Path) -> (WriteCoordinator, Store) {
     let set = SegmentSet::open(dir.join("events"), SegmentConfig::new(TEST_SEGMENT_SIZE)).unwrap();
-    WriteCoordinator::start(set, WriterConfig::default()).unwrap()
+    let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default()).unwrap();
+    (coordinator, Store::writing(store))
 }
 
 /// Append one event through the same lowering a command uses, so a seeded event is
 /// byte for byte what the runtime would have written.
 pub fn seed_event(
-    store: &WriteHandle,
+    store: &Store,
     project: &LoadedProject,
     ctx: &CommandContext,
     event_type: &str,
@@ -569,8 +571,8 @@ pub fn seed_event(
 ) {
     let event = event_from_json(&project.program, event_type, &data).expect("a declared event");
     let mut host = HeklaHost {
-        program: Arc::new(project.program.clone()),
-        events: Arc::new(project.events.clone()),
+        program: Arc::clone(&project.program),
+        events: Arc::clone(&project.events),
         store: store.clone(),
         keystore: None,
         ctx: *ctx,

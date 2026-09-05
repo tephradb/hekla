@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use heklang::{Program, Projection};
-use tephra::{Event, Position, WaitOutcome, WriteHandle};
+use tephra::{Event, Position, WaitOutcome};
 
 use crate::crypto::KeyStore;
 use crate::heklang_host::{self, RowWriter};
@@ -29,6 +29,7 @@ use crate::invariant::Violation;
 use crate::loader::ProjectorUnit;
 use crate::read_model::ReadModel;
 use crate::schema::{EntityDef, ModuleDef};
+use crate::store::Store;
 
 /// How long a caught-up projector blocks before re-checking its shutdown flag.
 const IDLE_POLL: Duration = Duration::from_millis(250);
@@ -298,7 +299,7 @@ impl ProjectorSet {
 /// missing database file.
 pub fn start_all(
     projectors: Vec<Arc<ProjectorUnit>>,
-    store: &WriteHandle,
+    store: &Store,
     projectors_dir: &Path,
     program: Arc<Program>,
     keystore: Option<Arc<KeyStore>>,
@@ -324,7 +325,7 @@ pub fn start_all(
 #[allow(clippy::too_many_arguments)]
 fn spawn(
     unit: Arc<ProjectorUnit>,
-    store: WriteHandle,
+    store: Store,
     projectors_dir: &Path,
     program: Arc<Program>,
     keystore: Option<Arc<KeyStore>>,
@@ -478,7 +479,7 @@ fn reconcile_plan(
 fn run(
     shared: Arc<ProjectorShared>,
     unit: Arc<ProjectorUnit>,
-    store: WriteHandle,
+    store: Store,
     program: Arc<Program>,
     keystore: Option<Arc<KeyStore>>,
     model: ReadModel,
@@ -508,7 +509,7 @@ fn run(
 fn run_inner(
     shared: &ProjectorShared,
     unit: &ProjectorUnit,
-    store: &WriteHandle,
+    store: &Store,
     program: &Program,
     keystore: Option<&KeyStore>,
     mut model: ReadModel,
@@ -547,13 +548,13 @@ fn run_inner(
         ),
     }
 
-    let mut sub = store.subscribe(query.clone(), model.read_checkpoint()?);
+    let mut sub = store.subscribe("a projector", query.clone(), model.read_checkpoint()?)?;
     loop {
         if shared.replay.swap(false, Ordering::Relaxed) {
             // A replay is the only way out of `Stale` or `Failed`, and it is harmless
             // otherwise.
             model = rebuild_or_degrade(shared, unit, store, program, keystore, model, definition)?;
-            sub = store.subscribe(query.clone(), model.read_checkpoint()?);
+            sub = store.subscribe("a projector", query.clone(), model.read_checkpoint()?)?;
             continue;
         }
 
@@ -623,7 +624,7 @@ fn run_inner(
 fn rebuild_or_degrade(
     shared: &ProjectorShared,
     unit: &ProjectorUnit,
-    store: &WriteHandle,
+    store: &Store,
     program: &Program,
     keystore: Option<&KeyStore>,
     model: ReadModel,
@@ -675,7 +676,7 @@ fn rebuild_or_degrade(
 /// whenever the log ends in events the query does not select, including the case
 /// where it selects nothing at all.
 pub fn project_to(
-    store: &WriteHandle,
+    store: &Store,
     unit: &ProjectorUnit,
     program: &Program,
     keystore: Option<&KeyStore>,
@@ -691,7 +692,7 @@ pub fn project_to(
     let query = heklang_host::query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
     let entities_by_name = by_name(entities);
     let name = unit.def.name().to_owned();
-    let mut sub = store.subscribe(query, model.read_checkpoint()?);
+    let mut sub = store.subscribe("a projector", query, model.read_checkpoint()?)?;
     let mut seen = 0usize;
     loop {
         let batch = sub
@@ -750,7 +751,7 @@ pub fn project_to(
 
 /// [`project_to`] with no upper bound: project everything to the current head.
 pub fn project_to_head(
-    store: &WriteHandle,
+    store: &Store,
     unit: &ProjectorUnit,
     program: &Program,
     keystore: Option<&KeyStore>,
@@ -811,7 +812,7 @@ fn apply_batch(
 fn rebuild(
     shared: &ProjectorShared,
     unit: &ProjectorUnit,
-    store: &WriteHandle,
+    store: &Store,
     program: &Program,
     keystore: Option<&KeyStore>,
     model: ReadModel,

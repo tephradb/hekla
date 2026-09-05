@@ -810,6 +810,19 @@ consistent copy is not required for them.
 - `hekla verify <dir>`: the runtime invariant sweep over a data directory. Section 11.2.
 - `hekla plan <dir>`: what deploying this project over a data directory would change. It reads the
   `declaration` table rather than the log, so it needs no lock and runs against a live directory.
+  `--replay` adds the other half: recorded invocations of every affected effect are re-run against
+  the candidate code and the journal the original run left, which says not just that an effect
+  changed but whether the change would move a single call. That half does open the log, and reaches
+  it through a tephra `Follower`: read-only descriptors, nothing created or deleted, no lock, so it
+  too runs against a deployment serving traffic. A follower pins one committed prefix when it opens,
+  and the invocation query is bounded by that tip, so a server appending mid-plan produces no
+  findings that are really a race, and only invocations the *deployed* version of the effect recorded
+  are replayed, so a row left over from a version already superseded cannot be reported as this
+  deploy's doing. An effect is affected when its own digest moved *or* when something it names moved:
+  a `fn` it calls, an event it handles or folds over, a record or enum it annotates or constructs.
+  Each of those is a declaration of its own and an entry's hash covers only what is written inside
+  it, so that closure is what keeps an edited helper, or an event field that just became `@subject`,
+  from hiding behind an unchanged effect hash.
 
 **`hekla fmt` and `hekla lsp` are gone.** Both were Starlark tooling: starlark-rust ships a formatter
 and a language server, and hekla wrapped them with its own project knowledge (which builtins are in

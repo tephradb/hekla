@@ -11,6 +11,7 @@ pub mod opdb;
 pub mod read_api;
 pub mod read_model;
 pub mod schema;
+pub mod store;
 pub mod tags;
 pub mod ui;
 

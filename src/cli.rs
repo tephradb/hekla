@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 use crate::http::{HttpClient, UreqClient};
 use crate::loader::{Finding, LoadedProject, Severity};
 use crate::opdb::OpDb;
+use crate::plan::Replay;
 use crate::{crypto, runtime, server, testing, validate};
 
 /// The default HTTP bind address when `--addr` is not given.
@@ -108,11 +109,12 @@ enum Command {
     },
     /// Report what deploying this project over a data directory would change: which
     /// declarations were added, removed, or now do something different, and which
-    /// projectors would rebuild.
+    /// projectors would rebuild. With `--replay`, also what it would *do*.
     ///
-    /// Reads only. It opens no event log and takes no data-directory lock, so unlike
-    /// `verify` it runs against a directory a server has open. Exits zero whether or
-    /// not anything would change; a change is the answer, not a fault.
+    /// Reads only, and takes no data-directory lock, so unlike `verify` it runs against
+    /// a directory a server has open. Without `--replay` it opens no event log at all.
+    /// Exits zero whether or not anything would change; a change is the answer, not a
+    /// fault.
     Plan {
         /// The project directory.
         #[arg(default_value = ".")]
@@ -124,6 +126,22 @@ enum Command {
         /// Print the plan as JSON on stdout, for a deploy gate to read.
         #[arg(long)]
         json: bool,
+        /// Also re-run recorded effect invocations against the candidate code and report
+        /// the ones it would not reproduce. Reads the event log through a read-only
+        /// follower, so it still runs against a live deployment. An effect that reveals
+        /// needs HEKLA_MASTER_KEY, and is reported as unreplayable without one.
+        #[arg(long)]
+        replay: bool,
+        /// How many of each effect's most recent invocations `--replay` re-runs. What
+        /// the cap drops is named in the report rather than dropped quietly.
+        ///
+        /// At least one: a cap of zero would replay nothing while reporting every
+        /// effect as capped, which is a coverage number that describes no work at all.
+        /// Requires `--replay`, for the same reason: a cap on a replay that is not
+        /// happening is a request this command would otherwise accept and drop.
+        #[arg(long, requires = "replay", default_value_t = crate::plan::DEFAULT_REPLAY_LIMIT,
+              value_parser = clap::value_parser!(u32).range(1..))]
+        replay_limit: u32,
     },
     /// Erase a subject: delete its encryption key, making every value scoped to it
     /// unreadable and unmatchable across the log and every read model at once. This
@@ -161,7 +179,9 @@ pub fn run() -> ExitCode {
             dir,
             data_dir,
             json,
-        } => plan(&dir, data_dir.as_deref(), json),
+            replay,
+            replay_limit,
+        } => plan(&dir, data_dir.as_deref(), json, replay, replay_limit),
         Command::Erase {
             subject_field,
             subject_value,
@@ -339,7 +359,13 @@ fn check(dir: &Path) -> ExitCode {
 /// exits non-zero on a violation because a violation is a fault; a *change* is the
 /// expected result of running `plan` at all, and a command that fails when it succeeds
 /// is no use in a pipeline. A gate reads `--json`.
-fn plan(dir: &Path, data_dir: Option<&Path>, json: bool) -> ExitCode {
+fn plan(
+    dir: &Path,
+    data_dir: Option<&Path>,
+    json: bool,
+    replay: bool,
+    replay_limit: u32,
+) -> ExitCode {
     // Same reason as `openapi`: `load` succeeds vacuously on a path that is not a
     // project, and reporting "nothing would change" for a typo'd directory is the one
     // answer this command must never give.
@@ -357,8 +383,26 @@ fn plan(dir: &Path, data_dir: Option<&Path>, json: bool) -> ExitCode {
         eprintln!("refusing to plan: the project has {errors} error(s)");
         return ExitCode::FAILURE;
     }
+    // Read only when a replay will use it. Without `--replay` this command opens no log
+    // and reads no key material, and asking for a master it will not use would make a
+    // malformed one fail a run that never needed it.
+    let replay = if replay {
+        let master = match crypto::master_keys_from_env() {
+            Ok(master) => master,
+            Err(err) => {
+                eprintln!("error: reading the master key: {err:#}");
+                return ExitCode::FAILURE;
+            }
+        };
+        Replay::On {
+            master,
+            limit: replay_limit as usize,
+        }
+    } else {
+        Replay::Off
+    };
     let data = runtime::resolve_data_dir(dir, data_dir);
-    match crate::plan::compute(&project, &data) {
+    match crate::plan::compute_with(&project, &data, replay) {
         Ok(plan) => {
             if json {
                 match serde_json::to_string_pretty(&plan.json()) {

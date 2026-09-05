@@ -38,18 +38,19 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use serde_json::Value;
-use tephra::{Event, Position, Query, WriteHandle};
+use tephra::{Event, Position, Query};
 
 use heklang::Program;
 
 use crate::crypto::{KeyStore, MasterKeys, RowDecryptor};
-use crate::effect;
+use crate::effect::{self, Asked, Uncovered};
 use crate::envelope;
 use crate::loader::{EffectUnit, LoadedProject, ProjectorUnit};
 use crate::projector;
 use crate::read_model::ReadModel;
 use crate::runtime::Runtime;
 use crate::schema::{EntityDef, ModuleDef, scalar_to_string};
+use crate::store::Store;
 
 /// What a run of the checks found, and how much it covered.
 ///
@@ -61,7 +62,46 @@ pub struct Report {
     pub violations: Vec<Violation>,
     pub projectors_checked: usize,
     pub invocations_checked: usize,
-    pub invocations_skipped: usize,
+    pub skipped: Skipped,
+}
+
+/// Why invocations were not checked.
+///
+/// One number for three reasons said "some coverage is missing" without saying how much
+/// of it was expected. An edited effect is routine and self-explanatory; an erased
+/// subject is the documented cost of erasure; an event that no longer matches is neither
+/// and is worth looking at. Only separate counters can tell a reader which run they had.
+#[derive(Debug, Default)]
+pub struct Skipped {
+    /// The effect has been edited since, so the journal belongs to another program.
+    pub effect_edited: usize,
+    /// A `reveal` of an erased subject: nothing can be concluded, by design.
+    pub subject_erased: usize,
+    /// The recorded invocation journaled no call and the replay reached one, on a row
+    /// old enough that an operator skip and a run that called nothing are the same row.
+    pub no_journal: usize,
+    /// An operator skipped the invocation, so nothing ever ran it to an end and its
+    /// journal is the prefix of a run that stopped where it wedged.
+    pub operator_skipped: usize,
+    /// The invocation's record could not be read. Not evidence about the handler, so it
+    /// is a gap in coverage rather than a violation.
+    pub unreadable: usize,
+    /// Retention reclaimed the invocation's row while the sweep was replaying it.
+    pub reclaimed: usize,
+    /// The triggering event is no longer where the invocation says it was.
+    pub event_missing: usize,
+}
+
+impl Skipped {
+    pub fn total(&self) -> usize {
+        self.effect_edited
+            + self.subject_erased
+            + self.no_journal
+            + self.operator_skipped
+            + self.unreadable
+            + self.reclaimed
+            + self.event_missing
+    }
 }
 
 impl Report {
@@ -78,8 +118,19 @@ impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "checked {} projector(s) and {} invocation(s); skipped {}",
-            self.projectors_checked, self.invocations_checked, self.invocations_skipped
+            "checked {} projector(s) and {} invocation(s); skipped {} ({} edited, \
+             {} erased, {} without a journal, {} skipped by an operator, {} unreadable, \
+             {} reclaimed, {} without their event)",
+            self.projectors_checked,
+            self.invocations_checked,
+            self.skipped.total(),
+            self.skipped.effect_edited,
+            self.skipped.subject_erased,
+            self.skipped.no_journal,
+            self.skipped.operator_skipped,
+            self.skipped.unreadable,
+            self.skipped.reclaimed,
+            self.skipped.event_missing,
         )?;
         if self.violations.is_empty() {
             write!(f, "ok: no violations")
@@ -111,7 +162,7 @@ impl fmt::Display for Report {
 /// ordinary case, not a corrupt one.
 #[allow(clippy::too_many_arguments)]
 pub fn rebuild_equivalence(
-    store: &WriteHandle,
+    store: &Store,
     unit: &ProjectorUnit,
     program: &Program,
     keystore: Option<&KeyStore>,
@@ -372,30 +423,39 @@ fn sweep_effect(
         // old one. The hash is the digest's, so this asks whether the effect *does*
         // something different rather than whether the file was touched: reindenting one,
         // or renaming a local, keeps every invocation below in the check.
+        //
+        // `hekla plan` inverts exactly this test, for exactly this reason: there the
+        // point is what a not-yet-deployed program would do differently, so the
+        // divergence is the answer rather than the thing to step around.
         if script_hash != unit.digest_hash {
-            report.invocations_skipped += 1;
-            continue;
-        }
-        // The retention sweeper reclaims journals for completed invocations, so an
-        // older one has nothing left to replay against. Absent is not divergent.
-        if runtime.journal_keys(name, position)?.is_empty() {
-            report.invocations_skipped += 1;
+            report.skipped.effect_edited += 1;
             continue;
         }
         let Some((event_position, event)) = read_at(runtime, &query, position)? else {
-            report.invocations_skipped += 1;
+            report.skipped.event_missing += 1;
             continue;
         };
         debug_assert_eq!(event_position, position);
         let (_env, _data) = envelope::decode(event.data())
             .with_context(|| format!("reading the event effect `{name}` ran at {position}"))?;
-        report.invocations_checked += 1;
-        report.absorb(effect::verify_replay(
-            name,
-            position,
-            runtime.program(),
-            runtime,
-        ));
+        // No pre-check on the journal. An invocation retention reclaimed never reaches
+        // this loop (the row goes with the journal, so it is absent rather than empty),
+        // and one that is still here with an empty journal is worth replaying: if the
+        // handler still calls nothing, that is a real check. An operator skip is read off
+        // the row inside `replay`, so an unfinished run is not compared against its own
+        // prefix whatever shape that prefix has.
+        // `Sweep`: the program going in is the one that wrote this journal (the hash
+        // gate above says so), over a row some earlier process left behind.
+        let outcome = effect::replay(name, position, runtime, Asked::Sweep);
+        match outcome.uncovered() {
+            None => report.invocations_checked += 1,
+            Some(Uncovered::NoJournal) => report.skipped.no_journal += 1,
+            Some(Uncovered::OperatorSkipped) => report.skipped.operator_skipped += 1,
+            Some(Uncovered::Unreadable) => report.skipped.unreadable += 1,
+            Some(Uncovered::SubjectErased) => report.skipped.subject_erased += 1,
+            Some(Uncovered::Reclaimed) => report.skipped.reclaimed += 1,
+        }
+        report.absorb(outcome.violation(name, position));
     }
     Ok(())
 }

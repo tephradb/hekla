@@ -22,7 +22,7 @@ use crate::crypto;
 
 /// The current schema version, tracked in SQLite's `user_version`. Bump it and
 /// add a migration arm when the schema changes.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// How many rows a single sweep statement deletes, so a retention sweep never
 /// holds the connection across a long scan. The sweeper loops until a call
@@ -107,6 +107,7 @@ fn row_to_invocation(row: &rusqlite::Row) -> rusqlite::Result<InvocationRow> {
         script_hash: row.get(2)?,
         created_at: row.get(3)?,
         completed_at: row.get(4)?,
+        skipped_at: row.get(5)?,
     })
 }
 
@@ -229,6 +230,44 @@ impl OpDb {
             )
             .context("completing effect invocation")?;
         Ok(())
+    }
+
+    /// Mark an invocation `terminal` *and* record that an operator skipped it.
+    ///
+    /// Split from [`complete_invocation`](Self::complete_invocation) rather than given a
+    /// flag, because the two are different events that happen to leave the same status: a
+    /// completion is a handler reaching its own end, a skip is an operator stepping over
+    /// one that could not. Only the second is a position nothing ran to a conclusion for,
+    /// and a replay that cannot tell them apart has to guess from the journal.
+    pub fn skip_invocation(&self, effect: &str, position: u64, now: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE effect_invocation \
+                 SET status = 'terminal', completed_at = ?3, skipped_at = ?3 \
+                 WHERE effect = ?1 AND position = ?2",
+                params![effect, position as i64, now],
+            )
+            .context("recording an operator skip")?;
+        Ok(())
+    }
+
+    /// Whether an operator skipped this invocation rather than it reaching an end.
+    ///
+    /// `false` for a row written before schema v7, which had nowhere to record it. That
+    /// is the honest answer rather than a safe one: those rows keep the journal-shape
+    /// inference they have always had, and only rows written since can be answered
+    /// outright.
+    pub fn invocation_skipped(&self, effect: &str, position: u64) -> anyhow::Result<bool> {
+        let skipped: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT skipped_at FROM effect_invocation WHERE effect = ?1 AND position = ?2",
+                params![effect, position as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading an invocation skip marker")?;
+        Ok(skipped.flatten().is_some())
     }
 
     /// The recorded result of a journaled call, or `None` on a miss. A hit lets a
@@ -366,6 +405,80 @@ impl OpDb {
             .context("querying terminal invocations")?;
         rows.collect::<Result<Vec<_>, _>>()
             .context("collecting terminal invocations")
+    }
+
+    /// The most recent invocations of `effect` that `script_hash` recorded, at or below
+    /// `upto`, newest first, at most `limit` of them.
+    ///
+    /// For a replay against a *live* deployment, which is the difference from
+    /// [`terminal_invocations`](Self::terminal_invocations). `upto` is the tip of the
+    /// prefix the reader pinned: the server goes on appending and completing
+    /// invocations while a plan runs, and one recorded after the pin has no event the
+    /// reader can see, so replaying it would report a divergence that is really a race.
+    /// `limit` bounds the work, because a busy effect's seven days of history is
+    /// unbounded in a way a deploy gate is not.
+    ///
+    /// `script_hash` is the *deployed* program's, and filtering on it is what keeps a
+    /// plan honest. The retention window outlives an edit, so rows written by versions
+    /// this deploy is not replacing are still here; replaying those against the candidate
+    /// reports differences the running code already has, which is a finding about last
+    /// week rather than about this deploy.
+    ///
+    /// Newest first because recency is what a plan is about: if only some of the history
+    /// can be covered, the invocations closest to what is running now are the ones worth
+    /// covering.
+    pub fn recent_terminal_invocations(
+        &self,
+        effect: &str,
+        script_hash: &str,
+        upto: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT position FROM effect_invocation \
+                 WHERE effect = ?1 AND script_hash = ?2 AND status = 'terminal' \
+                 AND position <= ?3 ORDER BY position DESC LIMIT ?4",
+            )
+            .context("preparing the recent terminal invocation query")?;
+        // Saturating rather than wrapping: `usize::MAX` means "everything", and `LIMIT -1`
+        // is how SQLite spells that, but arriving there by two's complement would be an
+        // accident rather than a decision.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt
+            .query_map(params![effect, script_hash, upto as i64, limit], |row| {
+                let position: i64 = row.get(0)?;
+                Ok(position as u64)
+            })
+            .context("querying recent terminal invocations")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting recent terminal invocations")
+    }
+
+    /// How many rows [`recent_terminal_invocations`](Self::recent_terminal_invocations)
+    /// would have to choose from, unbounded by any limit.
+    ///
+    /// For a caller reporting invocations it is deliberately *not* replaying, where the
+    /// honest number is the whole set rather than the part a cap on the replay would
+    /// have covered.
+    pub fn count_terminal_invocations(
+        &self,
+        effect: &str,
+        script_hash: &str,
+        upto: u64,
+    ) -> anyhow::Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM effect_invocation \
+                 WHERE effect = ?1 AND script_hash = ?2 AND status = 'terminal' \
+                 AND position <= ?3",
+                params![effect, script_hash, upto as i64],
+                |row| row.get(0),
+            )
+            .context("counting terminal invocations")?;
+        Ok(count as usize)
     }
 
     /// The effect's durable resume point: the watermark it has processed every
@@ -714,7 +827,7 @@ impl OpDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT position, status, script_hash, created_at, completed_at \
+                "SELECT position, status, script_hash, created_at, completed_at, skipped_at \
                  FROM effect_invocation WHERE effect = ?1 AND position < ?2 \
                  ORDER BY position DESC LIMIT ?3",
             )
@@ -830,7 +943,7 @@ impl OpDb {
     pub fn invocation(&self, effect: &str, position: u64) -> anyhow::Result<Option<InvocationRow>> {
         self.conn
             .query_row(
-                "SELECT position, status, script_hash, created_at, completed_at \
+                "SELECT position, status, script_hash, created_at, completed_at, skipped_at \
                  FROM effect_invocation WHERE effect = ?1 AND position = ?2",
                 params![effect, position as i64],
                 row_to_invocation,
@@ -1052,6 +1165,7 @@ impl OpDb {
                 3 => tx.execute_batch(SCHEMA_V4).context("applying schema v4")?,
                 4 => tx.execute_batch(SCHEMA_V5).context("applying schema v5")?,
                 5 => tx.execute_batch(SCHEMA_V6).context("applying schema v6")?,
+                6 => tx.execute_batch(SCHEMA_V7).context("applying schema v7")?,
                 other => anyhow::bail!("no migration from schema version {other}"),
             }
             version += 1;
@@ -1205,16 +1319,34 @@ CREATE TABLE declaration (
 CREATE INDEX declaration_current ON declaration (current, kind, name);
 ";
 
-/// One effect invocation, as an introspection reader sees it. `status` is `running`
-/// or `terminal`; nothing distinguishes an invocation completed by success from one
-/// completed by an operator skip or a terminal `reveal()`, because the runtime
-/// records both as simply terminal.
+/// Schema v7 records *why* an invocation reached `terminal`, for the one case a reader
+/// cannot otherwise recover: an operator skip.
+///
+/// A skip completes a wedged invocation without running it to a conclusion, and until
+/// this column it left exactly the row a success leaves. Every reader that needed the
+/// distinction had to infer it from the shape of the journal, which cannot carry it: a
+/// skip before the first call and a run that genuinely called nothing are both an empty
+/// journal, and a skip after two calls reads as a run that made two. Pre-v7 rows are
+/// NULL, which reads as "not known to be a skip" and leaves them to that inference
+/// rather than asserting a fact the column was not there to record.
+const SCHEMA_V7: &str = "
+ALTER TABLE effect_invocation ADD COLUMN skipped_at TEXT;
+";
+
+/// One effect invocation, as an introspection reader sees it. `status` is `running` or
+/// `terminal`, and `skipped_at` is set when an operator skipped a wedged invocation
+/// rather than it reaching a conclusion of its own. A terminal `reveal()` stays plain
+/// completion: that is the handler reaching its own documented end, not an operator
+/// stepping over one.
 pub struct InvocationRow {
     pub position: u64,
     pub status: String,
     pub script_hash: String,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// When an operator skipped this wedged invocation. `None` for a run that reached
+    /// its own end, and for every row written before schema v7.
+    pub skipped_at: Option<String>,
 }
 
 /// One invocation found by position, carrying the effect it belongs to. Narrower
@@ -1573,6 +1705,64 @@ mod tests {
         );
     }
 
+    /// The three bounds a replay against a *live* deployment needs, and the order it
+    /// wants them in.
+    ///
+    /// `upto` is the tip of the prefix the reader pinned. A server appending while a
+    /// plan runs completes invocations the reader has no event for, and replaying one
+    /// would report a race as a behaviour change. `script_hash` keeps the baseline to
+    /// one program: retention outlives an edit, so rows from a version already replaced
+    /// would otherwise be replayed against a candidate that is not replacing them.
+    /// `limit` bounds the work, and takes the newest rows because those are the history
+    /// closest to what is running.
+    #[test]
+    fn recent_terminal_invocations_stops_at_the_prefix_the_hash_and_the_limit() {
+        let db = OpDb::open_in_memory().unwrap();
+        for position in 1..=5u64 {
+            db.begin_invocation("e", position, "h", "t0").unwrap();
+            db.complete_invocation("e", position, "t1").unwrap();
+        }
+        // Still running, so not a candidate at all.
+        db.begin_invocation("e", 6, "h", "t0").unwrap();
+        // The same effect, one edit ago.
+        db.begin_invocation("e", 7, "older", "t0").unwrap();
+        db.complete_invocation("e", 7, "t1").unwrap();
+
+        assert_eq!(
+            db.recent_terminal_invocations("e", "h", 100, 100).unwrap(),
+            vec![5, 4, 3, 2, 1],
+            "newest first, and a running invocation is not one"
+        );
+        assert_eq!(
+            db.recent_terminal_invocations("e", "h", 3, 100).unwrap(),
+            vec![3, 2, 1],
+            "nothing above the pinned prefix, however terminal it is"
+        );
+        assert_eq!(
+            db.recent_terminal_invocations("e", "h", 100, 2).unwrap(),
+            vec![5, 4],
+            "the limit keeps the most recent, not the first it happens to read"
+        );
+        assert_eq!(
+            db.recent_terminal_invocations("e", "older", 100, 100)
+                .unwrap(),
+            vec![7],
+            "a row belongs to the program that wrote it, not to the effect's name"
+        );
+        assert!(
+            db.recent_terminal_invocations("other", "h", 100, 100)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            db.count_terminal_invocations("e", "h", 100).unwrap(),
+            5,
+            "the count answers the same question with no limit on it"
+        );
+        assert_eq!(db.count_terminal_invocations("e", "h", 3).unwrap(), 3);
+        assert_eq!(db.count_terminal_invocations("e", "older", 100).unwrap(), 1);
+    }
     #[test]
     fn sweep_removes_only_old_terminal_and_cascades_the_journal() {
         let db = OpDb::open_in_memory().unwrap();

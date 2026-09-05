@@ -33,6 +33,7 @@ use crate::loader::LoadedProject;
 use crate::opdb::OpDb;
 use crate::read_model::ReadModel;
 use crate::schema::{EntityDef, EventDefs};
+use crate::store::Store;
 
 /// Throwaway per-test stores stay small, but the segment must still clear the writer's
 /// default max batch size.
@@ -136,6 +137,7 @@ impl HeklaWorld {
         let dir = TempDir::new()?;
         let set = SegmentSet::open(dir.path().join("events"), SegmentConfig::new(SEGMENT_SIZE))?;
         let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default())?;
+        let store = Store::writing(store);
 
         let opdb = Arc::new(Mutex::new(OpDb::open(&dir.path().join("hekla.db"))?));
         let keystore = Some(Arc::new(KeyStore::new(

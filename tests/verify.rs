@@ -24,6 +24,8 @@ use std::thread;
 use std::time::Duration;
 use support::{ALICE, BOB, Boot, CAROL, UUID_A, example_dir, load_ok, master_keys, register_user};
 
+const EFFECT: &str = "SendWelcome";
+
 /// Boot `examples/users`, register two users, wait for the projector, and shut
 /// down. Leaves a data directory with a populated read model and a completed effect
 /// invocation, which is the state every check below runs against.
@@ -496,9 +498,9 @@ fn an_edited_effect_is_skipped_rather_than_reported() {
         report.violations
     );
     assert!(
-        report.invocations_skipped >= 1,
+        report.skipped.effect_edited >= 1,
         "expected the edited effect's invocations to be skipped, got {}",
-        report.invocations_skipped
+        report.skipped.effect_edited
     );
     assert_eq!(report.invocations_checked, 0);
 }
@@ -547,7 +549,7 @@ fn a_cosmetically_edited_effect_is_still_checked() {
         report.invocations_checked >= 1,
         "a reformat must not cost the replay check its coverage, got checked={} skipped={}",
         report.invocations_checked,
-        report.invocations_skipped
+        report.skipped.total()
     );
 }
 
@@ -1134,4 +1136,53 @@ fn open_ticket(rt: &hekla::runtime::Runtime, ticket: &str, org: i64, owner: i64)
         )
         .unwrap();
     assert_eq!(result.status, 200, "OpenTicket failed: {:?}", result.body);
+}
+
+/// An operator skip must not become a violation.
+///
+/// This is the case that makes an empty journal ambiguous rather than informative.
+/// `honor_skip` completes the invocation, so the row is `terminal` with no journal
+/// entries, and `opdb::InvocationRow` says outright that nothing distinguishes it from a
+/// run that completed normally. Replaying it reaches the very call the wedge failed on,
+/// finds no entry for it, and would report a divergence for a directory an operator
+/// deliberately made healthy. The invocation row records the skip, so this is a gap in
+/// coverage instead of a fault. See
+/// `an_operator_skip_is_uncovered_whatever_its_journal_holds` in `tests/plan.rs` for the
+/// partial-journal case, which this single-call fixture cannot reach.
+#[test]
+fn an_operator_skip_is_uncovered_rather_than_a_violation() {
+    let data = tempfile::tempdir().unwrap();
+    {
+        let harness = Boot::example()
+            .data_dir(data.path())
+            .with_master_key()
+            .http_status(500)
+            .start();
+        register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
+        support::wait_until("the effect to wedge", || {
+            harness.rt.effect(EFFECT).unwrap().consecutive_failures() > 0
+        });
+        harness.rt.effect(EFFECT).unwrap().request_skip(1);
+        support::wait_until("the skip to advance the effect", || {
+            let effect = harness.rt.effect(EFFECT).unwrap();
+            effect.consecutive_failures() == 0 && effect.position() >= 1
+        });
+        harness.shutdown();
+    }
+
+    let report = support::sweep(&example_dir("users"), data.path());
+    assert!(
+        report.is_clean(),
+        "a skipped invocation is not a violation, got {:?}",
+        report.violations
+    );
+    assert_eq!(report.invocations_checked, 0);
+    assert_eq!(
+        report.skipped.operator_skipped, 1,
+        "and it is not silently counted as covered either"
+    );
+    assert!(
+        report.to_string().contains("skipped by an operator"),
+        "{report}"
+    );
 }

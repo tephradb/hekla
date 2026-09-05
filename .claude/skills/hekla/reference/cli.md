@@ -88,7 +88,8 @@ data-directory lock and checks rebuild equivalence, replay equivalence and check
 (see `operations.md`).
 
 ```
-checked 1 projector(s) and 0 invocation(s); skipped 1
+checked 1 projector(s) and 0 invocation(s); skipped 1 (1 edited, 0 erased, 0 without a
+journal, 0 reclaimed, 0 without their event)
 ok: no violations
 ```
 
@@ -97,11 +98,22 @@ on a directory another process holds. A project that uses `@subject` is refused 
 same way `serve` is: `error: this project uses subject-scoped encryption (...), so HEKLA_MASTER_KEY
 must be set to verify it`. Run it with the key the server used.
 
-An invocation is **skipped**, not checked, when the effect's source hash has changed since the run was
-recorded, when the retention sweeper has already reclaimed its journal, or when its event cannot be
-read. A run that skipped everything still says `ok`, which is why the counts are printed.
+An invocation is **skipped**, not checked, when the effect's source hash has changed since the run
+was recorded, when its event cannot be read, when a `reveal` it makes needs a subject key that has
+been erased, when an operator skipped it, when its record could not be read, when it journaled no
+call at all and the replay reaches one, or when retention reclaimed its record while the sweep was
+reading it. Each is counted separately, because they mean different things.
 
-## `hekla plan [DIR] [--data-dir PATH] [--json]`
+The operator skip is the subtle one. It completes a wedged invocation without running it to an end,
+so whatever the journal holds is the prefix of a run that never finished, and comparing a replay
+against that prefix would fail a directory an operator deliberately made healthy. The invocation row
+records the skip (`skipped_at`), so this does not depend on the shape of the journal. Invocations
+recorded before that column existed fall back to the old reading, which can only recognise a skip
+that journaled nothing at all, and those are counted separately as journaling no call.
+
+A run that skipped everything still says `ok`, which is why the counts are printed.
+
+## `hekla plan [DIR] [--data-dir PATH] [--json] [--replay] [--replay-limit N]`
 
 What deploying this project over a data directory would change, before it changes it. Loads the
 project, refuses on error findings, then compares its digest against the `declaration` rows the
@@ -120,14 +132,98 @@ did not move) or `contract` (what is visible outside changed). `const`, `refusal
 inlined and have no row of their own, so an edit to one shows as a fan-out with the cause named
 under it.
 
-Unlike `verify` it opens no event log and takes **no data-directory lock**, so it runs against a
-directory a server has open. It changes no database: the operational DB is opened only after its
-schema version is read separately and found to match, and read models are opened read-only.
+Without `--replay` it opens no event log at all. Either way it takes **no data-directory lock**, so
+it runs against a directory a server has open. It changes no database: the operational DB is opened
+only after its schema version is read separately and found to match, and read models are opened
+read-only.
 
 Exit is 0 whenever the plan was computed, whether or not anything would change; a change is the
 answer, not a fault. It is 1 on error findings, on a directory nothing was ever deployed to, on a
 schema version this build does not expect, and on a `--json` serialisation failure. `--json` puts the
 whole plan, including the before and after forms, on stdout with findings on stderr.
+
+### `--replay`
+
+A declaration diff says an effect changed. It cannot say whether the change matters, and "would this
+now send a different HTTP request" is what a deploy actually turns on. `--replay` re-runs recorded
+invocations of every affected effect against the candidate code and the journal the original run
+left behind.
+
+```
+  effect Notify @ 12: it reached a call the recorded run never made (http.post #0)
+replayed 2 invocation(s) across 1 affected effect(s); 0 reproduce, 2 diverge
+this project retains 7 day(s) of journals; anything older was reclaimed before the replay could see it
+```
+
+Nothing is mocked. The journal holds the responses the recorded run really received, so a candidate
+that branches differently on a response reaches a call the journal has no entry for, and that miss is
+the finding. Nothing is sent, nothing is appended, nothing is erased: it is the sealed replay `verify`
+runs, with a program that has not been deployed yet.
+
+**Affected** means the effect's own digest changed, *or* it names something whose digest changed:
+a module `fn` it calls, an event it handles, a record or enum reached through either. The second
+half matters, because heklang gives each of those an entry of its own and an entry's hash covers
+what is written inside it. Editing the helper that builds a URL does not move the calling effect's
+hash; neither does adding `@subject(...)` to an event field the arm binds, since an arm binds by
+name and the digest records the name and the slot, not the type. A check that looked only at the
+effect's own hash would miss both.
+
+The closure is deliberately conservative. An effect pulled in through a reference it does not
+really depend on costs one replay that reports `matched`; one left out costs the finding.
+
+This half opens the log, through a read-only tephra follower: read-only descriptors, nothing created,
+nothing deleted, no lock. It still runs against a deployment serving traffic, and
+`replay_runs_while_a_server_holds_the_directory` in `tests/plan.rs` is what keeps that true. Because
+a follower pins one committed prefix at the moment it opens, an invocation the live server records
+*after* that is left out rather than replayed against an event the reader cannot see.
+
+What it cannot see, all counted or named rather than assumed away:
+
+- **An erased subject.** A handler that branches on revealed plaintext cannot be re-run once its key
+  is shredded. Counted as unreplayable, never as a divergence.
+- **An operator skip.** A skipped invocation was completed on an operator's say-so without ever
+  running to an end, so its journal is the prefix of a run that stopped where it wedged. The row
+  records the skip, so this holds whatever that prefix contains.
+- **An invocation that journaled nothing**, where the candidate now reaches a call, and that was
+  recorded before the row could carry a skip marker. There an operator skip and a run that called
+  nothing are the same row, so there is nothing to compare against. (When the candidate also calls
+  nothing the two agree, and that *is* checked.)
+- **A record that could not be read.** A busy op-DB is ordinary against a live directory and says
+  nothing about the candidate, so a failed read is a gap in coverage rather than a divergence. The
+  same holds one level up: if an effect's history cannot be listed at all, that effect is named and
+  the rest of the plan still stands.
+- **Retention.** A reclaimed invocation loses its row and its journal together, so it is invisible
+  here rather than skipped. Nothing can count what is gone, so `retention.effect_journal_days` is
+  printed instead. It is the *candidate's* window and an upper bound: the deployed configuration is
+  what actually governed the sweeping, and hekla does not record it.
+- **`--replay-limit`** (default 1000, at least 1, per effect). A busy effect's week of history is
+  unbounded in a way a deploy gate is not, so only that many of the most recent invocations are
+  replayed, and any effect the cap bit is named in the report.
+- **An older version of the effect.** Only invocations the *deployed* program recorded are replayed.
+  Retention outlives an edit, so rows written by a version this deploy is not replacing are still on
+  disk, and replaying those would report a difference the running code already has.
+- **A terminal `fail`.** Rule 4 makes giving up an outcome rather than an error, and the row it
+  leaves is the one a success leaves, so nothing on disk says which happened. A candidate that would
+  newly `fail` on recorded events is reported as a divergence for exactly that reason: the record
+  cannot vouch for it. `verify` replays the program that wrote the row, where failing where it failed
+  is a reproduction, so it never sees this.
+- **An invocation retention reclaimed mid-run.** `--replay` is built to run against a directory a
+  server is still sweeping, so a row can go between being listed and being read. Counted rather than
+  read as a run that called nothing.
+
+An effect that `reveal`s needs `HEKLA_MASTER_KEY`. Without one its invocations are counted
+`no_master_key` and the rest of the project still replays, so a CI job can plan against production
+without holding the production key and still be told plainly what it did not see. The decision is
+per effect, read off the form: one sealed field somewhere does not blind an effect that never
+touches a key. A key that is *present* but cannot unwrap what is stored (a half-configured
+rotation) degrades the same way rather than failing the command, and the report names the reason:
+a wrong key must not be worse than no key.
+
+A divergence does not change the exit code. `plan` reports; a gate reads `--json`, which carries
+`divergences` and `coverage` beside the rest. Both are `null` when no replay ran: an empty
+`divergences` list would be a clean replay result, and a gate must not read one off a run that never
+opened the log. `--replay-limit` requires `--replay`, for the same reason a cap nobody can see is
+not acceptable: a limit on a replay that is not happening would be accepted and dropped.
 
 ## `hekla openapi [DIR]`
 

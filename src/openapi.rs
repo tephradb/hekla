@@ -2290,8 +2290,7 @@ fn effect_detail_schema() -> Value {
                 "format": "int64",
                 "description": "Invocations completed without doing their work since this \
                     process started. Process-local: a restart resets it, and the durable trace \
-                    of a skipped position is a terminal invocation row indistinguishable from a \
-                    completed one.",
+                    of a skipped position is a terminal invocation row carrying `skipped_at`.",
             },
             "last_terminal_error": { "type": ["string", "null"] },
             "quarantined": { "type": "boolean" },
@@ -2346,8 +2345,8 @@ fn effect_invocation_schema() -> Value {
                 "type": "string",
                 "enum": ["running", "terminal"],
                 "description": "The only two persisted states. `terminal` covers success, an \
-                    operator skip and a terminal `reveal()` alike: the runtime records all three \
-                    as done.",
+                    operator skip and a terminal `reveal()` alike; `skipped_at` is what tells the \
+                    operator skip apart from the other two.",
             },
             "script_hash": {
                 "type": "string",
@@ -2357,8 +2356,14 @@ fn effect_invocation_schema() -> Value {
             },
             "created_at": { "type": "string" },
             "completed_at": { "type": ["string", "null"] },
+            "skipped_at": {
+                "type": ["string", "null"],
+                "description": "When an operator skipped this wedged invocation, completing it \
+                    without running it to an end. Null for a run that reached its own end, and \
+                    for every invocation recorded before this column existed.",
+            },
         },
-        "required": ["position", "status", "script_hash", "created_at", "completed_at"],
+        "required": ["position", "status", "script_hash", "created_at", "completed_at", "skipped_at"],
         "additionalProperties": false,
     })
 }

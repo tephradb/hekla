@@ -380,22 +380,24 @@ fn the_fixture_sweeps_clean_and_covers_everything_it_should() {
         "one invocation per opened ticket, all three replayed"
     );
     assert_eq!(
-        report.invocations_skipped, 0,
+        report.skipped.total(),
+        0,
         "nothing was skipped, so the count above is coverage and not luck"
     );
 }
 
-/// An invocation that journaled nothing is skipped rather than checked, and the sweep
-/// cannot tell it from one whose journal the retention sweeper reclaimed. Both come
-/// back as an empty journal, and `sweep_effect` reads that as "nothing to replay
-/// against".
+/// An invocation that journaled nothing is replayed against its empty journal, not
+/// skipped, and counts as covered.
 ///
-/// Pinned rather than fixed, because the two are genuinely indistinguishable on disk:
-/// telling them apart needs a durable marker that does not exist today. It is worth
-/// knowing because it is the one way a clean report can cover less than it looks like
-/// it does, which is why `invocations_skipped` is asserted here and everywhere else.
+/// This used to be pinned the other way, on the theory that an empty journal was
+/// indistinguishable from one the retention sweeper had reclaimed. It is not:
+/// `sweep_effect_journal` deletes the `effect_invocation` row and `effect_journal`
+/// cascades off it, so a reclaimed invocation never reaches the sweep at all. An empty
+/// journal on a row that is still here is a run that genuinely called nothing, and
+/// replaying it (empty against empty) checks something real: that the handler still
+/// takes the branch that calls nothing.
 #[test]
-fn an_invocation_that_called_nothing_is_skipped_rather_than_replayed() {
+fn an_invocation_that_called_nothing_is_replayed_against_its_empty_journal() {
     let data = tempfile::tempdir().unwrap();
     {
         let harness = Boot::new(fixture_dir("tickets"))
@@ -412,11 +414,11 @@ fn an_invocation_that_called_nothing_is_skipped_rather_than_replayed() {
 
     let report = sweep(&fixture_dir("tickets"), data.path());
     assert!(report.is_clean(), "{:?}", report.violations);
-    assert_eq!(report.invocations_checked, 0);
     assert_eq!(
-        report.invocations_skipped, 1,
-        "a clean report that replayed nothing has to say so in its counts"
+        report.invocations_checked, 1,
+        "a run that called nothing is still a run whose calls can be compared"
     );
+    assert_eq!(report.skipped.total(), 0);
 }
 
 /// A subject written to again after an erasure gets new key material, and everything

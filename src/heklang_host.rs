@@ -28,7 +28,7 @@ use heklang::interp::{Error, ErrorKind};
 use heklang::ir::EventPath;
 use heklang::value::{self, Defs};
 use heklang::{Event, Json, Program, Record, Value};
-use tephra::{Position, QueryItem, Tag, Tags, WriteHandle};
+use tephra::{Position, QueryItem, Tag, Tags};
 
 use crate::context::CommandContext;
 use crate::crypto::KeyStore;
@@ -39,6 +39,7 @@ use crate::opdb::OpDb;
 use crate::read_api;
 use crate::read_model::ReadModel;
 use crate::schema::{self, EmittedEvent, EventDef, EventDefs, FieldKind};
+use crate::store::Store;
 
 /// heklang counts positions from zero and tephra counts from one, so the two are one
 /// apart everywhere. Written once here rather than remembered at each call site.
@@ -124,7 +125,7 @@ fn tag_text(value: &Value) -> String {
 pub struct HeklaHost {
     pub program: Arc<Program>,
     pub events: Arc<EventDefs>,
-    pub store: WriteHandle,
+    pub store: Store,
     pub keystore: Option<Arc<KeyStore>>,
     /// Causation for the events this run appends. heklang has no opinion on it, which
     /// is why it stays hekla's.
@@ -283,6 +284,17 @@ impl HeklaHost {
         ))
     }
 
+    /// The handle this host appends through, or the error for a log it may only read.
+    ///
+    /// A follower cannot extend the log, and refusing here rather than assuming is what
+    /// keeps `hekla plan --replay` structurally incapable of writing to the deployment
+    /// it is reporting on.
+    fn writer(&self) -> Result<&tephra::WriteHandle, Error> {
+        self.store
+            .writer("a handler")
+            .map_err(|err| host_error(err.to_string()))
+    }
+
     fn query_of(&self, slices: &[Predicate]) -> Result<tephra::Query, Error> {
         let items = slices
             .iter()
@@ -345,6 +357,14 @@ impl Log for HeklaHost {
         if self.sealed {
             return Err(host_error("a sealed replay tried to append to the log"));
         }
+        // Asked for before anything is lowered, not at the append itself. `lower` mints
+        // an id per event and the rewind below is what keeps those ids independent of a
+        // failed attempt; refusing after minting would leave the counter advanced for a
+        // request that wrote nothing. Nothing reaches this today, because only a sealed
+        // replay follows and the line above returns first, but a check must never be able
+        // to cause the fault it looks for, and that is a claim about what the code makes
+        // impossible rather than about what it happens to reach.
+        self.writer()?;
         // A command that decided to do nothing still commits, and heklang appends its
         // (empty) outcome rather than special-casing it. There is nothing to write and
         // nothing a condition could guard, so this is where that stops.
@@ -379,7 +399,7 @@ impl Log for HeklaHost {
             Some(tag) => boundary.fail_if_exists(tephra::Query::item(idem_item(&tag)?)),
             None => boundary,
         };
-        let landed = self.store.append(built, Some(dcb));
+        let landed = self.writer()?.append(built, Some(dcb));
         if landed.is_err() {
             self.minted = minter;
         }

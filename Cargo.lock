@@ -1505,9 +1505,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seglog"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af06af3a093e749256896a4f89cb9d00a6a513d08a401e8f4d2c8571bbc232e7"
+checksum = "7bdf270d84fa832708e8cfa521d04076da98e51fbeb9b096eccf1f7fba84a34d"
 dependencies = [
  "crc32fast",
  "nix",
@@ -1759,9 +1759,9 @@ dependencies = [
 
 [[package]]
 name = "tephra"
-version = "0.3.6"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "489670c38cae3ed5fe1820ff3f289133320952545f036d3a99e6f32059932147"
+checksum = "afb3e454eb1f6e1d9c184b6d70c854e1ae153a961d986f43798343a4442af33c"
 dependencies = [
  "crc32fast",
  "dashmap",
@@ -1769,6 +1769,7 @@ dependencies = [
  "flume",
  "fst",
  "futures-core",
+ "nix",
  "seglog",
  "smallvec",
  "tephra-types",
@@ -1778,9 +1779,9 @@ dependencies = [
 
 [[package]]
 name = "tephra-types"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3265e6985461b399ec415a80b256c87b8d3ec4c88aeb9a04458cda17f38aabc2"
+checksum = "a273d6fc445ad39bb4fd6cb235666aec8c775ca2e0aa0203376b7989fec0e8be"
 dependencies = [
  "smallvec",
  "thiserror",

@@ -36,6 +36,7 @@ hekla serve <dir>     # the runtime and the HTTP API, on 127.0.0.1:8080 by defau
 hekla openapi <dir>   # the generated OpenAPI 3.1 document on stdout, findings on stderr
 hekla verify <dir>    # the offline invariant sweep over a data directory
 hekla plan   <dir>    # what deploying this project over a data directory would change
+                      #   --replay also re-runs recorded effect invocations against it
 hekla erase <field> <value> <dir>    # delete one subject's key. Irreversible
 hekla rotate <dir>    # rewrap every subject key under the current master
 ```

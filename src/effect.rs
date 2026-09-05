@@ -36,6 +36,7 @@
 //! attempt's backoff, so a rate limiter's own window is waited out, not hammered.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
@@ -43,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use heklang::host::{Calls, Recorded};
-use heklang::{Interpreter, Invocation as HekInvocation, Program};
+use heklang::{Interpreter, Invocation as HekInvocation};
 use tephra::{Position, WaitOutcome};
 
 use crate::config::Config;
@@ -502,7 +503,6 @@ fn run_inner(
     let ModuleDef::Effect { name, sources } = &unit.def else {
         anyhow::bail!("run called on a non-effect module");
     };
-    let program = runtime.program();
     // Sources filter on plaintext fields only (check-time rejects encrypted source
     // constraints), so no key store is needed to lower them.
     let query = query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -517,7 +517,11 @@ fn run_inner(
         return Ok(());
     }
     let resume = runtime.effect_resume_after(name)?;
-    let mut sub = runtime.store().subscribe(query, Position::new(resume));
+    // Only a writer-backed store advances a watermark; see `Store::subscribe`. An effect
+    // driver on a read-only log would park forever rather than idle.
+    let mut sub = runtime
+        .store()
+        .subscribe("an effect", query, Position::new(resume))?;
     // Tell the supervisor the driver is back on the log; it owns what that means.
     subscribed();
     loop {
@@ -529,7 +533,6 @@ fn run_inner(
                 match run_invocation(
                     shared,
                     name,
-                    program,
                     &unit.digest_hash,
                     runtime,
                     http,
@@ -572,11 +575,9 @@ fn advance_watermark(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_invocation(
     shared: &EffectShared,
     effect: &str,
-    program: &Program,
     source_hash: &str,
     runtime: &Arc<Runtime>,
     http: &Arc<dyn HttpClient>,
@@ -594,14 +595,14 @@ fn run_invocation(
         // skip requested for a not-yet-reached position drop a healthy event.
         if attempt > 0 && shared.skip_position.load(Ordering::Relaxed) == position {
             honor_skip(shared, || {
-                runtime.complete_invocation(effect, position, &runtime::now_rfc3339())
+                runtime.skip_invocation(effect, position, &runtime::now_rfc3339())
             })?;
             tracing::warn!(
                 "effect `{effect}` skipped wedged position {position} by operator request"
             );
             return Ok(Progress::Advanced);
         }
-        match try_invocation(effect, position, program, runtime, http) {
+        match try_invocation(effect, position, runtime, http) {
             Ok(()) => {
                 // Complete first, then check. The live run has already performed and
                 // journaled its side effects, so this position's work is genuinely
@@ -612,14 +613,17 @@ fn run_invocation(
                 runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
                 shared.clear_failures();
                 if runtime.verify() {
-                    let violations = verify_replay(effect, position, program, runtime);
-                    if let Some(violation) = violations.first() {
+                    // `Live`: this process just watched the invocation complete, and an
+                    // operator skip returned above rather than reaching here, so an empty
+                    // journal here is a run that genuinely called nothing.
+                    let outcome = replay(effect, position, runtime, Asked::Live);
+                    if let Some(violation) = outcome.violation(effect, position) {
                         // Durable, so the restart a wedged effect invites does not
                         // silently clear it. The watermark is deliberately left where
                         // it is: this position is terminal, but nothing past it should
                         // be processed until an operator has looked.
                         runtime.quarantine_effect(effect, position, &violation.to_string())?;
-                        shared.quarantine(violation);
+                        shared.quarantine(&violation);
                         return Ok(Progress::Interrupted);
                     }
                 }
@@ -673,7 +677,6 @@ fn run_invocation(
 fn try_invocation(
     effect: &str,
     position: u64,
-    program: &Program,
     runtime: &Arc<Runtime>,
     http: &Arc<dyn HttpClient>,
 ) -> Result<(), InvocationFailure> {
@@ -708,7 +711,7 @@ fn try_invocation(
         now: &now,
         call,
     };
-    let mut interpreter = Interpreter::with_host(program, host);
+    let mut interpreter = Interpreter::with_host(runtime.program(), host);
     // heklang counts from zero and tephra from one, so the trigger is one lower there.
     // The journal key stays the tephra position: it is a row in hekla.db.
     let outcome = interpreter.deliver(effect, from_tephra(Position::new(position)), &mut journal);
@@ -977,8 +980,247 @@ impl HttpClient for SealedHttp {
     }
 }
 
-/// Re-run a recorded invocation against a sealed host and report every way it fails
-/// to reproduce itself.
+/// What re-running one recorded invocation came to.
+///
+/// The distinctions here are the whole point of the type. `verify` needs to know whether
+/// an invocation reproduced; `plan` needs that *and* whether an invocation it could not
+/// replay was counted as reproducing, because a coverage number that quietly includes
+/// what it never covered is worse than no coverage number at all.
+#[derive(Debug, Clone)]
+pub enum Replayed {
+    /// It made the same calls, in the same order, and performed none of them again.
+    Matched,
+    /// It reached a call the journal has no entry for. On a real retry that call would
+    /// have been performed a second time; on a candidate deploy it is a call the
+    /// recorded run never made.
+    NewCall { call: String, asked: Asked },
+    /// It hit every journal entry but not in the recorded order, or made fewer calls.
+    Different { journal: String, replay: String },
+    /// No arm selects the triggering event any more, so this code would not run at all
+    /// for it. Reachable only when the arms themselves changed, which is why `verify`
+    /// never sees it and `plan` does.
+    NoLongerHandled,
+    /// A `reveal` of a subject whose key has been erased. Nothing can be concluded: the
+    /// plaintext the handler branches on is gone, by design, and journaling it to make
+    /// this replayable would defeat the erasure. Not a divergence, and not a match.
+    SubjectErased { reason: String },
+    /// The recorded invocation journaled no call at all, and the replay reached one.
+    ///
+    /// Only for rows written before schema v7, which had nowhere to record an operator
+    /// skip: a run that took a branch calling nothing and a run skipped before its first
+    /// call both landed as `terminal` with an empty journal, and nothing on the row told
+    /// them apart. Reporting a call the second one *did* make as a call it did not would
+    /// fail a healthy directory, so this is uncovered rather than divergent. Rows written
+    /// since answer the question outright and produce
+    /// [`OperatorSkipped`](Replayed::OperatorSkipped) instead, whatever their journal
+    /// holds. [`Asked::Live`] never produces this either: it watched the run complete, so
+    /// it gets [`NewCall`](Replayed::NewCall). When the replay also calls nothing the two
+    /// agree and it is [`Matched`](Replayed::Matched), which is a real check.
+    NoJournal { call: String },
+    /// The invocation's row went away between being listed and being read.
+    ///
+    /// Retention deletes the row and cascades the journal, so an invocation it reclaimed
+    /// is invisible rather than skipped. That is normally true before the replay starts,
+    /// but `--replay` runs against a directory whose server is still sweeping, so the row
+    /// can go while this is looking at it. Nothing is left to compare against, and the
+    /// empty journal it leaves behind must not be read as a run that called nothing.
+    Reclaimed,
+    /// The handler reached `fail(...)`: rule 4's terminal outcome, which advances the
+    /// cursor rather than wedging.
+    ///
+    /// Only [`Asked::Candidate`] produces this. When the program going in is the one that
+    /// wrote the journal, a terminal failure is what that program does with this event
+    /// and the calls it made on the way are still the thing under test, so the comparison
+    /// runs and this never appears. When the program is a candidate, the record cannot
+    /// say whether the deployed one failed here too, and "this deploy would fail on 40 of
+    /// the last 100 events" is worth saying either way.
+    TerminallyFailed { detail: String },
+    /// An operator skipped this invocation, so nothing ran it to a conclusion.
+    ///
+    /// Read from the row rather than inferred from the journal, which is why this says
+    /// what [`NoJournal`](Replayed::NoJournal) can only guess at. A skip completes a
+    /// wedged position on an operator's say-so: the handler stopped wherever it stopped,
+    /// and whatever the journal holds is a prefix of a run that never finished. Comparing
+    /// a replay against that prefix would report a healthy directory as divergent, which
+    /// is what it did for four rounds of this, so it is uncovered whatever shape the
+    /// journal has and whatever the replay does.
+    OperatorSkipped,
+    /// The record could not be read, so nothing was compared.
+    ///
+    /// A database error is not evidence about the handler. `--replay` runs against a
+    /// directory whose server is live, so a busy op-DB is ordinary, and concluding
+    /// anything on the strength of a failed read would turn contention into a finding.
+    /// The same policy `reclaimed` applies to its own read, applied to the journal's.
+    Unreadable { detail: String },
+    /// It errored part-way through, so whatever it would have done, it did not do what
+    /// the journal records.
+    ///
+    /// Not conditional on the journal having anything in it: an error that never reached
+    /// a call is the candidate failing on this event, which the record neither explains
+    /// nor excuses.
+    Failed { detail: String },
+}
+
+/// Why an outcome could not be compared against the record at all.
+///
+/// The set [`Replayed::is_covered`] excludes, named rather than re-derived: every caller
+/// that reports *why* an invocation went uncounted reads this, so a new reason is a
+/// compile error at each of them instead of a wildcard that quietly miscounts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uncovered {
+    /// The plaintext the handler branches on has been shredded.
+    SubjectErased,
+    /// The record is empty, and cannot say whether that is because the run called
+    /// nothing or because an operator skipped it.
+    NoJournal,
+    /// Retention took the record while the replay was running.
+    Reclaimed,
+    /// An operator skipped the invocation, so no run of it ever reached an end.
+    OperatorSkipped,
+    /// The record could not be read at all.
+    Unreadable,
+}
+
+/// Who is asking, which settles two readings the outcome alone cannot.
+///
+/// An empty journal is ambiguous to a caller reading a row back, and unambiguous to the
+/// driver that watched the run complete. A terminal `fail` is what the recorded program
+/// does when the program being replayed *is* the recorded one, and news when it is not.
+/// Both are facts about the caller's situation rather than about the invocation, which is
+/// why they arrive as a parameter instead of being guessed at from the outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// The live check inside the effect driver: this process watched the invocation
+    /// complete moments ago, an operator skip returned before reaching here, and the
+    /// program is the one that recorded the journal.
+    Live,
+    /// [`crate::verify`]'s sweep: the same program, over a record some earlier process
+    /// wrote.
+    Sweep,
+    /// [`crate::plan`]: a record written by a program that is not the one going in.
+    Candidate,
+}
+
+impl Replayed {
+    /// Why the replay could not reach an answer about this invocation, if it could not.
+    ///
+    /// A failure is not one of these: erroring part-way through is a way of not
+    /// reproducing, and one worth reporting. What counts here is an invocation the replay
+    /// could not put a question to at all, because the key it needed is gone or because
+    /// the record it would be compared against cannot say what happened.
+    pub fn uncovered(&self) -> Option<Uncovered> {
+        match self {
+            Replayed::SubjectErased { .. } => Some(Uncovered::SubjectErased),
+            Replayed::NoJournal { .. } => Some(Uncovered::NoJournal),
+            Replayed::Reclaimed => Some(Uncovered::Reclaimed),
+            Replayed::OperatorSkipped => Some(Uncovered::OperatorSkipped),
+            Replayed::Unreadable { .. } => Some(Uncovered::Unreadable),
+            _ => None,
+        }
+    }
+
+    /// Whether the replay reached an answer about this invocation, either way.
+    pub fn is_covered(&self) -> bool {
+        self.uncovered().is_none()
+    }
+
+    /// A stable one-word name for this outcome, for a machine reading `--json`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Replayed::Matched => "matched",
+            Replayed::NewCall { .. } => "new_call",
+            Replayed::Different { .. } => "different_calls",
+            Replayed::NoLongerHandled => "no_longer_handled",
+            Replayed::SubjectErased { .. } => "subject_erased",
+            Replayed::NoJournal { .. } => "no_journal",
+            Replayed::Reclaimed => "reclaimed",
+            Replayed::OperatorSkipped => "operator_skipped",
+            Replayed::Unreadable { .. } => "unreadable",
+            Replayed::TerminallyFailed { .. } => "terminally_failed",
+            Replayed::Failed { .. } => "failed",
+        }
+    }
+
+    /// Whether the replay and the record agree.
+    pub fn reproduces(&self) -> bool {
+        matches!(self, Replayed::Matched)
+    }
+
+    /// This outcome as a check reads it: a violation, or nothing.
+    ///
+    /// An invocation nothing could be concluded about is not a violation. It is also not
+    /// a pass, which is what a caller's coverage counts are for. Everything the caller's
+    /// situation decides was decided in [`replay`], so this reads the outcome alone.
+    pub(crate) fn violation(&self, effect: &str, position: u64) -> Option<Violation> {
+        if self.reproduces() || !self.is_covered() {
+            return None;
+        }
+        Some(Violation::ReplayDivergence {
+            effect: effect.to_owned(),
+            position,
+            detail: self.to_string(),
+        })
+    }
+}
+
+impl fmt::Display for Replayed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Replayed::Matched => write!(f, "it made the calls the journal records"),
+            // The same observation reads two ways, and printing only the retry one told a
+            // `plan` reader that a retry would double-fire when the finding is that the
+            // candidate makes a call the recorded run never did.
+            Replayed::NewCall { call, asked } => match asked {
+                Asked::Candidate => {
+                    write!(f, "it reached a call the recorded run never made ({call})")
+                }
+                Asked::Live | Asked::Sweep => write!(
+                    f,
+                    "it reached a call with no journal entry ({call}); a real retry would \
+                     have performed it a second time"
+                ),
+            },
+            Replayed::Different { journal, replay } => write!(
+                f,
+                "it made a different sequence of calls than the journal records \
+                 (journal {journal}, replay {replay})"
+            ),
+            Replayed::NoLongerHandled => write!(
+                f,
+                "no arm selects the event that triggered it, so it would not run at all"
+            ),
+            Replayed::SubjectErased { reason } => write!(f, "it cannot be replayed: {reason}"),
+            Replayed::NoJournal { call } => write!(
+                f,
+                "it reached a call ({call}) against a journal with no entries, and an \
+                 operator skip and a run that called nothing both journal nothing, so \
+                 what it would now call cannot be compared"
+            ),
+            Replayed::Reclaimed => write!(
+                f,
+                "retention reclaimed its record while the replay was running, so there \
+                 is nothing left to compare against"
+            ),
+            Replayed::TerminallyFailed { detail } => write!(
+                f,
+                "it would end in a terminal `fail`, advancing past the event rather than \
+                 handling it: {detail}"
+            ),
+            Replayed::OperatorSkipped => write!(
+                f,
+                "an operator skipped it, so nothing ran it to an end and its journal is \
+                 whatever the wedged run had reached"
+            ),
+            Replayed::Unreadable { detail } => write!(
+                f,
+                "its record could not be read, so nothing was compared: {detail}"
+            ),
+            Replayed::Failed { detail } => write!(f, "it failed part-way through: {detail}"),
+        }
+    }
+}
+
+/// Re-run a recorded invocation against a sealed host and say how it went.
 ///
 /// Safe against a live system by construction: the sealed host performs nothing, so
 /// the worst outcome is a report. Sealing the transport alone is not enough, and that
@@ -994,19 +1236,35 @@ impl HttpClient for SealedHttp {
 /// longer makes. Because the journal is keyed by call content rather than by
 /// sequence, a handler that merely *reorders* its calls still hits every entry, so
 /// comparing the visited set against the recorded set is what surfaces it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn verify_replay(
-    effect: &str,
-    position: u64,
-    program: &Program,
-    runtime: &Arc<Runtime>,
-) -> Vec<Violation> {
-    let divergence = |detail: String| Violation::ReplayDivergence {
-        effect: effect.to_owned(),
-        position,
-        detail,
-    };
-
+///
+/// **The program comes from `runtime`, and from nowhere else.** Handing it the code that
+/// recorded the journal asks "did this reproduce itself", which is
+/// [`verify`](crate::verify); handing it code that has not been deployed yet asks "would
+/// this still do what happened", which is [`plan`](crate::plan), whose
+/// [`Runtime::open_following`] wraps the candidate project for exactly that. One machine,
+/// two questions, and the only difference is which runtime goes in.
+///
+/// It used to be a parameter beside the runtime, which let the two disagree: the
+/// interpreter ran one program while [`HeklaHost`] decoded the log through another, so a
+/// candidate's handler would fold events typed by the deployed schema and report the
+/// mismatch as a behaviour change. Taking both from one place makes that unrepresentable.
+pub fn replay(effect: &str, position: u64, runtime: &Arc<Runtime>, asked: Asked) -> Replayed {
+    // First, and before the handler is run at all, because an operator skip is a fact
+    // about the record rather than about this replay. A skipped position is one nothing
+    // ran to an end: the handler stopped where it wedged, so its journal is the prefix of
+    // an unfinished run and every comparison below would be against half of one. Inferred
+    // from journal shape this was wrong in three separate ways; read from the row it is
+    // one question. `Live` never reaches a skipped invocation, since `honor_skip` returns
+    // before the check runs, so it does not pay for the read. A read that fails is taken
+    // as "not skipped", which lands on the inference below rather than turning a busy
+    // op-DB into a coverage gap.
+    if asked != Asked::Live
+        && runtime
+            .invocation_skipped(effect, position)
+            .unwrap_or(false)
+    {
+        return Replayed::OperatorSkipped;
+    }
     let now = runtime::now_rfc3339();
     let host = HeklaHost {
         program: Arc::clone(runtime.program_shared()),
@@ -1043,56 +1301,145 @@ pub(crate) fn verify_replay(
         visited: RefCell::new(Vec::new()),
         missed: RefCell::new(None),
     };
-    let mut interpreter = Interpreter::with_host(program, host);
+    let mut interpreter = Interpreter::with_host(runtime.program(), host);
     // heklang counts from zero and tephra from one, so the trigger is one lower there.
     // The journal key stays the tephra position: it is a row in hekla.db.
     let outcome = interpreter.deliver(effect, from_tephra(Position::new(position)), &mut journal);
     let visited = journal.visited.borrow().clone();
     let missed = journal.missed.borrow().clone();
 
-    if let Err(err) = outcome {
-        return vec![match missed {
-            Some(call) => divergence(format!(
-                "it reached a call with no journal entry ({call}); a real retry would \
-                 have performed it a second time"
-            )),
-            None => divergence(format!("it failed part-way through: {err}")),
-        }];
+    // Before the journal is even read, because neither turns on what the record holds and
+    // reading it can fail. Ordering them after a database error would turn a busy op-DB
+    // into a violation for an invocation that is unanswerable by design.
+    //
+    // `Invocation::Skipped` has exactly one producer in heklang, `ErrorKind::Erased`, so
+    // this is the erased-subject case and nothing else. For a live retry it is the
+    // documented cost of the `erase last` rule; for a replay it is the one thing the
+    // journal deliberately cannot answer for.
+    if let Ok(HekInvocation::Skipped(reason)) = &outcome {
+        return Replayed::SubjectErased {
+            reason: reason.clone(),
+        };
     }
-    // A terminal skip is the documented cost of the `erase last` rule rather than a
-    // divergence: the replay re-runs the unjournaled `reveal` against a key the
-    // invocation itself deleted, exactly as the live retry path already does.
-    if matches!(outcome, Ok(HekInvocation::Skipped(_))) {
-        return Vec::new();
-    }
-    if let Some(call) = missed {
-        return vec![divergence(format!(
-            "it reached a call with no journal entry ({call}); a real retry would have \
-             performed it a second time"
-        ))];
+    // And an arm that no longer selects the event makes no calls at all, which every
+    // comparison below would report as a quieter fact than it is. A recorded invocation
+    // exists only because the deployed code *did* select this event (an ignored position
+    // journals nothing and gets no row), so an ignored replay is unambiguous news.
+    if matches!(outcome, Ok(HekInvocation::Ignored)) {
+        return Replayed::NoLongerHandled;
     }
 
     let recorded: Vec<CallKey> = match runtime.journal_keys(effect, position) {
         Ok(recorded) => recorded,
+        // Uncovered rather than failed. The handler did nothing wrong; the database was
+        // busy, which against a live directory is ordinary. Reporting it as a divergence
+        // put "N recorded invocation(s) would diverge" in front of an operator for
+        // invocations nothing ever compared. Same policy as `reclaimed`, whose read this
+        // sits beside.
         Err(err) => {
-            return vec![divergence(format!(
-                "its journal could not be read: {err:#}"
-            ))];
+            return Replayed::Unreadable {
+                detail: format!("{err:#}"),
+            };
         }
     };
+
+    // An empty journal can be hit (both called nothing), unanswerable (only the replay
+    // called something, and an operator skip journals nothing either), or beside the
+    // point (the replay failed before it got anywhere near a call, which the record
+    // neither explains nor excuses). Nothing can be in `visited`: with no entries to
+    // hit, every lookup misses.
+    if recorded.is_empty() {
+        return match (&outcome, missed) {
+            (_, Some(call)) if asked == Asked::Live => Replayed::NewCall { call, asked },
+            (_, Some(call)) => Replayed::NoJournal { call },
+            (Err(err), None) => Replayed::Failed {
+                detail: format!("{err}"),
+            },
+            // Nothing was compared, so before calling that agreement, make sure there was
+            // still something to compare against. A live server's retention sweeper takes
+            // the row and the journal together, and it can take them between the listing
+            // that produced this position and the read above.
+            (Ok(_), None) => match reclaimed(effect, position, runtime, asked) {
+                Some(gone) => gone,
+                None => terminal_failure(&outcome, asked).unwrap_or(Replayed::Matched),
+            },
+        };
+    }
+
+    if let Err(err) = outcome {
+        return match missed {
+            Some(call) => Replayed::NewCall { call, asked },
+            None => Replayed::Failed {
+                detail: format!("{err}"),
+            },
+        };
+    }
+    if let Some(call) = missed {
+        return Replayed::NewCall { call, asked };
+    }
     // Ordered comparison. A subset test would be blind to exactly the case the
     // content-keyed journal cannot see on its own: the pairs are unique within an
     // invocation and a sealed run can never visit a key the journal lacks (that path
     // returned above), so equal-as-sets is guaranteed and only the sequence is news.
     if visited != recorded {
-        return vec![divergence(format!(
-            "it made a different sequence of calls than the journal records \
-             (journal {}, replay {})",
-            render_keys(&recorded),
-            render_keys(&visited)
-        ))];
+        return Replayed::Different {
+            journal: render_keys(&recorded),
+            replay: render_keys(&visited),
+        };
     }
-    Vec::new()
+    // Last, because a `fail` after every recorded call is still a handler that made
+    // exactly the recorded calls, and for the two callers replaying the program that
+    // wrote them that is the whole question. Only a candidate is doing something the
+    // record cannot vouch for.
+    terminal_failure(&outcome, asked).unwrap_or(Replayed::Matched)
+}
+
+/// `Ok(Invocation::Failed)` as `asked` reads it, and `None` when it is not news.
+///
+/// heklang's rule 4 makes `fail(...)` an *outcome* rather than an error: the position is
+/// recorded failed and the cursor advances, so the row on disk is the same `terminal` row
+/// a success leaves and nothing says which it was. Replaying the program that wrote it
+/// therefore learns nothing by noticing (it fails where it failed), while a candidate that
+/// would newly `fail` on recorded events is a finding worth the whole command.
+fn terminal_failure(
+    outcome: &Result<HekInvocation, heklang::Error>,
+    asked: Asked,
+) -> Option<Replayed> {
+    match outcome {
+        Ok(HekInvocation::Failed(detail)) if asked == Asked::Candidate => {
+            Some(Replayed::TerminallyFailed {
+                detail: detail.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// [`Replayed::Reclaimed`] when the invocation's row is gone, and `None` while it is
+/// there.
+///
+/// Only asked when the journal read came back empty, which is the one answer retention
+/// and a callless run produce identically. Only [`Asked::Candidate`] can reach it, since
+/// it alone runs against a directory a server still holds: [`Asked::Live`] is that server
+/// and the sweeper works off a cutoff days in the past, so the row this process just
+/// wrote cannot be in range, and [`Asked::Sweep`] runs under the exclusive data-directory
+/// lock, so no sweeper exists to race. The other two would pay a lock and a query per
+/// empty journal to be told what they already know. A read that fails is treated as
+/// "still there", because refusing to conclude on the strength of a database error would
+/// turn a busy directory into a coverage gap.
+fn reclaimed(
+    effect: &str,
+    position: u64,
+    runtime: &Arc<Runtime>,
+    asked: Asked,
+) -> Option<Replayed> {
+    if asked != Asked::Candidate {
+        return None;
+    }
+    match runtime.invocation(effect, position) {
+        Ok(None) => Some(Replayed::Reclaimed),
+        Ok(Some(_)) | Err(_) => None,
+    }
 }
 
 /// A journal that reads but never writes, and remembers what it was asked for.
@@ -1345,5 +1692,76 @@ mod tests {
         assert_eq!(stub.send(&request).unwrap().status, 503);
         assert_eq!(stub.send(&request).unwrap().status, 200);
         assert_eq!(stub.call_count(), 2);
+    }
+
+    /// A terminal `fail` is a reproduction to two callers and news to the third.
+    ///
+    /// Rule 4 makes `fail(...)` an outcome rather than an error, and the `terminal` row it
+    /// leaves is the one a success leaves. So replaying the program that wrote the row
+    /// learns nothing by noticing (it fails where it failed), while a candidate that would
+    /// newly fail on recorded events is the finding the command exists for.
+    #[test]
+    fn who_is_asking_decides_a_terminal_fail() {
+        let failed = Ok(HekInvocation::Failed("rate limited".to_owned()));
+        assert!(matches!(
+            terminal_failure(&failed, Asked::Candidate),
+            Some(Replayed::TerminallyFailed { .. })
+        ));
+        for asked in [Asked::Live, Asked::Sweep] {
+            assert!(
+                terminal_failure(&failed, asked).is_none(),
+                "the program that wrote the journal failing where it failed is the record"
+            );
+        }
+        assert!(terminal_failure(&Ok(HekInvocation::Done), Asked::Candidate).is_none());
+    }
+
+    /// A violation is an outcome that was answerable and did not reproduce. Everything
+    /// the caller's situation decides is decided in `replay`, so this reads the outcome
+    /// alone, and the three uncovered ones are neither a pass nor a fault.
+    #[test]
+    fn only_a_covered_outcome_that_did_not_reproduce_is_a_violation() {
+        assert!(Replayed::Matched.violation("Notify", 7).is_none());
+
+        let new_call = Replayed::NewCall {
+            call: "http.post #0".to_owned(),
+            asked: Asked::Sweep,
+        };
+        let violation = new_call
+            .violation("Notify", 7)
+            .expect("a call the journal has no entry for is the whole point");
+        let Violation::ReplayDivergence { detail, .. } = &violation else {
+            panic!("expected a replay divergence, got {violation:?}");
+        };
+        assert!(
+            detail.contains("http.post #0") && detail.contains("second time"),
+            "the detail names the call and what a retry would do: {detail}"
+        );
+        for outcome in [
+            Replayed::Failed {
+                detail: "boom".to_owned(),
+            },
+            Replayed::TerminallyFailed {
+                detail: "rate limited".to_owned(),
+            },
+        ] {
+            assert!(outcome.violation("Notify", 7).is_some(), "{outcome}");
+        }
+
+        for outcome in [
+            Replayed::SubjectErased {
+                reason: "gone".to_owned(),
+            },
+            Replayed::NoJournal {
+                call: "http.post #0".to_owned(),
+            },
+            Replayed::Reclaimed,
+        ] {
+            assert!(outcome.uncovered().is_some(), "{outcome}");
+            assert!(
+                outcome.violation("Notify", 7).is_none(),
+                "nothing could be concluded, which is not a fault: {outcome}"
+            );
+        }
     }
 }

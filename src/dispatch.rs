@@ -14,7 +14,7 @@ use heklang::interp::ErrorKind;
 use heklang::ir::{Stage, Type};
 use heklang::value::Defs;
 use heklang::{Interpreter, Outcome, Program, Value};
-use tephra::{Position, PositionRange, Query, QueryItem, Tag, Tags, WriteHandle};
+use tephra::{Position, PositionRange, Query, QueryItem, Tag, Tags};
 use uuid::Uuid;
 
 use crate::context::CommandContext;
@@ -22,6 +22,7 @@ use crate::crypto::KeyStore;
 use crate::envelope;
 use crate::heklang_host::{HeklaHost, timestamp_wire, to_heklang_json};
 use crate::schema::{EmittedEvent, EventDefs};
+use crate::store::Store;
 use crate::tags::RESERVED_TAG_PREFIX;
 
 /// A command outcome recovered from the log by its idempotency tag: a prior committed
@@ -176,7 +177,7 @@ pub fn validate_input(
 /// beaten to the log costs the events that beat you rather than the whole boundary again.
 #[allow(clippy::too_many_arguments)]
 pub fn run_command(
-    store: &WriteHandle,
+    store: &Store,
     program: &Arc<Program>,
     events: &Arc<EventDefs>,
     name: &str,
@@ -305,7 +306,7 @@ pub fn run_command(
 /// A keyed request's own prior commit, checked when this attempt is about to return
 /// without appending anything.
 fn recover_if_committed(
-    store: &WriteHandle,
+    store: &Store,
     event_defs: &EventDefs,
     boundaried: bool,
     idem_tag: Option<&str>,
@@ -331,7 +332,7 @@ fn idem_item(tag: &str) -> anyhow::Result<QueryItem> {
 /// check on a unique, high-cardinality tag at `after = 0`: a term-dictionary probe per
 /// segment, no posting-list decode (the single position inlines into the FST value).
 fn find_committed_outcome(
-    store: &WriteHandle,
+    store: &Store,
     event_defs: &EventDefs,
     idem_tag: &str,
 ) -> anyhow::Result<Option<RecoveredOutcome>> {

@@ -27,7 +27,7 @@ use std::cell::Cell;
 
 use anyhow::Context;
 use serde_json::{Map, Value, json};
-use tephra::{Event, EventType, Position, Query, QueryItem, Tag, Tags, WriteHandle};
+use tephra::{Event, EventType, Position, Query, QueryItem, Tag, Tags};
 
 use crate::crypto::{KeyStore, RowDecryptor};
 use crate::effect::EffectShared;
@@ -41,6 +41,7 @@ use crate::read_api::filterable_fields;
 use crate::read_model::key_kind;
 use crate::schema::EventDefs;
 use crate::schema::{EntityDef, EventDef, FieldMeta, scalar_to_string};
+use crate::store::Store;
 use crate::tags;
 use crate::tags::RESERVED_TAG_PREFIX;
 
@@ -115,7 +116,7 @@ pub fn correlation_query(correlation_id: &str) -> anyhow::Result<Query> {
 /// will return and then ask for one more, so a clamp here would eat the extra and
 /// leave a full page indistinguishable from the last one.
 pub fn page(
-    store: &WriteHandle,
+    store: &Store,
     query: &Query,
     direction: Direction,
     cursor: Option<u64>,
@@ -144,7 +145,7 @@ pub fn page(
 /// Reads one event from an exclusive lower bound of `position - 1` and checks what
 /// came back, the same shape [`crate::verify`] uses: a limit-1 read returns the next
 /// matching event, which is the one asked for only when the log actually holds it.
-pub fn read_at(store: &WriteHandle, position: u64) -> anyhow::Result<Option<Event>> {
+pub fn read_at(store: &Store, position: u64) -> anyhow::Result<Option<Event>> {
     if position == 0 {
         return Ok(None);
     }
@@ -373,6 +374,7 @@ pub fn invocation(row: &InvocationRow) -> Value {
         "script_hash": row.script_hash,
         "created_at": row.created_at,
         "completed_at": row.completed_at,
+        "skipped_at": row.skipped_at,
     })
 }
 

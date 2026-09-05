@@ -611,16 +611,30 @@ impl Run<'_> {
                 self.scenario.projectors.len()
             )));
         }
-        if report.invocations_checked != journaled {
+        // An erasure is the only thing in this model that can make an invocation
+        // unreplayable: nothing edits an effect, no event goes missing, no journal is
+        // reclaimed under a sweep that is not running, and a handler that called nothing
+        // is replayed against its empty journal rather than skipped. Checked before the
+        // accounting below, and against the total rather than reason by reason, so a skip
+        // for a reason this model cannot produce is named here instead of surfacing as an
+        // equation that is short by one.
+        if report.skipped.total() != report.skipped.subject_erased {
             return Err(Disagreement::Sweep(format!(
-                "replayed {} invocation(s), the shadow journaled {journaled}",
-                report.invocations_checked
+                "the sweep skipped something no run here can produce: {:?}",
+                report.skipped
             )));
         }
-        if report.invocations_skipped != unjournaled {
+        // Every delivered invocation is then accounted for, one way or the other. An
+        // erasure in the sequence makes some of them unreplayable at sweep time (the
+        // plaintext a handler branched on is gone), and that is a different number from
+        // the shadow's own rule-12 skips: those are terminal at delivery, while these were
+        // fine when they ran and lost their key later. What must hold either way is that
+        // nothing falls out of the accounting.
+        let accounted = report.invocations_checked + report.skipped.total();
+        if accounted != journaled + unjournaled {
             return Err(Disagreement::Sweep(format!(
-                "skipped {} invocation(s), the shadow journaled nothing for {unjournaled}",
-                report.invocations_skipped
+                "the sweep accounted for {accounted} invocation(s), the shadow delivered {}",
+                journaled + unjournaled
             )));
         }
         Ok(())

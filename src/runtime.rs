@@ -23,8 +23,10 @@ use std::{env, fs};
 
 use anyhow::Context;
 use serde_json::{Value, json};
+use tephra::log::set::LogError;
 use tephra::{
-    PositionRange, SegmentConfig, SegmentSet, WriteCoordinator, WriteHandle, WriterConfig,
+    Follower, FollowerConfig, FollowerError, PositionRange, SegmentConfig, SegmentSet,
+    WriteCoordinator, WriterConfig,
 };
 use time::Duration as TimeDuration;
 use time::OffsetDateTime;
@@ -47,6 +49,7 @@ use crate::opdb::{
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
 use crate::schema::{EmittedEvent, EventDef, EventDefs};
+use crate::store::Store;
 use crate::tags;
 
 /// Individual event segments before rolling to a new file. 256 MiB matches
@@ -185,7 +188,7 @@ pub struct ExecResult {
 /// The live runtime shared across request handlers.
 pub struct Runtime {
     commands: HashMap<String, Arc<CommandUnit>>,
-    store: WriteHandle,
+    store: Store,
     opdb: Arc<Mutex<OpDb>>,
     /// Event type to its declared field metadata, for emit encryption and for
     /// wrapping subject fields as opaque handles in a fold.
@@ -201,11 +204,14 @@ pub struct Runtime {
     /// The effect handles, for `/status` and the skip endpoint. Set once, right
     /// after the effect threads spawn (they need `Arc<Runtime>` first).
     effects: OnceLock<Vec<Arc<EffectShared>>>,
-    /// The exclusive claim on the data directory, held for as long as the runtime
-    /// is open. tephra does not lock its segment directory, so without this a
-    /// second process on one directory would corrupt the log rather than refuse to
-    /// start. Never read: it exists for its `Drop`.
-    _lock: DataDirLock,
+    /// The exclusive claim on the data directory, held for as long as the runtime is
+    /// open. Without it a second writing process on one directory would corrupt the log
+    /// rather than refuse to start. Never read: it exists for its `Drop`.
+    ///
+    /// `None` for a runtime that only follows the log ([`Runtime::open_following`]).
+    /// That one takes no claim on purpose: it never writes, and a claim would make
+    /// reading a live deployment refuse rather than merely lag.
+    _lock: Option<DataDirLock>,
     /// Whether the continuous invariant checks run. Set from `[verify] enabled` in
     /// `hekla.toml`, which `serve --verify` turns on without editing the file.
     verify: bool,
@@ -247,6 +253,7 @@ impl Runtime {
             .with_context(|| format!("opening event store at {}", events_dir.display()))?;
         let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default())
             .context("starting the write coordinator")?;
+        let store = Store::writing(store);
 
         let mut opdb = OpDb::open(&data_dir.join("hekla.db"))?;
         let now = now_rfc3339();
@@ -277,7 +284,7 @@ impl Runtime {
         let config = project.config.clone();
         // Event field metadata, shared with the projector and effect runtimes so a
         // fold or a `handle` sees subject fields as opaque handles.
-        let events = Arc::new(project.events.clone());
+        let events = Arc::clone(&project.events);
         let uses_subjects = events
             .values()
             .any(|def| def.fields.iter().any(|(_, meta)| meta.subject.is_some()));
@@ -299,7 +306,7 @@ impl Runtime {
             keystore.verify_masters_present()?;
         }
         let keystore = keystore.map(Arc::new);
-        let program = Arc::new(project.program);
+        let program = Arc::clone(&project.program);
 
         // Each projector reconciles its own definition hash (stored in its read model)
         // against the current one at startup, rebuilding if it changed before applying
@@ -329,7 +336,7 @@ impl Runtime {
             projectors,
             effects: OnceLock::new(),
             openapi_json,
-            _lock: lock,
+            _lock: Some(lock),
             verify,
             config,
             data_dir: data_dir.to_path_buf(),
@@ -367,8 +374,9 @@ impl Runtime {
             .with_context(|| format!("opening event store at {}", events_dir.display()))?;
         let (coordinator, store) = WriteCoordinator::start(set, WriterConfig::default())
             .context("starting the write coordinator")?;
+        let store = Store::writing(store);
 
-        let events = Arc::new(project.events.clone());
+        let events = Arc::clone(&project.events);
         // The same guard `open` applies. Without it a sweep of a subject-using project
         // with no master key runs every check against a keystore-less runtime, where
         // `reveal` fails before the host can mark the failure terminal, so the replay
@@ -395,7 +403,7 @@ impl Runtime {
             store,
             opdb,
             events: events.clone(),
-            program: Arc::new(project.program.clone()),
+            program: Arc::clone(&project.program),
             keystore,
             started: Instant::now(),
             projectors: HashMap::new(),
@@ -403,12 +411,87 @@ impl Runtime {
             openapi_json: String::new(),
             config: project.config.clone(),
             data_dir: data_dir.to_path_buf(),
-            _lock: lock,
+            _lock: Some(lock),
             // The sweep calls the checks directly. Leaving this off keeps a replay it
             // runs from scheduling a second replay of itself.
             verify: false,
         });
         Ok((runtime, coordinator))
+    }
+
+    /// Open the operational database and *follow* the log, taking no claim on the data
+    /// directory and starting no thread.
+    ///
+    /// This is what lets `hekla plan --replay` answer for a deployment that is serving
+    /// traffic right now. A [`Follower`] opens every segment read-only, creates nothing,
+    /// deletes nothing and takes no lock, and what it sees is a committed prefix of the
+    /// writer's log: gap-free, duplicate-free, and only growing. One `open` is one fixed
+    /// prefix, which is what a plan wants; nothing here polls, because a forecast
+    /// computed against a moving tip would be a forecast of nothing in particular.
+    ///
+    /// `Ok(None)` is a data directory whose log has never been written. There is no
+    /// prefix to follow and no invocation that could have been recorded against one, so
+    /// the caller reports no coverage rather than an error.
+    ///
+    /// **No master key problem is fatal here**, which is where this parts company with
+    /// [`Runtime::open_quiescent`]. A sweep without a usable key reports corruption that
+    /// is not there, so it refuses. A plan without one simply cannot replay a handler
+    /// that reveals, and saying so is more useful than demanding a production key before
+    /// it will diff two declaration tables. That covers a key that is present but wrong
+    /// as well as one that is absent: a half-configured rotation must not be worse than
+    /// no key at all. The caller decides what a key it cannot use means, by asking
+    /// [`crate::crypto::KeyStore::verify_masters_present`] itself.
+    ///
+    /// It opens `hekla.db` through [`OpDb::open`], which migrates. Against a live
+    /// deployment that is a write nobody asked for, so a caller planning against one
+    /// checks [`crate::opdb::recorded_schema_version`] first and refuses a mismatch.
+    pub fn open_following(
+        project: &LoadedProject,
+        data_dir: &Path,
+        master: Option<MasterKeys>,
+    ) -> anyhow::Result<Option<Arc<Runtime>>> {
+        let events_dir = data_dir.join("events");
+        // Absent and present-but-empty are the same answer, and only the second reaches
+        // tephra: `SegmentSet::open_read_only` lists the directory before it can decide
+        // there is nothing in it, so a missing one surfaces as a bare i/o error.
+        if !events_dir.exists() {
+            return Ok(None);
+        }
+        let config = FollowerConfig::new(SegmentConfig::new(SEGMENT_SIZE));
+        let follower = match Follower::open(&events_dir, config) {
+            Ok(follower) => Arc::new(follower),
+            Err(FollowerError::Log(LogError::Uninitialized { .. })) => return Ok(None),
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "following the event store at {}: {err}",
+                    events_dir.display()
+                ));
+            }
+        };
+
+        let opdb = Arc::new(Mutex::new(OpDb::open(&data_dir.join("hekla.db"))?));
+        let keystore = master
+            .map(|master| KeyStore::new(opdb.clone(), master))
+            .map(Arc::new);
+
+        Ok(Some(Arc::new(Runtime {
+            commands: HashMap::new(),
+            store: Store::following(follower),
+            opdb,
+            events: Arc::clone(&project.events),
+            program: Arc::clone(&project.program),
+            keystore,
+            started: Instant::now(),
+            projectors: HashMap::new(),
+            effects: OnceLock::new(),
+            openapi_json: String::new(),
+            config: project.config.clone(),
+            data_dir: data_dir.to_path_buf(),
+            _lock: None,
+            // Nothing here schedules work, so there is nothing for a continuous check to
+            // run after. A plan calls the replay itself.
+            verify: false,
+        })))
     }
 
     /// Execute a command by name over the public surface. Resolves public commands
@@ -627,7 +710,7 @@ impl Runtime {
     }
 
     /// The store handle, for the effect drivers' subscriptions.
-    pub(crate) fn store(&self) -> &WriteHandle {
+    pub(crate) fn store(&self) -> &Store {
         &self.store
     }
 
@@ -661,6 +744,22 @@ impl Runtime {
         now: &str,
     ) -> anyhow::Result<()> {
         self.lock_opdb().complete_invocation(effect, position, now)
+    }
+
+    /// Complete a wedged invocation on an operator's behalf, recording that it was
+    /// skipped. See [`OpDb::skip_invocation`].
+    pub(crate) fn skip_invocation(
+        &self,
+        effect: &str,
+        position: u64,
+        now: &str,
+    ) -> anyhow::Result<()> {
+        self.lock_opdb().skip_invocation(effect, position, now)
+    }
+
+    /// Whether an operator skipped this invocation. See [`OpDb::invocation_skipped`].
+    pub(crate) fn invocation_skipped(&self, effect: &str, position: u64) -> anyhow::Result<bool> {
+        self.lock_opdb().invocation_skipped(effect, position)
     }
 
     /// Record a durable verify-mode quarantine for an effect.
@@ -812,6 +911,35 @@ impl Runtime {
     /// Every terminal invocation recorded for an effect, with its script hash.
     pub(crate) fn terminal_invocations(&self, effect: &str) -> anyhow::Result<Vec<(u64, String)>> {
         self.lock_opdb().terminal_invocations(effect)
+    }
+
+    /// The most recent invocations of `effect` that `script_hash` recorded, inside the
+    /// prefix this runtime can actually read, at most `limit` of them.
+    ///
+    /// See [`OpDb::recent_terminal_invocations`]: the bound is the follower's own tip, so
+    /// a plan never asks about an event a live server appended after it started reading.
+    pub(crate) fn recent_terminal_invocations(
+        &self,
+        effect: &str,
+        script_hash: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<u64>> {
+        let upto = self.log_head();
+        self.lock_opdb()
+            .recent_terminal_invocations(effect, script_hash, upto, limit)
+    }
+
+    /// How many invocations [`Runtime::recent_terminal_invocations`] could return if
+    /// nothing bounded it. For a caller that has to report a number of invocations it is
+    /// not going to replay, and so wants the real one.
+    pub(crate) fn count_terminal_invocations(
+        &self,
+        effect: &str,
+        script_hash: &str,
+    ) -> anyhow::Result<usize> {
+        let upto = self.log_head();
+        self.lock_opdb()
+            .count_terminal_invocations(effect, script_hash, upto)
     }
 
     pub(crate) fn running_with_hash_mismatch(

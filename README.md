@@ -95,8 +95,8 @@ HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
 `check` reports the compiler's diagnostics plus what only hekla knows: that a declaration sits in
 the directory its kind requires, that a read model can be keyed and indexed the way the read API
 needs, and two warnings about a boundary too broad or too narrow to do its job. Also `hekla erase`
-and `hekla rotate` for key management, `hekla plan` for what a deploy would change, and
-`hekla verify` for the invariant sweep below.
+and `hekla rotate` for key management, `hekla plan` for what a deploy would change (and, with
+`--replay`, would do), and `hekla verify` for the invariant sweep below.
 
 From a checkout the same three are `cargo run -- check examples/orders` and so on. The repository
 is also a flake: `nix build` for the binary, `nix flake check` for the suite.
@@ -129,9 +129,62 @@ A `const`, `refusal` or `guard` is spliced into what names it and has no row of 
 one moves every hash that reaches it. The report groups those and names the cause rather than
 leaving a wall of diffs.
 
-It reads the recorded declarations and the read models, never the event log, so it takes no lock and
-runs against a directory a server has open. It exits 0 whether or not anything would change, and
-`--json` carries the whole plan for a deploy gate.
+Without `--replay` it reads the recorded declarations and the read models and nothing else, so it
+opens no event log at all. Either way it takes **no data-directory lock**, so it runs against a
+directory a server has open. It exits 0 whether or not anything would change, and `--json` carries
+the whole plan for a deploy gate.
+
+### Would it still do the same thing?
+
+That diff says an effect changed. It cannot say whether the change matters, and "would this now send
+a different HTTP request" is what the deploy actually turns on. `--replay` answers it.
+
+```sh
+hekla plan . --data-dir /srv/hekla/data --replay
+```
+
+```
+  effect NotifyCustomer @ 4812: it reached a call the recorded run never made (http.post #0)
+replayed 312 invocation(s) across 2 affected effect(s); 310 reproduce, 2 diverge
+this project retains 7 day(s) of journals; anything older was reclaimed before the replay could see it
+0 added, 0 removed, 1 changed; 0 projector(s) would rebuild, 2 recorded invocation(s) would diverge
+```
+
+Every recorded invocation of every affected effect is re-run against the candidate code and the
+journal the original run left behind. Nothing is mocked: the journal holds the responses that run
+really received, so a candidate that branches differently on a response reaches a call the journal
+has no entry for, and that miss is the finding. Nothing is sent, appended or erased.
+
+Affected means the effect's own digest changed *or* it names something whose digest changed: a
+module `fn`, an event it handles, a record or enum either of those carries. Each of those is a
+declaration of its own, so editing the helper that builds a URL, or adding `@subject(...)` to a
+field the arm binds, leaves the effect's own hash exactly where it was, and a check that looked
+only at that hash would miss both.
+
+This half opens the log, through a read-only follower that takes no lock and creates nothing, so it
+too runs against a deployment serving traffic. It pins one committed prefix when it opens, so an
+invocation the live server records after that is left out rather than replayed against an event the
+reader cannot see.
+
+What it cannot see is counted or named rather than assumed away: an invocation whose subject has been
+erased (the plaintext the handler branched on is gone, by design); one an operator skipped, since
+nothing ran it to an end and its journal is the prefix of a run that stopped where it wedged; one
+whose record could not be read at all, because a busy op-DB is not evidence about the candidate; one
+retention already reclaimed (row and journal go together, so it is invisible rather than skipped, and
+the window is printed instead) or reclaims while the replay is reading it; and whatever
+`--replay-limit` drops,
+which defaults to the 1000 most recent invocations per effect and names any effect it bit. The
+baseline is also only what is *running*: rows written by a version this deploy is not replacing are
+still on disk, and replaying those would report a difference the running code already has.
+
+An effect that `reveal`s needs `HEKLA_MASTER_KEY`, decided per effect rather than per project.
+Without one those invocations are counted and the rest still replay, so a CI job can plan against
+production without holding the production key. A key that is present and cannot unwrap what is
+stored degrades the same way and says so, rather than throwing away a diff that is already computed.
+
+A gate reads `--json`, where `divergences` and `coverage` are both `null` when no replay ran: an
+empty divergence list would be a clean replay result, and nothing should read one off a run that
+never opened the log.
 
 ## Checking the invariants
 
