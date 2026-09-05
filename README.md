@@ -95,10 +95,43 @@ HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
 `check` reports the compiler's diagnostics plus what only hekla knows: that a declaration sits in
 the directory its kind requires, that a read model can be keyed and indexed the way the read API
 needs, and two warnings about a boundary too broad or too narrow to do its job. Also `hekla erase`
-and `hekla rotate` for key management, and `hekla verify` for the invariant sweep below.
+and `hekla rotate` for key management, `hekla plan` for what a deploy would change, and
+`hekla verify` for the invariant sweep below.
 
 From a checkout the same three are `cargo run -- check examples/orders` and so on. The repository
 is also a flake: `nix build` for the binary, `nix flake check` for the suite.
+
+## Planning a deploy
+
+The event log is append-only and a read model is rebuilt from it, so a deploy is not a thing you
+undo. `hekla plan` says what one would change before it changes it.
+
+```sh
+hekla plan . --data-dir /srv/hekla/data
+```
+
+```
+compared 6 declaration(s) against what is deployed
+  behaviour command DoA (commands/a.hk)
+  behaviour command DoB (commands/b.hk)
+  contract  projector UserStats (projectors/user-stats.hk)
+  projector UserStats rebuilds from zero, redoing 12481 position(s)
+  because `guard ShopIsConnected` changed: DoA, DoB
+0 added, 0 removed, 3 changed; 1 projector(s) would rebuild
+```
+
+`behaviour` means the declaration does something different behind a contract that did not move, so
+nothing outside the program can tell; `contract` means what is visible outside changed. Both come
+from heklang's digest, which hashes the lowered program, so reformatting a file or renaming a local
+is not a change and a corrected handler body is.
+
+A `const`, `refusal` or `guard` is spliced into what names it and has no row of its own, so editing
+one moves every hash that reaches it. The report groups those and names the cause rather than
+leaving a wall of diffs.
+
+It reads the recorded declarations and the read models, never the event log, so it takes no lock and
+runs against a directory a server has open. It exits 0 whether or not anything would change, and
+`--json` carries the whole plan for a deploy gate.
 
 ## Checking the invariants
 

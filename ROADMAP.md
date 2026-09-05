@@ -1445,10 +1445,56 @@ and the forty lines of `definition_hash` all went.
   as the three module kinds, and all of them are recorded. hekla previously persisted nothing about an
   event's declared shape, so a `Money` scale change, a flipped `@no_index` or a newly added `@subject`
   was undetectable. It is the prerequisite for a deploy-time diff.
-- **What it does not do.** `hekla plan` is not built. This phase is its foundation: the schema and
+- **What it does not do.** `hekla plan` is not built here; Phase 24 builds it on this. The schema and
   signature half of that diff is now a join over `declaration`, but nothing consumes it yet, and the
   effect-replay half additionally needs a baseline that can be *executed*, which the packed form
   cannot be (it is a rendering, not a serialisation).
+
+## Phase 24: what this deploy would change (done)
+
+Phase 23 recorded every declaration and its packed form and stopped there, which left the question
+that motivated it unanswered: this code is not what is running, so what is different, and what would
+booting it do? `hekla plan` answers it. It loads a candidate project, reads what a data directory
+records as deployed, and reports the difference.
+
+The recorded side needs no source tree. `Entry::from_packed` reads a stored `form` column back into
+a comparable entry, recomputing both hashes, so a deployment describes itself. heklang's own
+`docs/digest.md` prescribes the join and says explicitly that it ships no differ; this is the differ.
+
+- **Two axes, not one.** A declaration is `added`, `removed`, `behaviour` (its hash moved and its
+  signature did not, so it does something different behind a contract nothing outside can tell has
+  changed) or `contract` (the signature moved, so a caller could notice). The split is free: the
+  digest already carries both hashes, and Phase 23 already stored both.
+- **The fan-out is explained.** `const`, `refusal` and `guard` are spliced into what names them
+  before a program exists, so none has an entry and editing one moves every hash that reaches it.
+  The unit of evidence is the *edit*: declarations that changed by the same added and removed lines
+  are grouped, and only then identified. A guard is named exactly, from the call graph heklang keeps
+  after splicing for this purpose, and only when the group is its whole caller set: a guard some
+  unchanged command also names cannot be the reason, because that command would have changed too. A
+  `const` or `refusal` is inferred from what the edit touched and labelled as an inference, and
+  names nothing when more than one candidate fits. The specific cause wins over the general one, so
+  a reworded refusal is not reported as its enclosing guard.
+- **It runs against production.** `verify` takes the data-directory lock because it opens the event
+  log, and so refuses a directory a server has open. `plan` reads the `declaration` table and the
+  read models and nothing else, so it needs no lock. It changes no database: the operational DB is
+  opened only after its schema version is read over a separate read-only connection and found to
+  match, because `OpDb::open` migrates and silently upgrading a live deployment is not a reader's
+  business. Read models are opened read-only, which also stops a forecast from creating the model
+  for a projector that has never run.
+- **A change is not a fault.** It exits zero whether or not anything would change. `verify` exits
+  non-zero on a violation because a violation is a fault; a change is the expected result of running
+  `plan` at all, and a command that fails when it succeeds is no use in a pipeline. `--json` carries
+  the whole plan, including the before and after forms, for a gate that wants one.
+- **What it does not do.** No effect replay, so it cannot say an effect would now make different
+  HTTP calls. That needs a baseline that can be *executed*, and a packed form is a rendering rather
+  than a serialisation; the journal is where such a baseline lives, and reaching it means opening
+  the log and taking the lock. It would also be bounded by `retention.effect_journal_days`, which
+  defaults to 7, so the question of whether journals should be kept indefinitely belongs to that
+  phase rather than this one.
+- **One honest limit.** Opening a WAL database read-only still maps a shared-memory index, and a
+  read-only connection cannot remove it on close, so planning against a directory whose server is
+  down can leave an empty `-wal` and `-shm` pair behind. No database's contents change, and the next
+  boot reclaims them.
 
 ## Deferred, with triggers
 

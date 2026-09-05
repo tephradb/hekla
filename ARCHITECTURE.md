@@ -808,6 +808,8 @@ consistent copy is not required for them.
   master key, and each `given` event's id (counting from `…-000000000001`, so an id derived with
   `Uuid.derive` is assertable) and timestamp.
 - `hekla verify <dir>`: the runtime invariant sweep over a data directory. Section 11.2.
+- `hekla plan <dir>`: what deploying this project over a data directory would change. It reads the
+  `declaration` table rather than the log, so it needs no lock and runs against a live directory.
 
 **`hekla fmt` and `hekla lsp` are gone.** Both were Starlark tooling: starlark-rust ships a formatter
 and a language server, and hekla wrapped them with its own project knowledge (which builtins are in

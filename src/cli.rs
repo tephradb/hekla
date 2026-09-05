@@ -106,6 +106,25 @@ enum Command {
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
+    /// Report what deploying this project over a data directory would change: which
+    /// declarations were added, removed, or now do something different, and which
+    /// projectors would rebuild.
+    ///
+    /// Reads only. It opens no event log and takes no data-directory lock, so unlike
+    /// `verify` it runs against a directory a server has open. Exits zero whether or
+    /// not anything would change; a change is the answer, not a fault.
+    Plan {
+        /// The project directory.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// The data directory (event store and operational DB). Defaults to
+        /// `<dir>/data`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Print the plan as JSON on stdout, for a deploy gate to read.
+        #[arg(long)]
+        json: bool,
+    },
     /// Erase a subject: delete its encryption key, making every value scoped to it
     /// unreadable and unmatchable across the log and every read model at once. This
     /// is irreversible.
@@ -138,6 +157,11 @@ pub fn run() -> ExitCode {
         Command::Verify { dir, data_dir } => verify(&dir, data_dir.as_deref()),
         Command::Rotate { dir, data_dir } => rotate(&dir, data_dir.as_deref()),
         Command::Openapi { dir } => openapi(&dir),
+        Command::Plan {
+            dir,
+            data_dir,
+            json,
+        } => plan(&dir, data_dir.as_deref(), json),
         Command::Erase {
             subject_field,
             subject_value,
@@ -302,6 +326,57 @@ fn check(dir: &Path) -> ExitCode {
     } else {
         println!("failed: {errors} error(s), {warnings} warning(s)");
         ExitCode::FAILURE
+    }
+}
+
+/// `hekla plan`: what deploying this project over a data directory would change.
+///
+/// Findings go to stderr like `openapi`'s, because `--json` puts a machine-readable
+/// document on stdout. It does not initialise tracing: it opens no runtime, so there is
+/// nothing to trace.
+///
+/// Exits zero whenever the plan was computed, whether or not it is empty. `verify`
+/// exits non-zero on a violation because a violation is a fault; a *change* is the
+/// expected result of running `plan` at all, and a command that fails when it succeeds
+/// is no use in a pipeline. A gate reads `--json`.
+fn plan(dir: &Path, data_dir: Option<&Path>, json: bool) -> ExitCode {
+    // Same reason as `openapi`: `load` succeeds vacuously on a path that is not a
+    // project, and reporting "nothing would change" for a typo'd directory is the one
+    // answer this command must never give.
+    if !dir.is_dir() {
+        eprintln!("error: `{}` is not a directory", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let project = LoadedProject::load(dir);
+    let findings = collect_findings(&project);
+    for finding in &findings {
+        eprintln!("{}", render_finding(finding));
+    }
+    let errors = count_errors(&findings);
+    if errors > 0 {
+        eprintln!("refusing to plan: the project has {errors} error(s)");
+        return ExitCode::FAILURE;
+    }
+    let data = runtime::resolve_data_dir(dir, data_dir);
+    match crate::plan::compute(&project, &data) {
+        Ok(plan) => {
+            if json {
+                match serde_json::to_string_pretty(&plan.json()) {
+                    Ok(text) => println!("{text}"),
+                    Err(err) => {
+                        eprintln!("error: serializing the plan: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                println!("{plan}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 

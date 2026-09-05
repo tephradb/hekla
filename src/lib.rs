@@ -20,6 +20,7 @@ pub mod effect;
 pub mod introspect;
 pub mod loader;
 pub mod openapi;
+pub mod plan;
 pub mod projector;
 pub mod runtime;
 pub mod server;

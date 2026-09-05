@@ -404,7 +404,7 @@ impl Drop for RunningFlag<'_> {
 
 /// What reconciling the read model against the current definition requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reconcile {
+pub(crate) enum Reconcile {
     /// The recorded definition matches the current one.
     UpToDate,
     /// A fresh model: record the current definition as its baseline and build forward.
@@ -426,28 +426,52 @@ impl Reconcile {
     }
 }
 
-/// Decide how the read model must be reconciled with `definition`.
+/// Decide how a read model must be reconciled with `definition`, from what it records
+/// rather than from the model itself.
 ///
 /// A model with no recorded definition predates that field. If it is empty there is
 /// nothing to preserve, so it takes the current definition as its baseline; if it is
 /// populated its shape cannot be verified, so it is treated as a mismatch rather than
 /// blessed as current.
-fn reconcile_plan(
-    model: &ReadModel,
+///
+/// Separated from the two reads so `hekla plan` forecasts a rebuild off a read-only
+/// model without a second copy of this truth table. The rule for a model that records
+/// no definition is subtle enough that a copy would drift.
+pub(crate) fn reconcile_from(
+    previous: Option<&str>,
+    checkpoint: u64,
     definition: &str,
     auto_rebuild: bool,
-) -> anyhow::Result<Reconcile> {
+) -> Reconcile {
     let mismatch = if auto_rebuild {
         Reconcile::Rebuild
     } else {
         Reconcile::Stale
     };
-    Ok(match model.read_definition()? {
+    match previous {
         Some(previous) if previous == definition => Reconcile::UpToDate,
         Some(_) => mismatch,
-        None if model.read_checkpoint()?.get() == 0 => Reconcile::Stamp,
+        None if checkpoint == 0 => Reconcile::Stamp,
         None => mismatch,
-    })
+    }
+}
+
+/// Decide how the read model must be reconciled with `definition`.
+fn reconcile_plan(
+    model: &ReadModel,
+    definition: &str,
+    auto_rebuild: bool,
+) -> anyhow::Result<Reconcile> {
+    let previous = model.read_definition()?;
+    // Read unconditionally rather than only when `previous` is `None`: one extra
+    // `SELECT` against a single-row table, for one call site with no branch in it.
+    let checkpoint = model.read_checkpoint()?.get();
+    Ok(reconcile_from(
+        previous.as_deref(),
+        checkpoint,
+        definition,
+        auto_rebuild,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 
 use crate::crypto;
 
@@ -32,6 +32,22 @@ pub const SWEEP_CHUNK: usize = 1000;
 /// The operational database handle.
 pub struct OpDb {
     conn: Connection,
+}
+
+/// The schema version an existing `hekla.db` records, without opening it through
+/// [`OpDb::open`].
+///
+/// [`OpDb::open`] migrates, which is the wrong move for a reader: `hekla plan` runs
+/// against a live production directory, and silently upgrading its schema is a write
+/// nothing asked for. Reading `user_version` over a read-only connection lets a caller
+/// refuse an older database rather than quietly changing it.
+pub fn recorded_schema_version(path: &Path) -> anyhow::Result<i64> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening operational database {} read-only", path.display()))?;
+    let version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("reading schema version")?;
+    Ok(version)
 }
 
 /// Positions are stored signed, so a `u64::MAX` sentinel would bind as `-1` and match

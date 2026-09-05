@@ -1,6 +1,6 @@
 # The CLI
 
-One binary, seven subcommands, `<dir>` defaulting to `.` everywhere. `hekla --version` and
+One binary, eight subcommands, `<dir>` defaulting to `.` everywhere. `hekla --version` and
 `hekla <subcommand> --help` work.
 
 Logging is `tracing` behind `RUST_LOG`, default `info`. `serve` and `verify` initialise it; the other
@@ -100,6 +100,34 @@ must be set to verify it`. Run it with the key the server used.
 An invocation is **skipped**, not checked, when the effect's source hash has changed since the run was
 recorded, when the retention sweeper has already reclaimed its journal, or when its event cannot be
 read. A run that skipped everything still says `ok`, which is why the counts are printed.
+
+## `hekla plan [DIR] [--data-dir PATH] [--json]`
+
+What deploying this project over a data directory would change, before it changes it. Loads the
+project, refuses on error findings, then compares its digest against the `declaration` rows the
+directory records and forecasts what each projector would do.
+
+```
+compared 6 declaration(s) against what is deployed
+  behaviour command DoA (commands/a.hk)
+  behaviour command DoB (commands/b.hk)
+  because `guard ShopIsConnected` changed: DoA, DoB
+0 added, 0 removed, 2 changed; 0 projector(s) would rebuild
+```
+
+A declaration is `added`, `removed`, `behaviour` (it does something different behind a contract that
+did not move) or `contract` (what is visible outside changed). `const`, `refusal` and `guard` are
+inlined and have no row of their own, so an edit to one shows as a fan-out with the cause named
+under it.
+
+Unlike `verify` it opens no event log and takes **no data-directory lock**, so it runs against a
+directory a server has open. It changes no database: the operational DB is opened only after its
+schema version is read separately and found to match, and read models are opened read-only.
+
+Exit is 0 whenever the plan was computed, whether or not anything would change; a change is the
+answer, not a fault. It is 1 on error findings, on a directory nothing was ever deployed to, on a
+schema version this build does not expect, and on a `--json` serialisation failure. `--json` puts the
+whole plan, including the before and after forms, on stdout with findings on stderr.
 
 ## `hekla openapi [DIR]`
 
