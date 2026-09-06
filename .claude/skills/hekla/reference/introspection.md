@@ -65,7 +65,7 @@ failing the request:
 { "name": "SendWelcome", "state": "wedged", "position": 1, "watermark": 1, "lag": 3,
   "consecutive_failures": 8, "last_error": "effects/send-welcome.hk:11:20: ...",
   "wedged_lanes": 1, "pinning_key": "i:4471", "pinning_position": 2,
-  "live_boundary": 0, "live_suppressed": 0,
+  "live_boundary": 0, "live_suppressed": 0, "latest_collapsed": 0,
   "last_terminal_error": null, "terminal_skips": 0, "quarantined": false, "quarantine": null,
   "retry_in_ms": 39719, "sources": ["user.registered"] }
 ```
@@ -78,7 +78,9 @@ the highest position every lane has passed, not the newest thing finished.
 it is stuck: the position an operator skip takes. `wedged_lanes` says how many lanes are stuck at
 all, which `consecutive_failures` (the pinning lane's attempts) cannot. `live_boundary` is the log
 head at this effect's first activation here, which `on live` arms decline at or below;
-`live_suppressed` counts what they have declined since this process started.
+`live_suppressed` counts what they have declined since this process started, and
+`latest_collapsed` counts the positions an `on latest` arm has folded into another invocation, so lag
+falling without a matching number of invocations reads as the arm doing what it declared.
 
 `sources` is the event types the arms name, and it is always a list: there is no way to subscribe to
 everything.

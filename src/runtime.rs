@@ -44,7 +44,7 @@ use crate::loader::{self, CommandUnit, EffectUnit, LoadedProject, ProjectorUnit}
 use crate::lock::DataDirLock;
 use crate::opdb::{
     Activation, DeclarationRow, EffectState, InvocationAt, InvocationRow, InvocationState,
-    JournalRow, OpDb, SubjectInfo,
+    JournalRow, OpDb, SubjectInfo, TerminalInvocation,
 };
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
@@ -743,6 +743,17 @@ impl Runtime {
         self.lock_opdb().effect_lanes(effect)
     }
 
+    /// Positions above the mark this effect already has an invocation row for, which rule
+    /// 15's batch collapse may not fold. See [`OpDb::invocations_above`].
+    pub fn invocations_above(
+        &self,
+        effect: &str,
+        after: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<u64>> {
+        self.lock_opdb().invocations_above(effect, after, limit)
+    }
+
     /// Record how far one lane has got. See [`OpDb::record_effect_lane`] for why this is
     /// written after the completion it describes and never before.
     pub fn record_effect_lane(
@@ -799,8 +810,10 @@ impl Runtime {
         effect: &str,
         position: u64,
         now: &str,
+        collapsed_from: Option<u64>,
     ) -> anyhow::Result<()> {
-        self.lock_opdb().complete_invocation(effect, position, now)
+        self.lock_opdb()
+            .complete_invocation(effect, position, now, collapsed_from)
     }
 
     /// Complete a wedged invocation on an operator's behalf, recording that it was
@@ -810,8 +823,10 @@ impl Runtime {
         effect: &str,
         position: u64,
         now: &str,
+        collapsed_from: Option<u64>,
     ) -> anyhow::Result<()> {
-        self.lock_opdb().skip_invocation(effect, position, now)
+        self.lock_opdb()
+            .skip_invocation(effect, position, now, collapsed_from)
     }
 
     /// Whether an operator skipped this invocation. See [`OpDb::invocation_skipped`].
@@ -965,8 +980,12 @@ impl Runtime {
         self.lock_opdb().distinct_master_key_ids()
     }
 
-    /// Every terminal invocation recorded for an effect, with its script hash.
-    pub(crate) fn terminal_invocations(&self, effect: &str) -> anyhow::Result<Vec<(u64, String)>> {
+    /// Every terminal invocation recorded for an effect, with its script hash and the
+    /// range of positions rule 15 folded into it.
+    pub(crate) fn terminal_invocations(
+        &self,
+        effect: &str,
+    ) -> anyhow::Result<Vec<TerminalInvocation>> {
         self.lock_opdb().terminal_invocations(effect)
     }
 

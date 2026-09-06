@@ -703,6 +703,26 @@ check as reproduced, which is a claim about work nobody did. `hekla rewind <Effe
 only way back to history, CLI-only against a stopped process, and it leaves the boundary alone unless
 asked with `--live`.
 
+**`on latest` collapses a batch**: the arm runs once per key per dispatch batch, at the newest matching
+position in it. It is not "skip history": history is processed, and because a fold stops at the
+trigger's own position inclusive, that one invocation has already seen every event before it. What
+varies is batch size, and **the batch is what the lane has queued**: catching up, a shop's whole
+backlog is one publish; live, each event is a batch of one and collapses with nothing, so the arm only
+folds when several events for one key are pending while an earlier invocation is still running. The
+collapse group is `(arm, key)` and never the key alone, because two arms have two bodies and folding
+one into the other would drop work rather than repeat it. Nothing folds into an invocation that has
+begun: that one has a journal, and abandoning it would discard the record of calls that really
+happened, so a wedged `on latest` lane costs one extra invocation rather than a lost one.
+
+The surviving invocation records **the range it folded** (`effect_invocation.collapsed_from`), which is
+what keeps replay equivalence true: its members are every position in that range whose arm and lane
+match its own, so two integers reconstruct the grouping and the positions between them carry nothing a
+stored list would add. Re-deriving them needs the `@key` to still produce the same lanes, which the
+scheme check below and the recorded script hash between them guarantee. The positions it folded get no
+invocation row of their own; what stops them running again is the mark and the lane row, exactly as for
+any other retired position. `on latest` may not `invoke` (heklang enforces it statically,
+interprocedurally through effect-local `fn`), so a collapsed batch provably cannot change the log.
+
 **Changing an arm's `@key` repartitions the lanes**, so the rows above the mark are keyed under a
 scheme the new key never produces. An effect whose key moved while lanes were outstanding refuses to
 start, reporting `blocked`, and the rest of the runtime keeps serving. This is an **operator signal
@@ -941,11 +961,8 @@ three lints plus what a directory means.
 
 ## 13. Non-goals
 
-**Deferred** (see the roadmap, each with a trigger): metrics and Prometheus; batch collapse for
-`on latest` (a program declaring it is refused at load rather than run as `on`, since a runtime that
-quietly gave one invocation per event where the author asked for one per key would be honouring a
-different guarantee); an upload API with versioning, pinning, and retention, plus hot reload; a fold
-library; a workspace crate split.
+**Deferred** (see the roadmap, each with a trigger): metrics and Prometheus; an upload API with
+versioning, pinning, and retention, plus hot reload; a fold library; a workspace crate split.
 
 **Permanent commitments** (not deferrals, and not to be reopened): **there is exactly one authoring
 surface, and it is heklang.** There is no Rust, TypeScript, or WASM SDK path now or later. This is

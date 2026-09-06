@@ -352,6 +352,10 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
         // Positions declined since this process started, so an operator can see `on live`
         // working rather than guess why nothing fired.
         "live_suppressed": shared.live_suppressed(),
+        // The same, for the other modifier: positions an `on latest` arm folded into
+        // another invocation, so lag falling without a matching number of invocations
+        // reads as the arm doing what it declared rather than as work going missing.
+        "latest_collapsed": shared.latest_collapsed(),
         // The lane whose failure is pinning the mark, which is the one `last_error`
         // describes and the one an operator skips.
         "pinning_key": pinning.as_ref().map(|(lane, _)| lane),

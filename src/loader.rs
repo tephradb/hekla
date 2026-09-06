@@ -440,33 +440,6 @@ impl LoadedProject {
                 ));
                 continue;
             }
-            // Rule 15's `on latest` is a declaration this runtime cannot honour yet, and
-            // running it as `on` would give the arm one invocation per event where it
-            // asked for one per key. That is a different guarantee from the one the
-            // author wrote, delivered silently, and a program that checks but will not
-            // run beats one that runs differently from what it says. Deleting this is
-            // the last step of implementing batch collapse.
-            if effect
-                .arms
-                .iter()
-                .any(|arm| arm.delivery == Delivery::Latest)
-            {
-                findings.push(
-                    Finding::error(
-                        rel.clone(),
-                        format!(
-                            "`effect {}` declares `on latest`, which hekla {} does not implement",
-                            effect.name,
-                            env!("CARGO_PKG_VERSION"),
-                        ),
-                    )
-                    .with_hint(
-                        "write `on` until a release that does: dispatched as `on` the arm would \
-                         run once per event instead of once per key",
-                    ),
-                );
-                continue;
-            }
             let sources = event_types(effect.arms.iter().flat_map(|arm| arm.events.iter()));
             effects.push(EffectUnit {
                 def: ModuleDef::Effect {
@@ -807,11 +780,12 @@ effect Beta {
         );
     }
 
-    /// `on latest` is a guarantee this runtime does not yet honour, so it is refused at
-    /// load rather than quietly downgraded to `on`. Delete this test when batch collapse
-    /// lands; discovering the refusal by surprise then would be worse.
+    /// `on latest` used to be refused at load, because running it as `on` would have given
+    /// the arm one invocation per event where it asked for one per key. Batch collapse
+    /// honours it, so it loads, and the arm reaches the dispatcher carrying the modifier it
+    /// was written with.
     #[test]
-    fn an_on_latest_arm_is_refused_rather_than_run_as_on() {
+    fn an_on_latest_arm_loads_and_keeps_its_modifier() {
         let dir = tempfile::tempdir().unwrap();
         let project = load_effects(
             dir.path(),
@@ -823,27 +797,13 @@ effect Collapsing {
 }
 "#,
         );
-        let finding = project
-            .findings
-            .iter()
-            .find(|finding| finding.message.contains("on latest"))
-            .unwrap_or_else(|| panic!("expected a refusal, got {:?}", project.findings));
-        assert_eq!(finding.severity, Severity::Error);
-        assert!(
-            finding.message.contains("`effect Collapsing`")
-                && finding.message.contains(env!("CARGO_PKG_VERSION")),
-            "the message names the effect and the build that lacks it: {}",
-            finding.message
-        );
-        assert!(
-            finding
-                .hint
-                .as_deref()
-                .unwrap_or_default()
-                .contains("once per key"),
-            "the hint says what the downgrade would cost: {:?}",
-            finding.hint
-        );
+        assert!(!project.has_errors(), "{:?}", project.findings);
+        let arm = project.effects[0]
+            .arms
+            .get("e.one")
+            .expect("the arm loaded");
+        assert_eq!(arm.delivery, Delivery::Latest);
+        assert_eq!(arm.keys, ["id"]);
     }
 
     #[test]
@@ -862,8 +822,8 @@ effect Collapsing {
         assert!(!project.has_errors(), "{:?}", project.findings);
     }
 
-    /// `on live` is honoured, so it loads. Pinned beside the `latest` refusal because the
-    /// two modifiers are otherwise easy to reject together by accident.
+    /// `on live` is honoured, so it loads. Pinned beside the `latest` one because the two
+    /// modifiers are otherwise easy to reject together by accident.
     #[test]
     fn an_on_live_arm_loads() {
         let dir = tempfile::tempdir().unwrap();

@@ -1626,12 +1626,49 @@ Honest scope for this phase:
 - **Batch collapse for `on latest` is not implemented, and a program declaring it is refused at
   load.** Running it as `on` would give one invocation per event where the author asked for one per
   key: a different guarantee, delivered silently. A program that checks but will not run beats one
-  that runs differently from what it says.
+  that runs differently from what it says. *(Phase 27 implements it and deletes the refusal.)*
 - The key-change block is an **operator signal, not a correctness gate**. Reprocessing under a new key
   skips rather than re-fires, because rows above the mark are never swept. What stopping buys is that
   a repartition is noticed by whoever caused it.
 - Schema v8 adds `effect_lane` and `effect_activation`. `hekla plan` refuses a directory this build
   has not migrated, so run `hekla serve` against it once first.
+
+
+## Phase 27: an `on latest` arm runs once per key, not once per event (done)
+
+Rule 15's fourth obligation, deferred out of phase 26 because it is the most complex of the four and
+had one customer. It now has four: FlowWarranty's `EnableCartTransform`, `EnableWarrantyValidation`,
+`RegisterShopifyWebhooks` and `SyncShopPlansMetafield` all declare `on latest`, and the load refusal
+was the only thing standing between that port and a deploy.
+
+- **Collapse, as the language defines it.** One invocation per key per dispatch batch, at the newest
+  matching position in it. History is still processed: a fold stops at the trigger's own position
+  inclusive, so the one surviving invocation has already seen every event before it. The group is
+  `(arm, key)` and never the key alone, since two arms have two bodies.
+- **The batch is what the lane has queued**, which is what makes the live behaviour real as well as
+  the catch-up one: a merchant editing six plans in a minute gets one publish. A queue entry became a
+  group, so the in-flight cap now counts work that will run rather than positions, and a shop's whole
+  backlog collapses to one invocation however long it is.
+- **The record is a range, not a list.** `effect_invocation.collapsed_from` plus the invocation's own
+  position: the members are every position between them whose arm and lane match, so the two integers
+  reconstruct the grouping exactly and the retirement stays one `UPDATE` at any scale. `hekla verify`
+  re-derives membership rather than trusting a stored set, and counts what it found.
+- **Nothing folds into an invocation that has begun**, because that one has a journal and abandoning
+  it would discard the record of calls that really happened.
+- `/admin/effects/{name}` reports `latest_collapsed` beside `live_suppressed`, so lag falling without
+  a matching number of invocations reads as the arm doing what it declared.
+
+Honest scope for this phase:
+
+- **Two guards in other files are what make the range replayable**, and the record site says so:
+  `effect_activation.lane_scheme` stops an effect whose `@key` repartitioned the lanes, and a key
+  change also moves the effect's digest, which `hekla verify` compares before it reads the range.
+- **A group's span is not capped.** If one is ever needed it belongs on `hi - lo` rather than on the
+  global position count, and it has to say what it split: a silent cap reads as "collapsed
+  everything" when it did not.
+- Schema v9 adds `effect_invocation.collapsed_from`. Rows written before it read back as null, which
+  is the same honest answer as a row that folded nothing.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
@@ -1640,10 +1677,6 @@ warranted.
 - **Upload API with versioning, pinning, and retention, plus hot reload** (load-graph incremental
   invalidation): when inline or live editing becomes a goal. The effect journal already records the
   script hash for this.
-- **Batch collapse for `on latest`**: when a convergent effect's redundant runs cost enough to be
-  worth the bookkeeping. Recording which positions were folded into an invocation is what keeps
-  replay equivalence true, and it has one known customer. Until it lands, a program declaring `on
-  latest` is refused at load rather than run as `on`.
 - **Metrics and Prometheus**: when there is something to operate at scale.
 - **Fold library** (`event_counter`, `latest_event`, `toggle`): only after roughly fifteen real
   commands exist, and only if it compiles down to the existing `state` shape rather than becoming a

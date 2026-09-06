@@ -22,7 +22,7 @@ use crate::crypto;
 
 /// The current schema version, tracked in SQLite's `user_version`. Bump it and
 /// add a migration arm when the schema changes.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// How many rows a single sweep statement deletes, so a retention sweep never
 /// holds the connection across a long scan. The sweeper loops until a call
@@ -216,17 +216,30 @@ impl OpDb {
 
     /// Mark an invocation `terminal`. This is the journaled terminal step: it is
     /// idempotent, and the sweeper only reclaims rows once they reach it.
+    ///
+    /// `collapsed_from` is rule 15's batch collapse: the oldest position this invocation
+    /// folded into itself, or `None` when it covers only its own. **It is set by the same
+    /// statement that makes the row terminal, and that is the whole of why it can be
+    /// trusted.** The dispatcher retires the folded positions from its in-flight set the
+    /// moment this returns, so the mark moves past them; a completion that landed without
+    /// the range would leave them covered by nothing and say so nowhere.
     pub fn complete_invocation(
         &self,
         effect: &str,
         position: u64,
         now: &str,
+        collapsed_from: Option<u64>,
     ) -> anyhow::Result<()> {
         self.conn
             .execute(
-                "UPDATE effect_invocation SET status = 'terminal', completed_at = ?3 \
-                 WHERE effect = ?1 AND position = ?2",
-                params![effect, position as i64, now],
+                "UPDATE effect_invocation SET status = 'terminal', completed_at = ?3, \
+                 collapsed_from = ?4 WHERE effect = ?1 AND position = ?2",
+                params![
+                    effect,
+                    position as i64,
+                    now,
+                    collapsed_from.map(|from| from as i64)
+                ],
             )
             .context("completing effect invocation")?;
         Ok(())
@@ -239,13 +252,29 @@ impl OpDb {
     /// completion is a handler reaching its own end, a skip is an operator stepping over
     /// one that could not. Only the second is a position nothing ran to a conclusion for,
     /// and a replay that cannot tell them apart has to guess from the journal.
-    pub fn skip_invocation(&self, effect: &str, position: u64, now: &str) -> anyhow::Result<()> {
+    ///
+    /// `collapsed_from` carries the same range
+    /// [`complete_invocation`](Self::complete_invocation) does, and for the same reason: a
+    /// skipped invocation is still the one that retires its whole group, so the positions
+    /// it folded have to be recorded by the statement that retires them.
+    pub fn skip_invocation(
+        &self,
+        effect: &str,
+        position: u64,
+        now: &str,
+        collapsed_from: Option<u64>,
+    ) -> anyhow::Result<()> {
         self.conn
             .execute(
                 "UPDATE effect_invocation \
-                 SET status = 'terminal', completed_at = ?3, skipped_at = ?3 \
-                 WHERE effect = ?1 AND position = ?2",
-                params![effect, position as i64, now],
+                 SET status = 'terminal', completed_at = ?3, skipped_at = ?3, \
+                 collapsed_from = ?4 WHERE effect = ?1 AND position = ?2",
+                params![
+                    effect,
+                    position as i64,
+                    now,
+                    collapsed_from.map(|from| from as i64)
+                ],
             )
             .context("recording an operator skip")?;
         Ok(())
@@ -388,19 +417,24 @@ impl OpDb {
     /// the script hash it ran under. The replay check sweeps these; the hash is what
     /// lets it skip invocations whose module has since been edited, which diverge
     /// legitimately rather than in error.
-    pub fn terminal_invocations(&self, effect: &str) -> anyhow::Result<Vec<(u64, String)>> {
+    pub fn terminal_invocations(&self, effect: &str) -> anyhow::Result<Vec<TerminalInvocation>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT position, script_hash FROM effect_invocation \
+                "SELECT position, script_hash, collapsed_from FROM effect_invocation \
                  WHERE effect = ?1 AND status = 'terminal' ORDER BY position",
             )
             .context("preparing the terminal invocation query")?;
         let rows = stmt
             .query_map(params![effect], |row| {
                 let position: i64 = row.get(0)?;
-                let hash: String = row.get(1)?;
-                Ok((position as u64, hash))
+                let script_hash: String = row.get(1)?;
+                let collapsed_from: Option<i64> = row.get(2)?;
+                Ok(TerminalInvocation {
+                    position: position as u64,
+                    script_hash,
+                    collapsed_from: collapsed_from.map(|from| from as u64),
+                })
             })
             .context("querying terminal invocations")?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -479,6 +513,52 @@ impl OpDb {
             )
             .context("counting terminal invocations")?;
         Ok(count as usize)
+    }
+
+    /// Positions above `after` that this effect already has an invocation row for, in any
+    /// status.
+    ///
+    /// Rule 15's batch collapse is what wants this, and the rule it enforces is narrow:
+    /// such a position may not be **superseded**. It still takes over the group it lands in
+    /// and becomes what runs, which is how the partition an earlier process built is
+    /// reproduced; what it may not do is let a later position fold it away, because then
+    /// nothing would run at it. A crash leaves `running` rows for invocations that began,
+    /// and a completion whose mark never advanced leaves `terminal` ones: fold the first
+    /// away and its row is never completed, fold the second away and it sits inside a range
+    /// that also claims to cover it. After a restart the dispatcher cannot tell either from
+    /// memory, which is what this answers.
+    ///
+    /// Starts above the mark, because the subscription resumes there and nothing at or
+    /// below it is offered again. Read once, at resume: every row written after that is for
+    /// a position this process admitted, which its own lane high-water already answers for.
+    ///
+    /// **`limit` is a real bound and the caller has to handle reaching it.** Rows above the
+    /// mark are never swept and the mark is held down by the oldest unfinished lane, so
+    /// their number is bounded by how long a lane has been wedged rather than by anything: a
+    /// day of one wedged shop beside a busy plain arm is millions of rows, materialised on
+    /// the restart an operator reached for to clear the wedge. Answering a short list is why
+    /// this returns them rather than a count.
+    pub fn invocations_above(
+        &self,
+        effect: &str,
+        after: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<u64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT position FROM effect_invocation WHERE effect = ?1 AND position > ?2 \
+                 ORDER BY position LIMIT ?3",
+            )
+            .context("preparing the recorded position query")?;
+        let rows = stmt
+            .query_map(params![effect, after as i64, limit as i64], |row| {
+                let position: i64 = row.get(0)?;
+                Ok(position as u64)
+            })
+            .context("querying recorded positions")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting recorded positions")
     }
 
     /// The effect's durable resume point: the watermark it has processed every
@@ -676,6 +756,16 @@ impl OpDb {
     /// command silently does nothing. It is also what makes a rewind *re-fire*: the journal
     /// rows cascade with their invocations, so the calls they recorded are performed again
     /// rather than replayed.
+    ///
+    /// **A target inside a collapsed range loses the record of what covered its older
+    /// half.** Rule 15 lets one invocation stand for a batch, so a rewind to 50 that
+    /// discards an invocation at 100 covering positions from 3 leaves 3..50 accounted for by
+    /// nothing: they are at or below the new cursor, so they are neither re-delivered nor
+    /// still covered, and a later sweep can say less about them than it could. The work
+    /// itself happened and nothing re-fires twice; what the operator gave up is
+    /// auditability, on a command whose whole preview is about what it gives up. Refusing
+    /// such a target would be worse: it would make a rewind's legality depend on a
+    /// scheduling decision an operator cannot see.
     ///
     /// One transaction, because a half-applied rewind is exactly the shape
     /// [`OpDb::sweep_effect_journal`] warns about: terminal rows above the watermark with
@@ -1426,6 +1516,7 @@ impl OpDb {
                 5 => tx.execute_batch(SCHEMA_V6).context("applying schema v6")?,
                 6 => tx.execute_batch(SCHEMA_V7).context("applying schema v7")?,
                 7 => tx.execute_batch(SCHEMA_V8).context("applying schema v8")?,
+                8 => tx.execute_batch(SCHEMA_V9).context("applying schema v9")?,
                 other => anyhow::bail!("no migration from schema version {other}"),
             }
             version += 1;
@@ -1641,6 +1732,32 @@ CREATE TABLE effect_activation (
 );
 ";
 
+/// Schema v9 is rule 15's batch collapse: an `on latest` arm runs once per key per
+/// dispatch batch, at the newest matching position in it, and this column is where the
+/// positions it folded away are recorded.
+///
+/// **A range rather than a list, and the range is exact.** An invocation's collapsed set
+/// is every position in `[collapsed_from, position]` whose arm and lane match this
+/// invocation's, so the two integers reconstruct the grouping and the positions between
+/// them carry nothing the range does not. The dispatcher folds forward as it admits, so
+/// `collapsed_from` is the *first admitted* position of the group: a matching position an
+/// earlier invocation already covered was dropped before the group existed, and is
+/// therefore outside the range rather than counted twice.
+///
+/// **Re-deriving membership depends on two guards that live elsewhere**, so this says so
+/// rather than leaving a later reader to find them. `crate::effect`'s `lane_of` has to
+/// answer the same later, and it would not if the effect's `@key` had moved.
+/// `effect_activation.lane_scheme` is compared at every boot and stops an effect whose key
+/// repartitioned the lanes, and a key change also moves the effect's digest, so
+/// `crate::verify` skips the invocation as edited before it reads this column at all.
+///
+/// NULL is what a row with nothing folded into it holds, and what every pre-v9 row reads
+/// back as. Both are the same honest answer: this invocation covers its own position and
+/// no more. There is no index, because the only read is by primary key.
+const SCHEMA_V9: &str = "
+ALTER TABLE effect_invocation ADD COLUMN collapsed_from INTEGER;
+";
+
 /// What a rewind would discard, and what it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RewindCounts {
@@ -1710,6 +1827,17 @@ pub struct DeclarationRow {
     pub first_seen: String,
     pub last_seen: String,
     pub current: bool,
+}
+
+/// One recorded invocation that reached a terminal state, as the replay check sweeps it.
+pub struct TerminalInvocation {
+    pub position: u64,
+    /// What the module hashed to when it ran, so a replay can skip an invocation whose
+    /// code has since been edited rather than report it as a divergence.
+    pub script_hash: String,
+    /// Rule 15: the oldest position folded into this invocation by an `on latest` arm's
+    /// batch collapse, or `None` when it covers only its own position.
+    pub collapsed_from: Option<u64>,
 }
 
 /// A durable effect quarantine, with the time it was recorded.
@@ -1793,7 +1921,7 @@ mod tests {
             db.begin_invocation("e", 1, "h", "t1").unwrap(),
             InvocationState::Running
         ));
-        db.complete_invocation("e", 1, "t2").unwrap();
+        db.complete_invocation("e", 1, "t2", None).unwrap();
         assert!(matches!(
             db.begin_invocation("e", 1, "h", "t3").unwrap(),
             InvocationState::AlreadyTerminal
@@ -1842,7 +1970,7 @@ mod tests {
         db.begin_invocation("e", 1, "old", "t0").unwrap(); // running, stale hash
         db.begin_invocation("e", 2, "new", "t0").unwrap(); // running, current hash
         db.begin_invocation("e", 3, "old", "t0").unwrap();
-        db.complete_invocation("e", 3, "t1").unwrap(); // terminal, ignored
+        db.complete_invocation("e", 3, "t1", None).unwrap(); // terminal, ignored
         assert_eq!(db.running_with_hash_mismatch("e", "new").unwrap(), vec![1]);
     }
 
@@ -2051,13 +2179,13 @@ mod tests {
         let db = OpDb::open_in_memory().unwrap();
         for position in 1..=5u64 {
             db.begin_invocation("e", position, "h", "t0").unwrap();
-            db.complete_invocation("e", position, "t1").unwrap();
+            db.complete_invocation("e", position, "t1", None).unwrap();
         }
         // Still running, so not a candidate at all.
         db.begin_invocation("e", 6, "h", "t0").unwrap();
         // The same effect, one edit ago.
         db.begin_invocation("e", 7, "older", "t0").unwrap();
-        db.complete_invocation("e", 7, "t1").unwrap();
+        db.complete_invocation("e", 7, "t1", None).unwrap();
 
         assert_eq!(
             db.recent_terminal_invocations("e", "h", 100, 100).unwrap(),
@@ -2104,11 +2232,11 @@ mod tests {
         db.begin_invocation("e", 1, "h", "t0").unwrap();
         db.journal_put("e", 1, "abc", 0, "http", "{}", "t0")
             .unwrap();
-        db.complete_invocation("e", 1, "2026-01-01T00:00:00Z")
+        db.complete_invocation("e", 1, "2026-01-01T00:00:00Z", None)
             .unwrap();
         // Recent terminal: kept.
         db.begin_invocation("e", 2, "h", "t0").unwrap();
-        db.complete_invocation("e", 2, "2026-12-31T00:00:00Z")
+        db.complete_invocation("e", 2, "2026-12-31T00:00:00Z", None)
             .unwrap();
         // Old but still running: kept (never sweep in-flight work).
         db.begin_invocation("e", 3, "h", "2026-01-01T00:00:00Z")
@@ -2142,7 +2270,7 @@ mod tests {
         db.begin_invocation("e", 5, "h", "t0").unwrap();
         db.journal_put("e", 5, "abc", 0, "http", "{}", "t0")
             .unwrap();
-        db.complete_invocation("e", 5, "2020-01-01T00:00:00Z")
+        db.complete_invocation("e", 5, "2020-01-01T00:00:00Z", None)
             .unwrap();
 
         let deleted = db
@@ -2176,7 +2304,7 @@ mod tests {
             db.begin_invocation(effect, 1, "h", "t0").unwrap();
             db.journal_put(effect, 1, "abc", 0, "http", "{}", "t0")
                 .unwrap();
-            db.complete_invocation(effect, 1, "2020-01-01T00:00:00Z")
+            db.complete_invocation(effect, 1, "2020-01-01T00:00:00Z", None)
                 .unwrap();
         }
 
@@ -2201,7 +2329,7 @@ mod tests {
             db.begin_invocation("e", position, "h", "t0").unwrap();
             db.journal_put("e", position, "abc", 0, "http", "{}", "t0")
                 .unwrap();
-            db.complete_invocation("e", position, "2020-01-01T00:00:00Z")
+            db.complete_invocation("e", position, "2020-01-01T00:00:00Z", None)
                 .unwrap();
         }
 
@@ -2337,6 +2465,57 @@ mod tests {
         assert_eq!(db.effect_activation("e").unwrap(), None);
     }
 
+    /// v9 adds a column, so the question is what a row written before it says now. Null
+    /// rather than the row's own position: an invocation recorded before batch collapse
+    /// existed covered one position, and "nothing was folded into this" is exactly what
+    /// null means for a row written after it too.
+    #[test]
+    fn an_invocation_written_before_v9_reads_back_with_nothing_collapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for schema in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8,
+            ] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 8i64).unwrap();
+            conn.execute(
+                "INSERT INTO effect_invocation (effect, position, script_hash, status, created_at) \
+                 VALUES ('e', 7, 'h', 'terminal', 't0')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = OpDb::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let recorded = db.terminal_invocations("e").unwrap();
+        assert_eq!(recorded.len(), 1, "the migration preserves existing rows");
+        assert_eq!(recorded[0].position, 7);
+        assert_eq!(recorded[0].collapsed_from, None);
+    }
+
+    /// The range is written by the statement that makes the row terminal, so there is no
+    /// window in which a completion is durable and what it folded is not.
+    #[test]
+    fn a_completion_records_the_range_it_folded() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.begin_invocation("e", 9, "h", "t0").unwrap();
+        db.complete_invocation("e", 9, "t1", Some(4)).unwrap();
+        db.begin_invocation("e", 10, "h", "t0").unwrap();
+        db.complete_invocation("e", 10, "t1", None).unwrap();
+
+        let recorded = db.terminal_invocations("e").unwrap();
+        assert_eq!(recorded[0].collapsed_from, Some(4));
+        assert_eq!(
+            recorded[1].collapsed_from, None,
+            "an invocation that folded nothing says so rather than naming itself"
+        );
+    }
+
     // --- introspection readers ---------------------------------------------
 
     #[test]
@@ -2408,7 +2587,7 @@ mod tests {
                 db.begin_invocation(effect, position, "h", "t0").unwrap();
             }
         }
-        db.complete_invocation("a-effect", 2, "t9").unwrap();
+        db.complete_invocation("a-effect", 2, "t9", None).unwrap();
 
         let found = db
             .invocations_at(&["a-effect", "b-effect"], &[2, 1])
@@ -2451,7 +2630,7 @@ mod tests {
         for position in 1..=5 {
             db.begin_invocation("e", position, "h", "t0").unwrap();
         }
-        db.complete_invocation("e", 2, "t9").unwrap();
+        db.complete_invocation("e", 2, "t9", None).unwrap();
 
         let first = db.invocations("e", u64::MAX, 2).unwrap();
         assert_eq!(

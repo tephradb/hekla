@@ -59,6 +59,14 @@ until the backoff expires and returns its worker, so the position stays at the h
 queue and every other lane keeps running. This is the fix for one unprocessable event stalling an
 entire effect; the parallelism is a bonus, and `[effects] pool_size = 1` still gets it.
 
+**An `on latest` arm runs once per key per batch**, at the newest matching position in it, and the
+batch is what its lane has queued. Catching up, a key's whole backlog is one invocation; live, each
+event arrives on its own and collapses with nothing, so the arm only folds when several events for one
+key are pending while an earlier invocation is still running. It is not "skip history": that one
+invocation folded the whole prefix, so it acted on the final state. `latest_collapsed` on
+`/admin/effects/{name}` counts what it folded, which is why such an effect's `lag` can fall by far
+more than its invocation count rises.
+
 ### The states
 
 `/status` and `/admin/effects` derive one word, in this order:

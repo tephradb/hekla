@@ -104,6 +104,11 @@ been erased, when an operator skipped it, when its record could not be read, whe
 call at all and the replay reaches one, or when retention reclaimed its record while the sweep was
 reading it. Each is counted separately, because they mean different things.
 
+A **collapsed** position is counted there too, and on an `on latest` project it is usually the
+largest of them: nothing ran at that position, because an `on latest` arm folded it into a later
+invocation, so there is no journal of its own to reproduce. It is reported rather than left out so
+that `checked + skipped` stays the number of positions the effect was delivered.
+
 The operator skip is the subtle one. It completes a wedged invocation without running it to an end,
 so whatever the journal holds is the prefix of a run that never finished, and comparing a replay
 against that prefix would fail a directory an operator deliberately made healthy. The invocation row

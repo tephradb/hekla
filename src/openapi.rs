@@ -1154,8 +1154,10 @@ fn trace_path() -> Value {
                     An invocation the retention sweeper has already reclaimed is absent. \
                     So is one by an effect this process no longer loads: the join names the \
                     effects the running project declares, so a renamed or deleted effect's \
-                    work reads the same as no effect having run. Both absences are silent by \
-                    design, and neither means the position was never processed.",
+                    work reads the same as no effect having run. So is a position an `on \
+                    latest` arm folded into a later invocation, which is recorded on that \
+                    invocation rather than here. All three absences are silent by design, and \
+                    none of them means the position was never processed.",
             },
             "complete": {
                 "type": "boolean",
@@ -1266,7 +1268,10 @@ fn invocations_path(effects: &[&str]) -> Value {
             "tags": [INTROSPECTION_TAG],
             "operationId": "list_effect_invocations",
             "summary": "an effect's invocations, newest first",
-            "description": "One row per event position the effect has reacted to. A `running` \
+            "description": "One row per invocation, which is one row per event position \
+                except where an `on latest` arm collapsed a batch: there the positions it \
+                folded have no row of their own and are covered by the surviving one. A \
+                `running` \
                 row is either in flight or wedged; the two are told apart by the effect's \
                 `consecutive_failures`. Completed invocations are swept after the retention \
                 window, so this is not the whole history of a long-lived effect.",
@@ -2349,6 +2354,17 @@ fn effect_detail_schema() -> Value {
                     started, so an operator can see `on live` working rather than guess why \
                     nothing fired. Process-local: a restart resets it.",
             },
+            "latest_collapsed": {
+                "type": "integer",
+                "minimum": 0,
+                "format": "int64",
+                "description": "Positions an `on latest` arm folded into another invocation \
+                    since this process started, so lag falling without a matching number of \
+                    invocations reads as the arm doing what it declared. Process-local: a \
+                    restart resets it. The durable record is a column on the surviving \
+                    invocation and is not served over this API; `hekla verify` reports what \
+                    it accounts for.",
+            },
             "terminal_skips": {
                 "type": "integer",
                 "minimum": 0,
@@ -2375,8 +2391,8 @@ fn effect_detail_schema() -> Value {
         "required": [
             "name", "state", "position", "lag", "retry_in_ms", "sources", "watermark",
             "consecutive_failures", "last_error", "wedged_lanes", "pinning_key",
-            "pinning_position", "live_boundary", "live_suppressed", "terminal_skips",
-            "last_terminal_error",
+            "pinning_position", "live_boundary", "live_suppressed", "latest_collapsed",
+            "terminal_skips", "last_terminal_error",
             "quarantined", "quarantine"
         ],
         "additionalProperties": false,

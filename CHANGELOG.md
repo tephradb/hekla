@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- an `on latest` arm runs once per key per dispatch batch, at the newest matching position in it,
+  and the surviving invocation records the range it folded
+- `/admin/effects/{name}` reports `latest_collapsed`, the positions folded into another invocation
+  since this process started
+
+### Changed
+
+- [**breaking**] an effect arm declaring `on latest` loads and runs, where the previous release
+  refused it at load rather than running it as `on`
+- an effect's in-flight cap counts units of work rather than positions, so a lane's whole backlog
+  collapses to one invocation however long it is
+- schema v9 adds `effect_invocation.collapsed_from`; rows written before it read back as null, which
+  is the same answer as an invocation that folded nothing
+- heklang 0.4.0
+
 ## [0.2.0](https://git.tqwewe.com/tephra/hekla/compare/v0.1.1...v0.2.0) - 2026-09-06
 
 ### Added

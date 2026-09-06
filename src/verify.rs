@@ -29,6 +29,7 @@
 //! refuses to append and to erase as well.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::invariant::{Mismatch, Violation};
@@ -45,7 +46,9 @@ use heklang::Program;
 use crate::crypto::{KeyStore, MasterKeys, RowDecryptor};
 use crate::effect::{self, Asked, Uncovered};
 use crate::envelope;
+use crate::lane::LaneId;
 use crate::loader::{EffectUnit, LoadedProject, ProjectorUnit};
+use crate::opdb::TerminalInvocation;
 use crate::projector;
 use crate::read_model::ReadModel;
 use crate::runtime::Runtime;
@@ -90,6 +93,21 @@ pub struct Skipped {
     pub reclaimed: usize,
     /// The triggering event is no longer where the invocation says it was.
     pub event_missing: usize,
+    /// Rule 15: positions an `on latest` arm folded into another invocation, which is the
+    /// one that was replayed.
+    ///
+    /// A skip rather than a check, because nothing ran at these positions and there is no
+    /// journal of theirs to reproduce. Counting them here rather than nowhere is what keeps
+    /// `invocations_checked + skipped.total()` the number of positions the effect was
+    /// delivered, which is what a reader takes it for.
+    ///
+    /// **Except for an effect that has been edited**, whose invocations are skipped before
+    /// their range is read: re-deriving membership needs the `@key` that produced it, and
+    /// the hash that gates the skip cannot tell a moved key from a rewritten body. Such an
+    /// effect contributes one to `effect_edited` however many positions it folded, so the
+    /// sum reads low by the rest of them. Counting the span instead would read high, since
+    /// a range covers positions in other lanes that were never members.
+    pub collapsed: usize,
 }
 
 impl Skipped {
@@ -101,6 +119,7 @@ impl Skipped {
             + self.unreadable
             + self.reclaimed
             + self.event_missing
+            + self.collapsed
     }
 }
 
@@ -120,7 +139,7 @@ impl fmt::Display for Report {
             f,
             "checked {} projector(s) and {} invocation(s); skipped {} ({} edited, \
              {} erased, {} without a journal, {} skipped by an operator, {} unreadable, \
-             {} reclaimed, {} without their event)",
+             {} reclaimed, {} without their event, {} collapsed)",
             self.projectors_checked,
             self.invocations_checked,
             self.skipped.total(),
@@ -131,6 +150,7 @@ impl fmt::Display for Report {
             self.skipped.unreadable,
             self.skipped.reclaimed,
             self.skipped.event_missing,
+            self.skipped.collapsed,
         )?;
         if self.violations.is_empty() {
             write!(f, "ok: no violations")
@@ -417,7 +437,14 @@ fn sweep_effect(
     let query =
         crate::heklang_host::query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
 
-    for (position, script_hash) in runtime.terminal_invocations(name)? {
+    let invocations = runtime.terminal_invocations(name)?;
+    // Rule 15: an invocation may stand for a batch, and the positions it folded are counted
+    // once for the whole effect rather than once per invocation. See `collapsed_positions`
+    // for why that is not a tidiness question.
+    report.skipped.collapsed += collapsed_positions(runtime, unit, &query, &invocations)?;
+
+    for recorded in invocations {
+        let position = recorded.position;
         // An effect that now behaves differently diverges legitimately: the recorded run
         // and the current code are different programs, and the journal is keyed to the
         // old one. The hash is the digest's, so this asks whether the effect *does*
@@ -427,7 +454,12 @@ fn sweep_effect(
         // `hekla plan` inverts exactly this test, for exactly this reason: there the
         // point is what a not-yet-deployed program would do differently, so the
         // divergence is the answer rather than the thing to step around.
-        if script_hash != unit.digest_hash {
+        //
+        // It is also what makes the collapse range below replayable. The range names an
+        // arm and a key rather than a list of positions, so re-deriving its members needs
+        // the `@key` that produced them; a key change moves this hash, so an invocation
+        // whose lanes would repartition is skipped here rather than re-derived wrongly.
+        if recorded.script_hash != unit.digest_hash {
             report.skipped.effect_edited += 1;
             continue;
         }
@@ -458,6 +490,88 @@ fn sweep_effect(
         report.absorb(outcome.violation(name, position));
     }
     Ok(())
+}
+
+/// How many positions rule 15's batch collapse folded into the invocations `recorded`
+/// stands for.
+///
+/// **Membership is re-derived, not read back.** An invocation's group is every position in
+/// `[collapsed_from, position]` whose arm and lane match its own, and both are a pure
+/// function of the event, so the range says everything a stored list would. Only
+/// invocations whose digest still matches are counted, which is what makes the derivation
+/// today the same answer the dispatcher reached then: a changed `@key` would repartition
+/// the lanes, and it moves that hash. An edited effect's folded positions are therefore
+/// counted nowhere, which [`Skipped::collapsed`] says.
+///
+/// **One pass over the log, not one per invocation.** Every lane collapsing over the same
+/// backlog leaves a range spanning most of it, so re-deriving each separately costs the
+/// number of collapsed invocations times the width of the backlog: eight hundred shops
+/// catching up over a million events is eight hundred million record decodes for a log with
+/// a million in it. Walking once and attributing each position to the invocation that
+/// swallowed it is linear, and the ranges are what make that attribution possible without
+/// holding a position list per group.
+///
+/// Answers zero rather than failing for anything it cannot resolve. The invocations have
+/// each been replayed on their own terms by then, so a range that cannot be re-derived is a
+/// count this run does not know, not a finding about the handler.
+fn collapsed_positions(
+    runtime: &Arc<Runtime>,
+    unit: &EffectUnit,
+    query: &Query,
+    recorded: &[TerminalInvocation],
+) -> anyhow::Result<usize> {
+    let invocations: HashMap<u64, Option<u64>> = recorded
+        .iter()
+        .filter(|invocation| invocation.script_hash == unit.digest_hash)
+        .map(|invocation| (invocation.position, invocation.collapsed_from))
+        .collect();
+    let Some(from) = invocations.values().flatten().copied().min() else {
+        return Ok(0);
+    };
+    let upto = invocations
+        .iter()
+        .filter(|(_, folded)| folded.is_some())
+        .map(|(position, _)| *position)
+        .max()
+        .unwrap_or(from);
+
+    let program = runtime.program();
+    let Some(declared) = program.effect(unit.def.name()) else {
+        return Ok(0);
+    };
+
+    // Per `(arm, lane)`, the positions seen since that group last had an invocation. An
+    // invocation closes its own group, so nothing accumulates across one, and a position
+    // belongs to at most one range.
+    let mut pending: HashMap<(usize, LaneId), Vec<u64>> = HashMap::new();
+    let mut folded = 0;
+    let mut reads = runtime
+        .store()
+        .read(query, Position::new(from.saturating_sub(1)), None);
+    while let Some(item) = reads.next() {
+        let seq = item.map_err(|err| anyhow::anyhow!("reading a collapsed batch: {err}"))?;
+        let position = seq.position.get();
+        if position > upto {
+            break;
+        }
+        let Some(arm) = unit.arms.get(seq.event.event_type()) else {
+            continue;
+        };
+        let lane = effect::lane_of(program, declared, arm.index, seq.position, seq.event);
+        let group = pending.entry((arm.index, lane)).or_default();
+        match invocations.get(&position) {
+            // Everything this group has accumulated inside its range was folded into it.
+            Some(Some(range)) => {
+                folded += group.iter().filter(|seen| *seen >= range).count();
+                group.clear();
+            }
+            // An invocation covering only itself still ends the group, so nothing before it
+            // can be claimed by a range that starts after it.
+            Some(None) => group.clear(),
+            None => group.push(position),
+        }
+    }
+    Ok(folded)
 }
 
 /// Read the single event at `position` that `query` matches, if it is still there.

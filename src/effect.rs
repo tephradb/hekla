@@ -1,7 +1,11 @@
 //! The effect runtime: durable execution of side effects.
 //!
-//! One dedicated thread per effect subscribes to its `handle` keys and processes
-//! matching events strictly in order, one invocation per event. An invocation
+//! One dedicated thread per effect subscribes to its `handle` keys and hands each
+//! matching event to the lane its `@key` names; positions in one lane are processed
+//! strictly in order, and positions in different lanes need not wait for each other.
+//! One invocation per event, except where rule 15's `on latest` declares otherwise:
+//! there an arm runs once per key per dispatch batch, at the newest matching position
+//! in it, and the invocation records the range it folded. An invocation
 //! runs the effect's straight-line `handle`, whose impure builtins (`http.*`,
 //! `invoke_command`, `now`) are journaled: each call records its
 //! result in the operational DB, so a crash mid-handler resumes by replaying the
@@ -60,7 +64,7 @@ use crate::invariant::Violation;
 use heklang::ir::Delivery;
 
 use crate::lane::LaneId;
-use crate::lanes::LaneState;
+use crate::lanes::{LaneState, Work};
 use crate::loader::{self, EffectUnit};
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
 use crate::runtime::{self, Runtime};
@@ -176,6 +180,11 @@ pub struct EffectShared {
     /// How many positions the boundary has declined since this process started, so an
     /// operator can see `on live` working rather than guess why nothing fired.
     live_suppressed: AtomicU64,
+    /// How many positions an `on latest` arm has folded into another invocation since this
+    /// process started. The same job `live_suppressed` does for the other modifier: an
+    /// effect whose lag falls without a matching number of invocations is doing exactly
+    /// what its author asked for, and this is what says so.
+    latest_collapsed: AtomicU64,
     /// The lane whose failure is holding the watermark down, and the position it failed
     /// at, republished from `stuck` alongside `last_error`.
     ///
@@ -203,6 +212,7 @@ impl EffectShared {
             quarantined: AtomicBool::new(false),
             live_boundary,
             live_suppressed: AtomicU64::new(0),
+            latest_collapsed: AtomicU64::new(0),
             blocked: Mutex::new(None),
             stuck: Mutex::new(BTreeMap::new()),
             wedged_lanes: AtomicU64::new(0),
@@ -218,6 +228,12 @@ impl EffectShared {
     /// How many positions `on live` arms have declined since this process started.
     pub fn live_suppressed(&self) -> u64 {
         self.live_suppressed.load(Ordering::Relaxed)
+    }
+
+    /// How many positions `on latest` arms have folded into another invocation since this
+    /// process started.
+    pub fn latest_collapsed(&self) -> u64 {
+        self.latest_collapsed.load(Ordering::Relaxed)
     }
 
     /// The last watermark this effect has processed every matching event up to.
@@ -1054,6 +1070,14 @@ fn next_backoff(attempt: u32, recovered: bool) -> (Duration, u32) {
 /// is the unbounded pending queue the sequential design deliberately did not have.
 const MAX_INFLIGHT: usize = 1024;
 
+/// The most recorded positions above its mark a dispatcher will read before it stops
+/// collapsing.
+///
+/// Rows above the mark are never swept, so a wedged lane makes their number a function of
+/// how long it has been wedged. Reading them all would put an unbounded allocation on the
+/// restart path, which is the one an operator reaches for while the effect is wedged.
+const RECORDED_MAX: usize = 1 << 16;
+
 /// What one attempt at one position came to.
 enum Step {
     /// The position reached a terminal state (completed, skipped, or already done);
@@ -1126,12 +1150,51 @@ fn run_inner(
                 .into_iter()
                 .map(|(lane, position)| (LaneId::from(lane.as_str()), position))
                 .collect();
+            // Not a shortcut, unlike the rows above: rule 15 may fold a position into a
+            // later invocation, and one an earlier process already began or finished must
+            // not be folded *away* like that. It still takes over the group it lands in.
+            // Read here for the same reason, since a re-subscribe keeps the context and
+            // every row written since is for a position this dispatcher's own lane
+            // high-water already answers for.
+            //
+            // **Only for an effect that can fold**, which is what bounds it. Invocation
+            // rows above the mark are never swept, so a lane wedged for a month leaves a
+            // month of them, and an effect with no `on latest` arm would pay for reading
+            // every one to answer a question it never asks. `hek test`'s resolver
+            // short-circuits on the same condition.
+            let begun = if unit
+                .arms
+                .values()
+                .any(|arm| arm.delivery == Delivery::Latest)
+            {
+                runtime.invocations_above(name, resume, RECORDED_MAX + 1)?
+            } else {
+                Vec::new()
+            };
+            // Past the bound the answer is incomplete, and an incomplete one is worse than
+            // none: it would report a position as safe to fold when it is exactly the one
+            // that must not be. Folding nothing is the behaviour that shipped before rule
+            // 15, and the mark advancing past the wedge is what makes the next start read a
+            // short list again.
+            let blind = begun.len() > RECORDED_MAX;
+            if blind {
+                tracing::warn!(
+                    "effect `{name}` has more than {RECORDED_MAX} recorded invocations above \
+                     position {resume}, so this process will not collapse its `on latest` \
+                     batches; clear the lane holding its watermark down"
+                );
+            }
             let fresh = Arc::new(EffectCtx {
                 shared: Arc::clone(shared),
                 unit: Arc::clone(unit),
                 runtime: Arc::clone(runtime),
                 http: Arc::clone(http),
-                lanes: Lanes::new(LaneState::resuming(resume, rows)),
+                lanes: Lanes::new(LaneState::resuming(
+                    resume,
+                    rows,
+                    begun.into_iter().collect(),
+                    blind,
+                )),
                 cancelled: AtomicBool::new(false),
             });
             *resumed_ctx = Some(Arc::clone(&fresh));
@@ -1240,6 +1303,7 @@ fn admit(
     let declared = program.effect(ctx.name());
     let mut resolved = Vec::with_capacity(batch.len());
     let mut suppressed = 0u64;
+    let mut collapsed = 0u64;
     for (position, event) in batch {
         // The subscription selects on event type, so this normally matches. An event
         // type the effect no longer answers is simply scanned past, exactly as a
@@ -1257,10 +1321,11 @@ fn admit(
             continue;
         }
         let lane = match declared {
-            Some(declared) => lane_of(program, declared, arm.index, *position, event),
+            Some(declared) => lane_of(program, declared, arm.index, *position, event.as_ref()),
             None => LaneId::unreadable(),
         };
-        resolved.push((position.get(), lane));
+        let collapsible = collapsible(arm.delivery, &lane);
+        resolved.push((position.get(), lane, arm.index, collapsible));
     }
 
     if suppressed > 0 {
@@ -1271,18 +1336,36 @@ fn admit(
 
     let mut armed = Vec::new();
     let mut state = ctx.lanes.lock();
-    for (position, lane) in resolved {
-        if state.already_done(&lane, position) {
-            continue;
-        }
-        if state.admit(lane.clone(), position) {
+    for (position, lane, arm, collapsible) in resolved {
+        let admitted = state.admit(lane.clone(), position, arm, collapsible);
+        if admitted.armed {
             armed.push(lane);
         }
+        collapsed += u64::from(admitted.folded);
     }
     // In the same critical section as the admissions, so the mark can never be computed
     // from a cursor that has run ahead of the positions it let in.
     state.set_scanned(scanned);
+    drop(state);
+
+    if collapsed > 0 {
+        ctx.shared
+            .latest_collapsed
+            .fetch_add(collapsed, Ordering::Relaxed);
+    }
     Ok(armed)
+}
+
+/// Whether rule 15 may fold this position into another invocation.
+///
+/// An `on latest` arm, in a lane whose key was actually read. **Never the unreadable
+/// lane**, which is not one key but every record whose key could not be read at all, so
+/// folding those together would drop work for a key nobody identified. `hek test`'s
+/// dispatcher stops collapsing the whole log at the first such record; here only that lane
+/// is excluded, because lanes are exactly what makes the other keys independent of it, and
+/// it wedges on its own while they run.
+fn collapsible(delivery: Delivery, lane: &LaneId) -> bool {
+    delivery == Delivery::Latest && *lane != LaneId::unreadable()
 }
 
 /// The lane one event belongs to.
@@ -1292,14 +1375,14 @@ fn admit(
 /// same key through the same `partition_key`) reports it in heklang's own words. Failing
 /// here instead would either skip the position silently or take down the whole reader for
 /// one bad record.
-fn lane_of(
+pub(crate) fn lane_of(
     program: &heklang::Program,
     declared: &heklang::ir::Effect,
     arm: usize,
     position: Position,
-    event: &tephra::Event,
+    event: tephra::EventRef<'_>,
 ) -> LaneId {
-    let Ok(record) = crate::heklang_host::record_of(program, position, event.as_ref()) else {
+    let Ok(record) = crate::heklang_host::record_of(program, position, event) else {
         return LaneId::unreadable();
     };
     let Some(arm) = declared.arms.get(arm) else {
@@ -1328,7 +1411,16 @@ fn publish_mark(ctx: &Arc<EffectCtx>, name: &str) -> anyhow::Result<()> {
     // keeps the sweep off the per-event path rather than issuing a delete that matches
     // nothing on every advance. Asked and forgotten in two short critical sections, so the
     // lane lock is never held across the op-DB write.
-    if ctx.lanes.lock().rows_to_sweep(mark) {
+    //
+    // Forgetting the lanes the mark has passed is unconditional, because it is what bounds
+    // the in-memory admission guard and a healthy effect never takes the sweep branch at
+    // all.
+    let sweep = {
+        let mut state = ctx.lanes.lock();
+        state.forget(mark);
+        state.rows_to_sweep(mark)
+    };
+    if sweep {
         ctx.runtime.sweep_effect_lanes(name, mark)?;
         ctx.lanes.lock().prune_rows(mark);
     }
@@ -1357,14 +1449,14 @@ fn run_lane(ctx: &Arc<EffectCtx>, lane: &LaneId, pool: &LanePool) {
         if !runnable(ctx, pool) {
             break;
         }
-        let Some(position) = ctx.lanes.lock().head(lane) else {
+        let Some(work) = ctx.lanes.lock().head(lane) else {
             break;
         };
-        match attempt_caught(ctx, lane, position) {
+        match attempt_caught(ctx, lane, work) {
             Step::Done => {
-                let owed = ctx.lanes.lock().complete(lane, position);
+                let owed = ctx.lanes.lock().complete(lane, work.position);
                 if owed {
-                    record_lane_row(ctx, lane, position);
+                    record_lane_row(ctx, lane, work.position);
                 }
             }
             Step::Defer(delay) => {
@@ -1427,12 +1519,19 @@ fn record_lane_row(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) {
 /// and an attempt count, because the operator skip is gated on the position having failed
 /// at least once. Catching it further out gave none of those, which left the one escape
 /// from an unprocessable event unreachable for the very failure the catch was added for.
-fn attempt_caught(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) -> Step {
-    match panic::catch_unwind(AssertUnwindSafe(|| attempt(ctx, lane, position))) {
+fn attempt_caught(ctx: &Arc<EffectCtx>, lane: &LaneId, work: Work) -> Step {
+    match panic::catch_unwind(AssertUnwindSafe(|| attempt(ctx, lane, work))) {
         Ok(step) => step,
         Err(payload) => {
             let tried = ctx.shared.lane_attempt(lane);
-            defer(ctx, lane, position, tried, &panic_message(&payload), None)
+            defer(
+                ctx,
+                lane,
+                work.position,
+                tried,
+                &panic_message(&payload),
+                None,
+            )
         }
     }
 }
@@ -1453,8 +1552,16 @@ fn panic_message(payload: &Box<dyn Any + Send>) -> String {
 /// Everything durable about an invocation is unchanged from the sequential driver: the
 /// reservation, the journal, the completion, the verify replay. What moved out is the
 /// retry loop, which is now the lane's.
-fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) -> Step {
+///
+/// Rule 15's collapse adds one thing and only one: every statement that makes this
+/// invocation terminal also records the range it folded. They are one write on purpose.
+/// The moment a terminal step returns, the whole group leaves the in-flight set and the
+/// mark moves past it, so a completion that landed without the range would leave those
+/// positions covered by an invocation that does not admit to covering them.
+fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, work: Work) -> Step {
     let effect = ctx.name();
+    let position = work.position;
+    let folded = work.collapsed_from;
     let tried = ctx.shared.lane_attempt(lane);
     match ctx.runtime.begin_invocation(
         effect,
@@ -1468,6 +1575,12 @@ fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) -> Step {
             // here on the retry, and leaving the entry would report a healthy effect as
             // wedged forever and leave `tried > 0` for the lane's next position, which is
             // what the operator-skip guard below relies on being zero.
+            //
+            // No collapse range is written here, and none is owed. Reaching this with a
+            // group means an earlier process completed this position and then lost both
+            // ways of saying so, its lane row and a mark advance; it resumed from the same
+            // mark with the same lane rows, so it built the same group and its row already
+            // carries the same range this one would write.
             ctx.shared.clear_lane(lane);
             return Step::Done;
         }
@@ -1484,7 +1597,7 @@ fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) -> Step {
     if tried > 0 && ctx.shared.skip_requested(position) {
         match honor_skip(&ctx.shared, lane, position, || {
             ctx.runtime
-                .skip_invocation(effect, position, &runtime::now_rfc3339())
+                .skip_invocation(effect, position, &runtime::now_rfc3339(), folded)
         }) {
             Ok(()) => {
                 tracing::warn!(
@@ -1507,7 +1620,7 @@ fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) -> Step {
             // detection would become the double-fire it exists to prevent.
             if let Err(err) =
                 ctx.runtime
-                    .complete_invocation(effect, position, &runtime::now_rfc3339())
+                    .complete_invocation(effect, position, &runtime::now_rfc3339(), folded)
             {
                 return defer(ctx, lane, position, tried, &format!("{err:#}"), None);
             }
@@ -1548,7 +1661,7 @@ fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) -> Step {
             // wedge state for an invocation that never actually completed.
             if let Err(err) =
                 ctx.runtime
-                    .complete_invocation(effect, position, &runtime::now_rfc3339())
+                    .complete_invocation(effect, position, &runtime::now_rfc3339(), folded)
             {
                 return defer(ctx, lane, position, tried, &format!("{err:#}"), None);
             }
@@ -2438,6 +2551,20 @@ mod tests {
 
     fn test_lane() -> LaneId {
         LaneId::from("i:1")
+    }
+
+    /// The unreadable lane is the one place a key was not read, so it holds records for
+    /// keys nobody identified. Folding those together would drop work rather than repeat
+    /// it, which is the one way collapse could break the rule it serves. Pinned here
+    /// because a program that reaches it cannot be written: the checker refuses a key type
+    /// that could fail to read, so only a host handing over an event its own declaration
+    /// disagrees with gets there.
+    #[test]
+    fn the_unreadable_lane_never_collapses() {
+        assert!(collapsible(Delivery::Latest, &test_lane()));
+        assert!(!collapsible(Delivery::Latest, &LaneId::unreadable()));
+        assert!(!collapsible(Delivery::Every, &test_lane()));
+        assert!(!collapsible(Delivery::Live, &test_lane()));
     }
 
     #[test]

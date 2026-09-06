@@ -527,7 +527,11 @@ fn print_rewind(
         let fate = match (arm.delivery, live) {
             (Delivery::Live, false) => "  still declined below the boundary",
             (Delivery::Live, true) => "  will fire for history",
-            _ => "",
+            // Worth saying, because the invocation count above is the number of records
+            // discarded and this arm will not want that many back: it re-collapses, so the
+            // history it re-runs costs one invocation per key per batch, not one per event.
+            (Delivery::Latest, _) => "  re-runs once per key, not once per position",
+            (Delivery::Every, _) => "",
         };
         println!(
             "                 {modifier} @{ty} {{ @key {} }}{fate}",
