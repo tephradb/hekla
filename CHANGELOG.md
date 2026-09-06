@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://git.tqwewe.com/tephra/hekla/compare/v0.1.1...v0.2.0) - 2026-09-06
+
+### Added
+
+- *(cli)* hekla rewind takes an effect back over history, against a stopped process
+- a key change that would repartition the lanes stops the effect, and hekla plan names it
+- on live declines the history that predates an effect, resolved once at first activation
+- [**breaking**] an effect arm runs in the lane its key names, so one stuck aggregate blocks nobody else
+- [**breaking**] hekla plan replays recorded invocations against the code you are about to deploy
+- hekla plan says what a deploy would change, and names why
+- [**breaking**] one declaration table holds every version of what the program does
+
+### Other
+
+- heklang 0.3.0, and every effect arm names its lane
+- the project builds and releases on the forge it now lives on
+
 ### Added
 
 - an effect arm runs in the lane its `@key` names, so one stuck aggregate no longer blocks every
