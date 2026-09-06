@@ -576,7 +576,8 @@ impl OpDb {
 
     /// How many lanes are still ahead of the global mark.
     ///
-    /// Zero means the effect has drained.
+    /// Zero means the effect has drained, which is what makes a partition-key change
+    /// safe to accept (see [`OpDb::set_effect_lane_scheme`]).
     pub fn effect_lanes_outstanding(&self, effect: &str) -> anyhow::Result<usize> {
         // Bounded by the cursor rather than counting the table, so a row the sweep has not
         // reached yet (a crash between advancing the mark and deleting, say) does not read
@@ -646,6 +647,21 @@ impl OpDb {
             )
             .optional()
             .context("reading an effect activation")
+    }
+
+    /// Accept a new lane scheme for an effect that has drained.
+    ///
+    /// Only valid with no lane rows outstanding: rows above the mark are keyed under the
+    /// old scheme, so a scheme change while they exist would leave them naming lanes the
+    /// new key never produces. The caller checks that; this only writes.
+    pub fn set_effect_lane_scheme(&self, effect: &str, lane_scheme: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE effect_activation SET lane_scheme = ?2 WHERE effect = ?1",
+                params![effect, lane_scheme],
+            )
+            .context("recording an effect lane scheme")?;
+        Ok(())
     }
 
     /// Positions of this effect's still-`running` invocations that were recorded under
@@ -2153,6 +2169,19 @@ mod tests {
         let seen = db.effect_activation("e").unwrap().unwrap();
         assert_eq!(seen.live_boundary, 42);
         assert_eq!(seen.lane_scheme, "{\"@a.b\":[\"k\"]}");
+    }
+
+    #[test]
+    fn a_lane_scheme_is_replaceable_without_moving_the_boundary() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.activate_effect("e", 42, "old", "t0").unwrap();
+        db.set_effect_lane_scheme("e", "new").unwrap();
+        let seen = db.effect_activation("e").unwrap().unwrap();
+        assert_eq!(seen.lane_scheme, "new");
+        assert_eq!(
+            seen.live_boundary, 42,
+            "accepting a new key is not a rewind"
+        );
     }
 
     /// v8 adds tables rather than touching one, so the rows that were already there have

@@ -2052,3 +2052,91 @@ effect Notify {
     );
     assert!(plan.divergences.is_empty(), "got {:?}", plan.divergences);
 }
+
+// --- rule 15: a partition key that would repartition the lanes -------------
+
+/// An effect's signature now carries its delivery modifier and its `@key`, so a key change
+/// is something a caller could notice and lands as `Contract`. That reads sensibly with no
+/// new verdict, and this pins it: a key is not a body edit.
+#[test]
+fn changing_a_partition_key_is_a_contract_change() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    write_effect_project(project.path(), &[]);
+    deploy_with_invocations(project.path(), data.path(), 1);
+
+    let rekeyed = NOTIFY.replace("@key order_id, email", "order_id, @key email");
+    write_effect_project(project.path(), &[("effects/notify.hk", &rekeyed)]);
+    let plan = plan_of(project.path(), data.path());
+    assert_eq!(
+        change(&plan, "Notify").map(|change| change.verdict),
+        Some(plan::Verdict::Contract),
+        "the lane an event lands in is visible from outside: {plan}"
+    );
+}
+
+/// The verdict alone does not say *why* the deploy is awkward. The cause names the event
+/// types whose lane moved and whether the effect has drained, which is the difference
+/// between a deploy that just works and one that will refuse to start.
+#[test]
+fn a_repartitioning_deploy_names_the_events_whose_lane_moved() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    write_effect_project(project.path(), &[]);
+    deploy_with_invocations(project.path(), data.path(), 1);
+
+    let rekeyed = NOTIFY.replace("@key order_id, email", "order_id, @key email");
+    write_effect_project(project.path(), &[("effects/notify.hk", &rekeyed)]);
+    let plan = plan_of(project.path(), data.path());
+
+    let repartition = plan
+        .causes
+        .iter()
+        .find_map(|cause| match cause {
+            plan::Cause::LaneRepartition {
+                effect,
+                events,
+                lanes_outstanding,
+            } => Some((effect.clone(), events.clone(), *lanes_outstanding)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a repartition cause: {plan}"));
+    assert_eq!(repartition.0, "Notify");
+    assert_eq!(repartition.1, ["order.placed"]);
+    assert_eq!(
+        repartition.2, 0,
+        "this deployment drained, so the new key is simply accepted"
+    );
+    assert!(
+        format!("{plan}").contains("it has drained"),
+        "and the report says so rather than warning about nothing: {plan}"
+    );
+}
+
+/// A delivery modifier moves `signature_hash` too, and gating the drain on that would stop
+/// an effect over an edit that repartitioned nothing. This is the false positive the
+/// narrower comparison exists to avoid.
+#[test]
+fn changing_only_the_delivery_modifier_repartitions_nothing() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    write_effect_project(project.path(), &[]);
+    deploy_with_invocations(project.path(), data.path(), 1);
+
+    let live = NOTIFY.replace("on @order.placed", "on live @order.placed");
+    write_effect_project(project.path(), &[("effects/notify.hk", &live)]);
+    let plan = plan_of(project.path(), data.path());
+
+    assert_eq!(
+        change(&plan, "Notify").map(|change| change.verdict),
+        Some(plan::Verdict::Contract),
+        "the modifier is still part of the signature: {plan}"
+    );
+    assert!(
+        !plan
+            .causes
+            .iter()
+            .any(|cause| matches!(cause, plan::Cause::LaneRepartition { .. })),
+        "but the lanes are the same lanes: {plan}"
+    );
+}

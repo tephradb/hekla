@@ -550,6 +550,29 @@ fn lane_scheme(effect: &heklang::ir::Effect) -> String {
         .collect()
 }
 
+/// The event types whose lane changed between two [`EffectUnit::lane_scheme`] renderings.
+///
+/// Only types present in **both** are compared. A newly declared type has no prior
+/// positions and a removed one has no future ones, so neither can strand a lane row; and
+/// reporting them would make adding an arm look like a repartition.
+pub fn repartitioned(before: &str, after: &str) -> Vec<String> {
+    let before = parse_lane_scheme(before);
+    let after = parse_lane_scheme(after);
+    before
+        .iter()
+        .filter(|(ty, keys)| after.get(*ty).is_some_and(|now| now != *keys))
+        .map(|(ty, _)| ty.clone())
+        .collect()
+}
+
+fn parse_lane_scheme(scheme: &str) -> BTreeMap<String, String> {
+    scheme
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(ty, keys)| (ty.to_owned(), keys.to_owned()))
+        .collect()
+}
+
 /// Every `.hk` file in the project, sorted.
 ///
 /// The whole tree, not a list of directories. heklang has no import, so a file is either

@@ -49,9 +49,15 @@ definition change. Editing what a handler does is not, and needs a replay if the
 
 ## Effects
 
-One dedicated thread per effect, one in-flight invocation, strict position order. An effect that is
-slower than its event arrival rate falls behind, and that lag is the correct behaviour rather than an
-unbounded queue.
+One reader thread per effect owns its subscription; the invocations themselves run on a process-wide
+worker pool, one lane at a time. An event's `@key` names its lane: one lane processes in log order,
+different lanes do not wait for each other. An effect slower than its arrival rate falls behind, and
+that lag is the correct behaviour rather than an unbounded queue.
+
+**A wedged lane does not block another key.** A failing invocation records itself, parks its lane
+until the backoff expires and returns its worker, so the position stays at the head of that lane's
+queue and every other lane keeps running. This is the fix for one unprocessable event stalling an
+entire effect; the parallelism is a bonus, and `[effects] pool_size = 1` still gets it.
 
 ### The states
 
@@ -60,25 +66,44 @@ unbounded queue.
 | State | Means |
 | --- | --- |
 | `quarantined` | a verify-mode check found a divergence. Nothing clears it on its own |
-| `wedged` | `consecutive_failures > 0`: an invocation is retrying under backoff, or the driver is re-subscribing after a store error |
+| `blocked` | an arm's `@key` changed while lanes were outstanding. Stopped, waiting for a person; nothing is retrying |
+| `wedged` | `consecutive_failures > 0`: a lane is retrying under backoff, or the driver is re-subscribing after a store error |
 | `lagging` | position below the log head, with no failures |
 | `healthy` | caught up |
 
-Quarantine outranks a wedge because a quarantine restored from an earlier process has a zero failure
-count; a wedge outranks lag because a wedged effect lags precisely because it is wedged.
+Quarantine outranks the rest because one restored from an earlier process has a zero failure count.
+`blocked` outranks `wedged` because nothing is retrying: a block clears only when someone redeploys.
+A wedge outranks lag because a wedged effect lags precisely because it is wedged.
 
 ### Reading the counters
 
-- **`position` is the durable watermark**, advanced only once every invocation in a batch is terminal.
-  A wedge at position 3 shows `position: 1` while positions 1 and 2 are already done.
-- **The invocation that is actually stuck** is the one with `status: running` in
-  `/admin/effects/{Name}/invocations`.
+- **`position` is the durable low-water mark**: the highest position *every lane* has passed. A wedge
+  at position 3 shows `position: 2` even when positions 4 and 5 in other lanes are long finished.
+- **`pinning_key` names the lane holding it down** and `pinning_position` is where. That position is
+  what an operator skip takes, and the key is what makes lag actionable: a partitioned effect can lag
+  by thousands while every lane but one is healthy.
+- **`wedged_lanes`** is how many lanes are stuck. `consecutive_failures` counts the pinning lane's
+  attempts and cannot say how many lanes are in that state.
 - `consecutive_failures` and `last_error` are the wedge. `last_error` carries the arm's own source
   location, which is usually enough to name the call that will not complete.
 - `terminal_skips` and `last_terminal_error` are the opposite: work that was abandoned deliberately
   and advanced past. An author's `fail(...)` and a `reveal` of an erased subject both land here.
 - `retry_in_ms` is how long until the next attempt.
 
+
+### When an effect will not start (`blocked`)
+
+An arm's `@key` changed while lanes were still outstanding, so the per-lane rows above the
+watermark are keyed under a scheme the new key never produces. `last_error` names the event types
+whose lane moved and how many lanes are outstanding. The way out:
+
+- **Redeploy the previous key and let it drain.** Watch `/admin/effects/{Name}` until
+  `wedged_lanes` is 0 and `lag` is 0, then deploy the new key. This costs nothing.
+`hekla plan` reports the repartition before the deploy, so this is avoidable rather than something
+to discover at boot. The block is an operator signal rather than a correctness gate: reprocessing
+under a new key skips rather than re-fires, because `begin_invocation` is the authority on what has
+run and rows above the mark are never swept. What stopping buys is that a repartition is noticed by
+whoever caused it.
 ### Retries, and where they happen
 
 Two loops, deliberately separate. **heklang re-sends** on a transport error and on every retryable
@@ -94,13 +119,17 @@ One HTTP attempt is capped at 10s to connect and 30s overall. Neither is configu
 
 ### Getting past a wedge
 
-1. Read `last_error` and the running invocation's journaled calls.
+1. `pinning_key` names the lane and `pinning_position` is where it is stuck. Read `last_error` and
+   that invocation's journaled calls (`/admin/effects/{Name}/invocations/{position}`).
 2. Fix the cause. A code fix plus a restart replays the running invocation, and every completed call
    comes back from the journal instead of firing again.
-3. If the event is genuinely unprocessable, `POST /effects/{Name}/skip/{position}`. The driver honours
-   it only for a position that has already failed, and only one request is pending at a time. Nothing
-   is ever skipped automatically.
+3. If the event is genuinely unprocessable, `POST /effects/{Name}/skip/{position}`, naming
+   `pinning_position`. The driver honours it only for a position that has already failed. Several
+   requests can be pending at once, one per wedged lane, and a request the watermark passes is
+   forgotten. Nothing is ever skipped automatically.
 4. Erasing the subject a `reveal` needs also clears it, by turning the failure terminal.
+
+Worth doing promptly for a reason beyond the lag figure: see the retention note below.
 
 ### The journal
 
@@ -122,6 +151,11 @@ Journals live in the operational DB, never in the event log. A sweeper runs hour
 completed invocations older than `[retention] effect_journal_days`, **bounded by the effect's persisted
 watermark**: positions above it are exactly what the next boot replays, and reclaiming them would let
 their side effects fire twice. An effect that has never persisted a watermark is never swept.
+
+**A wedged lane therefore holds retention down for every lane.** The watermark cannot pass a stuck
+position, so a lane wedged for a month makes a month of journal rows unsweepable across the whole
+effect. The lag figure is not the thing that hurts; this is. `fail(...)` and an operator skip are
+what resolve it, which is why `/status` names the pinning key.
 
 ### Deploys
 
@@ -157,7 +191,8 @@ next boot, so a restart does not clear it.
 
 - Commands run on a blocking pool; a DCB conflict re-decides up to `HEKLA_MAX_ATTEMPTS` times
   (default 5, capped at 15) with jittered backoff before answering 409.
-- One task per projector, one thread per effect. `[effects] pool_size` is validated and reserved for
-  parallel lanes; it changes nothing today.
+- One task per projector, one reader thread per effect, and one process-wide pool running effect
+  lanes. `[effects] pool_size` bounds that pool. One pool rather than one per effect, because the
+  contended resource is the single operational-database mutex every journaled call goes through.
 - Nothing bounds a runaway program because nothing can run away: heklang has no `while`, rejects
   recursion, and iterates only finite containers.

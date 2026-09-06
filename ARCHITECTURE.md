@@ -701,6 +701,13 @@ staging and production each resolve correctly. A position an `on live` arm decli
 invocation row at all**, because a terminal row with an empty journal would read back through the replay
 check as reproduced, which is a claim about work nobody did.
 
+**Changing an arm's `@key` repartitions the lanes**, so the rows above the mark are keyed under a
+scheme the new key never produces. An effect whose key moved while lanes were outstanding refuses to
+start, reporting `blocked`, and the rest of the runtime keeps serving. This is an **operator signal
+rather than a correctness gate**: reprocessing under a new key skips rather than re-fires, because
+`begin_invocation` is the authority and rows above the mark are never swept. What stopping buys is
+that a repartition is noticed by the person who caused it.
+
 **Redeploy**: content-hash keying limits the blast radius. Unchanged calls replay from the journal
 regardless of edits elsewhere in the file, so the failure mode of editing during a deploy is "a
 different path was taken", not "a side effect fired twice"; duplicates require editing the URL or body

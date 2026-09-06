@@ -61,7 +61,7 @@ use heklang::ir::Delivery;
 
 use crate::lane::LaneId;
 use crate::lanes::LaneState;
-use crate::loader::EffectUnit;
+use crate::loader::{self, EffectUnit};
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
 use crate::runtime::{self, Runtime};
 use crate::schema::ModuleDef;
@@ -165,6 +165,10 @@ pub struct EffectShared {
     /// How many real lanes are wedged. `consecutive_failures` counts one lane's
     /// attempts and cannot say how many lanes are in that state.
     wedged_lanes: AtomicU64,
+    /// Why this effect will not start, when a partition key changed while lanes were
+    /// still outstanding. Set once at spawn and never cleared: fixing the code and
+    /// restarting is the recovery, which is what makes this different from a quarantine.
+    blocked: Mutex<Option<String>>,
     /// The position `on live` arms decline at or below: the log head the first time this
     /// effect ran against this data directory. Rule 15 resolves it once and keeps it, so
     /// source states intent and dev, staging and production each resolve correctly.
@@ -199,6 +203,7 @@ impl EffectShared {
             quarantined: AtomicBool::new(false),
             live_boundary,
             live_suppressed: AtomicU64::new(0),
+            blocked: Mutex::new(None),
             stuck: Mutex::new(BTreeMap::new()),
             wedged_lanes: AtomicU64::new(0),
             pinning: Mutex::new(None),
@@ -231,11 +236,29 @@ impl EffectShared {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
 
+    /// The failure worth reporting. A block outranks a wedge: nothing is retrying, so the
+    /// republished lane error would otherwise leave `last_error` empty for an effect that
+    /// is stopped and needs a human.
     pub fn last_error(&self) -> Option<String> {
-        self.last_error
+        self.blocked().or_else(|| {
+            self.last_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        })
+    }
+
+    /// Why this effect will not start, or `None` when it will.
+    pub fn blocked(&self) -> Option<String> {
+        self.blocked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    fn block(&self, reason: String) {
+        tracing::error!("{reason}");
+        *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason);
     }
 
     /// How many lanes are wedged. The driver's own failures are not a lane and are not
@@ -430,6 +453,11 @@ impl EffectShared {
     pub fn state(&self, head: u64) -> &'static str {
         if self.quarantined() {
             "quarantined"
+        } else if self.blocked().is_some() {
+            // Stopped and waiting for a person, which is neither a wedge (nothing is
+            // retrying) nor lag (nothing is moving). It outranks a wedge for the same
+            // reason a quarantine does: reporting the symptom would bury the cause.
+            "blocked"
         } else if self.consecutive_failures() > 0 {
             // A wedged lane retrying under backoff and the driver re-subscribing after a
             // store error both land here. Both are stuck and retrying, and under lanes
@@ -450,7 +478,7 @@ impl EffectShared {
     /// from drifting: a lane offered to a worker that immediately declines it is released
     /// and offered again, forever.
     pub(crate) fn accepts_work(&self) -> bool {
-        !self.shutdown.load(Ordering::Relaxed) && !self.quarantined()
+        !self.shutdown.load(Ordering::Relaxed) && !self.quarantined() && self.blocked().is_none()
     }
 
     /// Whether a verify-mode check stopped this effect. Unlike a wedge, nothing
@@ -861,6 +889,51 @@ fn spawn(
         &runtime::now_rfc3339(),
     )?;
 
+    // Rule 15: changing an arm's `@key` repartitions the lanes, so the per-lane rows above
+    // the mark are keyed under a scheme the new key never produces.
+    //
+    // **This is an operator signal, not a correctness gate, and it must not be turned into
+    // one.** Reprocessing under a new key is safe in both directions: `begin_invocation`
+    // reports `AlreadyTerminal` for anything the old scheme finished, and those rows are
+    // never swept above the mark, so nothing re-fires. Coarse-to-fine, two positions that
+    // were serialised now run concurrently, which is what the new key asks for;
+    // fine-to-coarse they serialise. What stopping buys is that the change is *noticed*,
+    // at the moment it happens, by the person who made it. `/status` is where that lands,
+    // and a line in a boot log is not. Do not delete this as dead, and do not build
+    // anything load-bearing on top of it.
+    //
+    // Compared on the key alone rather than on the digest's `signature_hash`, which also
+    // moves for a delivery modifier and for an added event path. Neither of those
+    // repartitions anything, and gating on the broader hash would stop an effect over an
+    // edit that changed no lane.
+    // Rendered back with the `@` an author writes, since the message names a declaration
+    // in their source rather than a tephra event type.
+    let repartitioned: Vec<String> =
+        loader::repartitioned(&activation.lane_scheme, &unit.lane_scheme)
+            .into_iter()
+            .map(|ty| format!("@{ty}"))
+            .collect();
+    let outstanding = if repartitioned.is_empty() {
+        0
+    } else {
+        runtime.effect_lanes_outstanding(&name)?
+    };
+    let blocking = !repartitioned.is_empty() && outstanding > 0;
+    if !blocking && activation.lane_scheme != unit.lane_scheme {
+        // Recorded whenever it moves, not only when it repartitions. An arm added for a
+        // *new* event type repartitions nothing and would otherwise never be written down,
+        // so a later `@key` change on that arm would compare against a scheme that never
+        // mentioned it and be missed by both this guard and `hekla plan`.
+        runtime.set_effect_lane_scheme(&name, &unit.lane_scheme)?;
+        if !repartitioned.is_empty() {
+            tracing::info!(
+                "effect `{name}` changed the lane for {} and had drained, so the new key is \
+                 in effect",
+                repartitioned.join(", ")
+            );
+        }
+    }
+
     let shared = Arc::new(EffectShared::new(
         name.clone(),
         sources,
@@ -868,6 +941,16 @@ fn spawn(
         activation.live_boundary,
     ));
     let task_shared = Arc::clone(&shared);
+    if blocking {
+        // Draining under the old key costs nothing, which is why it is the whole of the
+        // advice here. A way to force it without draining lands with `hekla rewind`.
+        shared.block(format!(
+            "effect `{name}` will not start: the partition key for {} changed while \
+             {outstanding} lane(s) are still outstanding above position {resume}. \
+             Deploy the previous key and let it drain, which costs nothing",
+            repartitioned.join(", "),
+        ));
+    }
 
     let join = thread::Builder::new()
         .name(format!("effect-{name}"))
@@ -883,6 +966,11 @@ fn run(
     http: Arc<dyn HttpClient>,
     pool: Arc<LanePool>,
 ) {
+    // Set before the thread started, and never cleared: the recovery is to fix the code
+    // and restart, so there is nothing here to supervise.
+    if shared.blocked().is_some() {
+        return;
+    }
     // Held across `supervise`'s retries, so a re-subscribe reuses one dispatcher rather
     // than racing a second one against the workers still holding the first's lanes.
     let mut ctx: Option<Arc<EffectCtx>> = None;
@@ -2472,7 +2560,11 @@ mod tests {
     }
 
     #[test]
-    fn a_stopping_effect_accepts_no_work() {
+    fn a_blocked_or_stopping_effect_accepts_no_work() {
+        let blocked = test_shared();
+        blocked.block("its key changed".to_owned());
+        assert!(!blocked.accepts_work());
+
         let stopping = test_shared();
         stopping.stop();
         assert!(!stopping.accepts_work());

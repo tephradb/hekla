@@ -299,81 +299,85 @@ fn thread_settle() {
     thread::sleep(Duration::from_millis(400));
 }
 
-/// A panic must not strand its lane.
+/// Changing an arm's `@key` repartitions the lanes, so the rows above the mark are keyed
+/// under a scheme the new key never produces.
 ///
-/// One pool serves every effect, so an unwinding handler is caught rather than taking a
-/// worker with it. Catching it is only half: the lane has to be released *and offered
-/// back*, because `admit` refuses to re-arm a lane that already has a place and `promote`
-/// only touches parked ones. Released without an offer, the lane sat queued with nothing
-/// to run it, its positions pinned the watermark for the life of the process, and
-/// `/status` reported the effect as merely lagging because no failure had been recorded.
+/// This is an operator signal rather than a correctness gate: reprocessing under a new
+/// key skips rather than re-fires, because `begin_invocation` is the authority and rows
+/// above the mark are never swept. What stopping buys is that the change is noticed by the
+/// person who made it, which is why the state is reported rather than logged.
 #[test]
-fn a_panicking_call_does_not_strand_its_lane() {
-    let dir = project();
+fn changing_a_key_with_lanes_outstanding_stops_that_effect_and_nothing_else() {
     let data = tempfile::tempdir().unwrap();
-    // Panics once, then behaves. If the lane is stranded the retry never happens and the
-    // watermark never moves.
-    let stub = Arc::new(StubHttpClient::new(move |index, _| {
-        assert!(index > 0, "the first call panics");
-        Ok(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: b"{}".to_vec(),
-        })
-    }));
-    let booted = boot(dir.path(), data.path(), stub.clone());
-
+    let before = project();
+    let booted = boot(before.path(), data.path(), only_one_customer_fails(1));
     order(&booted.rt, 1);
-
-    wait_until("the lane to recover and finish the position", || {
-        watermark(&open_op_db(booted.data_dir())) >= 1
+    order(&booted.rt, 2);
+    wait_until("a lane to run ahead of the wedge", || {
+        !lane_rows(&open_op_db(booted.data_dir())).is_empty()
     });
-    assert!(
-        stub.call_count() >= 2,
-        "the position was retried rather than abandoned"
-    );
     booted.shutdown();
+
+    // Same effect, keyed by the order instead of the customer.
+    let after = orders_project_with(&[(
+        "effects/notify.hk",
+        r#"
+effect Notify {
+  on @order.placed { @key order_id, customer_id } {
+    http.post("https://mail.test/send", { "customer": customer_id })
+  }
+}
+"#,
+    )]);
+    let again = boot(after.path(), data.path(), only_one_customer_fails(1));
+    let effect = again.rt.effect(EFFECT).unwrap();
+
+    assert_eq!(effect.state(9), "blocked");
+    let reason = effect.blocked().expect("a reason a person can act on");
+    assert!(
+        reason.contains("@order.placed") && reason.contains("1 lane(s)"),
+        "it names what repartitioned and how much is outstanding: {reason}"
+    );
+    assert!(
+        reason.contains("let it drain, which costs nothing"),
+        "and it names the remedy: {reason}"
+    );
+    assert_eq!(
+        again.rt.status()["projectors"].as_array().map(Vec::len),
+        Some(0),
+        "the server booted; nothing else was taken down for one declaration"
+    );
+    again.shutdown();
 }
 
-/// A handler that panics every time must behave like any other failure that will not
-/// clear: back off rather than spin, report itself, and be escapable.
-///
-/// The first fix for a panicking handler caught the unwind and re-offered the lane, which
-/// recovered a one-off but left a deterministic panic retrying with no delay and no record.
-/// Nothing called `record_lane_failure`, so the attempt count stayed at zero, and the
-/// operator skip is gated on the position having failed at least once: the documented
-/// escape from an unprocessable event was unreachable for exactly this case, while
-/// `/status` called the effect `lagging` and named no lane.
+/// The invisible common case. A graceful shutdown drains, lane rows are swept as the mark
+/// passes them, and the next deploy's new key is simply accepted.
 #[test]
-fn a_handler_that_always_panics_wedges_its_lane_and_can_be_skipped() {
-    let dir = project();
+fn changing_a_key_after_draining_is_accepted_silently() {
     let data = tempfile::tempdir().unwrap();
-    let stub = Arc::new(StubHttpClient::new(|_, _| panic!("the transport exploded")));
-    let booted = boot(dir.path(), data.path(), stub.clone());
-
+    let before = project();
+    let booted = boot(before.path(), data.path(), Arc::new(StubHttpClient::ok()));
     order(&booted.rt, 1);
-
-    wait_until("the panic to be reported as a wedge", || {
-        booted.rt.effect(EFFECT).unwrap().consecutive_failures() > 0
-    });
-    let effect = booted.rt.effect(EFFECT).unwrap();
-    assert_eq!(effect.state(1), "wedged", "not `lagging`");
-    assert!(
-        effect.last_error().unwrap_or_default().contains("panicked"),
-        "the failure says what it was: {:?}",
-        effect.last_error()
-    );
-    let (lane, at) = effect.pinning().expect("the lane is named");
-    assert_eq!((lane.as_str(), at), ("i:1", 1));
-    assert!(
-        effect.retry_in_ms().is_some(),
-        "and it is backing off rather than retrying flat out"
-    );
-
-    // The escape hatch has to work, which it cannot without an attempt count.
-    effect.request_skip(at);
-    wait_until("the skip to advance past the panicking position", || {
-        watermark(&open_op_db(booted.data_dir())) >= 1
+    order(&booted.rt, 2);
+    wait_until("the effect to catch up with nothing outstanding", || {
+        watermark(&open_op_db(booted.data_dir())) >= 2
     });
     booted.shutdown();
+    assert!(lane_rows(&open_op_db(data.path())).is_empty(), "drained");
+
+    let after = orders_project_with(&[(
+        "effects/notify.hk",
+        r#"
+effect Notify {
+  on @order.placed { @key order_id, customer_id } {
+    http.post("https://mail.test/send", { "customer": customer_id })
+  }
+}
+"#,
+    )]);
+    let again = boot(after.path(), data.path(), Arc::new(StubHttpClient::ok()));
+    let effect = again.rt.effect(EFFECT).unwrap();
+    assert_eq!(effect.blocked(), None);
+    assert_ne!(effect.state(2), "blocked");
+    again.shutdown();
 }

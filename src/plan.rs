@@ -168,6 +168,21 @@ pub enum Cause {
         declarations: Vec<String>,
         likely: Option<String>,
     },
+    /// An effect arm's `@key` changed, so the lanes it is partitioned into are not the
+    /// ones its recorded per-lane rows describe. Reported at the deploy rather than left
+    /// to the boot, because the deploy is where an operator can still choose to drain
+    /// first.
+    ///
+    /// Not derived from `signature_hash`, which also moves for a delivery modifier and for
+    /// an added event path, neither of which repartitions anything.
+    LaneRepartition {
+        effect: String,
+        /// The event types whose lane moved.
+        events: Vec<String>,
+        /// Lanes still ahead of the watermark, keyed under the scheme being replaced.
+        /// Zero means the effect has drained and the new key is simply accepted.
+        lanes_outstanding: usize,
+    },
 }
 
 /// One recorded invocation the candidate code would not reproduce.
@@ -335,6 +350,12 @@ impl Plan {
                     "declarations": declarations,
                     "likely": likely,
                 }),
+                Cause::LaneRepartition { effect, events, lanes_outstanding } => serde_json::json!({
+                    "cause": "lane_repartition",
+                    "effect": effect,
+                    "events": events,
+                    "lanes_outstanding": lanes_outstanding,
+                }),
             }).collect::<Vec<_>>(),
             // `null` when no replay ran, for the reason `Display` prints no divergence
             // clause there: an empty list is a clean replay result, and a gate reading one
@@ -453,6 +474,29 @@ impl fmt::Display for Plan {
                     }
                     write_lines(f, '-', removed)?;
                     write_lines(f, '+', added)?;
+                }
+                Cause::LaneRepartition {
+                    effect,
+                    events,
+                    lanes_outstanding,
+                } => {
+                    let moved: Vec<String> = events.iter().map(|ty| format!("@{ty}")).collect();
+                    if *lanes_outstanding > 0 {
+                        writeln!(
+                            f,
+                            "  effect `{effect}` repartitions its lanes ({}) with \
+                             {lanes_outstanding} lane(s) still outstanding, so it will not \
+                             start until it has drained under the current key",
+                            moved.join(", ")
+                        )?;
+                    } else {
+                        writeln!(
+                            f,
+                            "  effect `{effect}` repartitions its lanes ({}); it has drained, \
+                             so the new key takes effect on the next start",
+                            moved.join(", ")
+                        )?;
+                    }
                 }
             }
         }
@@ -715,6 +759,8 @@ pub fn compute_with(
     // The hash each effect is *running* under, which is the only baseline a replay may
     // use: see `OpDb::recent_terminal_invocations`.
     let deployed_effects: BTreeMap<String, String>;
+    // Which effects would land on a lane scheme their recorded rows do not describe.
+    let repartitions: Vec<Cause>;
     // Scoped, so the connection closes before a replay opens its own. Two connections to
     // one SQLite file work, but a plan against a live deployment has no reason to hold
     // a second one open for the whole run.
@@ -727,11 +773,16 @@ pub fn compute_with(
             .map(|row| (row.name.clone(), row.hash.clone()))
             .collect();
         plan.changes = diff(project, &recorded, &mut plan)?;
+        repartitions = lane_repartitions(project, &db)?;
     }
     plan.projectors = forecast(project, data_dir)?;
     if !plan.digest_version_mismatch {
         plan.causes = attribute(&project.program, &plan.changes);
     }
+    // Appended rather than attributed: a repartition is a fact about the deployed data
+    // directory, not an inference from the diff, so it stands whether or not the digest
+    // versions line up.
+    plan.causes.extend(repartitions);
 
     if let Replay::On { master, limit } = replay {
         if plan.digest_version_mismatch {
@@ -776,6 +827,32 @@ pub fn compute_with(
         }
     }
     Ok(plan)
+}
+
+/// The effects whose `@key` moved since they last ran against this data directory.
+///
+/// Compared on the lane scheme alone: an effect that only changed a delivery modifier or
+/// gained an event path repartitions nothing, and reporting it would train an operator to
+/// ignore the one that matters.
+fn lane_repartitions(project: &LoadedProject, db: &OpDb) -> anyhow::Result<Vec<Cause>> {
+    let mut causes = Vec::new();
+    for unit in &project.effects {
+        let name = unit.def.name();
+        let Some(activation) = db.effect_activation(name)? else {
+            // Never run here, so it has no lanes to repartition.
+            continue;
+        };
+        let events = loader::repartitioned(&activation.lane_scheme, &unit.lane_scheme);
+        if events.is_empty() {
+            continue;
+        }
+        causes.push(Cause::LaneRepartition {
+            effect: name.to_owned(),
+            events,
+            lanes_outstanding: db.effect_lanes_outstanding(name)?,
+        });
+    }
+    Ok(causes)
 }
 
 /// Merge the candidate digest against the recorded rows on `(kind, name)`.

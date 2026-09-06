@@ -777,6 +777,12 @@ impl Runtime {
             .activate_effect(effect, head, lane_scheme, now)
     }
 
+    /// Accept a new lane scheme for an effect that has drained. See
+    /// [`OpDb::set_effect_lane_scheme`].
+    pub fn set_effect_lane_scheme(&self, effect: &str, lane_scheme: &str) -> anyhow::Result<()> {
+        self.lock_opdb().set_effect_lane_scheme(effect, lane_scheme)
+    }
+
     pub(crate) fn begin_invocation(
         &self,
         effect: &str,
