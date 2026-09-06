@@ -88,6 +88,16 @@ function EffectList() {
         </span>`,
     },
     {
+      key: 'lanes',
+      header: 'Lanes',
+      align: 'right',
+      width: '70px',
+      render: (effect) =>
+        html`<span class=${effect.wedged_lanes ? 'mono' : 'mono faint'}>
+          ${effect.wedged_lanes}
+        </span>`,
+    },
+    {
       key: 'error',
       header: 'Last error',
       render: (effect) =>
@@ -140,9 +150,11 @@ function EffectDetail({ name, position }) {
   const invocations = useResource((signal) => api.invocations(name, { limit: 30 }, signal), [name, tick])
   const [confirming, setConfirming] = useState(null)
 
-  /* The stuck position is the newest invocation that is still running. `position` on
-   * the handle is the watermark (what it has finished), so it is not the answer. */
-  const stuck = invocations.data?.invocations?.find((row) => row.status === 'running')
+  /* The position to skip is the one the runtime names as pinning the watermark, which is
+   * the failing lane it also reports `last_error` for. Not "the newest running
+   * invocation": lanes mean several run at once, and the newest is exactly the wrong one,
+   * because skipping it would not release the prefix. */
+  const stuck = effect.data?.pinning_position ?? null
 
   return html`
     <${Resource} state=${effect}>
@@ -162,11 +174,11 @@ function EffectDetail({ name, position }) {
             <${Badge} kind="effect" value=${detail.state} />
             <${Countdown} ms=${detail.retry_in_ms} />
             <div style=${{ flex: 1 }}></div>
-            ${stuck &&
+            ${stuck !== null &&
             detail.consecutive_failures > 0 &&
             html`
-              <button type="button" class="btn danger" onClick=${() => setConfirming(stuck.position)}>
-                Skip #${stuck.position}
+              <button type="button" class="btn danger" onClick=${() => setConfirming(stuck)}>
+                Skip #${stuck}
               </button>
             `}
           </header>
@@ -191,6 +203,22 @@ function EffectDetail({ name, position }) {
 
               <dt>failures</dt>
               <dd>${detail.consecutive_failures}</dd>
+
+              <dt>pinned by</dt>
+              <dd>
+                ${detail.pinning_key === null
+                  ? html`<span class="faint">nothing in flight</span>`
+                  : html`<code>${detail.pinning_key}</code>
+                      <span class="note">at #${detail.pinning_position}</span>`}
+              </dd>
+
+              <dt>wedged lanes</dt>
+              <dd>
+                ${detail.wedged_lanes}
+                <span class="note">
+                  other lanes keep running; this one holds the watermark
+                </span>
+              </dd>
 
               <dt>terminal skips</dt>
               <dd>

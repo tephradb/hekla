@@ -6,6 +6,8 @@ pub mod hash;
 pub mod heklang_host;
 pub mod http;
 pub mod invariant;
+pub mod lane;
+pub mod lanes;
 pub mod lock;
 pub mod opdb;
 pub mod read_api;

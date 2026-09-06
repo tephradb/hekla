@@ -12,11 +12,11 @@
 //! So each type mixes a hand-written edge list with a uniform tail, weighted heavily
 //! toward the edges.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use heklang::Value;
 use heklang::ir::{EnumDef, RecordDef, RecordField, Type};
-use heklang::value::Defs;
+use heklang::value::{Defs, Key};
 use proptest::prelude::*;
 
 use crate::schema::FieldKind;
@@ -351,5 +351,68 @@ fn number() -> impl Strategy<Value = String> {
         Just("123456789012345678901234567890".to_owned()),
         Just("0.123456789012345678901234567890".to_owned()),
         int().prop_map(|value| value.to_string()),
+    ]
+}
+
+/// One rule-15 partition key, over a deliberately small alphabet.
+///
+/// The generators above hunt for a value that breaks a conversion table. This one hunts
+/// for the opposite: two *different* key sequences that encode to the same lane. A wide
+/// alphabet would make an equal pair vanishingly rare and would only ever test half of
+/// [`crate::lane::encode`]'s injectivity, so these values repeat on purpose, and the
+/// ones that repeat are the ones an encoding could confuse: the separators, a
+/// backslash, an already-escaped separator, and the same text under two discriminants.
+pub fn key() -> impl Strategy<Value = Key> {
+    prop_oneof![
+        lane_text().prop_map(|text| Key::Str(Arc::from(text))),
+        lane_text().prop_map(|text| Key::Uuid(Arc::from(text))),
+        lane_int().prop_map(Key::Int),
+        lane_int().prop_map(Key::Timestamp),
+        (lane_name(), lane_name()).prop_map(|(ty, variant)| Key::Enum { ty, variant }),
+    ]
+}
+
+/// A composite key. At least one, because heklang requires one and a zero-length
+/// composite is not a shape any arm can declare.
+pub fn keys() -> impl Strategy<Value = Vec<Key>> {
+    prop::collection::vec(key(), 1..4)
+}
+
+fn lane_text() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(String::new()),
+        Just("7".to_owned()),
+        Just("a".to_owned()),
+        Just("\\".to_owned()),
+        // Already-escaped separators, which a reader that unescaped twice would confuse
+        // with the separators themselves.
+        Just("\\u".to_owned()),
+        Just("\\v".to_owned()),
+        Just("\u{1f}".to_owned()),
+        Just("\u{1e}".to_owned()),
+        // Text that spells another key's encoding, which a join with no tag would merge.
+        Just("s:a".to_owned()),
+        Just("i:7".to_owned()),
+        Just("a\u{1f}s:b".to_owned()),
+    ]
+}
+
+fn lane_int() -> impl Strategy<Value = i64> {
+    prop_oneof![
+        Just(i64::MIN),
+        Just(-1),
+        Just(0),
+        Just(1),
+        Just(7),
+        Just(i64::MAX),
+    ]
+}
+
+fn lane_name() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("T".to_owned()),
+        Just("U".to_owned()),
+        Just("a".to_owned()),
+        Just("a\u{1e}b".to_owned()),
     ]
 }

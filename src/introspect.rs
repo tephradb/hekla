@@ -323,6 +323,9 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
     let position = shared.position();
     let watermark = state.and_then(|state| state.watermark);
     let quarantine = state.and_then(|state| state.quarantine.as_ref());
+    // Read once: the key and the position are a pair, and two loads could straddle a
+    // republish and report one lane's key beside another's position.
+    let pinning = shared.pinning();
     json!({
         "name": shared.name,
         // One word for what the counters below add up to, derived in the runtime so
@@ -342,6 +345,11 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
         "watermark": watermark,
         "consecutive_failures": shared.consecutive_failures(),
         "last_error": shared.last_error(),
+        "wedged_lanes": shared.wedged_lanes(),
+        // The lane whose failure is pinning the mark, which is the one `last_error`
+        // describes and the one an operator skips.
+        "pinning_key": pinning.as_ref().map(|(lane, _)| lane),
+        "pinning_position": pinning.as_ref().map(|(_, at)| at),
         // Process-local and reset by a restart. The durable trace of a skipped
         // position is a terminal invocation row, indistinguishable from a completed one.
         "terminal_skips": shared.terminal_skips(),

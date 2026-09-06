@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use heklang::ir::Delivery;
 use heklang::{Diagnostic, Digest, Entry, Kind, Program, Severity as HekSeverity};
 use walkdir::WalkDir;
 
@@ -76,6 +77,13 @@ impl Finding {
     /// Anchor this finding to a source span.
     pub fn with_span(mut self, span: Span) -> Finding {
         self.span = Some(span);
+        self
+    }
+
+    /// Give this finding something to do about it. heklang's own diagnostics carry one;
+    /// a finding hekla raises itself deserves the same.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Finding {
+        self.hint = Some(hint.into());
         self
     }
 
@@ -176,6 +184,23 @@ pub struct ProjectorUnit {
     pub sources: Vec<String>,
 }
 
+/// Where one event type lands in an effect: the arm that answers it, how that arm wants
+/// delivering, and the `@key` fields naming its lane.
+///
+/// Resolved once at load rather than per event. `Effect::arm_index` is a linear scan over
+/// arms with a nested scan over their paths, and the dispatcher asks for every position
+/// it admits.
+#[derive(Debug, Clone)]
+pub struct ArmRef {
+    /// Index into the effect's `arms`, which is how the `Arm` itself is reached from the
+    /// shared `Program` at dispatch time.
+    pub index: usize,
+    pub delivery: Delivery,
+    /// The `@key` field names, in the order the arm wrote them: a composite is a
+    /// sequence, so this is never sorted.
+    pub keys: Vec<String>,
+}
+
 pub struct EffectUnit {
     pub def: ModuleDef,
     pub rel_path: String,
@@ -184,6 +209,8 @@ pub struct EffectUnit {
     pub digest_hash: String,
     /// The event types its arms select.
     pub sources: Vec<String>,
+    /// Every event type this effect answers, and the arm that answers it.
+    pub arms: HashMap<String, ArmRef>,
 }
 
 /// Everything the loader produced from a project directory.
@@ -392,6 +419,33 @@ impl LoadedProject {
                 ));
                 continue;
             }
+            // Rule 15's `on latest` is a declaration this runtime cannot honour yet, and
+            // running it as `on` would give the arm one invocation per event where it
+            // asked for one per key. That is a different guarantee from the one the
+            // author wrote, delivered silently, and a program that checks but will not
+            // run beats one that runs differently from what it says. Deleting this is
+            // the last step of implementing batch collapse.
+            if effect
+                .arms
+                .iter()
+                .any(|arm| arm.delivery == Delivery::Latest)
+            {
+                findings.push(
+                    Finding::error(
+                        rel.clone(),
+                        format!(
+                            "`effect {}` declares `on latest`, which hekla {} does not implement",
+                            effect.name,
+                            env!("CARGO_PKG_VERSION"),
+                        ),
+                    )
+                    .with_hint(
+                        "write `on` until a release that does: dispatched as `on` the arm would \
+                         run once per event instead of once per key",
+                    ),
+                );
+                continue;
+            }
             let sources = event_types(effect.arms.iter().flat_map(|arm| arm.events.iter()));
             effects.push(EffectUnit {
                 def: ModuleDef::Effect {
@@ -400,6 +454,7 @@ impl LoadedProject {
                 },
                 digest_hash: hash_of(Kind::Effect, &effect.name),
                 rel_path: rel,
+                arms: arm_index(effect),
                 sources,
             });
         }
@@ -434,6 +489,28 @@ fn event_types<'a>(paths: impl Iterator<Item = &'a heklang::ir::EventPath>) -> V
         }
     }
     seen
+}
+
+/// Every event type an effect answers, and the arm that answers it.
+///
+/// Rule 1 of `docs/effects.md` makes an event select at most one arm, and the checker has
+/// already refused a program where two could, so a later arm can never displace an
+/// earlier one's entry here.
+fn arm_index(effect: &heklang::ir::Effect) -> HashMap<String, ArmRef> {
+    let mut arms = HashMap::new();
+    for (index, arm) in effect.arms.iter().enumerate() {
+        for path in &arm.events {
+            arms.insert(
+                schema::event_type(path),
+                ArmRef {
+                    index,
+                    delivery: arm.delivery,
+                    keys: arm.keys.clone(),
+                },
+            );
+        }
+    }
+    arms
 }
 
 /// Every `.hk` file in the project, sorted.
@@ -668,5 +745,114 @@ effect Beta {
             !named.iter().any(|(kind, _)| *kind == Kind::Test),
             "`entries` holds tests back, which is why nothing filters them downstream"
         );
+    }
+
+    /// `on latest` is a guarantee this runtime does not yet honour, so it is refused at
+    /// load rather than quietly downgraded to `on`. Delete this test when batch collapse
+    /// lands; discovering the refusal by surprise then would be worse.
+    #[test]
+    fn an_on_latest_arm_is_refused_rather_than_run_as_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = load_effects(
+            dir.path(),
+            r#"
+effect Collapsing {
+  on latest @e.one as one { @key id } {
+    log("{one.id}")
+  }
+}
+"#,
+        );
+        let finding = project
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("on latest"))
+            .unwrap_or_else(|| panic!("expected a refusal, got {:?}", project.findings));
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            finding.message.contains("`effect Collapsing`")
+                && finding.message.contains(env!("CARGO_PKG_VERSION")),
+            "the message names the effect and the build that lacks it: {}",
+            finding.message
+        );
+        assert!(
+            finding
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("once per key"),
+            "the hint says what the downgrade would cost: {:?}",
+            finding.hint
+        );
+    }
+
+    #[test]
+    fn the_same_arm_written_as_on_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = load_effects(
+            dir.path(),
+            r#"
+effect Collapsing {
+  on @e.one as one { @key id } {
+    log("{one.id}")
+  }
+}
+"#,
+        );
+        assert!(!project.has_errors(), "{:?}", project.findings);
+    }
+
+    /// `on live` is honoured, so it loads. Pinned beside the `latest` refusal because the
+    /// two modifiers are otherwise easy to reject together by accident.
+    #[test]
+    fn an_on_live_arm_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = load_effects(
+            dir.path(),
+            r#"
+effect Fresh {
+  on live @e.one as one { @key id } {
+    log("{one.id}")
+  }
+}
+"#,
+        );
+        assert!(!project.has_errors(), "{:?}", project.findings);
+    }
+
+    #[test]
+    fn an_arm_resolves_every_event_type_it_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = load_effects(
+            dir.path(),
+            r#"
+effect Both {
+  on @e.one, @e.two as either { @key id } {
+    log("{either.id}")
+  }
+}
+"#,
+        );
+        let unit = project.effects.first().expect("one effect");
+        let one = unit.arms.get("e.one").expect("@e.one resolves");
+        let two = unit.arms.get("e.two").expect("@e.two resolves");
+        assert_eq!(one.index, two.index, "one arm answers both");
+        assert_eq!(one.keys, ["id"]);
+        assert_eq!(one.delivery, Delivery::Every);
+    }
+
+    fn load_effects(dir: &Path, effects: &str) -> LoadedProject {
+        for (rel, text) in [
+            (
+                "events/e.hk",
+                "event @e.one { id: Uuid, other: Int }\nevent @e.two { id: Uuid, other: Int }\n",
+            ),
+            ("effects/probe.hk", effects),
+        ] {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        LoadedProject::load(dir)
     }
 }

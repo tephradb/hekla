@@ -1910,6 +1910,27 @@ fn effect_status_schema() -> Value {
                     than skipping, so this is how a wedge is distinguished from lag.",
             },
             "last_error": { "type": ["string", "null"] },
+            "wedged_lanes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How many partition lanes are stuck. `consecutive_failures` \
+                    counts one lane's attempts and cannot say how many lanes are in that \
+                    state.",
+            },
+            "pinning_key": {
+                "type": ["string", "null"],
+                "description": "The partition key of the lane whose failure is holding the \
+                    watermark down, or null when no lane is failing. This is what makes lag \
+                    actionable, since every other lane may be racing ahead. It is derived \
+                    from the same lane as `last_error`, so the key and the position below \
+                    always describe one lane.",
+            },
+            "pinning_position": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Where that lane is stuck: the position an operator skip \
+                    names. Null when no lane is failing.",
+            },
             "quarantined": {
                 "type": "boolean",
                 "description": "Set when it broke an invariant under `--verify` and stopped \
@@ -1925,6 +1946,7 @@ fn effect_status_schema() -> Value {
         },
         "required": [
             "name", "state", "position", "lag", "consecutive_failures", "last_error",
+            "wedged_lanes", "pinning_key", "pinning_position",
             "quarantined", "terminal_skips", "last_terminal_error",
         ],
         "additionalProperties": false,
@@ -2284,6 +2306,27 @@ fn effect_detail_schema() -> Value {
                     invocation is a wedge.",
             },
             "last_error": { "type": ["string", "null"] },
+            "wedged_lanes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How many partition lanes are stuck. `consecutive_failures` \
+                    counts one lane's attempts and cannot say how many lanes are in that \
+                    state.",
+            },
+            "pinning_key": {
+                "type": ["string", "null"],
+                "description": "The partition key of the lane whose failure is holding the \
+                    watermark down, or null when no lane is failing. This is what makes lag \
+                    actionable, since every other lane may be racing ahead. It is derived \
+                    from the same lane as `last_error`, so the key and the position below \
+                    always describe one lane.",
+            },
+            "pinning_position": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Where that lane is stuck: the position an operator skip \
+                    names. Null when no lane is failing.",
+            },
             "terminal_skips": {
                 "type": "integer",
                 "minimum": 0,
@@ -2309,7 +2352,8 @@ fn effect_detail_schema() -> Value {
         },
         "required": [
             "name", "state", "position", "lag", "retry_in_ms", "sources", "watermark",
-            "consecutive_failures", "last_error", "terminal_skips", "last_terminal_error",
+            "consecutive_failures", "last_error", "wedged_lanes", "pinning_key",
+            "pinning_position", "terminal_skips", "last_terminal_error",
             "quarantined", "quarantine"
         ],
         "additionalProperties": false,

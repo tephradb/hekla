@@ -382,7 +382,7 @@ Two things it does that the raw API does not:
 
 ```toml
 [effects]
-pool_size = 16              # validated, reserved for parallel lanes
+pool_size = 16              # how many effect lanes run at once, across every effect
 
 [retention]
 effect_journal_days = 7     # completed invocation journals are swept after this
@@ -415,6 +415,11 @@ rotation.
 - **Long free text gets `@no_index`**, so it does not become a huge tag.
 - **An effect gets state by folding the log, never by reading a projector.** That is why a fold
   cannot be stale and needs no journal entry, and it is why there is no read.
+- **Key an arm by what it coordinates on, not by the finest id available.** The `@key` names a lane,
+  and a lane is an ordering guarantee: events sharing one are processed in log order, and events in
+  different lanes are not. Two warranty plans in one shop write variants onto the same remote
+  product, so they belong in one lane keyed by the shop even though per-plan parallelism looks
+  tempting. Getting this too fine is a correctness bug; getting it too coarse only costs throughput.
 - **Write the test.** `hekla test` runs heklang's own runner against hekla's real world: real tephra,
   a real SQLite read model and a real key store. An erasure case there is worth running precisely
   because the ciphertext and the deleted key are real.

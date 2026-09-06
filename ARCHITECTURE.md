@@ -659,21 +659,40 @@ a fault.
 The runtime retries the whole invocation with capped exponential backoff, forever, replaying journaled
 calls each attempt so completed side effects never re-fire, and never skipping. Because a wedge is not
 the same as ordinary lag, the status endpoint reports each effect's consecutive-failure count and last
-error alongside its position. The only way past a genuinely unprocessable event is fixing the code and
-restarting (which replays the running invocation) or an explicit, manual operator skip
-(`POST /effects/{Name}/skip/{position}`); nothing is skipped automatically. The durable resume point is
-a per-effect watermark advanced only once a batch's invocations are all terminal, so a crash re-scans
-from the last completed batch and never skips an event; the journal rows and the terminal record commit
-call-by-call in autocommit, never in one per-invocation transaction, which is what lets journaled side
-effects survive a crash and be replayed.
+error alongside its position, **and names the lane holding it up**. The only way past a genuinely
+unprocessable event is fixing the code and restarting (which replays the running invocation) or an
+explicit, manual operator skip (`POST /effects/{Name}/skip/{position}`); nothing is skipped
+automatically. The journal rows and the terminal record commit call-by-call in autocommit, never in
+one per-invocation transaction, which is what lets journaled side effects survive a crash and be
+replayed.
 
-**Concurrency (v1)**: sequential per effect: one in-flight invocation, strict position order, no
-cross-lane watermark. v1 runs one dedicated thread per effect, which already bounds concurrency at the
-number of effects; the configured blocking-pool size (`hekla.toml`) is validated but reserved for a real
-shared pool once partition-key parallel lanes land (the watermark-plus-completed-set format enables
-them). Because processing is sequential but events are at-least-once, an effect whose handler is slower
-than its event arrival rate falls behind. Falling behind, visible as lag, is the correct behaviour, not
-an unbounded pending queue or unbounded thread growth.
+**Lanes** (heklang rule 15): every effect arm declares a `@key`, and the values those fields hold in
+one event name the lane it is processed in. Events in one lane are processed in log order; events in
+different lanes need not wait for each other. **This is an ordering guarantee the author chooses, not
+a parallelism hint**, and the difference matters: two warranty plans in one shop write variants onto
+the same remote product, so they must share a lane even though per-plan parallelism looks tempting.
+A lane is the key *alone*, across the effect's arms, so two arms touching one remote resource under
+one shop id share it.
+
+The reason is a production failure. Under one global lane, a single oversized order event stalled a
+warranty effect for every merchant on the platform for eight hours. What fixes that is not the
+parallelism but the **deferral**: a failing invocation records itself, parks its lane until the
+backoff expires, and returns its worker, so a wedged lane costs one entry in a map rather than a
+thread. `[effects] pool_size` bounds how many lanes run at once across the whole process; setting it
+to `1` still gets the fix.
+
+**The watermark is now a low-water mark**: the highest position every event at or below is terminal,
+which under out-of-order completion is not the newest thing finished. It stays the resume point, the
+journal-sweep bound, and what `/status` reports. Above it sit **per-lane rows** (`effect_lane`), so a
+restart skips what a lane already finished instead of re-dispatching it; they are deleted as the mark
+passes them, or a `@key user_id` effect would grow a permanent row per user. Those rows are an
+optimisation and not the correctness boundary: `begin_invocation` reporting `AlreadyTerminal` is
+what actually stops a position running twice, and a boot with the table empty is correct and slower.
+
+**One wedged lane pins the prefix**, and the consequence that hurts is not the lag figure: journal
+retention is bounded by the mark, so a lane wedged for a month makes a month of journal rows
+unsweepable for *every* lane. `fail()` and an operator skip are what resolve it, which is why
+`/status` names the pinning key rather than leaving an operator to find one bad shop among thousands.
 
 **Redeploy**: content-hash keying limits the blast radius. Unchanged calls replay from the journal
 regardless of edits elsewhere in the file, so the failure mode of editing during a deploy is "a
@@ -684,17 +703,20 @@ deploy have nothing in flight, so "drain before deploying changed effect code" i
 than a user chore.
 
 **Observability**: effect lag (current position vs log head) is surfaced in the status endpoint,
-since a sequential effect on a slow API will fall behind and that should be visible rather than
-silent.
+alongside how many lanes are wedged and which key holds the mark, since a partitioned effect can lag
+by thousands while every lane but one is healthy.
 
 ## 8. Runtime and concurrency
 
 - Lightweight tokio tasks with bespoke supervision. No actor framework in v1.
 - Commands run on `spawn_blocking`, because evaluation is synchronous.
 - One sequential task per projector.
-- One dedicated thread per effect (the projector model), each running its invocations synchronously in
-  strict position order. The configured blocking-pool size is validated but reserved for a real shared
-  pool once partition-key parallel lanes land (section 7).
+- One reader thread per effect, which owns the tephra subscription and decides which lane each
+  position belongs to, plus one process-wide worker pool that runs the lanes. tephra's subscription
+  owns a forward-only cursor and is not meant to be cloned, so exactly one thread per effect may read
+  the log; everything else about an effect is per lane. `[effects] pool_size` bounds the pool, and a
+  failure parks its lane rather than sleeping on a worker, so wedged lanes cost map entries rather
+  than threads (section 7).
 - **The program is compiled once at load and shared.** A `heklang::Program` is `Send + Sync` and is
   held behind an `Arc`, so every command attempt, projector batch and effect invocation runs against
   the same compiled artefact. What is per-run is the *host*: one `HeklaHost` per request or
@@ -903,8 +925,10 @@ three lints plus what a directory means.
 
 ## 13. Non-goals
 
-**Deferred** (see the roadmap, each with a trigger): metrics and Prometheus; partition-key parallel
-effect lanes; an upload API with versioning, pinning, and retention, plus hot reload; a fold
+**Deferred** (see the roadmap, each with a trigger): metrics and Prometheus; batch collapse for
+`on latest` (a program declaring it is refused at load rather than run as `on`, since a runtime that
+quietly gave one invocation per event where the author asked for one per key would be honouring a
+different guarantee); an upload API with versioning, pinning, and retention, plus hot reload; a fold
 library; a workspace crate split.
 
 **Permanent commitments** (not deferrals, and not to be reopened): **there is exactly one authoring

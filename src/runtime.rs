@@ -670,6 +670,9 @@ impl Runtime {
             .iter()
             .map(|handle| {
                 let position = handle.position();
+                // Read once: the key and the position are a pair an operator feeds to the
+                // skip endpoint, and two loads could straddle a republish.
+                let pinning = handle.pinning();
                 json!({
                     "name": handle.name,
                     // The same one-word summary `/admin/effects` reports, from the
@@ -679,6 +682,15 @@ impl Runtime {
                     "lag": head.saturating_sub(position),
                     "consecutive_failures": handle.consecutive_failures(),
                     "last_error": handle.last_error(),
+                    // How many lanes are stuck. `consecutive_failures` counts one
+                    // lane's attempts and cannot say how many are in that state.
+                    "wedged_lanes": handle.wedged_lanes(),
+                    // The lane whose failure holds the mark down, and where. Without
+                    // these an operator sees lag in the thousands and no way to find
+                    // the one bad shop, or to name a position for the skip endpoint.
+                    // Null when no lane is failing.
+                    "pinning_key": pinning.as_ref().map(|(lane, _)| lane),
+                    "pinning_position": pinning.as_ref().map(|(_, at)| at),
                     "quarantined": handle.quarantined(),
                     "terminal_skips": handle.terminal_skips(),
                     "last_terminal_error": handle.last_terminal_error(),
@@ -724,6 +736,32 @@ impl Runtime {
 
     pub(crate) fn set_effect_watermark(&self, effect: &str, watermark: u64) -> anyhow::Result<()> {
         self.lock_opdb().set_effect_watermark(effect, watermark)
+    }
+
+    /// Per-lane progress recorded above this effect's mark, for a resume to skip.
+    pub fn effect_lanes(&self, effect: &str) -> anyhow::Result<HashMap<String, u64>> {
+        self.lock_opdb().effect_lanes(effect)
+    }
+
+    /// Record how far one lane has got. See [`OpDb::record_effect_lane`] for why this is
+    /// written after the completion it describes and never before.
+    pub fn record_effect_lane(
+        &self,
+        effect: &str,
+        lane: &str,
+        position: u64,
+    ) -> anyhow::Result<()> {
+        self.lock_opdb().record_effect_lane(effect, lane, position)
+    }
+
+    /// Drop the lane rows the mark has caught up with.
+    pub fn sweep_effect_lanes(&self, effect: &str, watermark: u64) -> anyhow::Result<usize> {
+        self.lock_opdb().sweep_effect_lanes(effect, watermark)
+    }
+
+    /// How many lanes are still ahead of the mark. Zero means the effect has drained.
+    pub fn effect_lanes_outstanding(&self, effect: &str) -> anyhow::Result<usize> {
+        self.lock_opdb().effect_lanes_outstanding(effect)
     }
 
     pub(crate) fn begin_invocation(

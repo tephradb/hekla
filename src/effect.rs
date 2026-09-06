@@ -35,10 +35,14 @@
 //! without ever re-sending. A `Retry-After` on such a response raises that
 //! attempt's backoff, so a rate limiter's own window is waited out, not hammered.
 
+use std::any::Any;
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
+use std::mem;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -53,6 +57,9 @@ use crate::hash::sha256_hex;
 use crate::heklang_host::{HeklaHost, Journal, from_tephra, query_of_types};
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
 use crate::invariant::Violation;
+
+use crate::lane::LaneId;
+use crate::lanes::LaneState;
 use crate::loader::EffectUnit;
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
 use crate::runtime::{self, Runtime};
@@ -72,11 +79,47 @@ const RETRY_AFTER_CAP: Duration = Duration::from_secs(300);
 /// How long a graceful shutdown waits for effects to drain before abandoning a
 /// stuck one (its invocation stays `running` and replays next start).
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an idle pool worker waits before re-checking for work it was not notified
+/// about. Purely a backstop: `offer` and `stop` both notify.
+const POOL_IDLE_WAIT: Duration = Duration::from_secs(5);
 /// How often the retention sweeper runs.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// One lane that is not healthy right now: the position it is stuck on, how many times
+/// it has failed in a row, and when it next tries.
+///
+/// Only unhealthy lanes are recorded, so an effect with a million keys costs nothing
+/// until something breaks.
+#[derive(Debug, Clone)]
+struct StuckLane {
+    position: u64,
+    attempt: u32,
+    error: String,
+    retry_at_ms: u64,
+}
+
+/// The lane a driver-level failure is recorded under.
+///
+/// A store or op-DB error belongs to no lane, but it has to reach the same `/status`
+/// fields a lane failure does. Position `0` makes it always the lowest, so it is always
+/// the failure reported, which is right: a driver that cannot read the log at all is a
+/// worse problem than any one lane's. It is filtered out of the lane counters and never
+/// named as a pinning key, because it is not a key. No event sits at position 0 and `!`
+/// is not a key tag, so it cannot collide with a real lane.
+static DRIVER_LANE: LazyLock<LaneId> = LazyLock::new(|| LaneId::from("!driver"));
+
+fn driver_lane() -> &'static LaneId {
+    &DRIVER_LANE
+}
+
 /// Observable state for one effect, shared with the runtime (for `/status`) and
 /// the skip endpoint. Holds no reference to the runtime, so nothing cycles.
+///
+/// Under rule 15's lanes several positions can be in flight at once, so the fields that
+/// used to describe "the invocation" now describe **the pinning lane**: the stuck lane
+/// holding the lowest position, which is the one an operator has to clear first and the
+/// one holding journal retention down. Everything a reader saw before means the same
+/// thing it did, which is why [`EffectShared::state`] did not have to change.
 pub struct EffectShared {
     pub name: String,
     /// The event types this effect subscribes to. On the handle for the same reason a
@@ -84,9 +127,9 @@ pub struct EffectShared {
     pub sources: Vec<String>,
     position: AtomicU64,
     shutdown: AtomicBool,
-    /// How many times the *current* position has failed in a row while retrying.
-    /// A terminal skip never touches this, so a non-zero value means a genuine wedge
-    /// and nothing else.
+    /// How many times the *pinning* lane has failed in a row. Republished from
+    /// [`EffectShared::stuck`], and still zero exactly when nothing is wedged, which is
+    /// what keeps `state` reading the same as it always did.
     consecutive_failures: AtomicU64,
     last_error: Mutex<Option<String>>,
     /// Cumulative count of positions abandoned by a terminal (non-retryable) failure,
@@ -94,15 +137,16 @@ pub struct EffectShared {
     /// terminal skip advances rather than wedges, so it must not read as a wedge.
     terminal_skips: AtomicU64,
     last_terminal_error: Mutex<Option<String>>,
-    /// The position an operator asked to skip, or `0` for none (no event sits at
-    /// position 0).
-    skip_position: AtomicU64,
+    /// Positions an operator asked to skip. A set rather than one slot, because lanes
+    /// mean several positions can be wedged at once and a single slot would drop every
+    /// request but the last.
+    skips: Mutex<BTreeSet<u64>>,
     /// When this effect started, so a retry deadline can be held as a monotonic
     /// offset from it.
     started: Instant,
-    /// Millis since [`EffectShared::started`] at which the current backoff expires, or
-    /// `0` for "not waiting". Monotonic rather than wall clock on both ends: the
-    /// server's clock can step, and the reader's clock is a different machine's, so a
+    /// Millis since [`EffectShared::started`] at which the pinning lane's backoff
+    /// expires, or `0` for "not waiting". Monotonic rather than wall clock on both ends:
+    /// the server's clock can step, and the reader's clock is a different machine's, so a
     /// deadline published as an instant would render as a negative or hour-long
     /// countdown for a retry that is actually 400ms away. A remaining duration is
     /// immune to both.
@@ -115,23 +159,58 @@ pub struct EffectShared {
     /// later position would be processed on the strength of an assumption that has
     /// just been shown false.
     quarantined: AtomicBool,
+    /// The unhealthy lanes, and the driver's own failures under [`driver_lane`].
+    stuck: Mutex<BTreeMap<LaneId, StuckLane>>,
+    /// How many real lanes are wedged. `consecutive_failures` counts one lane's
+    /// attempts and cannot say how many lanes are in that state.
+    wedged_lanes: AtomicU64,
+    /// The lane whose failure is holding the watermark down, and the position it failed
+    /// at, republished from `stuck` alongside `last_error`.
+    ///
+    /// Derived from the same entry as `consecutive_failures` and `last_error` on purpose:
+    /// an operator pairs the key with the position and skips it, so the two must describe
+    /// one lane. Publishing the *oldest in flight* instead would name a healthy but slow
+    /// lane while a different one was the failure being reported.
+    pinning: Mutex<Option<(String, u64)>>,
 }
 
 impl EffectShared {
+    fn new(name: String, sources: Vec<String>, resume: u64) -> EffectShared {
+        EffectShared {
+            name,
+            sources,
+            position: AtomicU64::new(resume),
+            shutdown: AtomicBool::new(false),
+            consecutive_failures: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+            terminal_skips: AtomicU64::new(0),
+            last_terminal_error: Mutex::new(None),
+            skips: Mutex::new(BTreeSet::new()),
+            started: Instant::now(),
+            retry_at_ms: AtomicU64::new(0),
+            quarantined: AtomicBool::new(false),
+            stuck: Mutex::new(BTreeMap::new()),
+            wedged_lanes: AtomicU64::new(0),
+            pinning: Mutex::new(None),
+        }
+    }
+
     /// The last watermark this effect has processed every matching event up to.
+    ///
+    /// Under lanes this is a **low-water mark**: every position at or below it is
+    /// terminal, which is not the same as the newest position finished. One wedged lane
+    /// holds it at that lane's position however far the others have run ahead, and that
+    /// is the honest answer: it is what a restart resumes from.
     pub fn position(&self) -> u64 {
         self.position.load(Ordering::Relaxed)
     }
 
-    /// How many times the current (stuck) invocation has failed in a row, `0`
-    /// when healthy. A terminal skip never bumps this, so any non-zero value is a
-    /// genuine wedge (a position retrying under backoff), not a skipped one.
+    /// How many times the pinning lane has failed in a row. Zero exactly when nothing is
+    /// wedged.
     pub fn consecutive_failures(&self) -> u64 {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
 
-    /// The last error the current invocation hit, if it is wedged. Cleared on the next
-    /// success; a terminal skip records into `last_terminal_error` instead.
     pub fn last_error(&self) -> Option<String> {
         self.last_error
             .lock()
@@ -139,15 +218,28 @@ impl EffectShared {
             .clone()
     }
 
-    /// How many positions this effect has abandoned to a terminal failure since boot.
-    /// Non-zero means data an invocation needed is permanently gone (an erased subject),
-    /// not that the effect is stuck.
+    /// How many lanes are wedged. The driver's own failures are not a lane and are not
+    /// counted here.
+    pub fn wedged_lanes(&self) -> u64 {
+        self.wedged_lanes.load(Ordering::Relaxed)
+    }
+
+    /// The lane holding the low-water mark down, and the position it is stuck at.
+    ///
+    /// This is the whole of what makes a wedge actionable: without it an operator sees
+    /// lag in the thousands with no way to find the one bad shop, and the skip endpoint
+    /// takes a position they would have no way to name.
+    pub fn pinning(&self) -> Option<(String, u64)> {
+        self.pinning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn terminal_skips(&self) -> u64 {
         self.terminal_skips.load(Ordering::Relaxed)
     }
 
-    /// The error from the most recent terminal skip, if any. Unlike `last_error` it is
-    /// not cleared on a later success: it is a durable record of an abandoned position.
     pub fn last_terminal_error(&self) -> Option<String> {
         self.last_terminal_error
             .lock()
@@ -158,27 +250,131 @@ impl EffectShared {
     /// Ask the driver to skip `position`: an explicit, manual operator action to
     /// advance past a genuinely unprocessable event.
     pub fn request_skip(&self, position: u64) {
-        self.skip_position.store(position, Ordering::Relaxed);
+        self.skips
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(position);
+    }
+
+    fn skip_requested(&self, position: u64) -> bool {
+        self.skips
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&position)
+    }
+
+    /// Forget skip requests the mark has passed, so a skip asked for a position that was
+    /// never reached self-heals instead of waiting for a position that already ran.
+    fn forget_skips(&self, through: u64) {
+        self.skips
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|position| *position > through);
     }
 
     fn stop(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
 
-    fn record_failure(&self, message: &str) {
-        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
-        *self
-            .last_error
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(message.to_owned());
+    /// Record a driver-level failure, which belongs to no lane. See [`driver_lane`].
+    fn record_failure(&self, message: &str, delay: Duration) {
+        let attempt = self.lane_attempt(driver_lane()).saturating_add(1);
+        self.record_stuck(driver_lane(), 0, attempt, message, delay);
     }
 
+    /// Clear the driver's own failure. A lane's is cleared by [`EffectShared::clear_lane`]
+    /// when that lane completes a position.
     fn clear_failures(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        *self
-            .last_error
+        self.clear_lane(driver_lane());
+    }
+
+    /// How many times in a row this lane has failed on its current position.
+    fn lane_attempt(&self, lane: &LaneId) -> u32 {
+        self.stuck
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(lane)
+            .map_or(0, |stuck| stuck.attempt)
+    }
+
+    /// Record that `lane` failed on `position` and will try again after `delay`, and
+    /// report the attempt count that failure was.
+    fn record_lane_failure(
+        &self,
+        lane: &LaneId,
+        position: u64,
+        message: &str,
+        delay: Duration,
+    ) -> u32 {
+        let attempt = self.lane_attempt(lane).saturating_add(1);
+        self.record_stuck(lane, position, attempt, message, delay);
+        attempt
+    }
+
+    fn record_stuck(
+        &self,
+        lane: &LaneId,
+        position: u64,
+        attempt: u32,
+        message: &str,
+        delay: Duration,
+    ) {
+        // Always a real deadline. Publishing zero would read back through `retry_in_ms` as
+        // "nothing is waiting" for a lane that is in fact parked.
+        let retry_at_ms = self.elapsed_ms().saturating_add(delay.as_millis() as u64);
+        let mut stuck = self.stuck.lock().unwrap_or_else(PoisonError::into_inner);
+        stuck.insert(
+            lane.clone(),
+            StuckLane {
+                position,
+                attempt,
+                error: message.to_owned(),
+                retry_at_ms,
+            },
+        );
+        self.republish(&stuck);
+    }
+
+    /// This lane is healthy again.
+    fn clear_lane(&self, lane: &LaneId) {
+        let mut stuck = self.stuck.lock().unwrap_or_else(PoisonError::into_inner);
+        if stuck.remove(lane).is_some() {
+            self.republish(&stuck);
+        }
+    }
+
+    /// Re-derive the single-valued fields from the lanes that are unhealthy.
+    ///
+    /// The pinning lane is the one holding the *lowest* position, because that is the one
+    /// holding the prefix (and therefore journal retention) down. Every reader stays
+    /// lock-free: they load atomics that this writes, rather than walking the map.
+    fn republish(&self, stuck: &BTreeMap<LaneId, StuckLane>) {
+        let driver = driver_lane();
+        let lanes = stuck.keys().filter(|lane| *lane != driver).count();
+        self.wedged_lanes.store(lanes as u64, Ordering::Relaxed);
+        let worst = stuck.iter().min_by_key(|(_, stuck)| stuck.position);
+        *self.pinning.lock().unwrap_or_else(PoisonError::into_inner) = worst
+            .filter(|(lane, _)| *lane != driver)
+            .map(|(lane, stuck)| (lane.as_str().to_owned(), stuck.position));
+        match worst.map(|(_, stuck)| stuck) {
+            Some(worst) => {
+                self.consecutive_failures
+                    .store(u64::from(worst.attempt), Ordering::Relaxed);
+                *self
+                    .last_error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(worst.error.clone());
+                self.retry_at_ms.store(worst.retry_at_ms, Ordering::Relaxed);
+            }
+            None => {
+                self.consecutive_failures.store(0, Ordering::Relaxed);
+                *self
+                    .last_error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+                self.retry_at_ms.store(0, Ordering::Relaxed);
+            }
+        }
     }
 
     /// How long until the next retry attempt, or `None` when nothing is waiting.
@@ -194,15 +390,6 @@ impl EffectShared {
 
     fn elapsed_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
-    }
-
-    fn set_retry_deadline(&self, delay: Duration) {
-        let due = self.elapsed_ms().saturating_add(delay.as_millis() as u64);
-        self.retry_at_ms.store(due, Ordering::Relaxed);
-    }
-
-    fn clear_retry_deadline(&self) {
-        self.retry_at_ms.store(0, Ordering::Relaxed);
     }
 
     /// This effect's health in one word, against a log head.
@@ -224,14 +411,26 @@ impl EffectShared {
         if self.quarantined() {
             "quarantined"
         } else if self.consecutive_failures() > 0 {
-            // Both an invocation retrying under backoff and the driver re-subscribing
-            // after a store error land here. Both are stuck and retrying.
+            // A wedged lane retrying under backoff and the driver re-subscribing after a
+            // store error both land here. Both are stuck and retrying, and under lanes
+            // "wedged" means at least one lane is: the healthy ones keep running, which
+            // is the whole point, but the effect as a whole is not healthy.
             "wedged"
         } else if self.position() < head {
             "lagging"
         } else {
             "healthy"
         }
+    }
+
+    /// Whether this effect may still be handed work.
+    ///
+    /// Every condition here is one the dispatcher breaks on, and the offer side asks the
+    /// same question through [`runnable`]. Keeping it in one place is what stops the two
+    /// from drifting: a lane offered to a worker that immediately declines it is released
+    /// and offered again, forever.
+    pub(crate) fn accepts_work(&self) -> bool {
+        !self.shutdown.load(Ordering::Relaxed) && !self.quarantined()
     }
 
     /// Whether a verify-mode check stopped this effect. Unlike a wedge, nothing
@@ -261,7 +460,7 @@ impl EffectShared {
             .unwrap_or_else(PoisonError::into_inner) = Some(violation.to_string());
     }
     /// Record a terminal skip: count it and keep its message, without touching the wedge
-    /// counter (the position is abandoned, not stuck). Pair with `clear_failures` so any
+    /// counter (the position is abandoned, not stuck). Pair with `clear_lane` so any
     /// wedge state from earlier retries of the same position is reset.
     fn record_terminal_skip(&self, message: &str) {
         self.terminal_skips.fetch_add(1, Ordering::Relaxed);
@@ -278,6 +477,7 @@ impl EffectShared {
 pub struct EffectRuntime {
     shared: Vec<Arc<EffectShared>>,
     joins: Vec<JoinHandle<()>>,
+    pool: Arc<LanePool>,
     sweeper: Sweeper,
 }
 
@@ -291,10 +491,16 @@ impl EffectRuntime {
     /// Signal every effect and the sweeper to stop, then join them, abandoning
     /// any thread that has not drained within `SHUTDOWN_JOIN_TIMEOUT` (a stuck
     /// invocation stays `running` and replays next start).
+    ///
+    /// The readers stop before the pool does, and that order is load-bearing: a reader
+    /// waits for its lanes to finish before publishing its final mark, so stopping the
+    /// workers first would strand in-flight positions and leave the mark short of work
+    /// that had actually completed.
     pub fn shutdown_and_join(self) {
         let EffectRuntime {
             shared,
             joins,
+            pool,
             sweeper,
         } = self;
         for handle in &shared {
@@ -303,6 +509,7 @@ impl EffectRuntime {
         sweeper.signal_stop();
 
         let (tx, rx) = mpsc::channel();
+        let pool_for_join = Arc::clone(&pool);
         let joiner = thread::Builder::new()
             .name("effect-join".to_owned())
             .spawn(move || {
@@ -311,6 +518,7 @@ impl EffectRuntime {
                         tracing::error!("an effect thread panicked: {err:?}");
                     }
                 }
+                pool_for_join.shutdown();
                 sweeper.join();
                 let _ = tx.send(());
             });
@@ -325,10 +533,199 @@ impl EffectRuntime {
             Ok(()) => {
                 let _ = joiner.join();
             }
-            Err(_) => tracing::warn!(
-                "effect drain timed out after {}s; leaving stuck invocation(s) to replay next start",
-                SHUTDOWN_JOIN_TIMEOUT.as_secs()
-            ),
+            Err(_) => {
+                // The readers did not drain in time. Release the workers anyway, so a
+                // process on its way out is not held open by a pool waiting for work
+                // nobody will offer it.
+                pool.stop();
+                tracing::warn!(
+                    "effect drain timed out after {}s; leaving stuck invocation(s) to replay next start",
+                    SHUTDOWN_JOIN_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
+}
+
+/// Everything a worker needs to run one lane of one effect.
+///
+/// Cloned as an `Arc` into the pool's queue rather than passed by reference, because a
+/// lane outlives the batch that admitted it and the worker running it is not the thread
+/// that read it off the log.
+struct EffectCtx {
+    shared: Arc<EffectShared>,
+    unit: Arc<EffectUnit>,
+    runtime: Arc<Runtime>,
+    http: Arc<dyn HttpClient>,
+    lanes: Lanes,
+    /// Set when this context is finished with, so workers holding lanes from it stop
+    /// rather than running on against a dispatcher that has gone away.
+    cancelled: AtomicBool,
+}
+
+impl EffectCtx {
+    fn name(&self) -> &str {
+        &self.shared.name
+    }
+
+    /// Whether work may still be run for this context. See [`runnable`].
+    fn accepts_work(&self) -> bool {
+        !self.cancelled.load(Ordering::Relaxed) && self.shared.accepts_work()
+    }
+}
+
+/// One effect's [`LaneState`] behind a lock, with the condvar the reader waits on.
+struct Lanes {
+    state: Mutex<LaneState>,
+}
+
+impl Lanes {
+    /// `carried` says whether an earlier process left `effect_lane` rows behind. It seeds
+    /// the sweep flag, because those rows are exactly the ones this process has to clean up
+    /// and it may never write one of its own to notice them by.
+    fn new(state: LaneState) -> Lanes {
+        Lanes {
+            state: Mutex::new(state),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, LaneState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The shared pool the lanes of every effect run on.
+///
+/// One pool for the process, not one per effect. The contended resource is the single
+/// `Arc<Mutex<OpDb>>` every journaled call goes through, so the bound that matters is a
+/// process-wide one; a per-effect pool of sixteen with a dozen effects would put two
+/// hundred threads on one mutex. It also lets an effect with one hot lane and an effect
+/// with a thousand share capacity rather than being allotted it equally.
+///
+/// **`pool_size = 1` is not "lanes off".** A single worker still gives every lane mutual
+/// exclusion and still lets a wedged lane step aside for a healthy one, because what
+/// fixes the stall is the deferral in [`run_lane`], not the parallelism. Nobody has to
+/// change a config file to get the fix.
+struct LanePool {
+    ready: Mutex<VecDeque<(Arc<EffectCtx>, LaneId)>>,
+    wake: Condvar,
+    stopping: AtomicBool,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl LanePool {
+    fn start(size: u32) -> anyhow::Result<Arc<LanePool>> {
+        let pool = Arc::new(LanePool {
+            ready: Mutex::new(VecDeque::new()),
+            wake: Condvar::new(),
+            stopping: AtomicBool::new(false),
+            workers: Mutex::new(Vec::new()),
+        });
+        let mut workers = Vec::with_capacity(size as usize);
+        for index in 0..size {
+            let worker = Arc::clone(&pool);
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("effect-pool-{index}"))
+                    .spawn(move || {
+                        while let Some((ctx, lane)) = worker.next() {
+                            // A backstop. A panic inside the invocation is caught by
+                            // `attempt_caught` and becomes an ordinary lane failure, with
+                            // a backoff and a `stuck` entry; this catches one anywhere
+                            // else, so that an unwinding worker cannot be lost from a pool
+                            // every effect in the process shares.
+                            let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+                                run_lane(&ctx, &lane, &worker);
+                            }));
+                            if ran.is_err() {
+                                tracing::error!(
+                                    "effect `{}` panicked on lane `{lane}`; the lane is \
+                                     released and its position retried",
+                                    ctx.name()
+                                );
+                                // Released *and offered back*. `release` re-arms the lane
+                                // in the state map, and without a matching offer it would
+                                // sit `Queued` with nothing to run it: `admit` refuses to
+                                // re-arm a lane that already has a place, so its positions
+                                // would pin the mark for the life of the process while
+                                // `/status` reported the effect merely lagging.
+                                let rearmed = ctx.lanes.lock().release(&lane);
+                                if rearmed && runnable(&ctx, &worker) {
+                                    worker.offer(&ctx, [lane.clone()]);
+                                }
+                            }
+                        }
+                    })
+                    .inspect_err(|_| {
+                        // The workers already spawned hold an `Arc` on the pool and would
+                        // spin in `next()` for the life of the process, keeping it alive
+                        // after a boot that failed.
+                        pool.stop();
+                    })
+                    .with_context(|| format!("spawning effect pool worker {index}"))?,
+            );
+        }
+        *pool.workers.lock().unwrap_or_else(PoisonError::into_inner) = workers;
+        Ok(pool)
+    }
+
+    fn offer(&self, ctx: &Arc<EffectCtx>, lanes: impl IntoIterator<Item = LaneId>) {
+        let mut lanes = lanes.into_iter().peekable();
+        // Every effect's reader passes through here on every idle tick, and most passes
+        // have nothing to offer. Taking the one lock the whole pool shares to push nothing
+        // is contention for its own sake.
+        if lanes.peek().is_none() {
+            return;
+        }
+        let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = ready.len();
+        for lane in lanes {
+            ready.push_back((Arc::clone(ctx), lane));
+        }
+        let added = ready.len() - before;
+        drop(ready);
+        for _ in 0..added {
+            self.wake.notify_one();
+        }
+    }
+
+    fn next(&self) -> Option<(Arc<EffectCtx>, LaneId)> {
+        let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if self.stopping.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(claim) = ready.pop_front() {
+                return Some(claim);
+            }
+            // Every `offer` and `stop` notifies, so this wakes on work rather than on the
+            // clock. The timeout is insurance against a lost wakeup deadlocking the whole
+            // pool, not a poll: at `pool_size` workers a quarter-second tick would be
+            // thousands of acquisitions a second of the one lock they all share.
+            let (next, _) = self
+                .wake
+                .wait_timeout(ready, POOL_IDLE_WAIT)
+                .unwrap_or_else(PoisonError::into_inner);
+            ready = next;
+        }
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::Relaxed)
+    }
+
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+
+    fn shutdown(&self) {
+        self.stop();
+        let workers = mem::take(&mut *self.workers.lock().unwrap_or_else(PoisonError::into_inner));
+        for worker in workers {
+            if let Err(err) = worker.join() {
+                tracing::error!("an effect pool worker panicked: {err:?}");
+            }
         }
     }
 }
@@ -353,34 +750,71 @@ impl Sweeper {
     }
 }
 
-/// Start one thread per effect plus the retention sweeper. The threads hold
-/// `Arc<Runtime>` (for `invoke_command` and the boundary fold); the runtime does not hold the
-/// returned [`EffectRuntime`], so nothing cycles.
+/// Start one reader thread per effect, the shared lane pool, and the retention sweeper.
+/// The threads hold `Arc<Runtime>` (for `invoke_command` and the boundary fold); the
+/// runtime does not hold the returned [`EffectRuntime`], so nothing cycles.
 pub fn start_all(
     effects: Vec<Arc<EffectUnit>>,
     runtime: &Arc<Runtime>,
     http: Arc<dyn HttpClient>,
     config: &Config,
 ) -> anyhow::Result<EffectRuntime> {
+    // No effects, no pool. A project of commands and projectors used to run no effect
+    // threads at all, and should still.
+    let size = if effects.is_empty() {
+        0
+    } else {
+        config.effects.pool_size
+    };
+    let pool = LanePool::start(size)?;
+    // Every `?` past this point would otherwise leave the workers spinning for the life of
+    // the process: they hold their own `Arc` on the pool, nothing sets `stopping`, and
+    // `shutdown_and_join` is unreachable because `EffectRuntime` was never built.
+    let started = start_effects(effects, runtime, http, config, &pool);
+    let (shared, joins, sweeper) = match started {
+        Ok(started) => started,
+        Err(err) => {
+            pool.shutdown();
+            return Err(err);
+        }
+    };
+    Ok(EffectRuntime {
+        shared,
+        joins,
+        pool,
+        sweeper,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn start_effects(
+    effects: Vec<Arc<EffectUnit>>,
+    runtime: &Arc<Runtime>,
+    http: Arc<dyn HttpClient>,
+    config: &Config,
+    pool: &Arc<LanePool>,
+) -> anyhow::Result<(Vec<Arc<EffectShared>>, Vec<JoinHandle<()>>, Sweeper)> {
     let mut shared = Vec::with_capacity(effects.len());
     let mut joins = Vec::with_capacity(effects.len());
     for unit in effects {
-        let (handle, join) = spawn(unit, Arc::clone(runtime), Arc::clone(&http))?;
+        let (handle, join) = spawn(
+            unit,
+            Arc::clone(runtime),
+            Arc::clone(&http),
+            Arc::clone(pool),
+        )?;
         shared.push(handle);
         joins.push(join);
     }
     let sweeper = spawn_sweeper(Arc::clone(runtime), config)?;
-    Ok(EffectRuntime {
-        shared,
-        joins,
-        sweeper,
-    })
+    Ok((shared, joins, sweeper))
 }
 
 fn spawn(
     unit: Arc<EffectUnit>,
     runtime: Arc<Runtime>,
     http: Arc<dyn HttpClient>,
+    pool: Arc<LanePool>,
 ) -> anyhow::Result<(Arc<EffectShared>, JoinHandle<()>)> {
     let ModuleDef::Effect { name, sources } = &unit.def else {
         anyhow::bail!("spawn called on a non-effect module");
@@ -395,24 +829,11 @@ fn spawn(
         );
     }
 
-    let shared = Arc::new(EffectShared {
-        name: name.clone(),
-        sources,
-        position: AtomicU64::new(resume),
-        shutdown: AtomicBool::new(false),
-        consecutive_failures: AtomicU64::new(0),
-        last_error: Mutex::new(None),
-        terminal_skips: AtomicU64::new(0),
-        last_terminal_error: Mutex::new(None),
-        skip_position: AtomicU64::new(0),
-        started: Instant::now(),
-        retry_at_ms: AtomicU64::new(0),
-        quarantined: AtomicBool::new(false),
-    });
+    let shared = Arc::new(EffectShared::new(name.clone(), sources, resume));
     let task_shared = Arc::clone(&shared);
     let join = thread::Builder::new()
         .name(format!("effect-{name}"))
-        .spawn(move || run(task_shared, unit, runtime, http))
+        .spawn(move || run(task_shared, unit, runtime, http, pool))
         .with_context(|| format!("spawning effect `{name}`"))?;
     Ok((shared, join))
 }
@@ -422,10 +843,18 @@ fn run(
     unit: Arc<EffectUnit>,
     runtime: Arc<Runtime>,
     http: Arc<dyn HttpClient>,
+    pool: Arc<LanePool>,
 ) {
+    // Held across `supervise`'s retries, so a re-subscribe reuses one dispatcher rather
+    // than racing a second one against the workers still holding the first's lanes.
+    let mut ctx: Option<Arc<EffectCtx>> = None;
     supervise(&shared, |subscribed| {
-        run_inner(&shared, &unit, &runtime, &http, subscribed)
+        run_inner(&shared, &unit, &runtime, &http, &pool, &mut ctx, subscribed)
     });
+    // The thread is done; nothing may keep working lanes it will no longer publish for.
+    if let Some(ctx) = ctx {
+        ctx.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Supervise the driver: a transient store or op-DB error must not silently kill the
@@ -457,15 +886,15 @@ fn supervise(shared: &EffectShared, mut drive: impl FnMut(&mut dyn FnMut()) -> a
             break;
         }
         let (delay, next) = next_backoff(attempt, recovered);
-        shared.record_failure(&format!("driver: {err:#}"));
+        shared.record_failure(&format!("driver: {err:#}"), delay);
         tracing::error!(
             "effect `{}` driver error (attempt {}): {err:#}",
             shared.name,
             next
         );
-        shared.set_retry_deadline(delay);
-        let stop = sleep_watching(shared, None, delay);
-        shared.clear_retry_deadline();
+
+        let stop = sleep_watching(shared, delay);
+
         if stop {
             break;
         }
@@ -485,19 +914,41 @@ fn next_backoff(attempt: u32, recovered: bool) -> (Duration, u32) {
     (backoff(attempt), attempt.saturating_add(1))
 }
 
-/// Whether an invocation finished, or the driver should stop mid-wedge.
-enum Progress {
-    /// The invocation reached a terminal state (completed or skipped); advance.
-    Advanced,
-    /// Shutdown fired while the invocation was wedged; leave it `running`.
-    Interrupted,
+/// The most positions one effect will hold in flight before it stops reading.
+///
+/// Matched to tephra's own batch cap so a whole batch always fits and the reader can
+/// never block part-way through admitting one. Without a bound, an effect slower than
+/// its arrival rate would grow its lane queues without limit while catching up, which
+/// is the unbounded pending queue the sequential design deliberately did not have.
+const MAX_INFLIGHT: usize = 1024;
+
+/// What one attempt at one position came to.
+enum Step {
+    /// The position reached a terminal state (completed, skipped, or already done);
+    /// retire it and take the next in this lane.
+    Done,
+    /// It failed and will be retried. The lane parks for this long, and **the position
+    /// stays at the head of its queue**: what a failure releases is the worker, not the
+    /// work.
+    Defer(Duration),
+    /// Stop working this lane entirely: shutting down, or quarantined.
+    Stop,
 }
 
+/// The reader: one thread per effect, owning the subscription and deciding which lane
+/// each position belongs to.
+///
+/// It does no invocations itself. tephra's `Subscription` owns a forward-only cursor and
+/// is not meant to be cloned or resumed from a stale one, so exactly one thread per
+/// effect may read the log; everything else this loop does is bookkeeping that has to
+/// happen in the same place as the read.
 fn run_inner(
-    shared: &EffectShared,
-    unit: &EffectUnit,
+    shared: &Arc<EffectShared>,
+    unit: &Arc<EffectUnit>,
     runtime: &Arc<Runtime>,
     http: &Arc<dyn HttpClient>,
+    pool: &Arc<LanePool>,
+    resumed_ctx: &mut Option<Arc<EffectCtx>>,
     subscribed: &mut dyn FnMut(),
 ) -> anyhow::Result<()> {
     let ModuleDef::Effect { name, sources } = &unit.def else {
@@ -517,6 +968,45 @@ fn run_inner(
         return Ok(());
     }
     let resume = runtime.effect_resume_after(name)?;
+    // **Built once per effect thread, and reused when the driver re-subscribes.** A
+    // transient store or op-DB error sends `supervise` round again; allocating a second
+    // context there would leave the pool holding lanes from the first one, and the two
+    // dispatchers would hand the same position to two workers. `begin_invocation` cannot
+    // stop that, because reporting `Running` for an in-flight row is the crash-replay
+    // contract. The lanes, the in-flight set and the stuck map all describe the effect
+    // rather than one subscription, so keeping them across a re-subscribe is also the more
+    // honest reading.
+    let ctx = match resumed_ctx {
+        Some(ctx) => {
+            // The new subscription resumes from the persisted mark, which is at or below
+            // anything still in flight, so it re-delivers work this context already has.
+            // `LaneState::admit` drops those.
+            ctx.lanes.lock().set_scanned(resume);
+            Arc::clone(ctx)
+        }
+        None => {
+            // Per-lane progress an earlier process recorded above the mark. Purely a
+            // shortcut: without it every position above the mark would be dispatched and
+            // told `AlreadyTerminal`, which is correct and slower. Read only here, because
+            // a re-subscribe reuses the context and would throw the result away.
+            let rows: HashMap<LaneId, u64> = runtime
+                .effect_lanes(name)?
+                .into_iter()
+                .map(|(lane, position)| (LaneId::from(lane.as_str()), position))
+                .collect();
+            let fresh = Arc::new(EffectCtx {
+                shared: Arc::clone(shared),
+                unit: Arc::clone(unit),
+                runtime: Arc::clone(runtime),
+                http: Arc::clone(http),
+                lanes: Lanes::new(LaneState::resuming(resume, rows)),
+                cancelled: AtomicBool::new(false),
+            });
+            *resumed_ctx = Some(Arc::clone(&fresh));
+            fresh
+        }
+    };
+
     // Only a writer-backed store advances a watermark; see `Store::subscribe`. An effect
     // driver on a read-only log would park forever rather than idle.
     let mut sub = runtime
@@ -524,149 +1014,431 @@ fn run_inner(
         .subscribe("an effect", query, Position::new(resume))?;
     // Tell the supervisor the driver is back on the log; it owns what that means.
     subscribed();
+
     loop {
-        let batch = sub
-            .poll_batch()
-            .map_err(|err| anyhow::anyhow!("reading events: {err}"))?;
-        if !batch.is_empty() {
-            for (position, _event) in &batch {
-                match run_invocation(
-                    shared,
-                    name,
-                    &unit.digest_hash,
-                    runtime,
-                    http,
-                    position.get(),
-                )? {
-                    Progress::Advanced => {}
-                    // Leave the watermark where it is: the running invocation
-                    // replays next start.
-                    Progress::Interrupted => return Ok(()),
-                }
-            }
-            advance_watermark(shared, runtime, name, sub.position().get())?;
+        // A lane whose backoff has expired, and a lane an operator has asked to skip
+        // past, both become runnable here rather than on a timer of their own.
+        let woken = {
+            let mut state = ctx.lanes.lock();
+            let mut woken = state.promote(Instant::now());
+            woken.extend(state.promote_matching(|position| shared.skip_requested(position)));
+            woken
+        };
+        pool.offer(&ctx, woken);
+
+        let draining = shared.shutdown.load(Ordering::Relaxed);
+        let mut fetched = false;
+        // Stop reading while the in-flight set is full, so a fast log cannot outrun the
+        // pool into unbounded memory. The reader picks up again on its next pass rather
+        // than being woken: a completion is at most one idle poll away from being noticed,
+        // which for a resume point and a sweep bound is nothing.
+        let backpressured = !draining && ctx.lanes.lock().inflight() >= MAX_INFLIGHT;
+        if !draining && !backpressured {
+            let batch = sub
+                .poll_batch()
+                .map_err(|err| anyhow::anyhow!("reading events: {err}"))?;
+            fetched = !batch.is_empty();
+            let armed = admit(&ctx, &batch, sub.position().get())?;
+            pool.offer(&ctx, armed);
+        }
+        publish_mark(&ctx, name)?;
+
+        // A quarantine stops the whole effect, not one lane: a replay divergence is
+        // evidence about the program, and letting the other lanes run on would be
+        // processing them on the strength of an assumption just shown false.
+        if shared.quarantined() {
+            return Ok(());
+        }
+        // Only lanes a worker owns. A lane merely queued is abandoned rather than
+        // finished, and its positions stay `running` in the op-DB and replay at the next
+        // start, so waiting for the queue to empty would wait for work nobody will run.
+        if draining && ctx.lanes.lock().running() == 0 {
+            break;
+        }
+        if fetched {
             continue;
         }
-        // Caught up: advance past any non-matching tail so a restart does not
-        // re-scan the whole log, then idle.
-        advance_watermark(shared, runtime, name, sub.position().get())?;
-        if shared.shutdown.load(Ordering::Relaxed) {
+        let idle = idle_for(&ctx);
+        // The subscription wait is for the *log* to move past the cursor, so it only
+        // blocks when this loop is waiting on the log. When the poll was skipped the
+        // cursor has not moved and the watermark is already past it, so the wait returns
+        // instantly: at the in-flight cap that is a reader spinning at full CPU against
+        // the lane lock and the shared pool lock for the length of a catch-up, which is
+        // exactly when every other effect can least afford the contention.
+        if draining || backpressured {
+            thread::sleep(idle);
+        } else if let WaitOutcome::Closed = sub.wait_timeout(idle) {
             break;
         }
-        if let WaitOutcome::Closed = sub.wait_timeout(IDLE_POLL) {
-            break;
+    }
+    // A worker that stopped between positions may have retired one since the last pass
+    // published. Cheap here, and it saves re-running those at the next start.
+    publish_mark(&ctx, name)?;
+    Ok(())
+}
+
+/// How long the reader may sleep: until the earliest parked lane is due, capped at the
+/// idle poll so a completion is never more than that late in moving the mark.
+///
+/// Floored well above zero, because a deadline that has just passed would otherwise spin
+/// the reader against the lane lock until a worker picked the lane up.
+fn idle_for(ctx: &EffectCtx) -> Duration {
+    const FLOOR: Duration = Duration::from_millis(10);
+    let next = ctx.lanes.lock().next_deadline();
+    match next {
+        Some(due) => due
+            .saturating_duration_since(Instant::now())
+            .clamp(FLOOR, IDLE_POLL),
+        None => IDLE_POLL,
+    }
+}
+
+/// Assign every position in a batch to its lane and queue it, returning the lanes that
+/// became runnable.
+///
+/// The lane keys are computed **outside** the state lock: `record_of` decodes an event,
+/// and holding the lock across a thousand of those would stall every worker trying to
+/// retire a position.
+fn admit(
+    ctx: &Arc<EffectCtx>,
+    batch: &[(Position, tephra::Event)],
+    scanned: u64,
+) -> anyhow::Result<Vec<LaneId>> {
+    let program = ctx.runtime.program();
+    let declared = program.effect(ctx.name());
+    let mut resolved = Vec::with_capacity(batch.len());
+    for (position, event) in batch {
+        // The subscription selects on event type, so this normally matches. An event
+        // type the effect no longer answers is simply scanned past, exactly as a
+        // non-matching one always was.
+        let Some(arm) = ctx.unit.arms.get(event.event_type()) else {
+            continue;
+        };
+        let lane = match declared {
+            Some(declared) => lane_of(program, declared, arm.index, *position, event),
+            None => LaneId::unreadable(),
+        };
+        resolved.push((position.get(), lane));
+    }
+
+    let mut armed = Vec::new();
+    let mut state = ctx.lanes.lock();
+    for (position, lane) in resolved {
+        if state.already_done(&lane, position) {
+            continue;
         }
+        if state.admit(lane.clone(), position) {
+            armed.push(lane);
+        }
+    }
+    // In the same critical section as the admissions, so the mark can never be computed
+    // from a cursor that has run ahead of the positions it let in.
+    state.set_scanned(scanned);
+    Ok(armed)
+}
+
+/// The lane one event belongs to.
+///
+/// A key that cannot be read is **not** an error here. The position is admitted to
+/// [`LaneId::unreadable`] so it wedges where it is, and `deliver` (which computes the
+/// same key through the same `partition_key`) reports it in heklang's own words. Failing
+/// here instead would either skip the position silently or take down the whole reader for
+/// one bad record.
+fn lane_of(
+    program: &heklang::Program,
+    declared: &heklang::ir::Effect,
+    arm: usize,
+    position: Position,
+    event: &tephra::Event,
+) -> LaneId {
+    let Ok(record) = crate::heklang_host::record_of(program, position, event.as_ref()) else {
+        return LaneId::unreadable();
+    };
+    let Some(arm) = declared.arms.get(arm) else {
+        return LaneId::unreadable();
+    };
+    match heklang::partition_key(arm, &record.event) {
+        Ok(keys) => crate::lane::encode(&keys),
+        Err(_) => LaneId::unreadable(),
+    }
+}
+
+/// Persist and publish the effect's low-water mark, and say which lane is holding it.
+///
+/// Forward only, and durable before in-memory, exactly as the sequential watermark was.
+/// What changed is only how the number is arrived at: it is derived from the in-flight
+/// set rather than being the last position processed.
+fn publish_mark(ctx: &Arc<EffectCtx>, name: &str) -> anyhow::Result<()> {
+    let mark = ctx.lanes.lock().low_water();
+    if mark <= ctx.shared.position() {
+        return Ok(());
+    }
+    ctx.runtime.set_effect_watermark(name, mark)?;
+    ctx.shared.position.store(mark, Ordering::Relaxed);
+    ctx.shared.forget_skips(mark);
+    // Only when a row would actually be deleted. A healthy effect records none, so this
+    // keeps the sweep off the per-event path rather than issuing a delete that matches
+    // nothing on every advance. Asked and forgotten in two short critical sections, so the
+    // lane lock is never held across the op-DB write.
+    if ctx.lanes.lock().rows_to_sweep(mark) {
+        ctx.runtime.sweep_effect_lanes(name, mark)?;
+        ctx.lanes.lock().prune_rows(mark);
     }
     Ok(())
 }
 
-/// Persist and publish the effect's watermark, but only forward. It is safe to
-/// store here because every matching position up to it is now terminal.
-fn advance_watermark(
-    shared: &EffectShared,
-    runtime: &Runtime,
-    name: &str,
-    watermark: u64,
-) -> anyhow::Result<()> {
-    if watermark > shared.position.load(Ordering::Relaxed) {
-        runtime.set_effect_watermark(name, watermark)?;
-        shared.position.store(watermark, Ordering::Relaxed);
+/// Run one lane until it empties, defers, or the process stops.
+///
+/// The retry ladder lives on the lane rather than inside this call, which is the whole
+/// difference from the sequential driver: a failure records itself, parks the lane and
+/// **returns the worker**. `pool_size` wedged lanes therefore cost `pool_size` entries in
+/// a map rather than every thread in the pool.
+fn run_lane(ctx: &Arc<EffectCtx>, lane: &LaneId, pool: &LanePool) {
+    // Ownership is taken here rather than when the pool handed the lane over, so a stale
+    // queue entry is declined instead of running a lane a worker already owns.
+    if !ctx.lanes.lock().claim(lane) {
+        return;
     }
-    Ok(())
-}
-
-fn run_invocation(
-    shared: &EffectShared,
-    effect: &str,
-    source_hash: &str,
-    runtime: &Arc<Runtime>,
-    http: &Arc<dyn HttpClient>,
-    position: u64,
-) -> anyhow::Result<Progress> {
-    match runtime.begin_invocation(effect, position, source_hash, &runtime::now_rfc3339())? {
-        InvocationState::AlreadyTerminal => return Ok(Progress::Advanced),
-        InvocationState::Running => {}
-    }
-
-    let mut attempt: u32 = 0;
+    let mut parked = false;
     loop {
-        // Honor an operator skip only once this position is genuinely wedged (it
-        // has failed at least once). Checking before the first attempt would let a
-        // skip requested for a not-yet-reached position drop a healthy event.
-        if attempt > 0 && shared.skip_position.load(Ordering::Relaxed) == position {
-            honor_skip(shared, || {
-                runtime.skip_invocation(effect, position, &runtime::now_rfc3339())
-            })?;
-            tracing::warn!(
-                "effect `{effect}` skipped wedged position {position} by operator request"
-            );
-            return Ok(Progress::Advanced);
+        // A quarantine stops the whole effect, not the lane that found it: every other
+        // lane would otherwise keep working on the strength of an assumption a replay has
+        // just shown false, which is what the sequential driver's `Interrupted` prevented.
+        // Asked through the same predicate the re-offer below uses, so the two cannot
+        // disagree about whether this lane should be running.
+        if !runnable(ctx, pool) {
+            break;
         }
-        match try_invocation(effect, position, runtime, http) {
-            Ok(()) => {
-                // Complete first, then check. The live run has already performed and
-                // journaled its side effects, so this position's work is genuinely
-                // done; leaving the row `running` so the check could report on it
-                // would make the next boot re-enter the handler in `Live` mode and
-                // perform for real the very call the sealed replay refused. The
-                // detection would become the double-fire it exists to prevent.
-                runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
-                shared.clear_failures();
-                if runtime.verify() {
-                    // `Live`: this process just watched the invocation complete, and an
-                    // operator skip returned above rather than reaching here, so an empty
-                    // journal here is a run that genuinely called nothing.
-                    let outcome = replay(effect, position, runtime, Asked::Live);
-                    if let Some(violation) = outcome.violation(effect, position) {
-                        // Durable, so the restart a wedged effect invites does not
-                        // silently clear it. The watermark is deliberately left where
-                        // it is: this position is terminal, but nothing past it should
-                        // be processed until an operator has looked.
-                        runtime.quarantine_effect(effect, position, &violation.to_string())?;
-                        shared.quarantine(&violation);
-                        return Ok(Progress::Interrupted);
-                    }
+        let Some(position) = ctx.lanes.lock().head(lane) else {
+            break;
+        };
+        match attempt_caught(ctx, lane, position) {
+            Step::Done => {
+                let owed = ctx.lanes.lock().complete(lane, position);
+                if owed {
+                    record_lane_row(ctx, lane, position);
                 }
-                return Ok(Progress::Advanced);
             }
-            // A terminal failure (an erased subject a `reveal()` needed) cannot be
-            // recovered by retrying, so complete the invocation and move on rather
-            // than wedge forever.
-            Err(failure) if failure.terminal => {
-                tracing::error!(
-                    "effect `{effect}` invocation at position {position} failed terminally: {}",
-                    failure.message
-                );
-                // Record durably before touching the shared counters, as the success
-                // arm does. A failing op-DB write here propagates and the position is
-                // retried, so mutating first would count the skip twice and clear the
-                // wedge state for an invocation that never actually completed.
-                runtime.complete_invocation(effect, position, &runtime::now_rfc3339())?;
-                shared.record_terminal_skip(&failure.message);
-                shared.clear_failures();
-                return Ok(Progress::Advanced);
+            Step::Defer(delay) => {
+                ctx.lanes.lock().defer(lane, Instant::now() + delay);
+                parked = true;
+                break;
             }
-            Err(failure) => {
-                shared.record_failure(&failure.message);
-                let delay = retry_delay(attempt, failure.retry_after);
-                tracing::error!(
-                    "effect `{effect}` invocation at position {position} failed (attempt {}), \
-                     retrying in {delay:?}: {}",
-                    attempt + 1,
-                    failure.message
-                );
-                shared.set_retry_deadline(delay);
-                let stop = sleep_watching(shared, Some(position), delay);
-                shared.clear_retry_deadline();
-                if stop {
-                    return Ok(Progress::Interrupted);
-                }
-                attempt = attempt.saturating_add(1);
-            }
+            Step::Stop => break,
+        }
+    }
+    // A parked lane keeps its place; anything else gives it back, and takes it straight
+    // to the pool again if work arrived while this worker held it.
+    let rearmed = !parked && ctx.lanes.lock().release(lane);
+    // Only when there is a dispatcher left to run it for. A lane released after a
+    // quarantine or a shutdown keeps its queued work, which replays at the next start;
+    // re-offering it would hand it to a worker that breaks on the same condition at the
+    // top of this function and releases it again, spinning the pool at full CPU.
+    if rearmed && runnable(ctx, pool) {
+        pool.offer(ctx, [lane.clone()]);
+    }
+}
+
+/// Whether this effect should still be handed lanes.
+///
+/// **The same predicate `run_lane` breaks on**, deliberately one expression rather than two
+/// lists that have to be kept in step. When they drifted apart, a lane released after a
+/// quarantine was offered to a worker that broke on the condition the offer had not
+/// checked, released it, and was offered it again: the pool spun at full CPU for as long
+/// as the process lived.
+fn runnable(ctx: &EffectCtx, pool: &LanePool) -> bool {
+    !pool.stopping() && ctx.accepts_work()
+}
+
+/// Record how far a lane has got, for a resume to skip.
+///
+/// Written after the completion is durable, never before: a crash between the two replays
+/// the position into `begin_invocation`'s `AlreadyTerminal`, which costs nothing, while
+/// the reverse order would let a row claim a position that never finished. A failure here
+/// is logged and dropped for the same reason: the row is an optimisation, and losing one
+/// costs a re-dispatch rather than a correctness hole.
+fn record_lane_row(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) {
+    match ctx
+        .runtime
+        .record_effect_lane(ctx.name(), lane.as_str(), position)
+    {
+        Ok(()) => ctx.lanes.lock().record_row(lane, position),
+        Err(err) => tracing::warn!(
+            "effect `{}` could not record lane `{lane}` at position {position}; it will be \
+             re-dispatched after a restart: {err:#}",
+            ctx.name()
+        ),
+    }
+}
+
+/// [`attempt`], with an unwinding handler turned into an ordinary lane failure.
+///
+/// A panic is caught here rather than around the whole lane because everything a failure
+/// owes has to happen either way: a backoff, so a deterministic panic does not spin the
+/// op-DB; a `stuck` entry, so `/status` reports the effect as wedged and names the lane;
+/// and an attempt count, because the operator skip is gated on the position having failed
+/// at least once. Catching it further out gave none of those, which left the one escape
+/// from an unprocessable event unreachable for the very failure the catch was added for.
+fn attempt_caught(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) -> Step {
+    match panic::catch_unwind(AssertUnwindSafe(|| attempt(ctx, lane, position))) {
+        Ok(step) => step,
+        Err(payload) => {
+            let tried = ctx.shared.lane_attempt(lane);
+            defer(ctx, lane, position, tried, &panic_message(&payload), None)
         }
     }
 }
 
+/// What a caught panic said, as far as the payload carries it.
+fn panic_message(payload: &Box<dyn Any + Send>) -> String {
+    let said = payload
+        .downcast_ref::<&str>()
+        .map(|said| (*said).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned());
+    match said {
+        Some(said) => format!("the handler panicked: {said}"),
+        None => "the handler panicked".to_owned(),
+    }
+}
+/// One attempt at one position.
+///
+/// Everything durable about an invocation is unchanged from the sequential driver: the
+/// reservation, the journal, the completion, the verify replay. What moved out is the
+/// retry loop, which is now the lane's.
+fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, position: u64) -> Step {
+    let effect = ctx.name();
+    let tried = ctx.shared.lane_attempt(lane);
+    match ctx.runtime.begin_invocation(
+        effect,
+        position,
+        &ctx.unit.digest_hash,
+        &runtime::now_rfc3339(),
+    ) {
+        Ok(InvocationState::AlreadyTerminal) => {
+            // As terminal as any other completion, so it clears the lane the same way. A
+            // completion whose op-DB write succeeded but whose response errored lands
+            // here on the retry, and leaving the entry would report a healthy effect as
+            // wedged forever and leave `tried > 0` for the lane's next position, which is
+            // what the operator-skip guard below relies on being zero.
+            ctx.shared.clear_lane(lane);
+            return Step::Done;
+        }
+        Ok(InvocationState::Running) => {}
+        // An op-DB error is the same promise as a handler failure: retry forever with
+        // backoff. It used to travel up to `supervise` and re-subscribe, which a worker
+        // cannot do; parking the lane is the same behaviour without the reader's help.
+        Err(err) => return defer(ctx, lane, position, tried, &format!("{err:#}"), None),
+    }
+
+    // Honor an operator skip only once this position is genuinely wedged (it has failed
+    // at least once). Checking before the first attempt would let a skip requested for a
+    // not-yet-reached position drop a healthy event.
+    if tried > 0 && ctx.shared.skip_requested(position) {
+        match honor_skip(&ctx.shared, lane, position, || {
+            ctx.runtime
+                .skip_invocation(effect, position, &runtime::now_rfc3339())
+        }) {
+            Ok(()) => {
+                tracing::warn!(
+                    "effect `{effect}` skipped wedged position {position} in lane `{lane}` by \
+                     operator request"
+                );
+                return Step::Done;
+            }
+            Err(err) => return defer(ctx, lane, position, tried, &format!("{err:#}"), None),
+        }
+    }
+
+    match try_invocation(effect, position, &ctx.runtime, &ctx.http) {
+        Ok(()) => {
+            // Complete first, then check. The live run has already performed and
+            // journaled its side effects, so this position's work is genuinely
+            // done; leaving the row `running` so the check could report on it
+            // would make the next boot re-enter the handler in `Live` mode and
+            // perform for real the very call the sealed replay refused. The
+            // detection would become the double-fire it exists to prevent.
+            if let Err(err) =
+                ctx.runtime
+                    .complete_invocation(effect, position, &runtime::now_rfc3339())
+            {
+                return defer(ctx, lane, position, tried, &format!("{err:#}"), None);
+            }
+            ctx.shared.clear_lane(lane);
+            if ctx.runtime.verify() {
+                // `Live`: this process just watched the invocation complete, and an
+                // operator skip returned above rather than reaching here, so an empty
+                // journal here is a run that genuinely called nothing.
+                let outcome = replay(effect, position, &ctx.runtime, Asked::Live);
+                if let Some(violation) = outcome.violation(effect, position) {
+                    // Durable, so the restart a wedged effect invites does not silently
+                    // clear it. The mark is deliberately left where it is: this position
+                    // is terminal, but nothing further should be dispatched until an
+                    // operator has looked.
+                    if let Err(err) =
+                        ctx.runtime
+                            .quarantine_effect(effect, position, &violation.to_string())
+                    {
+                        tracing::error!("effect `{effect}` could not record a quarantine: {err:#}");
+                    }
+                    ctx.shared.quarantine(&violation);
+                    return Step::Stop;
+                }
+            }
+            Step::Done
+        }
+        // A terminal failure (an erased subject a `reveal()` needed) cannot be
+        // recovered by retrying, so complete the invocation and move on rather
+        // than wedge forever.
+        Err(failure) if failure.terminal => {
+            tracing::error!(
+                "effect `{effect}` invocation at position {position} failed terminally: {}",
+                failure.message
+            );
+            // Record durably before touching the shared counters, as the success
+            // arm does. A failing op-DB write here parks the lane and the position is
+            // retried, so mutating first would count the skip twice and clear the
+            // wedge state for an invocation that never actually completed.
+            if let Err(err) =
+                ctx.runtime
+                    .complete_invocation(effect, position, &runtime::now_rfc3339())
+            {
+                return defer(ctx, lane, position, tried, &format!("{err:#}"), None);
+            }
+            ctx.shared.record_terminal_skip(&failure.message);
+            ctx.shared.clear_lane(lane);
+            Step::Done
+        }
+        Err(failure) => defer(
+            ctx,
+            lane,
+            position,
+            tried,
+            &failure.message,
+            failure.retry_after,
+        ),
+    }
+}
+
+/// Record a failure against its lane and say how long that lane parks for.
+fn defer(
+    ctx: &Arc<EffectCtx>,
+    lane: &LaneId,
+    position: u64,
+    tried: u32,
+    message: &str,
+    retry_after: Option<Duration>,
+) -> Step {
+    let delay = retry_delay(tried, retry_after);
+    let attempt = ctx
+        .shared
+        .record_lane_failure(lane, position, message, delay);
+    tracing::error!(
+        "effect `{}` invocation at position {position} in lane `{lane}` failed (attempt \
+         {attempt}), retrying in {delay:?}: {message}",
+        ctx.name()
+    );
+    Step::Defer(delay)
+}
 /// One invocation, against heklang's own effect machinery.
 ///
 /// The durable half stays here (the journal, the retry, the completion) and the
@@ -823,34 +1595,38 @@ fn backoff(attempt: u32) -> Duration {
 /// the skip pending for the driver's next pass rather than losing it.
 fn honor_skip(
     shared: &EffectShared,
+    lane: &LaneId,
+    position: u64,
     complete: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     complete()?;
-    shared.skip_position.store(0, Ordering::Relaxed);
-    shared.clear_failures();
+    shared
+        .skips
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&position);
+    shared.clear_lane(lane);
     Ok(())
 }
 
-/// Sleep up to `total`, returning `true` if shutdown fired (the caller stops
-/// mid-wedge). A pending skip for `skip` also returns early (`false`), so the retry
-/// loop re-checks it at the top; the driver supervisor passes `None`, having no
-/// per-event skip to honor.
-fn sleep_watching(shared: &EffectShared, skip: Option<u64>, total: Duration) -> bool {
+/// Sleep up to `total`, returning `true` if shutdown fired.
+///
+/// Only the driver supervisor waits like this now. An invocation's backoff is the lane's
+/// (see [`run_lane`]), and a skip wakes a parked lane through the reader's own promote
+/// pass rather than by cutting a sleep short, which is what lets a wedged lane wait
+/// without holding a worker.
+fn sleep_watching(shared: &EffectShared, total: Duration) -> bool {
     let tick = Duration::from_millis(100);
     let mut waited = Duration::ZERO;
     while waited < total {
         if shared.shutdown.load(Ordering::Relaxed) {
             return true;
         }
-        if skip.is_some_and(|position| shared.skip_position.load(Ordering::Relaxed) == position) {
-            return false;
-        }
         thread::sleep(tick.min(total - waited));
         waited += tick;
     }
     shared.shutdown.load(Ordering::Relaxed)
 }
-
 // --- the retention sweeper -------------------------------------------------
 
 fn spawn_sweeper(runtime: Arc<Runtime>, config: &Config) -> anyhow::Result<Sweeper> {
@@ -1509,33 +2285,24 @@ mod tests {
     use super::*;
 
     fn test_shared() -> EffectShared {
-        EffectShared {
-            name: "test".to_owned(),
-            sources: Vec::new(),
-            position: AtomicU64::new(0),
-            shutdown: AtomicBool::new(false),
-            consecutive_failures: AtomicU64::new(0),
-            last_error: Mutex::new(None),
-            terminal_skips: AtomicU64::new(0),
-            last_terminal_error: Mutex::new(None),
-            skip_position: AtomicU64::new(0),
-            started: Instant::now(),
-            retry_at_ms: AtomicU64::new(0),
-            quarantined: AtomicBool::new(false),
-        }
+        EffectShared::new("test".to_owned(), Vec::new(), 0)
+    }
+
+    fn test_lane() -> LaneId {
+        LaneId::from("i:1")
     }
 
     #[test]
     fn a_failed_completion_leaves_the_skip_request_pending() {
         let shared = test_shared();
+        let lane = test_lane();
         shared.request_skip(7);
-        shared.record_failure("boom");
+        shared.record_lane_failure(&lane, 7, "boom", Duration::from_millis(200));
 
-        let err = honor_skip(&shared, || anyhow::bail!("op-db is locked")).unwrap_err();
+        let err = honor_skip(&shared, &lane, 7, || anyhow::bail!("op-db is locked")).unwrap_err();
         assert!(err.to_string().contains("op-db is locked"));
-        assert_eq!(
-            shared.skip_position.load(Ordering::Relaxed),
-            7,
+        assert!(
+            shared.skip_requested(7),
             "a skip must survive a failed completion so the driver honors it on the next pass"
         );
         assert_eq!(
@@ -1544,61 +2311,134 @@ mod tests {
             "the position is still wedged"
         );
 
-        honor_skip(&shared, || Ok(())).unwrap();
-        assert_eq!(shared.skip_position.load(Ordering::Relaxed), 0);
+        honor_skip(&shared, &lane, 7, || Ok(())).unwrap();
+        assert!(!shared.skip_requested(7));
         assert_eq!(shared.consecutive_failures(), 0);
         assert_eq!(shared.last_error(), None);
     }
 
-    /// Both the skip and the shutdown paths return before the full backoff elapses,
-    /// so each case is timed. Asserting only the returned bool would pass even with
-    /// the early return deleted: the call would simply take the whole 30 seconds and
-    /// still report `false`.
+    /// Lanes mean several positions can be wedged at once, which one slot could not say:
+    /// the second request used to overwrite the first and the operator's first skip was
+    /// silently lost.
     #[test]
-    fn sleep_watching_returns_early_only_for_the_wedged_position() {
-        let long = Duration::from_secs(30);
+    fn two_wedged_positions_can_both_be_skipped() {
         let shared = test_shared();
         shared.request_skip(7);
+        shared.request_skip(9);
+        assert!(shared.skip_requested(7) && shared.skip_requested(9));
 
-        let started = Instant::now();
-        assert!(
-            !sleep_watching(&shared, Some(7), long),
-            "a skip is not a shutdown"
+        honor_skip(&shared, &test_lane(), 7, || Ok(())).unwrap();
+        assert!(!shared.skip_requested(7));
+        assert!(shared.skip_requested(9), "the other request is untouched");
+    }
+
+    /// A skip for a position the effect never reached would otherwise sit in the set
+    /// forever, waiting on work that has already gone past.
+    #[test]
+    fn a_skip_the_mark_passed_is_forgotten() {
+        let shared = test_shared();
+        shared.request_skip(3);
+        shared.request_skip(11);
+        shared.forget_skips(5);
+        assert!(!shared.skip_requested(3));
+        assert!(shared.skip_requested(11));
+    }
+
+    /// The pinning lane is the one holding the *lowest* position, because that is what
+    /// holds the prefix (and therefore journal retention) down. It is not the newest
+    /// failure, and it is not the worst-looking one.
+    #[test]
+    fn the_reported_failure_is_the_lane_holding_the_prefix() {
+        let shared = test_shared();
+        let (old, new) = (LaneId::from("i:1"), LaneId::from("i:2"));
+        shared.record_lane_failure(&new, 900, "newer", Duration::from_millis(200));
+        shared.record_lane_failure(&old, 500, "older", Duration::from_millis(200));
+
+        assert_eq!(shared.last_error().as_deref(), Some("older"));
+        assert_eq!(shared.wedged_lanes(), 2);
+
+        shared.clear_lane(&old);
+        assert_eq!(
+            shared.last_error().as_deref(),
+            Some("newer"),
+            "clearing the pinning lane promotes the next one"
         );
+        assert_eq!(shared.wedged_lanes(), 1);
+
+        shared.clear_lane(&new);
+        assert_eq!(shared.consecutive_failures(), 0);
+        assert_eq!(shared.state(5), "lagging", "no lane is wedged any more");
+    }
+
+    /// A driver error belongs to no lane, so it must not be counted as one, but it must
+    /// still be the failure reported, because a driver that cannot read the log at all is
+    /// a worse problem than any one lane's.
+    #[test]
+    fn a_driver_failure_is_reported_without_being_counted_as_a_lane() {
+        let shared = test_shared();
+        shared.record_lane_failure(&test_lane(), 4, "lane", Duration::from_millis(200));
+        shared.record_failure("driver: reading events", Duration::from_millis(200));
+
+        assert_eq!(shared.wedged_lanes(), 1, "the driver is not a lane");
+        assert_eq!(
+            shared.last_error().as_deref(),
+            Some("driver: reading events")
+        );
+        assert_eq!(shared.pinning(), None, "and it is not a partition key");
+    }
+
+    /// The regression this guards spun a pool worker at full CPU. `run_lane` learned to
+    /// break on a quarantine while the re-offer beside it still only checked shutdown, so
+    /// a lane released after a quarantine was handed straight back to a worker that
+    /// declined it, released it, and was handed it again, starving every other effect in
+    /// the process. A live divergence cannot be provoked from a test (the language is pure
+    /// and every impure call is journaled, so a replay always agrees with its first run),
+    /// which is why the predicate itself is what is pinned here.
+    #[test]
+    fn an_effect_that_cannot_run_accepts_no_work() {
+        let shared = test_shared();
+        assert!(shared.accepts_work(), "a healthy effect takes lanes");
+
+        shared.record_lane_failure(&test_lane(), 4, "boom", BACKOFF_BASE);
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "a skip for this position must cut the backoff short, waited {:?}",
-            started.elapsed()
+            shared.accepts_work(),
+            "a wedge is not a reason to stop: the other lanes keep running, which is the \
+             whole point of partitioning"
         );
 
+        shared.quarantine(&Violation::ReplayDivergence {
+            effect: "test".to_owned(),
+            position: 1,
+            detail: "a call the journal does not have".to_owned(),
+        });
+        assert!(
+            !shared.accepts_work(),
+            "a quarantine stops the whole effect"
+        );
+    }
+
+    #[test]
+    fn a_stopping_effect_accepts_no_work() {
+        let stopping = test_shared();
+        stopping.stop();
+        assert!(!stopping.accepts_work());
+    }
+
+    /// Both the shutdown paths return before the full backoff elapses, so the case is
+    /// timed. Asserting only the returned bool would pass even with the early return
+    /// deleted: the call would simply take the whole 30 seconds and still report `true`.
+    #[test]
+    fn sleep_watching_returns_early_for_a_shutdown() {
+        let shared = test_shared();
         shared.stop();
         let started = Instant::now();
         assert!(
-            sleep_watching(&shared, None, long),
+            sleep_watching(&shared, Duration::from_secs(30)),
             "a shutdown is reported as such"
         );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "shutdown must cut the backoff short, waited {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// The skip only applies to the position it names: a skip for a different
-    /// position must let the backoff run its course.
-    #[test]
-    fn sleep_watching_ignores_a_skip_for_another_position() {
-        let shared = test_shared();
-        shared.request_skip(7);
-        let started = Instant::now();
-        assert!(!sleep_watching(
-            &shared,
-            Some(9),
-            Duration::from_millis(300)
-        ));
-        assert!(
-            started.elapsed() >= Duration::from_millis(250),
-            "waited only {:?}",
             started.elapsed()
         );
     }
@@ -1611,7 +2451,7 @@ mod tests {
     #[test]
     fn a_driver_back_on_the_log_clears_the_wedge_the_supervisor_recorded() {
         let shared = test_shared();
-        shared.record_failure("driver: reading events: op-db is locked");
+        shared.record_failure("driver: reading events: op-db is locked", BACKOFF_BASE);
         assert_eq!(shared.state(5), "wedged");
 
         // Re-subscribes, then stops cleanly. No backoff is slept here: this is the

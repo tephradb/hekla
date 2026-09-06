@@ -1,11 +1,10 @@
 //! Project configuration (`hekla.toml`).
 //!
-//! A small, optional file for operational knobs that are not code: the effect
-//! blocking-pool size and the effect-journal retention window. Defaults are
-//! sensible, so a project runs with no config. The retention window drives the
-//! sweeper; the pool size is validated but reserved (v1 runs one thread per
-//! effect). Validating here means a malformed `hekla.toml` fails at load, not at
-//! the moment the sweeper first reaches for a setting.
+//! A small, optional file for operational knobs that are not code: the effect worker-pool
+//! size and the effect-journal retention window. Defaults are sensible, so a project runs
+//! with no config. The retention window drives the sweeper; the pool size bounds how many
+//! effect lanes run at once. Validating here means a malformed `hekla.toml` fails at load,
+//! not at the moment the sweeper first reaches for a setting.
 
 use std::path::Path;
 use std::{fs, io};
@@ -20,6 +19,11 @@ pub const FILE_NAME: &str = "hekla.toml";
 /// sweeper's date arithmetic and turns an absurd typo into a clear error.
 const MAX_RETENTION_DAYS: u32 = 36_500;
 
+/// The largest effect pool we accept. Every worker is an OS thread spawned at boot, and
+/// well before this the single operational-database mutex is the bottleneck rather than
+/// the thread count.
+const MAX_POOL_SIZE: u32 = 1_024;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
@@ -32,9 +36,17 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Effects {
-    /// The size of the blocking pool effects run on. With N active effects that
-    /// is up to N concurrent blocking threads; when the pool is full, effects
-    /// wait rather than spawning without limit.
+    /// How many effect lanes run at once, across every effect.
+    ///
+    /// One pool for the process rather than one per effect: the contended resource is the
+    /// single operational-database mutex every journaled call goes through, so the bound
+    /// that matters is a process-wide one. It also lets an effect with one hot lane and an
+    /// effect with a thousand share capacity rather than being allotted it equally.
+    ///
+    /// **`1` is not "lanes off".** A single worker still gives every lane mutual exclusion
+    /// and still lets a wedged lane step aside for a healthy one, because what fixes a
+    /// stall is that a failure parks the lane and releases the worker, not the
+    /// parallelism. Raising this buys throughput on slow APIs, nothing else.
     pub pool_size: u32,
 }
 
@@ -114,6 +126,11 @@ impl Config {
     fn validate(&self) -> anyhow::Result<()> {
         if self.effects.pool_size == 0 {
             anyhow::bail!("effects.pool_size must be at least 1");
+        }
+        // The pool spawns this many OS threads at boot, so a typo is a resource
+        // commitment rather than a number nobody reads. It was reserved before lanes.
+        if self.effects.pool_size > MAX_POOL_SIZE {
+            anyhow::bail!("effects.pool_size must be at most {MAX_POOL_SIZE}");
         }
         if self.retention.effect_journal_days > MAX_RETENTION_DAYS {
             anyhow::bail!(

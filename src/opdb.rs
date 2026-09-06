@@ -22,7 +22,7 @@ use crate::crypto;
 
 /// The current schema version, tracked in SQLite's `user_version`. Bump it and
 /// add a migration arm when the schema changes.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// How many rows a single sweep statement deletes, so a retention sweep never
 /// holds the connection across a long scan. The sweeper loops until a call
@@ -507,6 +507,91 @@ impl OpDb {
             )
             .context("advancing effect cursor")?;
         Ok(())
+    }
+
+    /// The lane watermarks recorded above this effect's global mark, by lane id.
+    ///
+    /// The dispatcher consults this as it admits positions after a resume: a lane whose
+    /// recorded position is at or above the one being admitted has already finished it.
+    /// A missing row costs correctness nothing, only one `begin_invocation` round trip
+    /// per position to be told `AlreadyTerminal`, which is why this table may lag the
+    /// truth but must never lead it.
+    pub fn effect_lanes(&self, effect: &str) -> anyhow::Result<HashMap<String, u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT lane, position FROM effect_lane WHERE effect = ?1")
+            .context("preparing the lane read")?;
+        let rows = stmt
+            .query_map(params![effect], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .context("reading effect lanes")?;
+        let mut lanes = HashMap::new();
+        for row in rows {
+            let (lane, position) = row.context("reading an effect lane")?;
+            lanes.insert(lane, position);
+        }
+        Ok(lanes)
+    }
+
+    /// Record that `lane` has terminalised every position up to `position`.
+    ///
+    /// Written *after* the invocation reaches `terminal`, never before: a crash between
+    /// the two replays the position into `begin_invocation`'s `AlreadyTerminal`, which
+    /// is free, while the reverse order would let a lane row claim a position that never
+    /// completed and skip it forever.
+    ///
+    /// `max` rather than assignment because the two writes are not in one transaction,
+    /// so taking the higher of them is the only outcome that is right under a retry.
+    pub fn record_effect_lane(
+        &self,
+        effect: &str,
+        lane: &str,
+        position: u64,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO effect_lane (effect, lane, position) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(effect, lane) DO UPDATE SET position = max(position, excluded.position)",
+                params![effect, lane, position as i64],
+            )
+            .context("recording an effect lane")?;
+        Ok(())
+    }
+
+    /// Drop the lane rows the global mark has caught up with, and report how many went.
+    ///
+    /// A lane at or below the mark says nothing the mark does not already say, and
+    /// keeping it is how a per-user key turns into a row per user forever.
+    pub fn sweep_effect_lanes(&self, effect: &str, watermark: u64) -> anyhow::Result<usize> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM effect_lane WHERE effect = ?1 AND position <= ?2",
+                params![effect, watermark as i64],
+            )
+            .context("sweeping effect lanes")?;
+        Ok(deleted)
+    }
+
+    /// How many lanes are still ahead of the global mark.
+    ///
+    /// Zero means the effect has drained.
+    pub fn effect_lanes_outstanding(&self, effect: &str) -> anyhow::Result<usize> {
+        // Bounded by the cursor rather than counting the table, so a row the sweep has not
+        // reached yet (a crash between advancing the mark and deleting, say) does not read
+        // as work outstanding. Its two callers refuse to start an effect and warn on a
+        // deploy, so a stale row would turn a routine key change into a stopped effect.
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM effect_lane WHERE effect = ?1 AND position > \
+                 coalesce((SELECT watermark FROM effect_cursor WHERE effect = ?1), 0)",
+                params![effect],
+                |row| row.get(0),
+            )
+            .context("counting effect lanes")?;
+        Ok(count as usize)
     }
 
     /// Positions of this effect's still-`running` invocations that were recorded under
@@ -1166,6 +1251,7 @@ impl OpDb {
                 4 => tx.execute_batch(SCHEMA_V5).context("applying schema v5")?,
                 5 => tx.execute_batch(SCHEMA_V6).context("applying schema v6")?,
                 6 => tx.execute_batch(SCHEMA_V7).context("applying schema v7")?,
+                7 => tx.execute_batch(SCHEMA_V8).context("applying schema v8")?,
                 other => anyhow::bail!("no migration from schema version {other}"),
             }
             version += 1;
@@ -1333,6 +1419,35 @@ const SCHEMA_V7: &str = "
 ALTER TABLE effect_invocation ADD COLUMN skipped_at TEXT;
 ";
 
+/// Schema v8 is rule 15's half of the effect runtime: `docs/effects.md` makes an arm
+/// declare the lane it runs in and how much of history it wants, and neither fits in
+/// the one integer `effect_cursor` holds.
+///
+/// **`effect_lane` is what a watermark cannot say.** `effect_cursor.watermark` becomes
+/// the *global low-water mark* (the highest position every event at or below is
+/// terminal) and keeps its job as the resume point and the sweeper's bound. But lanes
+/// complete out of order, so one integer cannot also say that lane A is at 900 while
+/// lane B is at 500. These rows carry that, and only for lanes *ahead* of the mark:
+/// they are deleted as it passes them, because a `@key user_id` effect would otherwise
+/// accumulate one permanent row per user, nearly all of them lanes that saw one event
+/// and will never see another.
+///
+/// They are a resume *index*, not the correctness boundary. `begin_invocation`
+/// returning `AlreadyTerminal` is what actually stops a position running twice, and a
+/// boot with this table empty would be correct, only slower. What they buy is that a
+/// resume from a mark far behind a fast lane skips those positions in memory instead of
+/// asking the op-DB about each one, and that per-lane progress outlives the process.
+const SCHEMA_V8: &str = "
+CREATE TABLE effect_lane (
+    effect   TEXT    NOT NULL,
+    lane     TEXT    NOT NULL,   -- `crate::lane::encode` of the arm's `@key` values
+    position INTEGER NOT NULL,   -- every position in this lane at or below it is terminal
+    PRIMARY KEY (effect, lane)
+);
+-- The sweep deletes by `(effect, position <= mark)`, which the primary key cannot serve.
+CREATE INDEX effect_lane_by_position ON effect_lane (effect, position);
+";
+
 /// One effect invocation, as an introspection reader sees it. `status` is `running` or
 /// `terminal`, and `skipped_at` is set when an operator skipped a wedged invocation
 /// rather than it reaching a conclusion of its own. A terminal `reveal()` stays plain
@@ -1427,6 +1542,8 @@ mod tests {
             "effect_journal",
             "declaration",
             "effect_cursor",
+            "effect_quarantine",
+            "effect_lane",
             "subject_key",
         ] {
             let count: i64 = db
@@ -1885,6 +2002,82 @@ mod tests {
             None,
             "the last chunk cascaded its journal rows too"
         );
+    }
+
+    // --- effect lanes and activation ---------------------------------------
+
+    #[test]
+    fn a_lane_records_its_own_position_and_never_moves_backwards() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.record_effect_lane("e", "i:1", 5).unwrap();
+        db.record_effect_lane("e", "i:2", 9).unwrap();
+        // A retry can write an older position; `max` is what makes that harmless.
+        db.record_effect_lane("e", "i:1", 3).unwrap();
+
+        let lanes = db.effect_lanes("e").unwrap();
+        assert_eq!(lanes.get("i:1"), Some(&5));
+        assert_eq!(lanes.get("i:2"), Some(&9));
+        assert_eq!(db.effect_lanes_outstanding("e").unwrap(), 2);
+    }
+
+    #[test]
+    fn lanes_belong_to_one_effect() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.record_effect_lane("one", "i:1", 5).unwrap();
+        db.record_effect_lane("two", "i:1", 7).unwrap();
+        assert_eq!(db.effect_lanes("one").unwrap().get("i:1"), Some(&5));
+        assert_eq!(db.effect_lanes("two").unwrap().get("i:1"), Some(&7));
+    }
+
+    /// The rows exist only to describe lanes *ahead* of the global mark. Once it passes
+    /// one, the row says nothing the mark does not, and keeping it is how a `@key
+    /// user_id` effect grows a permanent row per user.
+    #[test]
+    fn the_sweep_drops_only_the_lanes_the_mark_has_passed() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.record_effect_lane("e", "behind", 4).unwrap();
+        db.record_effect_lane("e", "at", 7).unwrap();
+        db.record_effect_lane("e", "ahead", 9).unwrap();
+
+        assert_eq!(db.sweep_effect_lanes("e", 7).unwrap(), 2);
+        let lanes = db.effect_lanes("e").unwrap();
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes.get("ahead"), Some(&9));
+    }
+
+    /// v8 adds tables rather than touching one, so the rows that were already there have
+    /// to come through untouched, including the cursor, whose *meaning* changes without
+    /// its contents changing.
+    #[test]
+    fn rows_written_before_v8_survive_the_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for schema in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+            ] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 7i64).unwrap();
+            conn.execute(
+                "INSERT INTO effect_cursor (effect, watermark) VALUES ('e', 42)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO effect_invocation (effect, position, script_hash, status, created_at) \
+                 VALUES ('e', 7, 'h', 'terminal', 't0')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = OpDb::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(db.effect_resume_after("e").unwrap(), 42);
+        // A directory that predates lanes has no lane rows: nothing to resume past.
+        assert!(db.effect_lanes("e").unwrap().is_empty());
     }
 
     // --- introspection readers ---------------------------------------------
