@@ -96,7 +96,8 @@ HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
 the directory its kind requires, that a read model can be keyed and indexed the way the read API
 needs, and two warnings about a boundary too broad or too narrow to do its job. Also `hekla erase`
 and `hekla rotate` for key management, `hekla plan` for what a deploy would change (and, with
-`--replay`, would do), and `hekla verify` for the invariant sweep below.
+`--replay`, would do), `hekla rewind` for taking an effect back over history it has already
+processed, and `hekla verify` for the invariant sweep below.
 
 From a checkout the same three are `cargo run -- check examples/orders` and so on. The repository
 is also a flake: `nix build` for the binary, `nix flake check` for the suite.

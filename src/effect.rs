@@ -942,12 +942,18 @@ fn spawn(
     ));
     let task_shared = Arc::clone(&shared);
     if blocking {
-        // Draining under the old key costs nothing, which is why it is the whole of the
-        // advice here. A way to force it without draining lands with `hekla rewind`.
+        // The two remedies are not equivalent, and the message says which is which.
+        // Draining under the old key costs nothing. `hekla rewind` also deletes the
+        // recorded invocations above the target, which is what makes those positions run
+        // again, and perform their side effects again with them.
         shared.block(format!(
             "effect `{name}` will not start: the partition key for {} changed while \
              {outstanding} lane(s) are still outstanding above position {resume}. \
-             Deploy the previous key and let it drain, which costs nothing",
+             Deploy the previous key and let it drain, which costs nothing; or, as an \
+             escape hatch, `hekla \
+             rewind {name} {resume}`, which discards those lane rows *and* the recorded \
+             invocations above {resume}, so those positions run again and perform their \
+             side effects again",
             repartitioned.join(", "),
         ));
     }

@@ -257,6 +257,65 @@ request only.
 It refuses a data directory with no database rather than creating one:
 `error: no operational database at <path>/hekla.db`.
 
+## `hekla rewind <EFFECT> <POSITION> [DIR] [--data-dir PATH] [--live] [--yes]`
+
+Moves an effect's watermark backwards so it reprocesses everything after `POSITION`, and performs
+those side effects again. Irreversible. `0` reprocesses the whole log; the effect resumes *strictly
+after* the position you name, which is the same meaning the watermark has everywhere else.
+
+This is the only way back to history for an `on live` arm. Flipping the arm to `on` and redeploying
+does not help: the boundary is already persisted, and it is not re-resolved on a later boot.
+
+```
+$ hekla rewind SendWelcome 0 ./project
+effect `SendWelcome`
+  watermark      412 -> 0
+  live boundary  380 (unchanged; pass --live to lower it)
+  discards       412 recorded invocation(s), and the journal rows behind them
+  lanes          3 row(s) of per-lane progress
+  arms
+                 on @user.registered { @key user_id }
+                 on live @user.deleted { @key user_id }  still declined below the boundary
+
+This re-runs those positions and performs their side effects again.
+Continue? [y/N]
+```
+
+**It takes the data-directory lock**, so it refuses while a server is running. That is not caution
+for its own sake: a rewind against a live process would race the effect's in-memory mark and be
+overwritten by the next publish, so it would appear to apply and quietly not.
+
+**Deleting the recorded invocations is what makes it a rewind.** Without that, `begin_invocation`
+reports every position already terminal and the effect sails straight over them; the command would
+look like it worked and do nothing. It is also what makes those positions *re-fire*: the journal rows
+cascade with their invocations, so the calls they recorded are performed again rather than replayed.
+The journal will not save you here, and it would not have anyway: it is swept on a retention window.
+
+`--live` also lowers the `on live` boundary. **Off by default**, because an author who wrote `on live`
+declared that history must not fire, and a rewind aimed at a plain arm should not quietly re-send
+every notification that arm declined. A pure-`live` effect rewound without the flag correctly does
+nothing. Lowering it is permanent. `--live` on an effect with no `live` arm is an error rather than a
+no-op, so a stale runbook flag against the wrong effect is visible.
+
+`--yes` answers the prompt. It does **not** silence the summary: a deploy log should still show what
+the rewind was about to do. Without a terminal and without `--yes` it refuses rather than prompting,
+so a piped `yes` cannot arm it.
+
+It also clears a quarantine above the target, since the diverging invocation is exactly what is being
+discarded; leaving it would make the rewind a no-op the operator has to discover for themselves.
+
+Rewinding **to** the current watermark is allowed and is not a no-op: the mark does not move,
+but every `effect_lane` row and every recorded invocation above it goes. That is the form a
+`blocked` effect needs, and the form its message names.
+
+Refusals: a held lock, an effect the project does not declare (it lists the ones it does), a data
+directory with no database, `--live` on an effect with no `live` arm, and a `POSITION` ahead of
+the watermark (`... is at position N; M is ahead of it, not a rewind`, exit 0, nothing moved).
+
+**Why this prompts when `erase` does not.** An erase carries its blast radius in its own arguments,
+because you named the subject. `hekla rewind SendWelcome 0` tells you nothing about the four hundred
+emails it is about to re-send. That asymmetry is the whole reason for the summary and the prompt.
+
 ## `hekla rotate [DIR] [--data-dir PATH]`
 
 Rewraps every subject key under the primary `HEKLA_MASTER_KEY`, unwrapping with

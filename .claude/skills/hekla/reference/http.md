@@ -141,12 +141,19 @@ The operational snapshot. Not a liveness probe: it opens the log head and every 
                     "replays_completed": 0, "replays_failed": 0 } ],
   "effects": [ { "name": "SendWelcome", "position": 0, "lag": 4, "state": "wedged",
                  "consecutive_failures": 9, "last_error": "effects/send-welcome.hk:11:20: ...",
+                 "wedged_lanes": 1, "pinning_key": "i:4471", "pinning_position": 2,
                  "last_terminal_error": null, "terminal_skips": 0, "quarantined": false } ]
 }
 ```
 
-An effect's `position` is its **durable watermark**, not the invocation it is working on. See
+An effect's `position` is its **durable low-water mark**, the highest position every lane has passed,
+not the invocation it is working on. `pinning_key` names the lane holding it down. See
 `operations.md` for what each state and counter means.
+
+**There is no rewind endpoint, and that is deliberate.** Taking an effect back over history is
+`hekla rewind`, CLI only, against a stopped process: an effect declaring `on live` is one whose author
+said history must not fire, and those are exactly the effects where an accidental request would
+re-send every notification the log has ever seen.
 
 `GET /health` is `{"status": "ok"}` and nothing else.
 

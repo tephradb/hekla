@@ -37,6 +37,7 @@ hekla openapi <dir>   # the generated OpenAPI 3.1 document on stdout, findings o
 hekla verify <dir>    # the offline invariant sweep over a data directory
 hekla plan   <dir>    # what deploying this project over a data directory would change
                       #   --replay also re-runs recorded effect invocations against it
+hekla rewind <Effect> <position> <dir>  # take an effect back so it reprocesses. Irreversible
 hekla erase <field> <value> <dir>    # delete one subject's key. Irreversible
 hekla rotate <dir>    # rewrap every subject key under the current master
 ```
@@ -113,11 +114,14 @@ one under `tests/` does.
 | `serve` | yes | yes, creates | **yes** | if any `@subject` | errors, a bad addr, a held lock |
 | `verify` | yes | yes, must exist | **yes** | if any `@subject` | any violation |
 | `openapi` | yes | no | no | no | not a directory, errors, nothing declared |
+| `rewind` | yes, to name the arms | must hold `hekla.db` | **yes** | no | a held lock, an unknown effect |
 | `erase` | for the path only | must hold `hekla.db` | no | no | no database at that path |
 | `rotate` | for the path only | must hold `hekla.db` | no | **required** | no key, no database |
 
 `erase` takes no lock, so it works against a running server and takes effect on the next request.
-`verify` does, which is why the documented shape is to verify a copy of the directory.
+`verify` and `rewind` do. For `verify` that is why the documented shape is to check a copy of the
+directory; for `rewind` it is because a rewind against a live process would race its in-memory mark
+and be overwritten by the next publish, so it would appear to apply and quietly not.
 
 ## The HTTP surface, in one table
 
@@ -158,12 +162,16 @@ a client as `room_taken` with 422.
    telling you to declare the index, never a table scan.
 6. **An absent column is omitted from a read response**, not serialised as `null`. An erased subject's
    column looks exactly like a column that was never written.
-7. **`/status` reports an effect's durable watermark, not what it is working on.** A wedge at position
-   3 with the watermark at 1 reads as `position: 1, lag: 3`. The position that is actually stuck is
-   the invocation with `status: running` in `GET /admin/effects/{Name}/invocations`.
+7. **`/status` reports an effect's durable watermark, not what it is working on**, and under lanes
+   that is a *low-water* mark: the highest position every lane has passed. A wedge at position 3 with
+   the watermark at 1 reads as `position: 1, lag: 3` even when later positions in other lanes are
+   long finished. The position that is actually stuck is `pinning_position`, and `pinning_key` names
+   the partition key holding it, which is what you skip, and what you look for when lag is in the
+   thousands and only one shop is broken.
 8. **An operator skip is a request, not a command.** The endpoint answers 202 whatever position you
-   name; the driver honours it only once *that* position has failed at least once, and only one
-   request is pending at a time, so naming the wrong position clears the one you meant.
+   name; the driver honours it only once *that* position has failed at least once. Several requests
+   can be pending at once, one per wedged lane, and a request for a position the watermark passes is
+   forgotten rather than left waiting.
 9. **A project that uses `@subject` will not boot without `HEKLA_MASTER_KEY`**, and losing that key
    is unrecoverable loss of every subject-scoped value. Nothing else in the runtime fails this way.
 10. **Erasing is deleting a key, so it is instant, total and irreversible**, across the log and every

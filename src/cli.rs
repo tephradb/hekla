@@ -6,6 +6,7 @@
 //! operational key commands: rewrapping subject keys under a new master, and
 //! irreversibly deleting one subject's key.
 
+use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -15,10 +16,12 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::http::{HttpClient, UreqClient};
-use crate::loader::{Finding, LoadedProject, Severity};
-use crate::opdb::OpDb;
+use heklang::ir::Delivery;
+
+use crate::loader::{ArmRef, EffectUnit, Finding, LoadedProject, Severity};
+use crate::opdb::{self, OpDb};
 use crate::plan::Replay;
-use crate::{crypto, runtime, server, testing, validate};
+use crate::{crypto, lock, runtime, server, testing, validate};
 
 /// The default HTTP bind address when `--addr` is not given.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
@@ -158,6 +161,41 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Move an effect back to a position, so it reprocesses everything after it and
+    /// performs those side effects again. This is irreversible.
+    ///
+    /// The only way back to history for an `on live` arm, whose boundary is already
+    /// persisted: flipping the arm to `on` and redeploying does not help. Deliberately not
+    /// an HTTP endpoint. An effect declaring `on live` is by definition one whose author
+    /// said history must not fire, and those are exactly the effects where an accidental
+    /// rewind re-sends every notification the log has ever seen.
+    ///
+    /// Refuses while a server holds the data directory, so it runs against a stopped
+    /// process. It prints what it would discard and asks before doing it; `--yes` answers
+    /// the prompt without silencing the summary.
+    Rewind {
+        /// The effect to rewind.
+        effect: String,
+        /// The position to resume strictly after. `0` reprocesses the whole log.
+        position: u64,
+        /// The project directory (to resolve the data directory).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// The data directory (event store and operational DB). Defaults to `<dir>/data`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Also lower the `on live` boundary, so `live` arms fire for history too.
+        ///
+        /// Off by default, and the flag is the point: the author of an `on live` arm
+        /// declared that history is not news, so overriding that should be something you
+        /// typed rather than something a rewind did on your behalf. It is permanent:
+        /// first activation is not re-resolved on a later boot.
+        #[arg(long)]
+        live: bool,
+        /// Skip the confirmation prompt. The summary is still printed.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Parse arguments and run, returning the process exit code.
@@ -188,6 +226,14 @@ pub fn run() -> ExitCode {
             dir,
             data_dir,
         } => erase(&subject_field, &subject_value, &dir, data_dir.as_deref()),
+        Command::Rewind {
+            effect,
+            position,
+            dir,
+            data_dir,
+            live,
+            yes,
+        } => rewind(&effect, position, &dir, data_dir.as_deref(), live, yes),
     }
 }
 
@@ -312,6 +358,204 @@ fn erase(
             eprintln!("error: {err:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Move an effect's watermark backwards so it reprocesses, after saying what that costs.
+///
+/// **Why this prompts when `erase` does not**, which is a deliberate inconsistency: an
+/// erase carries its blast radius in its own arguments, because you named the subject.
+/// `hekla rewind SendWelcome 0` tells you nothing about the four hundred emails it is
+/// about to re-send. The asymmetry is the reason for the summary and the prompt, and the
+/// reason `--yes` suppresses only the question and never the summary.
+fn rewind(
+    effect: &str,
+    position: u64,
+    dir: &Path,
+    data_dir: Option<&Path>,
+    live: bool,
+    yes: bool,
+) -> ExitCode {
+    let project = LoadedProject::load(dir);
+    if report_findings(&project).0 > 0 {
+        eprintln!("error: the project does not load, so its arms cannot be named");
+        return ExitCode::FAILURE;
+    }
+    let Some(unit) = project
+        .effects
+        .iter()
+        .find(|unit| unit.def.name() == effect)
+    else {
+        eprintln!("error: no effect `{effect}` in {}", dir.display());
+        let known: Vec<&str> = project.effects.iter().map(|unit| unit.def.name()).collect();
+        eprintln!("       declared here: {}", render_list(&known));
+        return ExitCode::FAILURE;
+    };
+
+    let db_path = match operational_db(dir, data_dir) {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    // The lock is the "is a server running?" check. A rewind against a live process would
+    // race its in-memory mark and be overwritten by the next publish, so it would appear
+    // to apply and quietly not.
+    let resolved = runtime::resolve_data_dir(dir, data_dir);
+    let _lock = match lock::DataDirLock::acquire(&resolved) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            eprintln!("       a rewind runs against a stopped process; stop the server first");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut opdb = match OpDb::open(&db_path) {
+        Ok(opdb) => opdb,
+        Err(err) => {
+            eprintln!("error: opening the operational database: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Checked before anything about the directory's state, so a stale runbook flag is
+    // reported even when the rewind itself turns out to be a no-op.
+    if live && !unit.arms.values().any(|arm| arm.delivery == Delivery::Live) {
+        eprintln!("error: effect `{effect}` has no `on live` arm, so --live would do nothing");
+        return ExitCode::FAILURE;
+    }
+
+    let watermark = match opdb.effect_resume_after(effect) {
+        Ok(watermark) => watermark,
+        Err(err) => {
+            eprintln!("error: reading the effect cursor: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Strictly greater. Rewinding *to* the current watermark is a real operation and the
+    // one a `blocked` effect needs: it discards every lane row and every recorded
+    // invocation above the mark without moving the mark itself. Refusing it made the
+    // escape hatch the block message names a no-op, and unrecoverable at watermark 0.
+    if position > watermark {
+        println!(
+            "effect `{effect}` is at position {watermark}; {position} is ahead of it, not a rewind"
+        );
+        return ExitCode::SUCCESS;
+    }
+    let counts = match opdb.rewind_preview(effect, position) {
+        Ok(counts) => counts,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let boundary = match opdb.effect_activation(effect) {
+        Ok(activation) => activation.map(|activation| activation.live_boundary),
+        Err(err) => {
+            eprintln!("error: reading the effect activation: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print_rewind(effect, position, watermark, boundary, live, unit, &counts);
+    if !yes {
+        // A prompt nobody can answer is a usage error, not a decline. Exiting zero here
+        // would tell a script the rewind happened.
+        if !io::stdin().is_terminal() {
+            eprintln!("error: not a terminal; pass --yes to confirm without a prompt");
+            return ExitCode::FAILURE;
+        }
+        if !confirm() {
+            println!("nothing was rewound");
+            return ExitCode::SUCCESS;
+        }
+    }
+    match opdb.rewind_effect(effect, position, live) {
+        Ok(_) => {
+            println!("rewound `{effect}` to position {position}; start the server to reprocess");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// What the rewind would do, named arm by arm.
+///
+/// A count alone is not enough on a mixed effect: knowing that nine of the positions
+/// belong to an `on live` arm, and are therefore about to fire or not depending on one
+/// flag, is the whole of what an operator needs before answering the prompt.
+fn print_rewind(
+    effect: &str,
+    to: u64,
+    watermark: u64,
+    boundary: Option<u64>,
+    live: bool,
+    unit: &EffectUnit,
+    counts: &opdb::RewindCounts,
+) {
+    println!("effect `{effect}`");
+    println!("  watermark      {watermark} -> {to}");
+    match boundary {
+        Some(boundary) if live => println!("  live boundary  {boundary} -> {to}"),
+        Some(boundary) => {
+            println!("  live boundary  {boundary} (unchanged; pass --live to lower it)")
+        }
+        None => println!("  live boundary  unresolved; this effect has never run here"),
+    }
+    println!(
+        "  discards       {} recorded invocation(s), and the journal rows behind them",
+        counts.invocations
+    );
+    if counts.lanes > 0 {
+        println!(
+            "  lanes          {} row(s) of per-lane progress",
+            counts.lanes
+        );
+    }
+    if counts.quarantine {
+        println!("  quarantine     would be cleared");
+    }
+    println!("  arms");
+    let mut arms: Vec<(&String, &ArmRef)> = unit.arms.iter().collect();
+    arms.sort_by_key(|(ty, _)| (*ty).clone());
+    for (ty, arm) in arms {
+        let modifier = match arm.delivery {
+            Delivery::Live => "on live",
+            Delivery::Latest => "on latest",
+            Delivery::Every => "on",
+        };
+        let fate = match (arm.delivery, live) {
+            (Delivery::Live, false) => "  still declined below the boundary",
+            (Delivery::Live, true) => "  will fire for history",
+            _ => "",
+        };
+        println!(
+            "                 {modifier} @{ty} {{ @key {} }}{fate}",
+            arm.keys.join(", ")
+        );
+    }
+    println!();
+    println!("This re-runs those positions and performs their side effects again.");
+}
+
+/// Ask. Only ever called on a terminal: a rewind that could be armed by a piped `yes` is a
+/// rewind waiting to happen in a script nobody read, so the caller refuses outright
+/// rather than reading an answer from a pipe.
+fn confirm() -> bool {
+    print!("Continue? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+fn render_list(names: &[&str]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
     }
 }
 

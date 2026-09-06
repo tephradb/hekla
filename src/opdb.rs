@@ -664,6 +664,110 @@ impl OpDb {
         Ok(())
     }
 
+    /// Move an effect back to `to`, so it reprocesses everything after it.
+    ///
+    /// **The one write in hekla that moves a watermark backwards**, which is why it is here
+    /// rather than through [`OpDb::set_effect_watermark`]: that function's forward-only
+    /// contract is what every other caller relies on, and a rewind is the deliberate
+    /// exception rather than a reason to weaken it.
+    ///
+    /// Deleting the invocation rows is the part that makes it a rewind at all. Without it
+    /// `begin_invocation` reports `AlreadyTerminal` for every position moved past and the
+    /// command silently does nothing. It is also what makes a rewind *re-fire*: the journal
+    /// rows cascade with their invocations, so the calls they recorded are performed again
+    /// rather than replayed.
+    ///
+    /// One transaction, because a half-applied rewind is exactly the shape
+    /// [`OpDb::sweep_effect_journal`] warns about: terminal rows above the watermark with
+    /// no journal behind them, whose side effects fire a second time.
+    ///
+    /// `include_live` lowers the `on live` boundary too. Off by default: an author who
+    /// wrote `on live` declared that history must not fire, and a rewind aimed at a plain
+    /// arm should not quietly re-send every notification that arm declined.
+    pub fn rewind_effect(
+        &mut self,
+        effect: &str,
+        to: u64,
+        include_live: bool,
+    ) -> anyhow::Result<RewindCounts> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("beginning a rewind transaction")?;
+        let invocations = tx
+            .execute(
+                "DELETE FROM effect_invocation WHERE effect = ?1 AND position > ?2",
+                params![effect, to as i64],
+            )
+            .context("discarding recorded invocations")?;
+        let lanes = tx
+            .execute("DELETE FROM effect_lane WHERE effect = ?1", params![effect])
+            .context("discarding lane rows")?;
+        // Otherwise the effect refuses to start and the rewind looks like a no-op. The
+        // invocation the check diverged on is exactly what is being discarded.
+        let quarantine = tx
+            .execute(
+                "DELETE FROM effect_quarantine WHERE effect = ?1 AND position > ?2",
+                params![effect, to as i64],
+            )
+            .context("clearing a quarantine")?;
+        tx.execute(
+            "INSERT INTO effect_cursor (effect, watermark) VALUES (?1, ?2) \
+             ON CONFLICT(effect) DO UPDATE SET watermark = excluded.watermark",
+            params![effect, to as i64],
+        )
+        .context("rewinding the effect cursor")?;
+        if include_live {
+            tx.execute(
+                "UPDATE effect_activation SET live_boundary = ?2 \
+                 WHERE effect = ?1 AND live_boundary > ?2",
+                params![effect, to as i64],
+            )
+            .context("lowering the live boundary")?;
+        }
+        tx.commit().context("committing a rewind")?;
+        Ok(RewindCounts {
+            invocations,
+            lanes,
+            quarantine: quarantine > 0,
+        })
+    }
+
+    /// What a rewind to `to` would discard, without discarding it.
+    pub fn rewind_preview(&self, effect: &str, to: u64) -> anyhow::Result<RewindCounts> {
+        let invocations: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM effect_invocation WHERE effect = ?1 AND position > ?2",
+                params![effect, to as i64],
+                |row| row.get(0),
+            )
+            .context("counting invocations to discard")?;
+        let quarantine: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM effect_quarantine WHERE effect = ?1 AND position > ?2",
+                params![effect, to as i64],
+                |row| row.get(0),
+            )
+            .context("checking for a quarantine")?;
+        // Every row, not the ones above the mark: `rewind_effect` deletes the lot, and the
+        // summary is the number an operator answers the prompt against.
+        let lanes: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM effect_lane WHERE effect = ?1",
+                params![effect],
+                |row| row.get(0),
+            )
+            .context("counting lane rows to discard")?;
+        Ok(RewindCounts {
+            invocations: invocations as usize,
+            lanes: lanes as usize,
+            quarantine: quarantine > 0,
+        })
+    }
+
     /// Positions of this effect's still-`running` invocations that were recorded under
     /// a *known* other version of it, for the restart warning.
     ///
@@ -1536,6 +1640,17 @@ CREATE TABLE effect_activation (
     activated_at  TEXT    NOT NULL
 );
 ";
+
+/// What a rewind would discard, and what it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RewindCounts {
+    /// Recorded invocations above the target, whose journal rows cascade with them.
+    pub invocations: usize,
+    /// Per-lane rows, all of which describe progress the rewind repudiates.
+    pub lanes: usize,
+    /// Whether a quarantine was cleared.
+    pub quarantine: bool,
+}
 
 /// What an effect's first activation against this data directory recorded: the position
 /// `on live` arms decline at or below, and the lane scheme its rows above the watermark

@@ -95,10 +95,14 @@ A wedge outranks lag because a wedged effect lags precisely because it is wedged
 
 An arm's `@key` changed while lanes were still outstanding, so the per-lane rows above the
 watermark are keyed under a scheme the new key never produces. `last_error` names the event types
-whose lane moved and how many lanes are outstanding. The way out:
+whose lane moved and how many lanes are outstanding. Two ways out, and they are not equivalent:
 
 - **Redeploy the previous key and let it drain.** Watch `/admin/effects/{Name}` until
   `wedged_lanes` is 0 and `lag` is 0, then deploy the new key. This costs nothing.
+- **`hekla rewind <Effect> <watermark>`**, against a stopped process. It discards the lane rows
+  *and* the recorded invocations above the watermark, so those positions run again and perform
+  their side effects again. An escape hatch, not the alternative.
+
 `hekla plan` reports the repartition before the deploy, so this is avoidable rather than something
 to discover at boot. The block is an operator signal rather than a correctness gate: reprocessing
 under a new key skips rather than re-fires, because `begin_invocation` is the authority on what has

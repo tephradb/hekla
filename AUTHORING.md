@@ -376,6 +376,7 @@ Two things it does that the raw API does not:
 | `hekla serve <dir>` (`--addr`, `--data-dir`) | Run the runtime and HTTP API. |
 | `hekla openapi <dir>` | Print the generated OpenAPI 3.1 document to stdout. Reads the project only (no data directory, no master key), so a committed `openapi.json` can be diffed in CI. Findings go to stderr, so redirecting stdout gives you pure JSON. |
 | `hekla erase <field> <value> <dir>` | Delete a subject's key. Irreversible. |
+| `hekla rewind <Effect> <position> <dir>` | Take an effect back so it reprocesses, and performs, everything after that position. Refuses while a server is running, and prints what it would discard before asking. Irreversible. |
 | `hekla rotate <dir>` | Rewrap every subject key under the current `HEKLA_MASTER_KEY`. |
 
 `hekla.toml` is optional; every value has a default.

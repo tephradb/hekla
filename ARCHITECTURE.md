@@ -699,7 +699,9 @@ unsweepable for *every* lane. `fail()` and an operator skip are what resolve it,
 effect ran against this data directory, resolved once and kept, so source states intent and dev,
 staging and production each resolve correctly. A position an `on live` arm declines gets **no
 invocation row at all**, because a terminal row with an empty journal would read back through the replay
-check as reproduced, which is a claim about work nobody did.
+check as reproduced, which is a claim about work nobody did. `hekla rewind <Effect> <position>` is the
+only way back to history, CLI-only against a stopped process, and it leaves the boundary alone unless
+asked with `--live`.
 
 **Changing an arm's `@key` repartitions the lanes**, so the rows above the mark are keyed under a
 scheme the new key never produces. An effect whose key moved while lanes were outstanding refuses to

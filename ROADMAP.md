@@ -147,9 +147,8 @@ crash mid-handler resumes by replaying journaled calls and running only the unjo
 
 Honest scope for this phase:
 
-- `effects.pool_size` is validated but not enforced: v1 runs one thread per effect, which already bounds
-  concurrency. A real shared blocking pool is reserved for partition-key parallel lanes (a later phase),
-  which the watermark-plus-completed-set format already supports.
+- `effects.pool_size` is validated but not enforced here: this phase ran one thread per effect, which
+  already bounded concurrency. Phase 26 makes it live, as the bound on partition-key lanes.
 - `invoke_command` lands the domain fact exactly-once: it passes a deterministic idempotency key, so the
   target command tags every emitted event with that key and guards the append against the tag. A replay
   (including across the append-then-journal crash window) finds the prior commit by the tag and returns
@@ -1590,6 +1589,49 @@ what it sees is a committed prefix of the writer's log. `hekla plan --replay` sp
   gained discriminated skip counters, since one number for four reasons said coverage was missing
   without saying how much.
 
+
+## Phase 26: an effect arm names its lane, and says how much of history it wants (done)
+
+heklang 0.3.0 landed rule 15: every effect arm declares a `@key` and may carry a delivery modifier.
+This phase is the dispatcher half, without which the declaration means nothing. Two production
+failures are the reason it exists: one oversized order event stalled a warranty effect for every
+merchant on the platform for eight hours, because an effect had one global lane; and a new effect
+replayed from position 0, firing its side effects across the whole history.
+
+- **Lanes.** An event's `@key` values name the lane it runs in. One lane processes in log order;
+  different lanes do not wait for each other. A lane is the key *alone*, across the effect's arms, so
+  two arms touching one remote resource under one shop id share it. Documented as an ordering
+  guarantee the author chooses rather than a parallelism hint.
+- **A failure parks its lane rather than sleeping on a worker.** This, not the parallelism, is what
+  fixes the stall: `pool_size` wedged lanes would otherwise hold every thread in the pool. `[effects]
+  pool_size` becomes live as the process-wide bound, and `1` still gets the fix.
+- **The watermark becomes a low-water mark** (the highest position every event at or below is
+  terminal) with per-lane rows (`effect_lane`) above it so a restart skips what a lane finished.
+  Those rows are an optimisation; `begin_invocation` remains the authority on what has run.
+- **`/status` names the pinning key.** A partitioned effect can lag by thousands while every lane but
+  one is healthy, and journal retention is bounded by the mark, so a lane wedged for a month makes a
+  month of journal rows unsweepable for every lane.
+- **The live boundary** is a second number per effect (`effect_activation`), resolved to the log head
+  at first activation and kept. A position an `on live` arm declines gets no invocation row at all.
+- **`hekla rewind <Effect> <position>`**, CLI only, against a stopped process, never an HTTP endpoint.
+  It prints what it would discard, names the arms, and asks; `--yes` answers the prompt without
+  silencing the summary. `--live` also lowers the boundary, and is off by default because an author
+  who wrote `on live` said history must not fire.
+- **A `@key` change is reported before it bites.** `hekla plan` names the event types whose lane moved
+  and whether the effect has drained; at boot, an effect whose key moved with lanes outstanding
+  reports `blocked` and does not start, while the rest of the runtime keeps serving.
+
+Honest scope for this phase:
+
+- **Batch collapse for `on latest` is not implemented, and a program declaring it is refused at
+  load.** Running it as `on` would give one invocation per event where the author asked for one per
+  key: a different guarantee, delivered silently. A program that checks but will not run beats one
+  that runs differently from what it says.
+- The key-change block is an **operator signal, not a correctness gate**. Reprocessing under a new key
+  skips rather than re-fires, because rows above the mark are never swept. What stopping buys is that
+  a repartition is noticed by whoever caused it.
+- Schema v8 adds `effect_lane` and `effect_activation`. `hekla plan` refuses a directory this build
+  has not migrated, so run `hekla serve` against it once first.
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
@@ -1598,8 +1640,10 @@ warranted.
 - **Upload API with versioning, pinning, and retention, plus hot reload** (load-graph incremental
   invalidation): when inline or live editing becomes a goal. The effect journal already records the
   script hash for this.
-- **Partition-key parallel effect lanes**: when a single effect's throughput on slow APIs hurts. The
-  checkpoint format (watermark plus completed-set) already supports it.
+- **Batch collapse for `on latest`**: when a convergent effect's redundant runs cost enough to be
+  worth the bookkeeping. Recording which positions were folded into an invocation is what keeps
+  replay equivalence true, and it has one known customer. Until it lands, a program declaring `on
+  latest` is refused at load rather than run as `on`.
 - **Metrics and Prometheus**: when there is something to operate at scale.
 - **Fold library** (`event_counter`, `latest_event`, `toggle`): only after roughly fifteen real
   commands exist, and only if it compiles down to the existing `state` shape rather than becoming a

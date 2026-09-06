@@ -339,8 +339,9 @@ effect Notify {
         "it names what repartitioned and how much is outstanding: {reason}"
     );
     assert!(
-        reason.contains("let it drain, which costs nothing"),
-        "and it names the remedy: {reason}"
+        reason.contains("let it drain, which costs nothing")
+            && reason.contains("perform their side effects again"),
+        "and it does not present the two remedies as equivalent: {reason}"
     );
     assert_eq!(
         again.rt.status()["projectors"].as_array().map(Vec::len),
@@ -380,4 +381,153 @@ effect Notify {
     assert_eq!(effect.blocked(), None);
     assert_ne!(effect.state(2), "blocked");
     again.shutdown();
+}
+
+/// The escape hatch the block message names has to actually work. It told the operator to
+/// run `hekla rewind <Effect> <watermark>`, which the CLI refused as "not a rewind" until
+/// the guard admitted rewinding *to* the mark; at watermark 0 there was no smaller
+/// position to pass at all, so a blocked effect was unrecoverable through the command.
+#[test]
+fn the_rewind_the_block_message_names_unblocks_the_effect() {
+    let data = tempfile::tempdir().unwrap();
+    let before = project();
+    let booted = boot(before.path(), data.path(), only_one_customer_fails(1));
+    order(&booted.rt, 1);
+    order(&booted.rt, 2);
+    wait_until("a lane to run ahead of the wedge", || {
+        !lane_rows(&open_op_db(booted.data_dir())).is_empty()
+    });
+    booted.shutdown();
+
+    let rekeyed = orders_project_with(&[(
+        "effects/notify.hk",
+        r#"
+effect Notify {
+  on @order.placed { @key order_id, customer_id } {
+    http.post("https://mail.test/send", { "customer": customer_id })
+  }
+}
+"#,
+    )]);
+    let blocked = boot(rekeyed.path(), data.path(), only_one_customer_fails(1));
+    let reason = blocked
+        .rt
+        .effect(EFFECT)
+        .unwrap()
+        .blocked()
+        .expect("blocked");
+    blocked.shutdown();
+
+    // Run exactly what the message told the operator to run.
+    let quoted = reason
+        .split_once("`hekla rewind ")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(command, _)| command.to_owned())
+        .unwrap_or_else(|| panic!("the message names a command: {reason}"));
+    let mut parts = quoted.split_whitespace();
+    let named_effect = parts.next().expect("an effect");
+    let named_position = parts.next().expect("a position");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hekla"))
+        .args(["rewind", named_effect, named_position, "--yes"])
+        .arg(rekeyed.path())
+        .arg("--data-dir")
+        .arg(data.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        lane_rows(&open_op_db(data.path())).is_empty(),
+        "the rows keyed under the old scheme are what the block was about"
+    );
+
+    let again = boot(rekeyed.path(), data.path(), only_one_customer_fails(1));
+    assert_eq!(
+        again.rt.effect(EFFECT).unwrap().blocked(),
+        None,
+        "and the effect starts under the new key"
+    );
+    again.shutdown();
+}
+
+/// A panic must not strand its lane.
+///
+/// One pool serves every effect, so an unwinding handler is caught rather than taking a
+/// worker with it. Catching it is only half: the lane has to be released *and offered
+/// back*, because `admit` refuses to re-arm a lane that already has a place and `promote`
+/// only touches parked ones. Released without an offer, the lane sat queued with nothing
+/// to run it, its positions pinned the watermark for the life of the process, and
+/// `/status` reported the effect as merely lagging because no failure had been recorded.
+#[test]
+fn a_panicking_call_does_not_strand_its_lane() {
+    let dir = project();
+    let data = tempfile::tempdir().unwrap();
+    // Panics once, then behaves. If the lane is stranded the retry never happens and the
+    // watermark never moves.
+    let stub = Arc::new(StubHttpClient::new(move |index, _| {
+        assert!(index > 0, "the first call panics");
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+        })
+    }));
+    let booted = boot(dir.path(), data.path(), stub.clone());
+
+    order(&booted.rt, 1);
+
+    wait_until("the lane to recover and finish the position", || {
+        watermark(&open_op_db(booted.data_dir())) >= 1
+    });
+    assert!(
+        stub.call_count() >= 2,
+        "the position was retried rather than abandoned"
+    );
+    booted.shutdown();
+}
+
+/// A handler that panics every time must behave like any other failure that will not
+/// clear: back off rather than spin, report itself, and be escapable.
+///
+/// The first fix for a panicking handler caught the unwind and re-offered the lane, which
+/// recovered a one-off but left a deterministic panic retrying with no delay and no record.
+/// Nothing called `record_lane_failure`, so the attempt count stayed at zero, and the
+/// operator skip is gated on the position having failed at least once: the documented
+/// escape from an unprocessable event was unreachable for exactly this case, while
+/// `/status` called the effect `lagging` and named no lane.
+#[test]
+fn a_handler_that_always_panics_wedges_its_lane_and_can_be_skipped() {
+    let dir = project();
+    let data = tempfile::tempdir().unwrap();
+    let stub = Arc::new(StubHttpClient::new(|_, _| panic!("the transport exploded")));
+    let booted = boot(dir.path(), data.path(), stub.clone());
+
+    order(&booted.rt, 1);
+
+    wait_until("the panic to be reported as a wedge", || {
+        booted.rt.effect(EFFECT).unwrap().consecutive_failures() > 0
+    });
+    let effect = booted.rt.effect(EFFECT).unwrap();
+    assert_eq!(effect.state(1), "wedged", "not `lagging`");
+    assert!(
+        effect.last_error().unwrap_or_default().contains("panicked"),
+        "the failure says what it was: {:?}",
+        effect.last_error()
+    );
+    let (lane, at) = effect.pinning().expect("the lane is named");
+    assert_eq!((lane.as_str(), at), ("i:1", 1));
+    assert!(
+        effect.retry_in_ms().is_some(),
+        "and it is backing off rather than retrying flat out"
+    );
+
+    // The escape hatch has to work, which it cannot without an attempt count.
+    effect.request_skip(at);
+    wait_until("the skip to advance past the panicking position", || {
+        watermark(&open_op_db(booted.data_dir())) >= 1
+    });
+    booted.shutdown();
 }
