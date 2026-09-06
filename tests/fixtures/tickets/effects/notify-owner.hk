@@ -1,9 +1,9 @@
 // Crosses the decrypt boundary explicitly, then records delivery through the internal
 // command. An owner erased before this runs makes `reveal` terminal (the address is
-// gone; no retry recovers it) rather than wedging the lane.
+// gone; no retry recovers it) rather than wedging that ticket's lane.
 
 effect NotifyOwner {
-  on @ticket.opened { ticket_id, contact } {
+  on @ticket.opened { @key ticket_id, contact } {
     if contact.is_none() {
       log("ticket {ticket_id} has no contact to notify")
       return

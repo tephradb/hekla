@@ -298,7 +298,7 @@ projector Orders {
 /// decrypt boundary.
 pub const NOTIFY_EFFECT: &str = r#"
 effect Notify {
-  on @order.placed { email } {
+  on @order.placed { @key customer_id, email } {
     // `reveal` is the explicit boundary: the effect decrypts the customer email to
     // send it. A projector could not; only an effect has it.
     http.post("https://mail.test/send", { "to": reveal(email) })

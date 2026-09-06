@@ -191,7 +191,7 @@ fn invocation_status(data_dir: &Path, position: u64) -> Option<String> {
 
 const TWO_POSTS: &str = r#"
 effect Notify {
-  on @user.registered { user_id } {
+  on @user.registered { @key user_id } {
     http.post("https://a.test/first", { "id": user_id })
     http.post("https://a.test/second", {})
   }
@@ -295,7 +295,7 @@ fn a_crashed_invocation_resumes_from_the_journal_and_runs_only_the_tail() {
 
 const NOW_THEN_POST: &str = r#"
 effect Notify {
-  on @user.registered {
+  on @user.registered { @key user_id } {
     let t = now()
     http.post("https://a.test/at", { "t": t })
     http.post("https://a.test/fail", {})
@@ -348,7 +348,7 @@ fn now_replays_the_recorded_timestamp_on_every_retry() {
 
 const IDENTICAL_TWICE: &str = r#"
 effect Notify {
-  on @user.registered {
+  on @user.registered { @key user_id } {
     http.post("https://a.test/twice", { "n": 1 })
     http.post("https://a.test/twice", { "n": 1 })
     http.post("https://a.test/fail", {})
@@ -407,7 +407,7 @@ fn identical_repeated_calls_journal_under_separate_ordinals() {
 /// pins the shape rather than just that a dot parsed.
 const RESPONSE_SHAPE: &str = r#"
 effect Notify {
-  on @user.registered {
+  on @user.registered { @key user_id } {
     let response = http.post("https://a.test/first", { "x": 1 })
     http.post("https://a.test/echo", {
       "status": response.status,
@@ -457,7 +457,7 @@ fn a_non_json_response_body_is_not_a_failure_and_reads_as_absent() {
     let dir = project(
         r#"
 effect Notify {
-  on @user.registered {
+  on @user.registered { @key user_id } {
     let response = http.post("https://a.test/first", { "x": 1 })
     http.post("https://a.test/echo", {
       "status": response.status,
@@ -529,7 +529,7 @@ command ActivateUser(user_id: Uuid) {
             "effects/notify.hk",
             r#"
 effect Notify {
-  on @user.registered { user_id } {
+  on @user.registered { @key user_id } {
     let first = invoke ActivateUser { user_id }
     let second = invoke ActivateUser { user_id }
     http.post("https://a.test/echo", {
@@ -583,7 +583,7 @@ fn an_unknown_response_field_is_refused_at_load() {
                 "effects/notify.hk",
                 r#"
 effect Notify {
-  on @user.registered {
+  on @user.registered { @key user_id } {
     let response = http.post("https://a.test/first", { "x": 1 })
     log("{response.stauts}")
   }
@@ -599,7 +599,7 @@ effect Notify {
 
 const TWO_POSTS_V2: &str = r#"
 effect Notify {
-  on @user.registered { user_id } {
+  on @user.registered { @key user_id } {
     http.post("https://a.test/first-v2", { "id": user_id })
     http.post("https://a.test/second", {})
   }
@@ -669,7 +669,7 @@ fn an_edited_effect_replays_an_in_flight_invocation_against_the_new_code() {
 /// exactly the arms and nothing else.
 const PER_TYPE_EFFECT: &str = r#"
 effect Notify {
-  on @user.registered { user_id, email } {
+  on @user.registered { @key user_id, email } {
     http.post("https://a.test/welcome/{user_id}", { "email": email })
   }
 }
@@ -718,7 +718,7 @@ fn an_effects_arms_are_exactly_its_subscription() {
 /// assertion below reads the state the arm actually saw.
 const FOLDING_EFFECT: &str = r#"
 effect Notify {
-  on @user.registered { user_id } {
+  on @user.registered { @key user_id } {
     fold activations: Int = 0
       on @user.activated(user_id) => activations + 1
 

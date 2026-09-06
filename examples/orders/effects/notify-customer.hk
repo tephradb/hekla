@@ -1,15 +1,18 @@
 // Sends an order confirmation. Acting on the customer's address means crossing the
 // decrypt boundary explicitly with `reveal`: only an effect has it, and every call is
 // traced. If the customer was erased before this ran, `reveal` fails terminally (the
-// data is gone; no retry can recover it) rather than wedging the lane forever.
+// data is gone; no retry can recover it) rather than wedging this customer's lane
+// forever.
 //
 // State comes from the log, not from a projector: the `state` slice scopes a boundary
 // to this customer and counts it. The fold stops at this event's own position, so it
 // is a function of the log prefix and that position, and every retry and every replay
 // reproduces it exactly.
-
+//
+// `@key customer_id` names the lane: one customer's orders are confirmed in log
+// order, and an address that will not accept mail holds up nobody else.
 effect NotifyCustomer {
-  on @order.placed as e { order_id, customer_id, email } {
+  on @order.placed as e { order_id, @key customer_id, email } {
     // Inclusive of the triggering event, so a customer's first order leaves this at 1.
     fold orders: Int = 0
       on @order.placed(customer_id) => orders + 1

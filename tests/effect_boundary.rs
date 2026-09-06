@@ -65,7 +65,7 @@ fn failed() -> String {
 fn an_effect_folds_its_boundary_and_its_arm_sees_the_state() {
     let effect = r#"
 effect Probe {
-  on @t.placed { id, shop } {
+  on @t.placed { id, @key shop } {
     fold count: Int = 0
       on @t.placed(shop) => count + 1
 
@@ -96,7 +96,7 @@ test "the fold is scoped to the triggering event" {{
 fn the_fold_is_inclusive_of_the_triggering_event() {
     let effect = r#"
 effect Probe {
-  on @t.placed { id, shop } {
+  on @t.placed { id, @key shop } {
     fold count: Int = 0
       on @t.placed(shop) => count + 1
 
@@ -145,7 +145,7 @@ test "the trigger counts itself" {{
 fn an_effect_without_a_boundary_reads_nothing_and_still_delivers() {
     let effect = r#"
 effect Probe {
-  on @t.placed { id } {
+  on @t.placed { @key id } {
     let count = 7
 
     invoke Record { id, shop: count }
@@ -171,11 +171,11 @@ test "an arm that folds nothing still delivers" {{
 fn one_event_selects_exactly_one_arm() {
     let effect = r#"
 effect Probe {
-  on @t.placed { id } {
+  on @t.placed { @key id } {
     invoke Record { id, shop: 1 }
   }
 
-  on @t.placed { id } {
+  on @t.placed { @key id } {
     invoke Record { id, shop: 2 }
   }
 }

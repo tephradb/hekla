@@ -543,14 +543,14 @@ mod tests {
     /// Two effects in one file, so a per-file hash could not tell them apart.
     const TWO_EFFECTS: &str = r#"
 effect Alpha {
-  on @e.one as one {
+  on @e.one as one { @key id } {
     let reply = http.post("https://example.test/alpha", { "id": one.id })
     if reply.status >= 400 { fail("alpha rejected") }
   }
 }
 
 effect Beta {
-  on @e.two as two {
+  on @e.two as two { @key id } {
     let reply = http.post("https://example.test/beta", { "id": two.id })
     if reply.status >= 400 { fail("beta rejected") }
   }
@@ -606,7 +606,7 @@ effect Beta {
 // Two unrelated effects that happen to share a file.
 effect Alpha {
 
-  on @e.one as triggering {
+  on @e.one as triggering { @key id } {
     // Tell the alpha service.
     let response  =  http.post("https://example.test/alpha", { "id": triggering.id })
     if response.status >= 400 {
@@ -616,7 +616,7 @@ effect Alpha {
 }
 
 effect Beta {
-  on @e.two as two {
+  on @e.two as two { @key id } {
     let reply = http.post("https://example.test/beta", { "id": two.id })
     if reply.status >= 400 { fail("beta rejected") }
   }

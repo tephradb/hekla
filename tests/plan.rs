@@ -652,7 +652,7 @@ fn endpoint(order_id: Int) -> String {
 
 const NOTIFY: &str = "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     http.post(endpoint(order_id), { \"to\": email })
   }
 }
@@ -742,7 +742,7 @@ fn add_an_audit_call(project: &Path) {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     http.post(endpoint(order_id), { \"to\": email })
     http.post(\"https://audit.test/log\", { \"order_id\": order_id })
   }
@@ -766,7 +766,7 @@ fn an_effect_edit_that_changes_no_call_reproduces() {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     log(\"confirming order {order_id}\")
     http.post(endpoint(order_id), { \"to\": email })
   }
@@ -887,7 +887,7 @@ fn an_effect_that_no_longer_handles_the_event_is_reported() {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.cancelled { order_id } {
+  on @order.cancelled { @key order_id } {
     http.post(endpoint(order_id), { \"to\": \"nobody\" })
   }
 }
@@ -1008,7 +1008,7 @@ fn an_invocation_recorded_by_a_superseded_version_is_not_replayed() {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     http.post(endpoint(order_id), { \"to\": email })
     http.post(\"https://audit.test/log\", { \"order_id\": order_id })
     http.post(\"https://audit.test/v3\", { \"order_id\": order_id })
@@ -1166,7 +1166,7 @@ fn an_uninitialized_log_replays_nothing_rather_than_failing() {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     http.post(\"https://elsewhere.test\", { \"to\": email })
   }
 }
@@ -1249,7 +1249,7 @@ command PlaceOrder(order_id: Int, customer_id: Int, email: String) {
 
 const SEALED_NOTIFY: &str = "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     http.post(endpoint(order_id), { \"to\": reveal(email) })
   }
 }
@@ -1300,7 +1300,7 @@ fn add_a_second_call(project: &Path) {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     http.post(endpoint(order_id), { \"to\": reveal(email) })
     http.post(\"https://audit.test/log\", { \"order_id\": order_id })
   }
@@ -1397,7 +1397,7 @@ fn only_an_effect_that_reveals_needs_the_master_key() {
         "effects/audit.hk",
         "\
 effect Audit {
-  on @order.placed { order_id } {
+  on @order.placed { @key order_id } {
     http.post(\"https://audit.test/log\", { \"order_id\": order_id })
   }
 }
@@ -1427,7 +1427,7 @@ effect Audit {
         "effects/audit.hk",
         "\
 effect Audit {
-  on @order.placed { order_id } {
+  on @order.placed { @key order_id } {
     http.post(\"https://audit.test/log\", { \"order_id\": order_id })
     http.post(\"https://audit.test/v2\", { \"order_id\": order_id })
   }
@@ -1502,7 +1502,7 @@ fn an_effect_that_stops_handling_an_uncalled_invocation_is_still_reported() {
             "effects/notify.hk",
             "\
 effect Notify {
-  on @order.placed { order_id } {
+  on @order.placed { @key order_id } {
     log(\"seen {order_id}\")
   }
 }
@@ -1516,7 +1516,7 @@ effect Notify {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.cancelled { order_id } {
+  on @order.cancelled { @key order_id } {
     log(\"seen {order_id}\")
   }
 }
@@ -1679,7 +1679,7 @@ fn an_invocation_that_journaled_nothing_and_now_crashes_is_reported() {
             "effects/notify.hk",
             "\
 effect Notify {
-  on @order.placed { order_id } {
+  on @order.placed { @key order_id } {
     log(\"placed {order_id}\")
   }
 }
@@ -1695,7 +1695,7 @@ effect Notify {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.placed { order_id } {
+  on @order.placed { @key order_id } {
     log(\"placed {order_id / (order_id - order_id)}\")
   }
 }
@@ -1740,7 +1740,7 @@ fn an_event_an_effect_only_folds_over_still_pulls_it_in() {
             "effects/notify.hk",
             "\
 effect Notify {
-  on @order.placed as e {
+  on @order.placed as e { @key order_id } {
     fold cancelled: Int = 0
       on @order.cancelled(order_id: e.order_id) => cancelled + 1
 
@@ -1792,7 +1792,7 @@ fn a_record_an_effect_only_constructs_still_pulls_it_in() {
                 "effects/notify.hk",
                 "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     let body = Payload { to: email }
     http.post(endpoint(order_id), { \"to\": body.to })
   }
@@ -1837,7 +1837,7 @@ fn an_added_effect_is_not_counted_against_the_replay() {
         "effects/ship.hk",
         "\
 effect Ship {
-  on @order.placed { order_id } {
+  on @order.placed { @key order_id } {
     http.post(\"https://ship.test/queue\", { \"order_id\": order_id })
   }
 }
@@ -1871,7 +1871,7 @@ fn a_candidate_that_would_now_fail_terminally_is_reported() {
 
     let giving_up = "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     http.post(endpoint(order_id), { \"to\": email })
     fail(\"the mailer is being retired\")
   }
@@ -2028,7 +2028,7 @@ fn an_operator_skip_is_uncovered_whatever_its_journal_holds() {
         "effects/notify.hk",
         "\
 effect Notify {
-  on @order.placed { order_id, email } {
+  on @order.placed { @key order_id, email } {
     log(\"notifying {order_id}\")
     http.post(endpoint(order_id), { \"to\": email })
     http.post(\"https://audit.test/log\", { \"order_id\": order_id })

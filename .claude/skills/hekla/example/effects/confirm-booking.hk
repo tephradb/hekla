@@ -5,9 +5,11 @@
 // any 5xx) before the arm sees them, so a `status >= 400` here is a real decision.
 // Each `http.*` call is journaled, so a crash after the POST replays the recorded
 // response instead of sending twice, and the `invoke` below lands exactly once.
-
+//
+// `@key guest_id` names the lane. A guest's bookings confirm in log order, which is
+// what the fold below counts; two different guests need not wait for each other.
 effect ConfirmBooking {
-  on @booking.made as e {
+  on @booking.made as e { @key guest_id } {
     // The fold is bounded at this event's own position, so the count is a function of
     // the log prefix rather than of when the handler happened to run. An effect gets
     // state this way, never by reading a projector.

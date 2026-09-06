@@ -5,9 +5,11 @@
 // any 5xx) before the arm sees them, so a `status >= 400` that reaches here is a real
 // rejection to decide on. A crash after the POST but before the journal write replays
 // the POST; the `invoke` lands exactly once.
-
+//
+// `@key user_id` names the lane, so a registration whose welcome will not send holds
+// up that user and no one else.
 effect SendWelcome {
-  on @user.registered { user_id, email } {
+  on @user.registered { @key user_id, email } {
     let response = http.post("https://example.test/welcome", { "email": email })
     if response.status >= 400 {
       log("welcome email rejected with status {response.status}")

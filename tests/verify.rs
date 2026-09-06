@@ -349,7 +349,7 @@ command LogNote(note_id: Uuid) { emit @note.logged { note_id } }
             "effects/record-note.hk",
             r#"
 effect RecordNote {
-  on @note.made { note_id } {
+  on @note.made { @key note_id } {
     http.post("https://example.test/note", { "id": note_id })
     invoke LogNote { note_id }
   }
@@ -424,7 +424,7 @@ command CloseAccount(account_id: Int, email: String?) {
             "effects/shred-account.hk",
             r#"
 effect ShredAccount {
-  on @account.closed { account_id } {
+  on @account.closed { @key account_id } {
     http.post("https://example.test/farewell", { "id": account_id })
     erase(account_id)
   }
@@ -821,7 +821,7 @@ command CloseAccount(customer_id: Int, email: String?) {
             "effects/forget-customer.hk",
             r#"
 effect ForgetCustomer {
-  on @customer.closed { customer_id, email } {
+  on @customer.closed { @key customer_id, email } {
     let address = reveal(email)
     http.post("https://example.test/farewell", { "to": address })
     erase(customer_id)

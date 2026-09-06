@@ -869,7 +869,7 @@ fn rotating_the_master_survives_a_restart_and_a_wrong_master_fails_boot() {
 /// condition is an ordinary `if` in the body.
 const SHRED_EFFECT: &str = r#"
 effect Shred {
-  on @order.placed { customer_id } {
+  on @order.placed { @key customer_id } {
     if customer_id == 42 {
       erase(customer_id)
     }
@@ -917,7 +917,7 @@ fn an_effect_erases_a_subject_and_shreds_its_data() {
 /// ordinals, so both are journaled separately and a replay skips both.
 const DOUBLE_SHRED_EFFECT: &str = r#"
 effect Shred {
-  on @order.placed { customer_id } {
+  on @order.placed { @key customer_id } {
     erase(customer_id)
     erase(customer_id)
   }

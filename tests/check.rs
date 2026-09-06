@@ -133,7 +133,7 @@ projector Stray {
                 "projectors/stray.hk",
                 r#"
 effect Stray {
-  on @thing.happened {
+  on @thing.happened { @key thing_id } {
     log("hi")
   }
 }
@@ -847,7 +847,7 @@ test "the wrong secret" {
 
 const RELAY_EFFECT: &str = r#"
 effect Relay {
-  on @thing.happened { thing_id, owner, secret } {
+  on @thing.happened { @key thing_id, owner, secret } {
     let response = http.post("https://relay.test/first", { "id": thing_id })
     if response.status >= 400 {
       log("relay rejected with status {response.status}")
@@ -975,7 +975,7 @@ test "backwards" {
 fn an_erase_is_assertable_and_the_key_is_really_gone() {
     let shred = r#"
 effect Shred {
-  on @thing.happened { owner } {
+  on @thing.happened { @key owner } {
     erase(owner)
   }
 }
@@ -1043,7 +1043,7 @@ fn an_effect_that_does_nothing_asserts_nothing() {
                 "effects/quiet.hk",
                 r#"
 effect Quiet {
-  on @thing.happened { owner } {
+  on @thing.happened { @key owner } {
     if owner > 100 {
       log("big owner")
     }
