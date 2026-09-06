@@ -594,6 +594,60 @@ impl OpDb {
         Ok(count as usize)
     }
 
+    /// Resolve this effect's first activation against this data directory, or read back
+    /// the one already recorded.
+    ///
+    /// `docs/effects.md` rule 15: `on live` is not a position constant in source, it is
+    /// a number the runtime resolves once and keeps, so dev, staging and production each
+    /// resolve correctly and `hek digest` does not move when an operator makes an
+    /// operational decision.
+    ///
+    /// Insert-or-ignore then read is what makes "once" true. The insert is a single
+    /// autocommit statement, so the row either holds the first-ever head or does not
+    /// exist; a crash between the two re-reads the same row next boot. `head` is only
+    /// consulted the first time, which is what makes the boundary mean "after this
+    /// effect first ran here" rather than "after the last restart".
+    pub fn activate_effect(
+        &self,
+        effect: &str,
+        head: u64,
+        lane_scheme: &str,
+        now: &str,
+    ) -> anyhow::Result<Activation> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO effect_activation \
+                 (effect, live_boundary, lane_scheme, activated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![effect, head as i64, lane_scheme, now],
+            )
+            .context("activating an effect")?;
+        self.effect_activation(effect)?
+            .ok_or_else(|| anyhow::anyhow!("effect `{effect}` has no activation row after insert"))
+    }
+
+    /// The recorded activation, without creating one. `None` before the effect has ever
+    /// run against this directory.
+    ///
+    /// Separate from [`OpDb::activate_effect`] because a reader must not activate an
+    /// effect by looking at it: `/admin/effects` and `hekla plan` both ask, and a plan
+    /// that resolved a live boundary as a side effect of reporting on one would pin
+    /// history at whatever the head was when someone ran a dry run.
+    pub fn effect_activation(&self, effect: &str) -> anyhow::Result<Option<Activation>> {
+        self.conn
+            .query_row(
+                "SELECT live_boundary, lane_scheme FROM effect_activation WHERE effect = ?1",
+                params![effect],
+                |row| {
+                    Ok(Activation {
+                        live_boundary: row.get::<_, i64>(0)? as u64,
+                        lane_scheme: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .context("reading an effect activation")
+    }
+
     /// Positions of this effect's still-`running` invocations that were recorded under
     /// a *known* other version of it, for the restart warning.
     ///
@@ -1437,6 +1491,14 @@ ALTER TABLE effect_invocation ADD COLUMN skipped_at TEXT;
 /// boot with this table empty would be correct, only slower. What they buy is that a
 /// resume from a mark far behind a fast lane skips those positions in memory instead of
 /// asking the op-DB about each one, and that per-lane progress outlives the process.
+///
+/// **`effect_activation` is the `on live` boundary, and it is deliberately not a column
+/// on `effect_cursor`.** The boundary is written at first activation, before the effect
+/// has advanced anything, and a cursor row means "this effect has persisted a
+/// watermark": `/admin/effects` reports a missing one as `null` for "never ran", and
+/// `sweep_effect_journal` relies on the same absence to sweep nothing. Writing a cursor
+/// row early would quietly destroy both. `lane_scheme` rides along because it has the
+/// same lifetime: one row per effect, written when it first runs here.
 const SCHEMA_V8: &str = "
 CREATE TABLE effect_lane (
     effect   TEXT    NOT NULL,
@@ -1446,7 +1508,27 @@ CREATE TABLE effect_lane (
 );
 -- The sweep deletes by `(effect, position <= mark)`, which the primary key cannot serve.
 CREATE INDEX effect_lane_by_position ON effect_lane (effect, position);
+
+CREATE TABLE effect_activation (
+    effect        TEXT    NOT NULL PRIMARY KEY,
+    -- The log head the first time this effect ran against this data directory. `on live`
+    -- arms decline every position at or below it, for as long as the row exists.
+    live_boundary INTEGER NOT NULL,
+    -- Which lane each event type lands in, as canonical JSON. Compared at every boot:
+    -- a key that changed repartitions the lanes, so the rows above are meaningless.
+    lane_scheme   TEXT    NOT NULL,
+    activated_at  TEXT    NOT NULL
+);
 ";
+
+/// What an effect's first activation against this data directory recorded: the position
+/// `on live` arms decline at or below, and the lane scheme its rows above the watermark
+/// are keyed under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activation {
+    pub live_boundary: u64,
+    pub lane_scheme: String,
+}
 
 /// One effect invocation, as an introspection reader sees it. `status` is `running` or
 /// `terminal`, and `skipped_at` is set when an operator skipped a wedged invocation
@@ -1544,6 +1626,7 @@ mod tests {
             "effect_cursor",
             "effect_quarantine",
             "effect_lane",
+            "effect_activation",
             "subject_key",
         ] {
             let count: i64 = db
@@ -2045,6 +2128,33 @@ mod tests {
         assert_eq!(lanes.get("ahead"), Some(&9));
     }
 
+    /// The whole point of resolving the boundary once: a later boot at a longer log
+    /// reads back the head the *first* boot saw, so `on live` means "after this effect
+    /// first ran here" rather than "after the last restart".
+    #[test]
+    fn an_activation_keeps_the_head_the_first_one_saw() {
+        let db = OpDb::open_in_memory().unwrap();
+        let first = db.activate_effect("e", 100, "{}", "t0").unwrap();
+        assert_eq!(first.live_boundary, 100);
+
+        let second = db.activate_effect("e", 900, "{}", "t1").unwrap();
+        assert_eq!(
+            second.live_boundary, 100,
+            "a restart does not re-resolve it"
+        );
+    }
+
+    #[test]
+    fn reading_an_activation_does_not_create_one() {
+        let db = OpDb::open_in_memory().unwrap();
+        assert_eq!(db.effect_activation("e").unwrap(), None);
+        db.activate_effect("e", 42, "{\"@a.b\":[\"k\"]}", "t0")
+            .unwrap();
+        let seen = db.effect_activation("e").unwrap().unwrap();
+        assert_eq!(seen.live_boundary, 42);
+        assert_eq!(seen.lane_scheme, "{\"@a.b\":[\"k\"]}");
+    }
+
     /// v8 adds tables rather than touching one, so the rows that were already there have
     /// to come through untouched, including the cursor, whose *meaning* changes without
     /// its contents changing.
@@ -2076,8 +2186,11 @@ mod tests {
         let db = OpDb::open(&path).unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(db.effect_resume_after("e").unwrap(), 42);
-        // A directory that predates lanes has no lane rows: nothing to resume past.
+        // A directory that predates lanes has no lane rows and no activation, which is
+        // exactly what a first boot under v8 should find: nothing to resume past, and a
+        // boundary still to resolve.
         assert!(db.effect_lanes("e").unwrap().is_empty());
+        assert_eq!(db.effect_activation("e").unwrap(), None);
     }
 
     // --- introspection readers ---------------------------------------------

@@ -420,6 +420,9 @@ rotation.
   different lanes are not. Two warranty plans in one shop write variants onto the same remote
   product, so they belong in one lane keyed by the shop even though per-plan parallelism looks
   tempting. Getting this too fine is a correctness bug; getting it too coarse only costs throughput.
+- **`on live` is resolved once, at the effect's first activation against a data directory**, and kept.
+  So deploy a `live` effect when you mean its history to be ignored from, not later and not with
+  the intention of fixing it up afterwards.
 - **Write the test.** `hekla test` runs heklang's own runner against hekla's real world: real tephra,
   a real SQLite read model and a real key store. An erasure case there is worth running precisely
   because the ciphertext and the deleted key are real.

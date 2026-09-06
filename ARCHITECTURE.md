@@ -694,6 +694,13 @@ retention is bounded by the mark, so a lane wedged for a month makes a month of 
 unsweepable for *every* lane. `fail()` and an operator skip are what resolve it, which is why
 `/status` names the pinning key rather than leaving an operator to find one bad shop among thousands.
 
+**The live boundary** is a second number, not a watermark started at head: an effect may mix `on` and
+`on live` arms and one cursor cannot begin at both 0 and head. It is the log head the first time the
+effect ran against this data directory, resolved once and kept, so source states intent and dev,
+staging and production each resolve correctly. A position an `on live` arm declines gets **no
+invocation row at all**, because a terminal row with an empty journal would read back through the replay
+check as reproduced, which is a claim about work nobody did.
+
 **Redeploy**: content-hash keying limits the blast radius. Unchanged calls replay from the journal
 regardless of edits elsewhere in the file, so the failure mode of editing during a deploy is "a
 different path was taken", not "a side effect fired twice"; duplicates require editing the URL or body

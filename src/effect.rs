@@ -57,6 +57,7 @@ use crate::hash::sha256_hex;
 use crate::heklang_host::{HeklaHost, Journal, from_tephra, query_of_types};
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
 use crate::invariant::Violation;
+use heklang::ir::Delivery;
 
 use crate::lane::LaneId;
 use crate::lanes::LaneState;
@@ -164,6 +165,13 @@ pub struct EffectShared {
     /// How many real lanes are wedged. `consecutive_failures` counts one lane's
     /// attempts and cannot say how many lanes are in that state.
     wedged_lanes: AtomicU64,
+    /// The position `on live` arms decline at or below: the log head the first time this
+    /// effect ran against this data directory. Rule 15 resolves it once and keeps it, so
+    /// source states intent and dev, staging and production each resolve correctly.
+    live_boundary: u64,
+    /// How many positions the boundary has declined since this process started, so an
+    /// operator can see `on live` working rather than guess why nothing fired.
+    live_suppressed: AtomicU64,
     /// The lane whose failure is holding the watermark down, and the position it failed
     /// at, republished from `stuck` alongside `last_error`.
     ///
@@ -175,7 +183,7 @@ pub struct EffectShared {
 }
 
 impl EffectShared {
-    fn new(name: String, sources: Vec<String>, resume: u64) -> EffectShared {
+    fn new(name: String, sources: Vec<String>, resume: u64, live_boundary: u64) -> EffectShared {
         EffectShared {
             name,
             sources,
@@ -189,10 +197,22 @@ impl EffectShared {
             started: Instant::now(),
             retry_at_ms: AtomicU64::new(0),
             quarantined: AtomicBool::new(false),
+            live_boundary,
+            live_suppressed: AtomicU64::new(0),
             stuck: Mutex::new(BTreeMap::new()),
             wedged_lanes: AtomicU64::new(0),
             pinning: Mutex::new(None),
         }
+    }
+
+    /// The position `on live` arms decline at or below.
+    pub fn live_boundary(&self) -> u64 {
+        self.live_boundary
+    }
+
+    /// How many positions `on live` arms have declined since this process started.
+    pub fn live_suppressed(&self) -> u64 {
+        self.live_suppressed.load(Ordering::Relaxed)
     }
 
     /// The last watermark this effect has processed every matching event up to.
@@ -829,8 +849,26 @@ fn spawn(
         );
     }
 
-    let shared = Arc::new(EffectShared::new(name.clone(), sources, resume));
+    // Rule 15: `on live` is not a position constant in source, it is one the runtime
+    // resolves once, at first activation, per data directory. Resolved here rather than in
+    // the reader so it is fixed before any position can be dispatched, and for every
+    // effect whether or not it has a `live` arm today, and that is what makes the number mean
+    // "when this effect first ran here" rather than "when someone added a live arm".
+    let activation = runtime.activate_effect(
+        &name,
+        runtime.log_head(),
+        &unit.lane_scheme,
+        &runtime::now_rfc3339(),
+    )?;
+
+    let shared = Arc::new(EffectShared::new(
+        name.clone(),
+        sources,
+        resume,
+        activation.live_boundary,
+    ));
     let task_shared = Arc::clone(&shared);
+
     let join = thread::Builder::new()
         .name(format!("effect-{name}"))
         .spawn(move || run(task_shared, unit, runtime, http, pool))
@@ -1107,6 +1145,7 @@ fn admit(
     let program = ctx.runtime.program();
     let declared = program.effect(ctx.name());
     let mut resolved = Vec::with_capacity(batch.len());
+    let mut suppressed = 0u64;
     for (position, event) in batch {
         // The subscription selects on event type, so this normally matches. An event
         // type the effect no longer answers is simply scanned past, exactly as a
@@ -1114,11 +1153,26 @@ fn admit(
         let Some(arm) = ctx.unit.arms.get(event.event_type()) else {
             continue;
         };
+        // Rule 15: an `on live` arm declines history outright. Declining is not
+        // completing: the position gets no `effect_invocation` row, never enters the
+        // in-flight set, and the mark passes straight over it. A terminal row with an
+        // empty journal would read back through `replay` as `Matched`, a claim that a
+        // position nothing ran is covered.
+        if arm.delivery == Delivery::Live && position.get() <= ctx.shared.live_boundary() {
+            suppressed += 1;
+            continue;
+        }
         let lane = match declared {
             Some(declared) => lane_of(program, declared, arm.index, *position, event),
             None => LaneId::unreadable(),
         };
         resolved.push((position.get(), lane));
+    }
+
+    if suppressed > 0 {
+        ctx.shared
+            .live_suppressed
+            .fetch_add(suppressed, Ordering::Relaxed);
     }
 
     let mut armed = Vec::new();
@@ -2285,7 +2339,7 @@ mod tests {
     use super::*;
 
     fn test_shared() -> EffectShared {
-        EffectShared::new("test".to_owned(), Vec::new(), 0)
+        EffectShared::new("test".to_owned(), Vec::new(), 0, 0)
     }
 
     fn test_lane() -> LaneId {

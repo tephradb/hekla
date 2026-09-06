@@ -1882,12 +1882,16 @@ fn projector_status_schema() -> Value {
 fn effect_state_schema() -> Value {
     json!({
         "type": "string",
-        "enum": ["healthy", "lagging", "quarantined", "wedged"],
+        "enum": ["blocked", "healthy", "lagging", "quarantined", "wedged"],
         "description": "What the counters below add up to, derived once in the runtime \
-            so no two readers disagree. `quarantined` outranks `wedged`, which outranks \
-            `lagging`: a quarantine restored from an earlier process carries no failure \
-            count, and a wedged effect lags precisely because it is wedged, so reporting \
-            the symptom would bury the cause. \n\n\
+            so no two readers disagree. `quarantined` outranks `blocked`, which \
+            outranks `wedged`, which outranks `lagging`: a quarantine restored from an \
+            earlier process carries no failure count, and a wedged effect lags precisely \
+            because it is wedged, so reporting the symptom would bury the cause. \n\n\
+            `blocked` is stopped and waiting for a person: an arm's partition key changed \
+            while lanes were still outstanding, so the runtime will not start it until the \
+            effect has drained under the previous key. Nothing is retrying, and nothing \
+            clears it but a redeploy. \n\n\
             `lagging` is normal and transient. The driver polls on an interval while the \
             log head is read per request, so every append leaves a healthy effect briefly \
             behind. Treat a sustained `lagging` as a signal and a momentary one as noise.",
@@ -2327,6 +2331,24 @@ fn effect_detail_schema() -> Value {
                 "description": "Where that lane is stuck: the position an operator skip \
                     names. Null when no lane is failing.",
             },
+            "live_boundary": {
+                "type": "integer",
+                "minimum": 0,
+                "format": "int64",
+                "description": "The log head the first time this effect ran against this \
+                    data directory. An `on live` arm declines every position at or below \
+                    it, for as long as the record exists. Resolved once and kept, so source \
+                    states intent and dev, staging and production each resolve correctly; \
+                    `hekla rewind --live` is the only way to move it.",
+            },
+            "live_suppressed": {
+                "type": "integer",
+                "minimum": 0,
+                "format": "int64",
+                "description": "Positions declined by the boundary since this process \
+                    started, so an operator can see `on live` working rather than guess why \
+                    nothing fired. Process-local: a restart resets it.",
+            },
             "terminal_skips": {
                 "type": "integer",
                 "minimum": 0,
@@ -2353,7 +2375,8 @@ fn effect_detail_schema() -> Value {
         "required": [
             "name", "state", "position", "lag", "retry_in_ms", "sources", "watermark",
             "consecutive_failures", "last_error", "wedged_lanes", "pinning_key",
-            "pinning_position", "terminal_skips", "last_terminal_error",
+            "pinning_position", "live_boundary", "live_suppressed", "terminal_skips",
+            "last_terminal_error",
             "quarantined", "quarantine"
         ],
         "additionalProperties": false,
@@ -3553,7 +3576,10 @@ mod tests {
                 .collect()
         };
         let detail = enum_of("EffectDetail");
-        assert_eq!(detail, ["healthy", "lagging", "quarantined", "wedged"]);
+        assert_eq!(
+            detail,
+            ["blocked", "healthy", "lagging", "quarantined", "wedged"]
+        );
         // `/status` and `/admin/effects` read one function on the shared handle, so a
         // client that learned the vocabulary from either must not meet a word from the
         // other. Both schemas carry `additionalProperties: false`, which makes a

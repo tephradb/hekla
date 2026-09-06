@@ -11,7 +11,7 @@
 //! event, a guard, a refusal or a `fn` is declared is the author's business. `events/`,
 //! `lib/` and `tests/` are what the examples do, and nothing here checks them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -211,6 +211,27 @@ pub struct EffectUnit {
     pub sources: Vec<String>,
     /// Every event type this effect answers, and the arm that answers it.
     pub arms: HashMap<String, ArmRef>,
+    /// Which lane each of those event types lands in, as one canonical line per type:
+    ///
+    /// ```text
+    /// @order.placed=customer_id
+    /// @shop.connected=shop_id,plan_id
+    /// ```
+    ///
+    /// Compared at every boot against what the last one recorded, because a `@key` that
+    /// changed repartitions the lanes and leaves the per-lane rows above the watermark
+    /// keyed under a scheme that no longer produces them.
+    ///
+    /// **Deliberately narrower than the digest's `signature_hash`**, which an effect's
+    /// arms also move by changing a delivery modifier or gaining an event path. Neither
+    /// of those invalidates a lane row, and gating on the broader hash would stop an
+    /// effect over an edit that repartitioned nothing.
+    ///
+    /// Sorted by event type, so reordering an effect's arms is not a change. The key list
+    /// keeps its written order, because `{ @key a, @key b }` and `{ @key b, @key a }` are
+    /// different lanes. Neither an event type nor a field name can contain `=`, `,` or a
+    /// newline, so the rendering is unambiguous without escaping.
+    pub lane_scheme: String,
 }
 
 /// Everything the loader produced from a project directory.
@@ -455,6 +476,7 @@ impl LoadedProject {
                 digest_hash: hash_of(Kind::Effect, &effect.name),
                 rel_path: rel,
                 arms: arm_index(effect),
+                lane_scheme: lane_scheme(effect),
                 sources,
             });
         }
@@ -511,6 +533,21 @@ fn arm_index(effect: &heklang::ir::Effect) -> HashMap<String, ArmRef> {
         }
     }
     arms
+}
+
+/// Renders [`EffectUnit::lane_scheme`], which documents the format and why it is the
+/// shape it is.
+fn lane_scheme(effect: &heklang::ir::Effect) -> String {
+    let mut lines: BTreeMap<String, String> = BTreeMap::new();
+    for arm in &effect.arms {
+        for path in &arm.events {
+            lines.insert(schema::event_type(path), arm.keys.join(","));
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(ty, keys)| format!("{ty}={keys}\n"))
+        .collect()
 }
 
 /// Every `.hk` file in the project, sorted.
@@ -841,6 +878,37 @@ effect Both {
         assert_eq!(one.delivery, Delivery::Every);
     }
 
+    /// The scheme is what a re-partition is detected by, so it has to move for a key
+    /// change and stay put for everything else an author might edit.
+    #[test]
+    fn the_lane_scheme_moves_only_when_a_key_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = lane_scheme_of(dir.path(), "on @e.one as one { @key id } { log(\"a\") }");
+        assert_eq!(base, "e.one=id\n");
+
+        assert_eq!(
+            base,
+            lane_scheme_of(dir.path(), "on @e.one as one { @key id } { log(\"b\") }"),
+            "a body edit repartitions nothing"
+        );
+        assert_eq!(
+            base,
+            lane_scheme_of(
+                dir.path(),
+                "on live @e.one as one { @key id } { log(\"a\") }"
+            ),
+            "a delivery modifier repartitions nothing, though it does move signature_hash"
+        );
+        assert_ne!(
+            base,
+            lane_scheme_of(
+                dir.path(),
+                "on @e.one as one { id, @key other } { log(\"a\") }"
+            ),
+            "a different key is a different lane"
+        );
+    }
+
     fn load_effects(dir: &Path, effects: &str) -> LoadedProject {
         for (rel, text) in [
             (
@@ -854,5 +922,16 @@ effect Both {
             std::fs::write(path, text).unwrap();
         }
         LoadedProject::load(dir)
+    }
+
+    fn lane_scheme_of(dir: &Path, arm: &str) -> String {
+        let project = load_effects(dir, &format!("effect Probe {{\n  {arm}\n}}\n"));
+        assert!(!project.has_errors(), "{:?}", project.findings);
+        project
+            .effects
+            .first()
+            .expect("one effect")
+            .lane_scheme
+            .clone()
     }
 }

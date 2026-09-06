@@ -64,19 +64,31 @@ failing the request:
 ```json
 { "name": "SendWelcome", "state": "wedged", "position": 1, "watermark": 1, "lag": 3,
   "consecutive_failures": 8, "last_error": "effects/send-welcome.hk:11:20: ...",
+  "wedged_lanes": 1, "pinning_key": "i:4471", "pinning_position": 2,
+  "live_boundary": 0, "live_suppressed": 0,
   "last_terminal_error": null, "terminal_skips": 0, "quarantined": false, "quarantine": null,
   "retry_in_ms": 39719, "sources": ["user.registered"] }
 ```
 
 `position` is the in-memory watermark and `watermark` is the persisted one (`null` when the effect has
-never persisted one, which means the next boot replays from position 0). `sources` is the event types
-the arms name, and it is always a list: there is no way to subscribe to everything.
+never persisted one, which means the next boot replays from position 0). Both are **low-water marks**:
+the highest position every lane has passed, not the newest thing finished.
+
+`pinning_key` is the partition key of the lane holding that mark down and `pinning_position` is where
+it is stuck: the position an operator skip takes. `wedged_lanes` says how many lanes are stuck at
+all, which `consecutive_failures` (the pinning lane's attempts) cannot. `live_boundary` is the log
+head at this effect's first activation here, which `on live` arms decline at or below;
+`live_suppressed` counts what they have declined since this process started.
+
+`sources` is the event types the arms name, and it is always a list: there is no way to subscribe to
+everything.
 
 ## `/admin/effects/{name}/invocations[/{position}]`
 
 The list gives one row per invocation: `position`, `status` (`running` or `terminal`), `created_at`,
-`completed_at`, `script_hash`. **This is where a wedge actually shows**: the stuck position is the one
-with `status: running`, while `/status` still reports the older watermark.
+`completed_at`, `script_hash`. Under lanes several rows can be `running` at once, one per lane, so
+**the stuck position to act on is `pinning_position`** rather than whichever running row is newest,
+skipping the newest would not release the watermark.
 
 One invocation adds its journaled calls:
 

@@ -43,8 +43,8 @@ use crate::http::HttpClient;
 use crate::loader::{self, CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::lock::DataDirLock;
 use crate::opdb::{
-    DeclarationRow, EffectState, InvocationAt, InvocationRow, InvocationState, JournalRow, OpDb,
-    SubjectInfo,
+    Activation, DeclarationRow, EffectState, InvocationAt, InvocationRow, InvocationState,
+    JournalRow, OpDb, SubjectInfo,
 };
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
@@ -762,6 +762,19 @@ impl Runtime {
     /// How many lanes are still ahead of the mark. Zero means the effect has drained.
     pub fn effect_lanes_outstanding(&self, effect: &str) -> anyhow::Result<usize> {
         self.lock_opdb().effect_lanes_outstanding(effect)
+    }
+
+    /// Resolve this effect's first activation against this data directory, or read back
+    /// the one already recorded. See [`OpDb::activate_effect`].
+    pub fn activate_effect(
+        &self,
+        effect: &str,
+        head: u64,
+        lane_scheme: &str,
+        now: &str,
+    ) -> anyhow::Result<Activation> {
+        self.lock_opdb()
+            .activate_effect(effect, head, lane_scheme, now)
     }
 
     pub(crate) fn begin_invocation(

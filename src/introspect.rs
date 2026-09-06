@@ -346,6 +346,12 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
         "consecutive_failures": shared.consecutive_failures(),
         "last_error": shared.last_error(),
         "wedged_lanes": shared.wedged_lanes(),
+        // Rule 15: the position `on live` arms decline at or below, resolved once at
+        // this effect's first activation against this data directory and kept since.
+        "live_boundary": shared.live_boundary(),
+        // Positions declined since this process started, so an operator can see `on live`
+        // working rather than guess why nothing fired.
+        "live_suppressed": shared.live_suppressed(),
         // The lane whose failure is pinning the mark, which is the one `last_error`
         // describes and the one an operator skips.
         "pinning_key": pinning.as_ref().map(|(lane, _)| lane),
