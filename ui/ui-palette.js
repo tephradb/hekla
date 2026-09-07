@@ -42,6 +42,21 @@ function suggestions(query, status) {
       })
     }
   }
+  /* Both lists, because the detail page answers for both: a public command opens its
+   * run form, and an internal one opens the page that explains why it has none. */
+  for (const [name, internal] of [
+    ...(status?.commands?.public ?? []).map((name) => [name, false]),
+    ...(status?.commands?.internal ?? []).map((name) => [name, true]),
+  ]) {
+    if (matches(name)) {
+      out.push({
+        group: 'COMMAND',
+        label: name,
+        hint: internal ? 'internal' : 'run',
+        href: `/admin/commands/${encodeURIComponent(name)}`,
+      })
+    }
+  }
   for (const projector of status?.projectors ?? []) {
     if (matches(projector.name)) {
       out.push({

@@ -1728,6 +1728,63 @@ Honest scope for this phase:
   router the moment they were written. `describe`'s two corrected forms are pinned by unit tests in
   `src/schema.rs`.
 
+## Phase 29: the console can run a command (done)
+
+After phase 28 the console could diagnose everything and cause nothing. The only writes it drove were
+`replay` and `skip`, both operator surgery; to make the application actually do something you left for
+`curl`, and the empty-log state said "run a command and it will appear here" with no way to do so.
+
+Commands were also the one module kind with no per-name `/admin` endpoint. An effect and a projector
+each had one; a command existed only as a row inside `/admin/schema`. This closes that gap and then
+uses it: `GET /admin/commands` and `GET /admin/commands/{name}` answer JSON, and answer the console's
+run form to a browser, on the same URL as everything else here.
+
+- **The form is generated from the declaration, and that is worth more than a `curl` snippet for one
+  reason: it makes the wire rules structural.** A `Money(n)` leaves as a decimal string and never as a
+  JSON number, a `Timestamp` carries its offset because the `now` button emits `toISOString`, and an
+  `Int` past 2^53 keeps its digits. Those are three of the easiest things to get wrong by hand and a
+  generated body cannot get them wrong at all.
+- **The body is built as JSON text, not as an object.** Two field kinds cannot survive a round trip
+  through a JavaScript value: an `Int` past 2^53 loses digits and a `Money` turned into a number is a
+  float. Emitting each field as an already-correct JSON fragment settles both where the rule is known,
+  and it makes the `JSON` tab literally the bytes that get posted rather than a rendering of them. The
+  same reasoning as `arbitrary_precision` in `Cargo.toml`, at the other end of the wire.
+- **A plain Run button, not the typed confirmation `replay` and `skip` use.** A command is the
+  application's front door rather than operator surgery, the console is exactly as powerful here as
+  `curl` against the same port, and a dialog per run would make the loop this exists for unusable.
+- **The result links onward.** A committed run shows each appended position as a link to that event,
+  the emitted events with their tags, and the correlation id as a link to the trace. `positions: null`
+  says plainly that the command decided to append nothing, which is a success and what an idempotent
+  replay looks like.
+- **A 422 is rendered as the command working.** It ran, folded its boundary and declined; the code is
+  a declared `refusal` and nothing was appended. Painting it the same red as a 500 would teach the
+  opposite of what a refusal is for. A 409 gets a Retry button, because retrying is what its message
+  says to do.
+- **One renderer for a command, not two.** `introspect::command_detail` is what `/admin/commands`,
+  `/admin/commands/{name}` and `/admin/schema` all return, and the document `$ref`s it in both places.
+  The inline copy that used to live in `schema_path` was the shape most likely to drift, because
+  nothing failed when the two disagreed.
+
+Honest scope for this phase:
+
+- **An internal command gets the page and not the form.** `Runtime::execute` filters them, so `POST
+  /commands/{name}` is a 404 for one; the page says so and still lists its parameters, because an
+  operator reading an effect's journal needs the shape.
+- **`input` gained `optional`.** The `?` is in the `kind` string already, but parsing it back out is
+  not uniform (an optional enum is `(A | B)?` where an optional bounded string is `String? @max(200)`),
+  and an entity's and an event's fields already report the flag. One more field, three surfaces
+  consistent.
+- **An empty optional is omitted rather than sent as an explicit null.** Both are accepted, and
+  omission is the one a single control can express. The `JSON` tab is the escape hatch for the other,
+  and for an empty string, and for anything else the form renders imperfectly.
+- **A required enum starts on its first variant**, which is legal but is not necessarily the enum's
+  `@default`: `FieldKind::OneOf` carries the variants and not which one that is. Starting empty was
+  worse, since a required select has no empty option and would post `""`.
+- **Still no JavaScript test runner.** The two scanning tests covered the new URLs and the two new
+  assets without being touched, as designed. The interactive paths were driven in a real browser
+  instead, through `HEKLA_UI_DIR`: the form building the right body for every kind, the JSON override,
+  a refusal, and an idempotency key replaying a commit without appending a second one.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

@@ -41,7 +41,7 @@ use crate::introspect;
 use crate::projector::{ProjectorSet, ProjectorShared, Readiness};
 use crate::read_api;
 use crate::runtime::{Runtime, error_body};
-use crate::schema::{EntityDef, EventDef, ModuleDef};
+use crate::schema::{EntityDef, EventDef};
 use crate::ui;
 
 type Shared = Arc<Runtime>;
@@ -103,6 +103,8 @@ pub const ADMIN_INVOCATIONS_ROUTE: &str = "/admin/effects/{name}/invocations";
 pub const ADMIN_INVOCATION_ROUTE: &str = "/admin/effects/{name}/invocations/{position}";
 pub const ADMIN_PROJECTORS_ROUTE: &str = "/admin/projectors";
 pub const ADMIN_PROJECTOR_ROUTE: &str = "/admin/projectors/{name}";
+pub const ADMIN_COMMANDS_ROUTE: &str = "/admin/commands";
+pub const ADMIN_COMMAND_ROUTE: &str = "/admin/commands/{name}";
 pub const ADMIN_SCHEMA_ROUTE: &str = "/admin/schema";
 pub const ADMIN_SYSTEM_ROUTE: &str = "/admin/system";
 pub const ADMIN_SUBJECTS_ROUTE: &str = "/admin/subjects";
@@ -142,6 +144,8 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (ADMIN_INVOCATION_ROUTE, get(admin_invocation)),
         (ADMIN_PROJECTORS_ROUTE, get(admin_projectors)),
         (ADMIN_PROJECTOR_ROUTE, get(admin_projector)),
+        (ADMIN_COMMANDS_ROUTE, get(admin_commands)),
+        (ADMIN_COMMAND_ROUTE, get(admin_command)),
         (ADMIN_SCHEMA_ROUTE, get(admin_schema)),
         (ADMIN_SYSTEM_ROUTE, get(admin_system)),
         (ADMIN_SUBJECTS_ROUTE, get(admin_subjects)),
@@ -823,6 +827,8 @@ async fn admin_index() -> Json<Value> {
             { "path": ADMIN_INVOCATION_ROUTE, "description": "one invocation and every call it journaled" },
             { "path": ADMIN_PROJECTORS_ROUTE, "description": "every projector and its readiness" },
             { "path": ADMIN_PROJECTOR_ROUTE, "description": "one projector, its entities and their shapes" },
+            { "path": ADMIN_COMMANDS_ROUTE, "description": "every command and its parameters, internal ones included" },
+            { "path": ADMIN_COMMAND_ROUTE, "description": "one command" },
             { "path": ADMIN_SCHEMA_ROUTE, "description": "the loaded project: events, commands, projectors, effects" },
             { "path": ADMIN_SYSTEM_ROUTE, "description": "version, uptime, configuration and storage" },
             { "path": ADMIN_SUBJECTS_ROUTE, "description": "the subject-key inventory" },
@@ -1176,6 +1182,37 @@ async fn admin_projector(
     .await
 }
 
+/// `GET /admin/commands`: every declared command and what it takes.
+///
+/// Internal ones included, for the reason `/admin/schema` includes them: they are not
+/// routed, but they exist, and an operator tracing an effect's `invoke_command` needs
+/// to see one. `internal` on each says which is which.
+async fn admin_commands(State(runtime): State<Shared>) -> Response {
+    blocking_json(move || {
+        let commands = runtime
+            .command_units()
+            .into_iter()
+            .map(|unit| introspect::command_detail(unit))
+            .collect::<anyhow::Result<Vec<Value>>>()?;
+        Ok(json!({ "commands": commands }))
+    })
+    .await
+}
+
+/// `GET /admin/commands/{name}`: one command, public or internal.
+async fn admin_command(State(runtime): State<Shared>, Path(name): Path<String>) -> Response {
+    if runtime.command_unit(&name).is_none() {
+        return not_found(&format!("no command `{name}`"));
+    }
+    blocking_json(move || {
+        let unit = runtime
+            .command_unit(&name)
+            .context("the command disappeared between lookup and read")?;
+        introspect::command_detail(unit)
+    })
+    .await
+}
+
 /// `GET /admin/schema`: what this process actually loaded.
 ///
 /// Internal commands appear here, unlike in the generated OpenAPI document. They are
@@ -1189,29 +1226,7 @@ async fn admin_schema(State(runtime): State<Shared>) -> Response {
         let commands: Vec<Value> = runtime
             .command_units()
             .into_iter()
-            .map(|unit| {
-                // No fallback arm: the command map holds nothing else, and an arm
-                // reporting an empty input would render a command as taking no fields
-                // rather than surfacing the mismatch.
-                let ModuleDef::Command { input, .. } = &unit.def else {
-                    anyhow::bail!(
-                        "`{}` is in the command map but is not a command",
-                        unit.def.name()
-                    );
-                };
-                let input: Vec<Value> = input
-                    .fields
-                    .iter()
-                    .map(|(name, kind)| json!({ "name": name, "kind": kind.describe() }))
-                    .collect();
-                Ok(json!({
-                    "name": unit.def.name(),
-                    "internal": unit.internal,
-                    "path": unit.rel_path,
-                    "hash": unit.digest_hash,
-                    "input": input,
-                }))
-            })
+            .map(|unit| introspect::command_detail(unit))
             .collect::<anyhow::Result<Vec<Value>>>()?;
         let projectors: Vec<Value> = runtime
             .projector_handles()

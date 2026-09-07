@@ -33,6 +33,7 @@ use crate::crypto::{KeyStore, RowDecryptor};
 use crate::effect::EffectShared;
 use crate::envelope;
 use crate::heklang_host::unsealed_json;
+use crate::loader::CommandUnit;
 use crate::opdb::{
     DeclarationRow, EffectState, InvocationAt, InvocationRow, JournalRow, SubjectInfo,
 };
@@ -40,7 +41,7 @@ use crate::projector::ProjectorShared;
 use crate::read_api::filterable_fields;
 use crate::read_model::key_kind;
 use crate::schema::EventDefs;
-use crate::schema::{EntityDef, EventDef, FieldMeta, scalar_to_string};
+use crate::schema::{EntityDef, EventDef, FieldMeta, ModuleDef, scalar_to_string};
 use crate::store::Store;
 use crate::tags;
 use crate::tags::RESERVED_TAG_PREFIX;
@@ -507,6 +508,49 @@ pub fn event_def(def: &EventDef) -> Value {
         "type": def.event_type,
         "fields": def.fields.iter().map(|(name, meta)| field(name, meta)).collect::<Vec<_>>(),
     })
+}
+
+/// One declared command: what it takes, where it came from, and whether the HTTP
+/// surface routes it.
+///
+/// Shared by `/admin/commands`, `/admin/commands/{name}` and `/admin/schema`, so a
+/// command cannot describe itself differently depending on which one you asked.
+///
+/// No fallback arm on the `ModuleDef` match: the command map holds nothing else, and an
+/// arm reporting an empty input would render a command as taking no fields rather than
+/// surfacing the mismatch.
+pub fn command_detail(unit: &CommandUnit) -> anyhow::Result<Value> {
+    let ModuleDef::Command { input, .. } = &unit.def else {
+        anyhow::bail!(
+            "`{}` is in the command map but is not a command",
+            unit.def.name()
+        );
+    };
+    let input: Vec<Value> = input
+        .fields
+        .iter()
+        .map(|(name, kind)| {
+            json!({
+                "name": name,
+                "kind": kind.describe(),
+                // Reported rather than left to be read off the `?` in `kind`, both
+                // because an entity's and an event's fields already report it and
+                // because the string form is not uniform: an optional enum is
+                // `(A | B)?` where an optional bounded string is `String? @max(200)`.
+                "optional": kind.is_nullable(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "name": unit.def.name(),
+        // `commands/internal/` is invokable by an effect and not routed, so `POST
+        // /commands/{name}` answers 404 for one. Reported here because someone
+        // debugging an effect's `invoke_command` needs to see that it exists.
+        "internal": unit.internal,
+        "path": unit.rel_path,
+        "hash": unit.digest_hash,
+        "input": input,
+    }))
 }
 
 /// One deployed declaration as recorded at boot.

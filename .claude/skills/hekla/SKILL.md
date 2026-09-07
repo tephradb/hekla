@@ -145,6 +145,10 @@ and every error body is `{correlation_id, causation_id, error: {code, message}}`
 absent outside `/commands`). A refusal's `code` is its name in snake_case: `refusal RoomTaken` reaches
 a client as `room_taken` with 422.
 
+The console's **Commands** section (`/admin/commands`) builds these bodies from each command's declared
+parameters and posts them, which is usually faster than assembling one by hand and gets the wire forms
+right by construction. `reference/introspection.md` covers it.
+
 ## Rules that are easy to break
 
 1. **A `Timestamp` goes in two ways and comes out one.** A command parameter takes RFC 3339

@@ -17,6 +17,7 @@ events without authentication, and one prefix is what a proxy can deny.
 | `/admin/effects/{name}/invocations` | invocations, newest first |
 | `/admin/effects/{name}/invocations/{position}` | one invocation and every call it journaled |
 | `/admin/projectors`, `/admin/projectors/{name}` | readiness, entity shapes, definition hash |
+| `/admin/commands`, `/admin/commands/{name}` | every command and its parameters, internal ones included |
 | `/admin/schema` | the loaded project: every declaration with its hash and signature hash |
 | `/admin/system` | version, uptime, data directory, op-DB schema version, keystore, effective config |
 | `/admin/subjects`, `/admin/subjects/{field}/{value}` | which subjects still hold key material, never the material |
@@ -142,6 +143,18 @@ than its name, bracketed when optional: `(Low | Normal | Urgent)?`.
 In a browser this same URL is also where the console browses the rows themselves; see *Browsing a
 read model* below.
 
+## `/admin/commands/{name}`
+
+```json
+{ "name": "RegisterUser", "internal": false, "path": "commands/register-user.hk",
+  "hash": "b5f6a780…",
+  "input": [ { "name": "user_id", "kind": "Uuid", "optional": false } ] }
+```
+
+The same object `/admin/schema` lists under `commands`, from the same renderer. `internal: true` means
+`commands/internal/`: an effect reaches it through `invoke_command` and `POST /commands/{name}` answers
+404, so it is described here and absent from the generated OpenAPI document.
+
 ## `/admin/schema` and `/admin/system`
 
 `/admin/schema` is the project this process loaded, including internal commands, each command's input
@@ -175,6 +188,29 @@ instead, for editing them without a recompile.
 Two things it does that the raw API does not: it can post a replay or a skip (each behind a
 confirmation that makes you type the module's name), and it decrypts one event at a time, so one audit
 line means one operator read one event.
+
+### Running a command
+
+`/admin/commands` lists them; opening a public one gives a form generated from its parameters, and
+`Run` posts `POST /commands/{Name}`. A plain button, not the typed confirmation `replay` and `skip`
+carry: a command is the application's front door, and the console is exactly as powerful here as
+`curl` against the same port.
+
+The form is worth more than a `curl` snippet because it makes the wire rules structural. A `Money(n)`
+leaves as a decimal string, `now` on a `Timestamp` emits an offset-carrying RFC 3339, and an `Int` past
+2^53 keeps its digits (the body is built as JSON text, so nothing round-trips through a JS number).
+
+- An empty **optional** is omitted. The `JSON` tab is the override for the other accepted form (an
+  explicit null), for an empty string, and for anything else: it is seeded from the form on every
+  switch and what is in it is what gets posted.
+- `Idempotency-Key` and `X-Correlation-Id` are under `headers`. Running twice with the same key
+  replays the first commit's response verbatim and appends nothing.
+- A **422 is the command working**: it folded its boundary and declined, the code is a declared
+  `refusal`, and nothing was appended. It renders as a refusal, not a failure. A 409 offers a retry.
+- A committed run links each appended position to its event and the correlation id to its trace.
+  `positions: null` means the command decided to append nothing, which is a success.
+- An **internal** command opens the same page without a form, since nothing outside the process can
+  post to it.
 
 ### Browsing a read model
 

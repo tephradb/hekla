@@ -853,9 +853,10 @@ async fn the_journaled_call_list_pages_rather_than_truncating_silently() {
 
 #[tokio::test]
 async fn a_command_input_field_reports_only_what_an_input_schema_carries() {
-    // `schema()` rejects `subject` and `unique` outright and carries no `indexed`, so
-    // describing command input as a full field declaration would promise four
-    // properties that do not exist and fail every validator.
+    // A parameter carries a type and whether it may be absent, and nothing else.
+    // Tagging, subjects and uniqueness are event and entity policy, so describing
+    // command input as a full field declaration would promise three properties that do
+    // not exist and fail every validator.
     let harness = boot_with(Arc::new(StubHttpClient::ok()));
     let app = harness.app();
 
@@ -868,8 +869,71 @@ async fn a_command_input_field_reports_only_what_an_input_schema_carries() {
         .unwrap();
     for field in register["input"].as_array().unwrap() {
         let keys: Vec<&String> = field.as_object().unwrap().keys().collect();
-        assert_eq!(keys, vec!["kind", "name"]);
+        assert_eq!(keys, vec!["kind", "name", "optional"]);
     }
+
+    harness.shutdown();
+}
+
+/// `/admin/commands` reports what `POST /commands/{name}` will not: an internal
+/// command exists, is invokable by an effect, and is not routed.
+#[tokio::test]
+async fn the_command_list_covers_internal_commands_and_flags_them() {
+    let harness = boot_with(Arc::new(StubHttpClient::ok()));
+    let app = harness.app();
+
+    let (status, listing) = get(&app, "/admin/commands").await;
+    assert_eq!(status, 200);
+    let commands = listing["commands"].as_array().unwrap();
+    assert!(
+        commands.len() >= 2,
+        "the example declares more than one command: {commands:?}"
+    );
+
+    let register = commands
+        .iter()
+        .find(|c| c["name"] == json!("RegisterUser"))
+        .expect("RegisterUser is declared");
+    assert_eq!(register["internal"], json!(false));
+    assert!(
+        register["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["name"] == json!("user_id") && field["kind"] == json!("Uuid")),
+        "input carries the declared parameters: {register:?}"
+    );
+
+    assert!(
+        commands.iter().any(|c| c["internal"] == json!(true)),
+        "the example declares an internal command, and this is where it shows: {commands:?}"
+    );
+
+    harness.shutdown();
+}
+
+/// The shared renderer is the point of the endpoint: two URLs that disagreed about a
+/// command would be worse than one URL.
+#[tokio::test]
+async fn one_command_reads_the_same_here_as_it_does_in_the_schema() {
+    let harness = boot_with(Arc::new(StubHttpClient::ok()));
+    let app = harness.app();
+
+    let (status, one) = get(&app, "/admin/commands/RegisterUser").await;
+    assert_eq!(status, 200);
+
+    let (_, schema) = get(&app, "/admin/schema").await;
+    let from_schema = schema["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == json!("RegisterUser"))
+        .unwrap();
+    assert_eq!(&one, from_schema);
+
+    let (missing, body) = get(&app, "/admin/commands/NoSuchCommand").await;
+    assert_eq!(missing, 404);
+    assert_eq!(body["error"]["code"], json!("not_found"));
 
     harness.shutdown();
 }

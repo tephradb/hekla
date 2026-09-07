@@ -12,6 +12,10 @@ import { useEffect, useState } from './vendor-preact.js'
 /** Every view, in sidebar order. `path` is a pattern; `{name}` captures one segment. */
 export const ROUTES = [
   { id: 'overview', path: '/admin', title: 'Overview' },
+  /* Second, above everything that reads: the console's story is "here is the app, here
+   * is how you drive it, here is what happened". */
+  { id: 'commands', path: '/admin/commands', title: 'Commands' },
+  { id: 'commands', path: '/admin/commands/{name}', title: 'Commands' },
   { id: 'events', path: '/admin/events', title: 'Events' },
   { id: 'events', path: '/admin/events/{position}', title: 'Events' },
   { id: 'trace', path: '/admin/traces/{correlation_id}', title: 'Trace' },

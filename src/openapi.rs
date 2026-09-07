@@ -47,6 +47,13 @@ const INTROSPECTION_TAG: &str = "introspection";
 pub struct Surface<'a> {
     /// Public commands only. An internal one is not routed, so it is not described.
     pub commands: Vec<(&'a str, &'a InputSchema)>,
+    /// Every declared command's name, internal ones included, in name order.
+    ///
+    /// Separate from `commands` because the two answer different questions:
+    /// `commands` is the routed surface, and `/admin/commands/{name}` describes what
+    /// this process loaded, which is a superset. Enumerating only the routed names
+    /// there would document the endpoint as refusing a command it serves.
+    pub all_command_names: Vec<&'a str>,
     pub projectors: Vec<ProjectorSurface<'a>>,
     pub effects: Vec<EffectSurface<'a>>,
     pub events: Vec<(&'a str, &'a EventDef)>,
@@ -68,15 +75,17 @@ pub struct EffectSurface<'a> {
 impl<'a> Surface<'a> {
     pub fn from_project(project: &'a LoadedProject) -> Surface<'a> {
         let mut commands = Vec::new();
+        let mut all_command_names = Vec::new();
         for unit in &project.commands {
-            if unit.internal {
-                continue;
-            }
             if let ModuleDef::Command { name, input } = &unit.def {
-                commands.push((name.as_str(), input));
+                all_command_names.push(name.as_str());
+                if !unit.internal {
+                    commands.push((name.as_str(), input));
+                }
             }
         }
         commands.sort_by_key(|(name, _)| *name);
+        all_command_names.sort_unstable();
 
         let mut projectors = Vec::new();
         for unit in &project.projectors {
@@ -115,6 +124,7 @@ impl<'a> Surface<'a> {
 
         Surface {
             commands,
+            all_command_names,
             projectors,
             effects,
             events,
@@ -279,11 +289,12 @@ impl ComponentNames {
 }
 
 /// The schemas that are always present, whatever the project declares.
-const FIXED_SCHEMAS: [&str; 22] = [
+const FIXED_SCHEMAS: [&str; 23] = [
     "ErrorDetail",
     "Error",
     "CommandError",
     "CommandAccepted",
+    "CommandDetail",
     "EmittedEvent",
     "Status",
     "ProjectorStatus",
@@ -947,6 +958,11 @@ fn introspection_paths(surface: &Surface) -> Vec<(String, Value)> {
             server::ADMIN_PROJECTOR_ROUTE.to_owned(),
             projector_path(&projectors),
         ),
+        (server::ADMIN_COMMANDS_ROUTE.to_owned(), commands_path()),
+        (
+            server::ADMIN_COMMAND_ROUTE.to_owned(),
+            command_detail_path(&surface.all_command_names),
+        ),
         (server::ADMIN_SCHEMA_ROUTE.to_owned(), schema_path()),
         (server::ADMIN_SYSTEM_ROUTE.to_owned(), system_path()),
         (server::ADMIN_SUBJECTS_ROUTE.to_owned(), subjects_path()),
@@ -1395,51 +1411,56 @@ fn projector_path(projectors: &[&str]) -> Value {
     })
 }
 
+fn commands_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "commands": { "type": "array", "items": schema_ref("CommandDetail") },
+        },
+        "required": ["commands"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "list_commands",
+            "summary": "every command and its parameters",
+            "description": "Internal commands included, unlike the `POST /commands/{name}` \
+                paths in this document: they are not routed, but they exist and an effect \
+                can invoke one. `internal` says which is which.",
+            "responses": {
+                "200": response("every command", body),
+            },
+        }
+    })
+}
+
+fn command_detail_path(commands: &[&str]) -> Value {
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_command",
+            "summary": "one command",
+            "parameters": [
+                path_param("name", "The command, public or internal.", name_schema(commands)),
+            ],
+            "responses": {
+                "200": response("the command", schema_ref("CommandDetail")),
+                "404": response("no such command", schema_ref("Error")),
+            },
+        }
+    })
+}
+
 fn schema_path() -> Value {
     let body = json!({
         "type": "object",
         "properties": {
             "events": { "type": "array", "items": schema_ref("EventDetail") },
-            "commands": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string" },
-                        "internal": {
-                            "type": "boolean",
-                            "description": "An internal command is not routed, so it is absent \
-                                from this document. It is reported here because it exists and \
-                                an effect can invoke it.",
-                        },
-                        "path": { "type": "string", "description": "Project-relative source path." },
-                        "hash": { "type": "string", "description": "Its digest entry hash." },
-                        // Not a `FieldDetail`: a command's `input = schema(...)` carries
-                        // a name and a kind and nothing else. Tagging, subjects and
-                        // uniqueness are event and entity policy, and `schema()` rejects
-                        // them outright, so there is no `indexed`/`subject`/`unique` to
-                        // report and claiming otherwise would fail every validator.
-                        "input": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": { "type": "string" },
-                                    "kind": {
-                                        "type": "string",
-                                        "description": "The type as declared, \
-                                            e.g. `Uuid` or `String?`.",
-                                    },
-                                },
-                                "required": ["name", "kind"],
-                                "additionalProperties": false,
-                            },
-                        },
-                    },
-                    "required": ["name", "internal", "path", "hash", "input"],
-                    "additionalProperties": false,
-                },
-            },
+            // The same `$ref` `/admin/commands` uses, because one function renders both.
+            // An inline copy here was the shape most likely to drift, since nothing
+            // fails when the two disagree.
+            "commands": { "type": "array", "items": schema_ref("CommandDetail") },
             "projectors": {
                 "type": "array",
                 "items": {
@@ -1627,6 +1648,7 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("Error".to_owned(), error_schema());
     out.insert("CommandError".to_owned(), command_error_schema());
     out.insert("CommandAccepted".to_owned(), command_accepted_schema());
+    out.insert("CommandDetail".to_owned(), command_detail_schema());
     out.insert("EmittedEvent".to_owned(), emitted_event_schema(surface));
     out.insert("Status".to_owned(), status_schema());
     out.insert("ProjectorStatus".to_owned(), projector_status_schema());
@@ -1754,6 +1776,69 @@ fn command_accepted_schema() -> Value {
             },
         },
         "required": ["correlation_id", "causation_id", "positions", "events"],
+        "additionalProperties": false,
+    })
+}
+
+/// One declared command as introspection reports it, which is a superset of what this
+/// document routes: an internal command has no `POST /commands/{name}` path and still
+/// appears here, flagged.
+fn command_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A declared command: what it takes, where it was declared, and \
+            whether the HTTP surface routes it.",
+        "properties": {
+            "name": { "type": "string" },
+            "internal": {
+                "type": "boolean",
+                "description": "Declared under `commands/internal/`. Invokable by an effect \
+                    and not routed, so `POST /commands/{name}` answers 404 for one.",
+            },
+            "path": {
+                "type": "string",
+                "description": "The `.hk` file it was declared in, relative to the project.",
+            },
+            "hash": {
+                "type": "string",
+                "description": "The digest entry hash: what the command does, not how it is \
+                    written, so a reformat leaves it where it was.",
+            },
+            "input": {
+                "type": "array",
+                "description": "The parameters, in declaration order. These are the request \
+                    body's fields for a routed command.",
+                "items": command_input_schema(),
+            },
+        },
+        "required": ["name", "internal", "path", "hash", "input"],
+        "additionalProperties": false,
+    })
+}
+
+/// One command parameter as introspection reports it.
+///
+/// Not a `FieldDetail`: a command's parameter carries a name and a kind and nothing
+/// else. Tagging, subjects and uniqueness are event and entity policy, and heklang
+/// rejects them on a parameter outright, so there is no `indexed`/`subject`/`unique` to
+/// report and claiming otherwise would fail every validator.
+fn command_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "kind": {
+                "type": "string",
+                "description": "The type as declared, e.g. `Uuid` or `String? @max(80)`. \
+                    An optional marks the type, so any constraint follows it.",
+            },
+            "optional": {
+                "type": "boolean",
+                "description": "Whether the parameter may be omitted or sent as an explicit \
+                    null.",
+            },
+        },
+        "required": ["name", "kind", "optional"],
         "additionalProperties": false,
     })
 }
@@ -2950,6 +3035,7 @@ mod tests {
     ) -> Surface<'a> {
         Surface {
             commands: vec![("do-thing", input)],
+            all_command_names: vec!["do-thing", "settle-thing"],
             projectors: vec![ProjectorSurface {
                 name: "users",
                 entities,

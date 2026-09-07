@@ -818,7 +818,8 @@ dl.kv dd {
 }
 
 input,
-select {
+select,
+textarea {
   padding: 4px 8px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
@@ -828,14 +829,64 @@ select {
   font-size: 13px;
 }
 
-input::placeholder {
+input::placeholder,
+textarea::placeholder {
   color: var(--text-faint);
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   border-color: var(--accent);
   outline: none;
+}
+
+/* --- command runner ------------------------------------------------------ */
+
+/* The same two-column grid `dl.kv` uses, so a parameter list and a value list line up
+   the same way even though only one of them is a definition list. */
+.cmd-form {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--s3) var(--s4);
+  align-items: start;
+  padding: var(--s4);
+}
+
+.cmd-form > label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 5px;
+}
+
+.cmd-field {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+
+.cmd-field > input[type='text'],
+.cmd-field > select,
+.cmd-field > textarea {
+  flex: 1;
+  min-width: 0;
+}
+
+.cmd-field > input[type='checkbox'] {
+  flex: none;
+}
+
+.cmd-json {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.cmd-headers > summary {
+  cursor: pointer;
 }
 
 .chip {

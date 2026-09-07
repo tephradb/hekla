@@ -912,6 +912,14 @@ impl Runtime {
         units
     }
 
+    /// One command unit by name, public or internal, for introspection. Deliberately
+    /// unlike [`execute`](Runtime::execute)'s lookup, which filters internal commands
+    /// because they are not routed: describing one and running one are different
+    /// questions, and only the second is closed to them.
+    pub fn command_unit(&self, name: &str) -> Option<&Arc<CommandUnit>> {
+        self.commands.get(name)
+    }
+
     pub(crate) fn opdb_schema_version(&self) -> anyhow::Result<i64> {
         self.lock_opdb().schema_version()
     }

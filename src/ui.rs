@@ -104,6 +104,11 @@ pub const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../ui/format.js"),
     },
     Asset {
+        name: "kinds.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/kinds.js"),
+    },
+    Asset {
         name: "theme.js",
         content_type: JS,
         bytes: include_bytes!("../ui/theme.js"),
@@ -157,6 +162,11 @@ pub const ASSETS: &[Asset] = &[
         name: "ui-table.js",
         content_type: JS,
         bytes: include_bytes!("../ui/ui-table.js"),
+    },
+    Asset {
+        name: "view-commands.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-commands.js"),
     },
     Asset {
         name: "view-effects.js",

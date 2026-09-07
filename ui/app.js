@@ -9,6 +9,7 @@ import { Empty } from './ui-states.js'
 import { Palette } from './ui-palette.js'
 import { count, duration, plural } from './format.js'
 import { OverviewView } from './view-overview.js'
+import { CommandsView } from './view-commands.js'
 import { EventsView } from './view-events.js'
 import { TraceView } from './view-trace.js'
 import { EffectsView } from './view-effects.js'
@@ -19,6 +20,7 @@ import { SystemView } from './view-system.js'
 
 const VIEWS = {
   overview: OverviewView,
+  commands: CommandsView,
   events: EventsView,
   trace: TraceView,
   effects: EffectsView,

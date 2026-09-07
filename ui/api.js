@@ -66,11 +66,15 @@ async function toError(response) {
  * One request. `signal` lets a view abandon a fetch when the user navigates away,
  * which matters most on the pages that are slow enough to be worth leaving.
  */
-export async function request(path, { params, method = 'GET', body, signal } = {}) {
-  const init = { method, headers: { ...JSON_HEADERS }, signal }
+export async function request(path, { params, method = 'GET', body, headers, signal } = {}) {
+  const init = { method, headers: { ...JSON_HEADERS, ...headers }, signal }
   if (body !== undefined) {
     init.headers['content-type'] = 'application/json'
-    init.body = JSON.stringify(body)
+    /* A string body is already JSON text and is posted verbatim. That is what keeps an
+     * `Int` past 2^53 exact: parsing one into a JS number and re-serialising it would
+     * round it silently, which is the same class of bug `arbitrary_precision` exists to
+     * prevent on the way in. */
+    init.body = typeof body === 'string' ? body : JSON.stringify(body)
   }
   let response
   try {
@@ -180,6 +184,9 @@ export const api = {
       { signal },
     ),
 
+  commands: (signal) => request('/admin/commands', { signal }),
+  command: (name, signal) => request(`/admin/commands/${encodeURIComponent(name)}`, { signal }),
+
   schema: (signal) => request('/admin/schema', { signal }),
   system: (signal) => request('/admin/system', { signal }),
 
@@ -198,9 +205,19 @@ export const api = {
       signal,
     }),
 
-  /* The two mutations. They live outside /admin because /admin is read-only by
-   * design; the console drives them anyway, since seeing a wedge and being unable to
-   * clear it is half a tool. */
+  /* The mutations. They live outside /admin because /admin is read-only by design; the
+   * console drives them anyway, since seeing a system it cannot act on is half a tool.
+   *
+   * `run` is the application's own front door rather than an operator action, and it is
+   * exactly as powerful here as `curl` is against the same port. `body` is JSON text,
+   * not an object: see `request`. */
+  run: (name, body, { idempotencyKey, correlationId } = {}) => {
+    const headers = {}
+    if (idempotencyKey) headers['idempotency-key'] = idempotencyKey
+    if (correlationId) headers['x-correlation-id'] = correlationId
+    return request(`/commands/${encodeURIComponent(name)}`, { method: 'POST', body, headers })
+  },
+
   replay: (name) =>
     request(`/projectors/${encodeURIComponent(name)}/replay`, { method: 'POST' }),
 

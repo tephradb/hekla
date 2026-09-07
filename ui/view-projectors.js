@@ -23,6 +23,7 @@ import { Confirm } from './ui-confirm.js'
 import { Copy } from './ui-copy.js'
 import { DetailPanel } from './ui-panel.js'
 import { JsonTree } from './ui-json.js'
+import { baseKind, numeric } from './kinds.js'
 import { count, plural, shortHash, sources, truncate } from './format.js'
 
 /** Rows per page. The read API's own default, so the console asks for what it tuned. */
@@ -342,26 +343,6 @@ function Entity({ projector, entity, browsing, onBrowse }) {
 }
 
 /* --- the rows ------------------------------------------------------------- */
-
-/**
- * The declared kind stripped to the word that decides how a value is drawn:
- * `String? @max(200)` is `String`, `Money(2)?` stays `Money(2)`.
- *
- * The type comes first and any constraint follows it, so the first token is the whole
- * answer. A `OneOf` reduces to its first variant, which is not its kind but is a
- * string, and a string is exactly how such a column is rendered anyway.
- */
-function baseKind(kind) {
-  return String(kind ?? '')
-    .split(' ')[0]
-    .replace(/\?$/, '')
-}
-
-/** Numbers and money are read by their last digit, so they align right. */
-function numeric(kind) {
-  const base = baseKind(kind)
-  return base === 'Int' || base.startsWith('Money')
-}
 
 /**
  * What a column that is not in the response means.
