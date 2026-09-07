@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use heklang::{Program, Projection};
@@ -818,6 +819,7 @@ fn rebuild(
     model: ReadModel,
     definition: &str,
 ) -> anyhow::Result<ReadModel> {
+    let start = Instant::now();
     let db_path = &shared.db_path;
     let rebuild_path = db_path.with_extension("rebuild.db");
     remove_db_files(&rebuild_path)?;
@@ -841,7 +843,11 @@ fn rebuild(
 
     let reopened = ReadModel::open(db_path, &shared.entities)?;
     shared.reset_position(reopened.read_checkpoint()?.get());
-    tracing::info!("projector `{}` replayed {count} events", shared.name);
+    tracing::info!(
+        "projector `{}` replayed {count} events in {:.2?}",
+        shared.name,
+        start.elapsed()
+    );
     Ok(reopened)
 }
 
