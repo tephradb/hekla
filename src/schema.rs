@@ -76,7 +76,19 @@ impl FieldKind {
             FieldKind::Money { scale } => format!("Money({scale})"),
             FieldKind::Json => "Json".to_owned(),
             FieldKind::OneOf(values) => values.join(" | "),
-            FieldKind::Optional(inner) => format!("{}?", inner.describe()),
+            // The `?` binds to the type and a constraint follows it, so a nullable
+            // bounded string is `String? @max(200)`; suffixing the whole rendering
+            // produced `String @max(200)?`, which is not a declaration anyone wrote.
+            FieldKind::Optional(inner) => match inner.as_ref() {
+                FieldKind::Text {
+                    max_length: Some(n),
+                } => format!("String? @max({n})"),
+                // A `OneOf` renders as its variants rather than the enum's name, which
+                // the kind does not carry. Unbracketed, the `?` would read as though it
+                // belonged to the last variant alone.
+                FieldKind::OneOf(values) => format!("({})?", values.join(" | ")),
+                other => format!("{}?", other.describe()),
+            },
         }
     }
 
@@ -618,3 +630,51 @@ impl InputSchema {
 /// Every declared event by its wire type, which is what the append and read paths look
 /// a definition up by.
 pub type EventDefs = std::collections::HashMap<String, EventDef>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn optional(inner: FieldKind) -> FieldKind {
+        FieldKind::Optional(Box::new(inner))
+    }
+
+    /// `describe` is the vocabulary three introspection surfaces report a field in, so
+    /// it has to be a declaration an author would recognise as their own.
+    #[test]
+    fn an_optional_marks_the_type_rather_than_the_whole_declaration() {
+        assert_eq!(
+            FieldKind::Text {
+                max_length: Some(500)
+            }
+            .describe(),
+            "String @max(500)"
+        );
+        assert_eq!(
+            optional(FieldKind::Text {
+                max_length: Some(500)
+            })
+            .describe(),
+            "String? @max(500)"
+        );
+        // Nothing follows the type, so the suffix is unambiguous where it lands.
+        assert_eq!(optional(FieldKind::Uuid).describe(), "Uuid?");
+        assert_eq!(
+            optional(FieldKind::Money { scale: 3 }).describe(),
+            "Money(3)?"
+        );
+        assert_eq!(
+            optional(FieldKind::Text { max_length: None }).describe(),
+            "String?"
+        );
+    }
+
+    /// A variant list is not a name, so the `?` needs something to bind to that is not
+    /// the last variant.
+    #[test]
+    fn an_optional_enum_brackets_its_variants() {
+        let status = FieldKind::OneOf(vec!["Active".to_owned(), "Claimed".to_owned()]);
+        assert_eq!(status.describe(), "Active | Claimed");
+        assert_eq!(optional(status).describe(), "(Active | Claimed)?");
+    }
+}

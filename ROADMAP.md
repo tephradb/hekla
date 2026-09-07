@@ -1669,6 +1669,65 @@ Honest scope for this phase:
 - Schema v9 adds `effect_invocation.collapsed_from`. Rows written before it read back as null, which
   is the same honest answer as a row that folded nothing.
 
+## Phase 28: the console browses a projector's rows (done)
+
+Phase 20 shipped a console that could describe every read model and show none of it.
+`/admin/projectors/{name}` rendered each entity's fields, indexes, key kind and opt-in row count, then
+stopped at a `GET /read/...` hyperlink you were expected to click into a raw JSON tab. The question an
+operator opens a read model to ask, "what is in it", was the one the console did not answer.
+
+- **No new route, and no new server code.** Every `/admin` view is also a JSON endpoint at the same
+  URL, which makes a route expensive (a second representation, duplicating `/read`) and a query
+  parameter free. The browse selection is therefore `?entity=&field=&value=&cursor=&row=` on the
+  projector's existing URL, and a row someone found is a link they can send.
+- **The rows come from the public read API, and that is the point rather than a shortcut.** What the
+  page shows is what an application sees over the same port: the same key order, the same refusal to
+  scan an unindexed column, the same columns missing where a subject key is gone. A privileged view of
+  the same table would show more and mean less.
+- **The filter select lists every column and disables the ones that are not indexed**, naming the
+  reason. The read API's `unindexed_filter` 400 becomes an affordance that teaches the indexing model
+  rather than an error found by hitting it.
+- **`absent` is told apart from `null`.** `row_to_json` omits a SQL NULL and the read API omits a
+  subject column whose key it cannot obtain, so absence carries two meanings and the response cannot
+  separate them. Which of them are *possible* is a fact about the declaration, and that is what the
+  cell reads: `null` where only null can occur, `absent` where a key may be gone. Drawing every
+  absence as `null` would hide an erasure, which is the one thing here worth noticing.
+- **A row links back to the events that built it**, filtered to the tag its key carries and to the
+  source event types that can carry it. Offered only where the type declares that field `indexed` and
+  unscoped: an unindexed field is not a tag at all, and a subject-scoped one is tagged with its
+  ciphertext, so its tag can never be matched from a plaintext key. Either would be a confident link
+  to an empty result, which is worse than no link, so a `Totals` keyed `"all"` gets a sentence saying
+  why instead.
+- **A 503 from `/read` is a state, not a failure.** A projector that is rebuilding, stale or
+  quarantined cannot serve rows at the definition the page above is describing, and the server's own
+  message already names the fix. Painting that red would say something broke.
+- **`describe` was corrected while it was being read.** The `?` was suffixed to the whole rendering,
+  so a nullable bounded string reported as `String @max(500)?` rather than the `String? @max(500)` its
+  author wrote, and an optional enum as `Active | Claimed?`, which reads as though only the last
+  variant were optional. Three introspection surfaces report through that function; the enum case now
+  brackets its variants.
+
+Honest scope for this phase:
+
+- **Rows are not on the shared 3s poll.** A scan costs the process more than a `/status` read, and
+  rows shifting under someone reading them is worse than rows three seconds old, so the refresh is a
+  button. The shape and readiness above them keep ticking as before.
+- **One indexed filter, key order, no total.** All three are the read API's own shape, and the page
+  states each rather than papering over it: `older` is enabled by the server's `next_cursor` and not
+  by a full page, `newer` walks a trail the console keeps because the cursor is forward-only, and a
+  row count stays the opt-in full-table scan it already was.
+- **The selection replaces history rather than pushing it**, as the events view's filters do, so
+  `back` leaves the page rather than stepping through pages of it.
+- **`OneOf` renders its variants, not the enum's name.** `FieldKind` does not carry the name, and the
+  variants are the more useful of the two in a data browser: they say what a column may hold without
+  opening the `.hk`. Carrying the name would mean threading it down from `Type::Enum` and then
+  choosing between the two.
+- **Still no JavaScript test runner.** The two scanning tests cover this without being touched, which
+  is what they were built for: the prefixes they scan are derived from `server::routes()`, so the new
+  `/read/{projector}/{entity}` and `/read/{projector}/{entity}/{key}` calls were checked against the
+  router the moment they were written. `describe`'s two corrected forms are pinned by unit tests in
+  `src/schema.rs`.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

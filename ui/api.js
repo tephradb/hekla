@@ -156,6 +156,30 @@ export const api = {
       params: [['counts', String(counts)]],
     }),
 
+  /* The rows themselves come from the public read API rather than from `/admin`, and
+   * that is the point rather than a shortcut: what the console renders is what an
+   * application sees over this port, decrypted columns and erased ones alike, not a
+   * privileged view of the same table. It also means browsing costs the server exactly
+   * what a client's own read costs it, with no second query path to keep honest. */
+  rows: (projector, entity, { field, value, cursor, limit } = {}, signal) =>
+    request(`/read/${encodeURIComponent(projector)}/${encodeURIComponent(entity)}`, {
+      signal,
+      params: [
+        /* The filter is a parameter *named after the column*, so it is spread in
+         * rather than named here. `hekla check` refuses an entity field that collides
+         * with `limit`/`cursor`/`after`/`timeout_ms`, so this cannot shadow one. */
+        ...(field && value ? [[field, value]] : []),
+        ['cursor', cursor],
+        ['limit', limit],
+      ],
+    }),
+
+  row: (projector, entity, key, signal) =>
+    request(
+      `/read/${encodeURIComponent(projector)}/${encodeURIComponent(entity)}/${encodeURIComponent(key)}`,
+      { signal },
+    ),
+
   schema: (signal) => request('/admin/schema', { signal }),
   system: (signal) => request('/admin/system', { signal }),
 

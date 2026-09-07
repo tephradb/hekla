@@ -20,6 +20,15 @@ export function shortId(value) {
   return value.length > 12 ? `${value.slice(0, 8)}…` : value
 }
 
+/**
+ * Text cut to `max` characters with an ellipsis, for a value of unknown length in a
+ * fixed-width cell. The caller keeps the whole string for the `title`, so this
+ * abbreviates what is shown and never what is available.
+ */
+export function truncate(text, max) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
 /** A source hash, abbreviated the way git abbreviates one. */
 export function shortHash(value) {
   return typeof value === 'string' ? value.slice(0, 8) : '-'

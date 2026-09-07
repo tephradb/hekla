@@ -1427,8 +1427,8 @@ fn schema_path() -> Value {
                                     "name": { "type": "string" },
                                     "kind": {
                                         "type": "string",
-                                        "description": "The field constructor as declared, \
-                                            e.g. `uuid()` or `optional(str())`.",
+                                        "description": "The type as declared, \
+                                            e.g. `Uuid` or `String?`.",
                                     },
                                 },
                                 "required": ["name", "kind"],
@@ -2534,8 +2534,8 @@ fn field_detail_schema() -> Value {
             "name": { "type": "string" },
             "kind": {
                 "type": "string",
-                "description": "The field constructor as declared, e.g. `uuid()` or \
-                    `optional(str(max_length = 80))`.",
+                "description": "The type as declared, e.g. `Uuid` or `String? @max(80)`. \
+                    An optional marks the type, so any constraint follows it.",
             },
             "optional": { "type": "boolean" },
             "indexed": {

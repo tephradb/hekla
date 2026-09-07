@@ -135,6 +135,13 @@ with.
 Readiness, lag, position, entity shapes and the `definition_hash` the read model was built under.
 `?counts=true` adds a row count per entity, which is a full scan and so opt-in.
 
+A field's `kind` is the type as declared, with the optional marker on the type and any constraint
+after it: `String? @max(200)`, `Money(2)?`, `Timestamp`, `Json`. An enum reports its variants rather
+than its name, bracketed when optional: `(Low | Normal | Urgent)?`.
+
+In a browser this same URL is also where the console browses the rows themselves; see *Browsing a
+read model* below.
+
 ## `/admin/schema` and `/admin/system`
 
 `/admin/schema` is the project this process loaded, including internal commands, each command's input
@@ -168,6 +175,30 @@ instead, for editing them without a recompile.
 Two things it does that the raw API does not: it can post a replay or a skip (each behind a
 confirmation that makes you type the module's name), and it decrypts one event at a time, so one audit
 line means one operator read one event.
+
+### Browsing a read model
+
+`/admin/projectors/{Name}` describes each entity's shape; `Rows →` on an entity card opens its data
+beneath it. The rows are fetched through the public read API rather than through `/admin`, so the page
+shows what an application sees over the same port: key order, one indexed filter, cursor paging, and
+subject columns decrypted. The selection lives in the query string, so a row is a link:
+
+```
+/admin/projectors/CustomerOrders?entity=Order&field=customer_id&value=42&cursor=<c>&row=<key>
+```
+
+- The filter is a select over every column, with the ones that are not indexed disabled, so the read
+  API's `unindexed_filter` 400 is visible before you can hit it.
+- A column the response omits reads as `null` where only null is possible, and `absent` where the
+  subject's key may be gone. The read API drops both cases, and only the declaration says which one a
+  given column can be in.
+- A row's panel links to the events that built it, when a source event type declares the entity key as
+  an **indexed and unscoped** field. An unindexed field is not a tag, and a subject-scoped one is
+  tagged with its ciphertext, so neither can be matched from a plaintext key; the panel says so rather
+  than linking to an empty result.
+- Rows do not refresh on the 3s poll (a scan is not a `/status` read); the header carries a `⟳`.
+- A projector that is rebuilding, stale or quarantined cannot serve rows at its current definition.
+  The section reports the server's own message, which names the fix, rather than an error.
 
 | Key | Does |
 | --- | --- |
