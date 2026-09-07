@@ -18,7 +18,7 @@ import { go } from './router.js'
 import { Empty, Resource, useResource } from './ui-states.js'
 import { Badge } from './ui-badge.js'
 import { Copy } from './ui-copy.js'
-import { clock, offset, shortId } from './format.js'
+import { clock, offset, plural, shortId } from './format.js'
 
 const PAGE = 200
 
@@ -146,7 +146,7 @@ export function TraceView({ params }) {
               <${Copy} value=${data.correlation_id} />
               <div style=${{ flex: 1 }}></div>
               <span class="tiny faint" style=${{ textTransform: 'none', letterSpacing: 0 }}>
-                ${data.events.length} events · ${offset(span)} span
+                ${plural(data.events.length, 'event')} · ${offset(span)} span
                 ${!data.complete ? ' · truncated' : ''}
               </span>
             </header>

@@ -12,7 +12,9 @@
 import { html, useEffect, useRef, useState } from './vendor-preact.js'
 
 /**
- * `columns` is `{ key, header, width, align, render(row) }`.
+ * `columns` is `{ key, header, width, align, clip, render(row) }`. `clip` marks the one
+ * column that holds prose rather than a value: it takes the width left over and ends in
+ * an ellipsis instead of widening the table.
  * `onOpen(row, index)` fires on Enter and on click.
  */
 export function DataTable({
@@ -106,7 +108,11 @@ export function DataTable({
               >
                 ${columns.map(
                   (column) => html`
-                    <td class=${column.align === 'right' ? 'num' : undefined}>
+                    <td
+                      class=${[column.align === 'right' ? 'num' : '', column.clip ? 'clip' : '']
+                        .filter(Boolean)
+                        .join(' ') || undefined}
+                    >
                       ${column.render(row)}
                     </td>
                   `,

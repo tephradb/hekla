@@ -11,7 +11,7 @@ import { useStatus } from './store.js'
 import { Empty, Resource, useResource, Skeleton } from './ui-states.js'
 import { Badge, Lag } from './ui-badge.js'
 import { Sparkline, bucket } from './ui-sparkline.js'
-import { clock, count, duration, shortId } from './format.js'
+import { clock, count, duration, plural, shortId } from './format.js'
 
 const WINDOW_MS = 5 * 60 * 1000
 const RECENT = 50
@@ -84,7 +84,7 @@ export function OverviewView() {
           <div class="stat">${count(status.log_head)}</div>
           <div class="tiny faint">events appended</div>
           <div class="spark-wrap">
-            <${Sparkline} values=${series} label=${`${inWindow} events in the last 5 minutes`} />
+            <${Sparkline} values=${series} label=${`${plural(inWindow, 'event')} in the last 5 minutes`} />
             <span class="tiny faint">
               ${inWindow} in the last 5m
               <span

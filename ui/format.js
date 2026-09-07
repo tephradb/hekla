@@ -9,6 +9,11 @@ export function count(value) {
   return typeof value === 'number' ? NUMBER.format(value) : '-'
 }
 
+/** `1 event`, `5 events`. For a noun whose plural is the singular plus `s`. */
+export function plural(value, noun) {
+  return `${count(value)} ${noun}${value === 1 ? '' : 's'}`
+}
+
 /** The first 8 characters of a uuid, which is what a human matches on. */
 export function shortId(value) {
   if (typeof value !== 'string') return '-'

@@ -12,7 +12,7 @@ import { html } from './vendor-preact.js'
 import { api } from './api.js'
 import { Empty, Resource, useResource } from './ui-states.js'
 import { Copy } from './ui-copy.js'
-import { shortHash, sources, stamp } from './format.js'
+import { plural, shortHash, sources, stamp } from './format.js'
 
 export function SchemaView() {
   const state = useResource((signal) => api.schema(signal), [])
@@ -49,7 +49,7 @@ export function SchemaView() {
                           <div class="graph-event">
                             <code>${event.type}</code>
                             <span class="tiny faint">
-                              ${event.fields.length} fields
+                              ${plural(event.fields.length, 'field')}
                               ${encrypted > 0 ? ` · ${encrypted} encrypted` : ''}
                             </span>
                           </div>
@@ -139,9 +139,9 @@ export function SchemaView() {
               html`
                 <p class="tiny faint" style=${{ marginBottom: 0 }}>
                   Which commands an effect invokes is not shown here: the journal records
-                  each call's result rather than its arguments, so a completed
-                  <code>invoke</code> does not carry the name either. An invocation's
-                  journal shows <em>that</em> one happened and what came back.
+                  each call's result rather than its arguments, so a
+                  completed <code>invoke</code> does not carry the name either. An
+                  invocation's journal shows <em>that</em> one happened and what came back.
                 </p>
               `}
             </div>
@@ -149,11 +149,13 @@ export function SchemaView() {
 
           <section class="card">
             <header>Declarations</header>
-            <p class="tiny faint">
-              Hashed by what each declaration does, not by how it is written, so a reformat
-              leaves every hash where it was. <em>Signature</em> is the part visible from
-              outside: change it and a client can tell.
-            </p>
+            <div class="body" style=${{ paddingBottom: 0 }}>
+              <p class="tiny faint" style=${{ margin: 0 }}>
+                Hashed by what each declaration does, not by how it is written, so a
+                reformat leaves every hash where it was. <em>Signature</em> is the part
+                visible from outside: change it and a client can tell.
+              </p>
+            </div>
             <table class="data">
               <thead>
                 <tr>
@@ -171,13 +173,17 @@ export function SchemaView() {
                     <tr key=${`${declaration.kind}/${declaration.name}`}>
                       <td><code>${declaration.name}</code></td>
                       <td><span class="pill mute">${declaration.kind}</span></td>
-                      <td class="mono tiny row">
-                        ${shortHash(declaration.hash)}<${Copy} value=${declaration.hash} />
+                      <td class="mono tiny">
+                        <div class="row">
+                          ${shortHash(declaration.hash)}<${Copy} value=${declaration.hash} />
+                        </div>
                       </td>
-                      <td class="mono tiny row">
+                      <td class="mono tiny">
                         ${declaration.signature_hash
-                          ? html`${shortHash(declaration.signature_hash)}
-                              <${Copy} value=${declaration.signature_hash} />`
+                          ? html`<div class="row">
+                              ${shortHash(declaration.signature_hash)}
+                              <${Copy} value=${declaration.signature_hash} />
+                            </div>`
                           : html`<span
                               class="dim"
                               title="nothing outside the program can name a fn, so it has no signature"

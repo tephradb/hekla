@@ -7,7 +7,7 @@ import { isLive, setLive, refreshNow, useStatus } from './store.js'
 import { useTheme } from './theme.js'
 import { Empty } from './ui-states.js'
 import { Palette } from './ui-palette.js'
-import { count, duration } from './format.js'
+import { count, duration, plural } from './format.js'
 import { OverviewView } from './view-overview.js'
 import { EventsView } from './view-events.js'
 import { TraceView } from './view-trace.js'
@@ -117,7 +117,7 @@ function Header({ location, status, error }) {
       <div class="spacer"></div>
       ${error && html`<span class="pill err" title=${error.message}>${error.code}</span>`}
       <kbd title="Jump to a position, correlation id, effect or view">⌘K</kbd>
-      ${status && html`<span class="tiny faint mono">${count(status.log_head)} events</span>`}
+      ${status && html`<span class="tiny faint mono">${plural(status.log_head, 'event')}</span>`}
       <button
         type="button"
         class="btn"

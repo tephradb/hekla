@@ -100,9 +100,12 @@ function EffectList() {
     {
       key: 'error',
       header: 'Last error',
+      clip: true,
       render: (effect) =>
         effect.last_error
-          ? html`<span class="tiny" style=${{ color: 'var(--err)' }}>${effect.last_error}</span>`
+          ? html`<span class="tiny" style=${{ color: 'var(--err)' }} title=${effect.last_error}>
+              ${effect.last_error}
+            </span>`
           : html`<span class="faint">-</span>`,
     },
     {

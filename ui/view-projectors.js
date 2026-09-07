@@ -13,7 +13,7 @@ import { Empty, Resource, useResource } from './ui-states.js'
 import { DataTable } from './ui-table.js'
 import { Badge, Lag } from './ui-badge.js'
 import { Confirm } from './ui-confirm.js'
-import { count, shortHash, sources } from './format.js'
+import { count, plural, shortHash, sources } from './format.js'
 
 export function ProjectorsView({ params }) {
   if (params?.name) return html`<${ProjectorDetail} key=${params.name} name=${params.name} />`
@@ -200,7 +200,7 @@ function Entity({ projector, entity }) {
         <div style=${{ flex: 1 }}></div>
         ${entity.rows !== null &&
         entity.rows !== undefined &&
-        html`<span class="pill mute plain mono">${count(entity.rows)} rows</span>`}
+        html`<span class="pill mute plain mono">${plural(entity.rows, 'row')}</span>`}
       </header>
       <table class="data">
         <thead>
