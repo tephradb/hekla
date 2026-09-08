@@ -6,7 +6,8 @@
 //! effect lanes run at once. Validating here means a malformed `hekla.toml` fails at load,
 //! not at the moment the sweeper first reaches for a setting.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use anyhow::Context;
@@ -31,6 +32,41 @@ pub struct Config {
     pub retention: Retention,
     pub projectors: Projectors,
     pub verify: Verify,
+    /// Where each `secret` the project declares is read from. A name absent here falls
+    /// back to `HEKLA_SECRET_<NAME>`, so a project needs no entry at all; the table is
+    /// for naming a variable a platform already sets, or a file an orchestrator mounts.
+    ///
+    /// Keyed by the declared name, so a key naming no declaration is a typo `validate`
+    /// catches rather than a line that silently does nothing.
+    pub secrets: BTreeMap<String, SecretSource>,
+}
+
+/// Where one deployment credential's value comes from.
+///
+/// Two forms and deliberately no third that carries the value itself: `hekla.toml` is
+/// committed, and a credential written into it is exactly the mistake `secret` exists to
+/// prevent. `deny_unknown_fields` is what turns that mistake into a parse error naming
+/// the key rather than a silently ignored line.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SecretSource {
+    /// `{ env = "STRIPE_KEY" }`: the variable a platform already sets, under whatever
+    /// name it chose.
+    Env { env: String },
+    /// `{ file = "/run/secrets/stripe_key" }`: what systemd's `LoadCredential`, Docker
+    /// secrets and a Kubernetes projected volume all produce. One trailing newline is
+    /// trimmed on read; `secrets::trim_one_newline` says why.
+    File { file: PathBuf },
+}
+
+impl SecretSource {
+    pub fn env(name: impl Into<String>) -> SecretSource {
+        SecretSource::Env { env: name.into() }
+    }
+
+    pub fn file(path: impl Into<PathBuf>) -> SecretSource {
+        SecretSource::File { file: path.into() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -137,6 +173,20 @@ impl Config {
                 "retention.effect_journal_days must be at most {MAX_RETENTION_DAYS} (100 years)"
             );
         }
+        // An empty source is a half-written line rather than a deliberate one, and it
+        // would otherwise resolve to "the variable named `` is unset", which reads as a
+        // missing credential and sends an operator looking in the wrong place.
+        for (name, source) in &self.secrets {
+            match source {
+                SecretSource::Env { env } if env.is_empty() => {
+                    anyhow::bail!("secrets.{name}: `env` must name a variable");
+                }
+                SecretSource::File { file } if file.as_os_str().is_empty() => {
+                    anyhow::bail!("secrets.{name}: `file` must name a path");
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 }
@@ -172,6 +222,51 @@ mod tests {
     #[test]
     fn unknown_field_is_rejected() {
         assert!(Config::parse("[effects]\nnope = 1\n").is_err());
+    }
+
+    #[test]
+    fn a_secret_names_an_environment_variable_or_a_file() {
+        let config = Config::parse(
+            "[secrets]\nSTRIPE_KEY = { env = \"STRIPE_LIVE\" }\nHOOK = { file = \"/run/secrets/hook\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.secrets.get("STRIPE_KEY"),
+            Some(&SecretSource::env("STRIPE_LIVE"))
+        );
+        assert_eq!(
+            config.secrets.get("HOOK"),
+            Some(&SecretSource::file("/run/secrets/hook"))
+        );
+    }
+
+    #[test]
+    fn a_secret_with_no_source_table_is_fine() {
+        // The `HEKLA_SECRET_<NAME>` convention is the whole point: a project that
+        // configures nothing still resolves every credential it declares.
+        assert!(Config::default().secrets.is_empty());
+    }
+
+    #[test]
+    fn a_literal_value_in_the_config_is_rejected() {
+        // The mistake the feature exists to prevent, and it must not be a line that
+        // parses and quietly does nothing.
+        assert!(Config::parse("[secrets]\nSTRIPE_KEY = { value = \"sk_live_x\" }\n").is_err());
+        assert!(Config::parse("[secrets]\nSTRIPE_KEY = \"sk_live_x\"\n").is_err());
+    }
+
+    #[test]
+    fn a_secret_naming_two_sources_is_rejected() {
+        assert!(
+            Config::parse("[secrets]\nK = { env = \"A\", file = \"/b\" }\n").is_err(),
+            "one credential cannot come from two places"
+        );
+    }
+
+    #[test]
+    fn an_empty_secret_source_is_rejected() {
+        assert!(Config::parse("[secrets]\nK = { env = \"\" }\n").is_err());
+        assert!(Config::parse("[secrets]\nK = { file = \"\" }\n").is_err());
     }
 
     #[test]

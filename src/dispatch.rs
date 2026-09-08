@@ -229,6 +229,10 @@ pub fn run_command(
         // A command never reaches `http.*`: heklang's parser is what guarantees it,
         // so there is nothing to give one here.
         http: None,
+        // Nor a `secret`, which rule 16 gates to an effect arm and an effect-local `fn`
+        // for the same reason. Passing none makes that a property of this world rather
+        // than a rule the language is trusted to keep enforcing.
+        secrets: None,
     };
     let mut interpreter = Interpreter::with_host(program, host);
     let attempts = retry.max_attempts;

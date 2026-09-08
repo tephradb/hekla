@@ -23,11 +23,15 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use hekla::heklang_host::{from_heklang_json, to_heklang_json};
 use hekla::schema::{EntityDef, FieldKind};
+use hekla::secrets::SecretStore;
 use heklang::Row;
-use heklang::host::{AppendCondition, Attempt, Clock, Http, Keys, Log, Query, Request, Rows};
+use heklang::host::{
+    AppendCondition, Attempt, Clock, Http, Keys, Log, Query, Request, Rows, Secrets,
+};
 use heklang::interp::{Error, Interpreter, Invocation, Projection, Store, key_as_value};
 use heklang::ir::Ident;
 use heklang::value::{Defs, Event, Json, Key, Record, Value};
@@ -76,15 +80,24 @@ pub struct ShadowHost {
     /// What every request answers with, matching the `StubHttpClient` the real side
     /// boots against.
     status: u16,
+    /// The deployment credentials, resolved exactly as the real side resolves them.
+    ///
+    /// Not a stub: the model checks that the two worlds agree, and a shadow answering a
+    /// different credential would make them disagree for a reason that is the harness
+    /// rather than the runtime. A required one answered with nothing is worse still,
+    /// since heklang wedges on `MissingSecret` and the disagreement reads as a bug in
+    /// the effect.
+    secrets: Arc<SecretStore>,
 }
 
 impl ShadowHost {
-    pub fn new(status: u16) -> Self {
+    pub fn new(status: u16, secrets: Arc<SecretStore>) -> Self {
         Self {
             log: Harness::default(),
             erasures: RefCell::new(Vec::new()),
             delivering: Cell::new(0),
             status,
+            secrets,
         }
     }
 
@@ -190,6 +203,14 @@ impl Http for ShadowHost {
     }
 }
 
+/// The same store the real side booted with, so a credential is one thing both worlds
+/// read rather than two things that happen to agree.
+impl Secrets for ShadowHost {
+    fn secret(&self, name: &str) -> Option<Arc<str>> {
+        self.secrets.get(name)
+    }
+}
+
 /// One shadow run: the interpreter, its effect cursor, and what the effects have done.
 pub struct Shadow<'a> {
     interp: Interpreter<'a, ShadowHost>,
@@ -211,9 +232,14 @@ pub struct Shadow<'a> {
 }
 
 impl<'a> Shadow<'a> {
-    pub fn new(program: &'a Program, effect: Option<&'a str>, status: u16) -> Self {
+    pub fn new(
+        program: &'a Program,
+        effect: Option<&'a str>,
+        status: u16,
+        secrets: Arc<SecretStore>,
+    ) -> Self {
         Self {
-            interp: Interpreter::with_host(program, ShadowHost::new(status)),
+            interp: Interpreter::with_host(program, ShadowHost::new(status, secrets)),
             program,
             effect,
             at: 0,

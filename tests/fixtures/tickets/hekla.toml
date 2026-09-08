@@ -3,3 +3,13 @@
 # read that as coverage it did not get.
 [retention]
 effect_journal_days = 3650
+
+# A file rather than an environment variable, which is what systemd's `LoadCredential`,
+# Docker secrets and a Kubernetes projected volume all produce. Relative, so it resolves
+# against the project root and this fixture works wherever the checkout sits.
+#
+# `hekla test` never reads this: a test world answers `secret:NAME` unless the test says
+# otherwise, so a suite cannot pass because the machine running it happened to be
+# configured.
+[secrets]
+NOTIFY_URL = { file = "notify-url" }

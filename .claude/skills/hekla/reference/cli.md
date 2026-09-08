@@ -1,6 +1,6 @@
 # The CLI
 
-One binary, eight subcommands, `<dir>` defaulting to `.` everywhere. `hekla --version` and
+One binary, nine subcommands, `<dir>` defaulting to `.` everywhere. `hekla --version` and
 `hekla <subcommand> --help` work.
 
 Logging is `tracing` behind `RUST_LOG`, default `info`. `serve` and `verify` initialise it; the other
@@ -244,6 +244,32 @@ The strictest subcommand about its argument, because its output gets committed:
 
 The document is the same value the server serves at `/openapi.json`.
 
+## `hekla secrets [DIR]`
+
+Every `secret` the project declares, where this machine reads it from, and whether it is set. One
+line each:
+
+```
+  DISCORD_WEBHOOK  set      2633c771             file /run/secrets/discord
+  SENTRY_DSN       unset    (optional)           env HEKLA_SECRET_SENTRY_DSN
+  STRIPE_KEY       MISSING                       env STRIPE_LIVE_KEY
+```
+
+**Never a value.** The fingerprint is a short sha256 of the credential domain-separated by its
+declared name, which is enough to tell staging from production and no use for anything else.
+
+A source that is there and *unreadable* reports the reason rather than reading as unset, so an
+operator is not sent looking for a file that is right in front of them:
+
+```
+  STRIPE_KEY       MISSING                       file /run/secrets/stripe (Permission denied)
+```
+
+Reads the project, `[secrets]` and the environment, and nothing else: no data directory, no log, no
+lock, so it runs anywhere `check` does and against a live deployment. Exits 1 when a **required**
+credential is unset, so it is a pre-deploy gate on its own for the thing `serve` would otherwise
+refuse to start over. An unset `secret NAME?` is reported and exits 0.
+
 ## `hekla erase <SUBJECT_FIELD> <SUBJECT_VALUE> [DIR] [--data-dir PATH]`
 
 Deletes one subject's key from the operational database. Irreversible, O(1), and immediately visible
@@ -351,6 +377,7 @@ the rows are rewrapped it can no longer unwrap them: reads of a sealed column an
 | `HEKLA_MASTER_KEY_PREVIOUS` | the same | comma-separated prior masters, for unwrapping during rotation |
 | `HEKLA_MAX_ATTEMPTS` | `serve` | how many times a command re-decides after a DCB conflict before answering 409. Default 5, capped at 15, read once per process |
 | `HEKLA_UI_DIR` | `serve` | serve the admin console's assets from this directory instead of the ones compiled in |
+| `HEKLA_SECRET_<NAME>` | `serve`, `verify`, `plan`, `secrets` | the fallback source for a declared `secret NAME` that `[secrets]` does not name. Never read by `check` or `test` |
 | `RUST_LOG` | `serve`, `verify` | tracing filter, default `info` |
 
 ## Every finding `hekla check` reports
@@ -379,3 +406,9 @@ Warnings, which never fail the check:
 | --- | --- |
 | ``X folds `t` with no constraint on a high-cardinality field, so it guards a broad set of events; a boundary is best keyed on an entity id`` | a slice whose filters name no `Uuid`, `Int`, `String`, `Money` or `Timestamp` field |
 | ``X constrains most of `t`'s fields, which looks like a copied `emit`; a slice is a subset match and over-constraining can match nothing`` | on an event of 4 or more fields, filters on 75% or more of them |
+| ``N is declared and nothing reads it, so this deployment is asked for a credential the program never uses`` | a `secret` no effect reads. Answered from the digest, so a credential only a `test` reaches counts as unread |
+| ``[secrets] names `N`, which the project does not declare`` | a `hekla.toml` entry naming no `secret` declaration: a line that parses and does nothing |
+
+**`hekla check` never reads the environment**, so a credential being *unset* is never a finding. That
+is `hekla secrets`' question and `hekla serve`'s refusal. A CI gate that needed production
+credentials to pass would either be run with them or be skipped, and both are worse than the problem.

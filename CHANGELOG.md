@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- a project declares the deployment credentials it needs with `secret NAME`, and hekla resolves each
+  from `[secrets]` in `hekla.toml` (`{ env = "..." }` or `{ file = "..." }`) or from
+  `HEKLA_SECRET_<NAME>`. `hekla serve` refuses to start when a required one is unset, naming every
+  missing one at once
+- `hekla secrets` reports every declared credential, where this machine reads it from, and a short
+  fingerprint, and exits non-zero when a required one is unset, so it works as a pre-deploy gate
+- `hekla plan` reports the same, always present in `--json`, and `--replay` counts invocations it
+  could not replay because an effect reads a credential this machine has not set
+- `/admin/system` and `/admin/schema` list the declared credentials beside the keystore: a name, a
+  source and a fingerprint, never a value
+- `hekla check` warns about a declared credential nothing reads, and about a `[secrets]` entry naming
+  no declaration. It never reads the environment, so it stays a CI gate
 - an `on latest` arm runs once per key per dispatch batch, at the newest matching position in it,
   and the surviving invocation records the range it folded
 - `/admin/effects/{name}` reports `latest_collapsed`, the positions folded into another invocation
@@ -22,7 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapses to one invocation however long it is
 - schema v9 adds `effect_invocation.collapsed_from`; rows written before it read back as null, which
   is the same answer as an invocation that folded nothing
-- heklang 0.4.0
+- a transport failure's message now names a credential rather than spelling it. `ureq` writes the url
+  it was given into its own error text, and hekla concatenates that onto the wedge message, so a
+  webhook whose whole address is the credential used to reach `/status`, `/admin` and the logs on the
+  first DNS failure
+- heklang 0.5.0
 
 ## [0.2.0](https://git.tqwewe.com/tephra/hekla/compare/v0.1.1...v0.2.0) - 2026-09-06
 

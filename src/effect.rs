@@ -1736,6 +1736,7 @@ fn try_invocation(
         minted: None,
         sealed: false,
         http: Some(Arc::clone(http)),
+        secrets: Some(Arc::clone(runtime.secrets_shared())),
     };
     let mut journal = Journal {
         opdb: runtime.opdb(),
@@ -2326,6 +2327,11 @@ pub fn replay(effect: &str, position: u64, runtime: &Arc<Runtime>, asked: Asked)
         // `erase` would perform, both of which reach the store through the host.
         sealed: true,
         http: Some(Arc::new(SealedHttp) as Arc<dyn HttpClient>),
+        // Unjournaled, so it re-runs here the way `reveal` does. Answering nothing
+        // would wedge every replay of a secret-reading effect on `MissingSecret` and
+        // report a divergence that is not there, which is the fault this check exists
+        // to find rather than to cause.
+        secrets: Some(Arc::clone(runtime.secrets_shared())),
     };
     let mut journal = SealedJournal {
         inner: Journal {

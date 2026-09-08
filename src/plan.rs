@@ -75,6 +75,7 @@ use crate::opdb::{self, DeclarationRow, OpDb, SCHEMA_VERSION};
 use crate::projector::{Reconcile, reconcile_from};
 use crate::read_model::ReadModel;
 use crate::runtime::Runtime;
+use crate::secrets::{self, Resolution};
 
 /// How one declaration differs from what is deployed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +244,11 @@ pub struct Coverage {
     /// Counted per effect from its form, so an effect that never reveals is replayed
     /// even in a project that seals fields elsewhere.
     pub no_master_key: usize,
+    /// Invocations of an effect that reads a `secret` this machine has not set. The same
+    /// shape as `no_master_key` and for the same reason: the handler would wedge on
+    /// `MissingSecret` before reaching a call, so the replay learns nothing about the
+    /// candidate and counting it as a divergence would be a false alarm.
+    pub no_secret: usize,
     /// Why the master key that *was* configured could not be used, when one was.
     ///
     /// A half-configured rotation (the current master set, the previous one forgotten)
@@ -296,6 +302,14 @@ pub struct Plan {
     /// How much history the replay spoke for. `None` when replay was not asked for,
     /// which is not the same as a replay that covered nothing.
     pub coverage: Option<Coverage>,
+    /// One entry per `secret` the project declares, and whether this machine can supply
+    /// it. Reported rather than refused: a plan is asked from a laptop and from a
+    /// deploy pipeline, and only one of those has the credentials.
+    ///
+    /// Appended rather than attributed, for the reason [`Cause::LaneRepartition`] gives:
+    /// it is a fact about the environment the deploy lands in, not an inference from the
+    /// diff, so it stands whether or not the digest versions line up.
+    pub secrets: Vec<Resolution>,
 }
 
 impl Plan {
@@ -303,6 +317,10 @@ impl Plan {
     pub fn is_empty(&self) -> bool {
         self.changes.is_empty()
             && self.divergences.is_empty()
+            // A missing credential is a change: the deploy would refuse to boot, and
+            // "nothing would change" about a process that will not start is the one
+            // answer this command must never give.
+            && !self.secrets.iter().any(Resolution::missing)
             && self
                 .projectors
                 .iter()
@@ -321,6 +339,21 @@ impl Plan {
         serde_json::json!({
             "declarations_compared": self.declarations_compared,
             "digest_version_mismatch": self.digest_version_mismatch,
+            // Always present, never null, unlike `divergences`: this one is always
+            // computable, so an absent key would let a gate pass on the strength of a
+            // check that was made and simply not reported.
+            "secrets": self.secrets.iter().map(|one| serde_json::json!({
+                "name": one.name,
+                "optional": one.optional,
+                "source": one.source,
+                "kind": one.kind,
+                "resolved": one.resolved(),
+                // A short digest, domain-separated by the name. Enough to tell staging
+                // from production; never the credential.
+                "fingerprint": one.fingerprint,
+                "error": one.error,
+                "module": one.module,
+            })).collect::<Vec<_>>(),
             "changes": self.changes.iter().map(|change| serde_json::json!({
                 "kind": change.kind.name(),
                 "name": change.name,
@@ -380,6 +413,7 @@ impl Plan {
                 "unreadable_history": coverage.unreadable_history,
                 "reclaimed": coverage.reclaimed,
                 "no_master_key": coverage.no_master_key,
+                "no_secret": coverage.no_secret,
                 "unusable_master_key": coverage.unusable_master_key,
                 "unavailable": coverage.unavailable,
                 "truncated": coverage.truncated,
@@ -400,6 +434,28 @@ impl fmt::Display for Plan {
             "compared {} declaration(s) against what is deployed",
             self.declarations_compared
         )?;
+
+        // Before the digest-version bail, because a credential is not a comparison: it
+        // is a fact about the machine this would deploy from, so it stands whether or
+        // not the recorded hashes line up. Its own doc says so, and printing it only on
+        // the comparable path would make `is_empty` and `--json` disagree with what an
+        // operator reads. Only the ones that need saying, so a fully configured deploy
+        // prints nothing here.
+        for one in self.secrets.iter().filter(|one| !one.resolved()) {
+            if one.optional {
+                writeln!(
+                    f,
+                    "  secret {} is not set here ({}), and is optional",
+                    one.name, one.source
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "  secret {} is not set here ({}), so serving would refuse to start",
+                    one.name, one.source
+                )?;
+            }
+        }
 
         // Every hash differs for one reason, so listing them all would bury it.
         if self.digest_version_mismatch {
@@ -603,6 +659,14 @@ fn write_coverage(f: &mut fmt::Formatter<'_>, coverage: &Coverage) -> fmt::Resul
             )?,
         }
     }
+    if coverage.no_secret > 0 {
+        writeln!(
+            f,
+            "not replayable: {} invocation(s) of an effect that reads a deployment \
+             credential this machine has not set",
+            coverage.no_secret
+        )?;
+    }
     if coverage.subject_erased > 0 {
         writeln!(
             f,
@@ -755,7 +819,13 @@ pub fn compute_with(
         );
     }
 
-    let mut plan = Plan::default();
+    // What this machine can supply for the credentials the candidate declares. Resolved
+    // here rather than taken off a runtime, because a plan runs without `--replay` and
+    // then never opens one. Never fatal: see `Runtime::open_following`.
+    let mut plan = Plan {
+        secrets: secrets::resolve(&project.program, &project.config, &project.root).1,
+        ..Plan::default()
+    };
     // The hash each effect is *running* under, which is the only baseline a replay may
     // use: see `OpDb::recent_terminal_invocations`.
     let deployed_effects: BTreeMap<String, String>;
@@ -1243,6 +1313,21 @@ fn replay_effects(
             }
         },
     };
+    // Off the runtime rather than resolved again: `open_following` already read every
+    // source, and reading a file twice could disagree with itself if a deploy rotated
+    // one mid-plan.
+    //
+    // `missing`, not `!resolved`: an unset **optional** credential is a branch the
+    // program takes, not a wedge. `Expr::Secret { optional: true }` answers an absent
+    // `Opt(Secret)` and the handler carries on, so an effect that reads one is perfectly
+    // replayable and counting it as uncovered would throw away real divergence coverage
+    // for a credential the deployment deliberately left out.
+    let unset_secrets: BTreeSet<&str> = runtime
+        .secret_report()
+        .iter()
+        .filter(|one| one.missing())
+        .map(|one| one.name.as_str())
+        .collect();
 
     let mut divergences = Vec::new();
     for (unit, form, script_hash) in affected {
@@ -1260,6 +1345,19 @@ fn replay_effects(
             // same rule the reads below follow.
             match runtime.count_terminal_invocations(name, script_hash) {
                 Ok(total) => coverage.no_master_key += total,
+                Err(err) => {
+                    tracing::warn!("counting invocations of effect `{name}` failed: {err:#}");
+                    coverage.unreadable_history.push(name.to_owned());
+                }
+            }
+            continue;
+        }
+        // And the same, one line down, for rule 16's credentials. Checked after the key
+        // so an effect that needs both is reported under the first thing missing rather
+        // than counted twice.
+        if reads_unset_secret(form, &unset_secrets) {
+            match runtime.count_terminal_invocations(name, script_hash) {
+                Ok(total) => coverage.no_secret += total,
                 Err(err) => {
                     tracing::warn!("counting invocations of effect `{name}` failed: {err:#}");
                     coverage.unreadable_history.push(name.to_owned());
@@ -1484,6 +1582,26 @@ fn references_of(form: &Sexp, out: &mut BTreeSet<Decl>) {
 /// behind a call.
 fn reveals(form: &Sexp) -> bool {
     any_node(form, &mut |node| node.head() == Some("reveal"))
+}
+
+/// Whether `form` reads a credential this machine has not set.
+///
+/// The same shape as [`reveals`] and for the same reason: a read is unjournaled, so it
+/// re-runs on every replay, and a required one the host cannot answer wedges the
+/// invocation on `MissingSecret` before it reaches a call. That is not evidence about
+/// the candidate, so the invocation is counted as coverage this plan did not have.
+///
+/// Only the *unset* ones. A project with ten credentials of which nine are configured
+/// replays every effect that reads only those nine, which is the same per-effect
+/// precision `reveals` buys for the master key.
+fn reads_unset_secret(form: &Sexp, unset: &BTreeSet<&str>) -> bool {
+    if unset.is_empty() {
+        return false;
+    }
+    any_node(form, &mut |node| {
+        node.head() == Some("secret")
+            && matches!(node.rest().first(), Some(Sexp::Atom(name)) if unset.contains(name.as_str()))
+    })
 }
 
 /// Whether `pred` holds of `form` or of anything inside it.

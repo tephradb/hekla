@@ -1486,9 +1486,16 @@ fn schema_path() -> Value {
                     "additionalProperties": false,
                 },
             },
+            "secrets": {
+                "type": "array",
+                "items": secret_entry_schema(),
+                "description": "The deployment credentials this project declares. A `secret` is \
+                    a declaration, so it belongs in the answer to \"what is this process \
+                    running\". Never a value.",
+            },
             "declarations": { "type": "array", "items": schema_ref("DeclarationSummary") },
         },
-        "required": ["events", "commands", "projectors", "effects", "declarations"],
+        "required": ["events", "commands", "projectors", "effects", "secrets", "declarations"],
         "additionalProperties": false,
     });
     json!({
@@ -2791,6 +2798,15 @@ fn system_info_schema() -> Value {
                 "required": ["configured", "master_key_ids"],
                 "additionalProperties": false,
             },
+            "secrets": {
+                "type": "array",
+                "items": secret_entry_schema(),
+                "description": "Every deployment credential the project declares, and where this \
+                    process read it from. Never a value. Every *required* one here resolved, \
+                    because one that had not would have stopped this process booting; an \
+                    optional one (`secret NAME?`) may report `resolved: false`, which is a \
+                    branch the program takes rather than a fault.",
+            },
             "config": {
                 "type": "object",
                 "description": "The effective configuration, after `hekla.toml` and any flag \
@@ -2827,8 +2843,53 @@ fn system_info_schema() -> Value {
         },
         "required": [
             "version", "uptime_seconds", "log_head", "data_dir",
-            "opdb_schema_version", "verify", "keystore", "config"
+            "opdb_schema_version", "verify", "keystore", "secrets", "config"
         ],
+        "additionalProperties": false,
+    })
+}
+
+/// One declared deployment credential, without the credential.
+///
+/// The same shape `/admin/schema` serves, because both come from one shaper. `source`
+/// names where this process looked rather than what it found, so it is safe to publish
+/// even when the value is not: an environment variable's *name* is configuration, and its
+/// contents are the secret.
+fn secret_entry_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One deployment credential the project declares. Never its value.",
+        "properties": {
+            "name": { "type": "string", "description": "The declared name." },
+            "optional": {
+                "type": "boolean",
+                "description": "Declared `secret NAME?`. An unset optional is a branch the \
+                    program takes rather than a refusal to start.",
+            },
+            "source": {
+                "type": "string",
+                "description": "Where this process read it from, as `env NAME` or `file PATH`.",
+            },
+            "kind": { "type": "string", "enum": ["env", "file"] },
+            "resolved": { "type": "boolean" },
+            "fingerprint": {
+                "type": ["string", "null"],
+                "description": "A short digest of the value, domain-separated by the declared \
+                    name, so two deployments can be told apart without either being shown. Null \
+                    when the credential is not set.",
+            },
+            "module": {
+                "type": ["string", "null"],
+                "description": "The file the declaration was written in.",
+            },
+            "error": {
+                "type": ["string", "null"],
+                "description": "Why the source could not be read, when it was there and \
+                    unreadable. Null both when the credential resolved and when its source is \
+                    simply absent, which `resolved` tells apart.",
+            },
+        },
+        "required": ["name", "optional", "source", "kind", "resolved", "fingerprint", "module", "error"],
         "additionalProperties": false,
     })
 }

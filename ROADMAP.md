@@ -1785,6 +1785,102 @@ Honest scope for this phase:
   instead, through `HEKLA_UI_DIR`: the form building the right body for every kind, the JSON override,
   a refusal, and an idempotency key replaying a commit without appending a second one.
 
+## Phase 30: a deployment credential is a declaration, not a constant (done)
+
+A project had no way to hold a Discord webhook url or a Stripe key. `docs/language.md` documented
+`const WEBHOOK: String = "https://..."` as the shape, and it is the wrong one three times over: the
+value is in git; `digest.rs:1339` puts a `Literal::Str`'s text into the packed form, so rotating it
+moves every hash that reaches it and costs replay coverage on every invocation already recorded
+against that `script_hash`; and one constant cannot be three different things in dev, staging and
+production.
+
+The log was not the answer either, and saying why is most of this phase. heklang already stores
+**per-tenant** credentials there: a shop's OAuth token arrives as a command, lands as a
+`@subject`-sealed field, and an effect folds it out and reveals it. A **per-deployment** credential is
+not a domain fact, is permanent once written, costs a fold per invocation, and leaves a fresh database
+unable to do anything until an operator posts a command, which turns "deploy is restart" into "deploy
+is restart plus a runbook". So the split is the design: log for per-tenant, environment for
+per-deployment, and `AUTHORING.md` §5a says so where an author will hit it.
+
+heklang shipped rule 16 (`secret NAME`, a `Secret` type that is a taint rather than a wall, and a
+`Request` carrying `wire` and `shown`). This is hekla's half.
+
+- **The refusal is at boot, and it names every missing credential at once.** `Runtime::open` and
+  `open_quiescent` refuse; `open_following` deliberately does not, because a plan is asked from a
+  laptop as well as from a pipeline and demanding production credentials before it will diff two
+  declaration tables is worse than saying what it could not replay. That is the same three-way split
+  the master key already has, and the third stance is why `Coverage` gained `no_secret`.
+- **`hekla check` never reads the environment**, which is a deliberate departure from the plan this
+  was written against. It is the CI gate; one that needed production credentials to pass would either
+  be run with them, which is worse than the problem, or be skipped. It warns about a declaration
+  nothing reads and a `[secrets]` entry naming no declaration, and that is all. Whether a credential
+  is *set* is `hekla plan`'s question and `Runtime::open`'s refusal.
+- **The unused-credential warning reads the digest rather than the IR.** A read site renders as
+  `(secret NAME)` and the declaration has no entry of its own, so a substring search over the packed
+  form answers "does anything read it" without walking the expression arena. Tests are excluded on
+  purpose: a credential only a `test` reaches is one production never uses.
+- **A fingerprint is domain-separated by the declared name and truncated to 8 hex.** The job is an
+  operator telling staging from production, not identity, and the full digest of a credential is a
+  stronger oracle than that needs.
+- **The leak heklang could not close.** rule 16 redacts the journal key, `ErrorKind::Unreachable` and
+  every `Display`. It cannot redact `ureq`'s error text, which is written below the seam, and hekla
+  concatenates that onto the wedge message: a webhook whose whole address is the credential could
+  reach `/status`, `/admin` and `tracing` on the first DNS failure. `HeklaHost::redact_transport`
+  makes two passes. Substituting `request.shown.url` for `request.wire.url` is exact and handles a
+  transport that echoed the url verbatim; the store's own scrubber then scans for the credential
+  *values*, which survives a rendering that normalised the url around them (a default port dropped, a
+  reserved character percent-encoded). Both, because measuring settled it: `ureq` 3 renders a DNS
+  failure with **no url at all**, so the substitution alone could not be shown to be doing anything,
+  and a rendering that included a parsed uri would have slipped past it. The scrubber skips a value
+  under 8 characters, since one that short occurs inside ordinary words.
+- **A source that is present and unreadable is reported, not raised.** `secrets::resolve` is
+  infallible and records the reason on the `Resolution`. `refusal` counts it as missing and names why,
+  so `serve` still refuses and says "Permission denied" rather than "not set"; but `hekla plan`
+  against a deployment whose `/run/secrets` mount the pipeline user cannot read still produces a plan.
+  Raising would have made the one case an operator most needs a diff for the one case that yields
+  none.
+- **The refusal happens before the declaration table is written.** A boot that refuses must leave no
+  trace: recording the candidate and then bailing would make the next `hekla plan` compare the
+  candidate against itself and report that nothing would change, for a deploy that has never run.
+- **The sealed replay gets the real store.** A read is unjournaled, so it re-runs the way `reveal`
+  does; a replay answering nothing would wedge on `MissingSecret` and report a divergence for every
+  invocation of every effect that reads one. That is the fault the check exists to find, not to cause.
+- **A relative `file` path resolves against the project root**, not the working directory, so
+  `hekla serve ./app` and `cd app && hekla serve` read the same credential and a container image can
+  ship one.
+
+**Honest scope:**
+
+- **`verify` refuses rather than degrading per effect, and that is deliberate.** `plan` counts an
+  effect it cannot replay and carries on, because a plan is asked from a laptop. A sweep is the
+  opposite: its whole output is an assertion that the invariants hold, and one that quietly checked a
+  third of the history reports `ok` having established very little. That is the same reasoning the
+  master-key guard in `open_quiescent` already carries, and splitting the two would make one of them
+  wrong. The cost is real: `hekla verify` needs the credential set for the project, even for effects
+  that read none. If a deployment turns up where that is the difference between sweeping nightly and
+  not, the fix is `reads_unset_secret` applied per effect, exactly as `plan` does it.
+- **Journaled response bodies are still stored and served in the clear.** `Recorded::Response { body }`
+  lands in `effect_journal.result` and `admin_invocation` serves it, so an OAuth token-exchange effect
+  writes its access token there for the retention window. Untouched here because it is a different
+  problem with a different fix: either put the credential in the log as a `@subject` field, which is
+  the per-tenant story working as designed, or put the body behind the `?decrypt=`-shaped opt-in
+  `/admin/events` already establishes. Nothing in this phase makes it worse.
+- **Nothing is zeroized past the source.** `Value::Secret` holds `Arc<str>`, and a shared buffer
+  cannot be wiped, so heklang holds plaintext for the life of the invocation and hekla's store holds
+  it for the life of the process. `SecretStore` is not `Debug`, which stops the obvious accident and
+  not a determined one. A partial guarantee would be worse than an honest absence, and both repos say
+  so rather than implying otherwise.
+- **A revealed value is still untainted.** `reveal` hands back an ordinary string, so an author can
+  put a customer's email in a log line exactly as before. `Sealed` protects content at rest and after
+  erasure and `Secret` protects it in observable output; these are different threats and unifying
+  them would be a breaking change to every effect in the corpus.
+- **No `_PREVIOUS` list, deliberately.** A master key needs one because stored data is wrapped under
+  it. A credential wraps nothing, so create-new, deploy, revoke-old is handled by a restart, and the
+  docs say it out loud because someone will otherwise copy the master-key shape.
+- **`[secrets]` has two source forms and no provider.** Vault, AWS Secrets Manager and a SOPS- or
+  age-encrypted file are all new variants of the same enum rather than a redesign, which is why the
+  table is keyed by source rather than by value. None is built because none is asked for.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

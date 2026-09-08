@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use heklang::host::{
     AppendCondition, Attempt, Calls, Clock, Http, Keys, Log, Predicate, Query, Recorded, Request,
+    Secrets,
 };
 use heklang::interp::{Error, ErrorKind};
 use heklang::ir::EventPath;
@@ -39,6 +40,7 @@ use crate::opdb::OpDb;
 use crate::read_api;
 use crate::read_model::ReadModel;
 use crate::schema::{self, EmittedEvent, EventDef, EventDefs, FieldKind};
+use crate::secrets::SecretStore;
 use crate::store::Store;
 
 /// heklang counts positions from zero and tephra counts from one, so the two are one
@@ -96,6 +98,14 @@ pub fn from_heklang_json(value: &Json) -> serde_json::Value {
             serde_json::Value::Number,
         ),
         Json::Str(text) => serde_json::Value::String(text.clone()),
+        // The **redaction**, never the credential. This function feeds the event log and
+        // the read models, which are the two places a credential must never reach, and
+        // an arm that spelled it out would put one there permanently the first time an
+        // unreachable case stopped being unreachable. Unreachable today because
+        // `Json::wire` and `Json::shown` both strip the variant before a host is handed
+        // a request, and because rule 16 keeps a `Secret` out of an `emit` and a
+        // projector write; this is what that costs if either ever stops being true.
+        Json::Secret { redacted, .. } => serde_json::Value::String(redacted.clone()),
         Json::Arr(items) => serde_json::Value::Array(items.iter().map(from_heklang_json).collect()),
         Json::Obj(fields) => serde_json::Value::Object(
             fields
@@ -161,6 +171,16 @@ pub struct HeklaHost {
     /// The network, absent for a command: heklang's parser guarantees a command never
     /// reaches `http.*`, so a command's world has nothing to give it.
     pub http: Option<Arc<dyn HttpClient>>,
+    /// What this deployment supplies for the project's `secret` declarations, absent for
+    /// the same reason `http` is: rule 16 gates a read to an effect arm and an
+    /// effect-local `fn`, so a command's world has no credential to give either. Keeping
+    /// it `None` there makes that a structural guarantee rather than a convention.
+    ///
+    /// Resolved once per process and shared, unlike everything else on this struct,
+    /// which is per run. A **sealed replay still gets the real one**: a read is
+    /// unjournaled, so it re-runs the way `reveal` does, and a replay answering nothing
+    /// would wedge on `MissingSecret` and report a divergence that is not there.
+    pub secrets: Option<Arc<SecretStore>>,
     /// The window a rate limiter asked for, if a retryable response named one in
     /// seconds. Written here rather than handed to the language: heklang decides
     /// *whether* to retry and this decides what one attempt costs, and only a host has
@@ -438,6 +458,17 @@ impl Log for HeklaHost {
     }
 }
 
+/// Rule 16's other half. A world with no store answers nothing, which is a command's
+/// world and the bare appender a test seeds a log through; neither can reach a `secret`,
+/// so neither is ever asked. Unjournaled by design, so this is called once per read on
+/// every attempt and every replay, and a rotation therefore takes effect on the next
+/// restart with no recorded answer left to invalidate.
+impl Secrets for HeklaHost {
+    fn secret(&self, name: &str) -> Option<Arc<str>> {
+        self.secrets.as_ref()?.get(name)
+    }
+}
+
 impl Clock for HeklaHost {
     fn now(&self) -> i64 {
         value::timestamp(&self.now).unwrap_or(0)
@@ -511,12 +542,49 @@ fn http_method(verb: &str) -> String {
     verb.rsplit('.').next().unwrap_or(verb).to_uppercase()
 }
 
+impl HeklaHost {
+    /// The one leak rule 16's redaction cannot reach on its own.
+    ///
+    /// heklang renders `ErrorKind::Unreachable` from `Request::shown`, so the language's
+    /// own message is safe. This string is not the language's: it is the transport's,
+    /// written *below* the seam by `ureq` from whatever it chose to include. The wedge
+    /// message concatenates the two (`effect::try_invocation`), and from there it reaches
+    /// `/status`, `/admin` and `tracing`. A `secret DISCORD_WEBHOOK` used as a url is a
+    /// credential that is entirely a url, so anything echoing it publishes the whole
+    /// thing.
+    ///
+    /// Two passes, because one is not enough. Substituting the url handles the case where
+    /// the transport echoed it verbatim, and is exact. But `ureq` is free to render a
+    /// *parsed* uri instead: a default port dropped, an empty path filled in, a reserved
+    /// character percent-encoded, and the substitution silently misses. So the store's own
+    /// scrubber runs after it, scanning for the credential values themselves, which
+    /// survives any framing the transport put around them. Measured rather than assumed:
+    /// `ureq` 3 renders a DNS failure with no url at all, which is why the first pass on
+    /// its own could not be shown to be doing anything.
+    fn redact_transport(&self, reason: &str, request: &Request) -> String {
+        let substituted = if request.wire.url == request.shown.url {
+            reason.to_owned()
+        } else {
+            reason.replace(&request.wire.url, &request.shown.url)
+        };
+        match &self.secrets {
+            Some(store) => store.redact(&substituted),
+            None => substituted,
+        }
+    }
+}
+
+/// Rule 16's host obligation, and the reason `Request` has two renderings: a credential
+/// may sit in a url, a header value or a body, so `wire` is what to send and `shown` is
+/// what anything else is allowed to see. heklang made these separate fields rather than
+/// one field plus a convention precisely so this choice is made once, here, at the
+/// compiler's insistence. `heklang/docs/host.md` has the rule.
 impl Http for HeklaHost {
     fn send(&mut self, request: &Request) -> Attempt {
         let Some(client) = self.http.clone() else {
             return Attempt::Transport("this world has no network".to_string());
         };
-        let headers = match &request.headers {
+        let headers = match &request.wire.headers {
             Json::Obj(fields) => fields
                 .iter()
                 .map(|(name, value)| (name.clone(), value::text(&Value::Json(value.clone()))))
@@ -524,12 +592,13 @@ impl Http for HeklaHost {
             _ => Vec::new(),
         };
         let body = request
+            .wire
             .body
             .as_ref()
             .map(|body| from_heklang_json(body).to_string().into_bytes());
         let sent = HttpRequest {
             method: http_method(request.verb),
-            url: request.url.clone(),
+            url: request.wire.url.clone(),
             headers,
             body,
         };
@@ -554,7 +623,7 @@ impl Http for HeklaHost {
                 }
             }
             Err(err) => {
-                let reason = format!("{err:#}");
+                let reason = self.redact_transport(&format!("{err:#}"), request);
                 self.last_transport = Some(reason.clone());
                 Attempt::Transport(reason)
             }

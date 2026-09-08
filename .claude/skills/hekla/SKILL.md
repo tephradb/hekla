@@ -37,6 +37,7 @@ hekla openapi <dir>   # the generated OpenAPI 3.1 document on stdout, findings o
 hekla verify <dir>    # the offline invariant sweep over a data directory
 hekla plan   <dir>    # what deploying this project over a data directory would change
                       #   --replay also re-runs recorded effect invocations against it
+hekla secrets <dir>   # every declared credential, where it is read from, and whether it is set
 hekla rewind <Effect> <position> <dir>  # take an effect back so it reprocesses. Irreversible
 hekla erase <field> <value> <dir>    # delete one subject's key. Irreversible
 hekla rotate <dir>    # rewrap every subject key under the current master
@@ -100,6 +101,9 @@ one under `tests/` does.
 | change a projector's shape | edit it and restart (`auto_rebuild`), or `POST /projectors/{Name}/replay` |
 | forget a person | `hekla erase <subject_field> <value> <dir>`, or `erase(...)` in an effect arm |
 | change the master key | set the new `HEKLA_MASTER_KEY`, keep the old in `HEKLA_MASTER_KEY_PREVIOUS`, `hekla rotate` |
+| give a project a webhook url or an API key | `secret NAME` in a `.hk` file, then `HEKLA_SECRET_<NAME>` or a `[secrets]` entry |
+| check a deploy has the credentials it needs | `hekla secrets`, or the `secrets` section of `hekla plan` |
+| rotate a credential | change the source and restart. There is no `_PREVIOUS` list and none is needed |
 | prove a deployment did not diverge | stop it (or copy the data directory) and `hekla verify` |
 | pin the API in CI | `hekla openapi . > openapi.json` and diff it |
 | see what the log actually holds | `GET /admin/events`, or open `/admin` in a browser |
@@ -114,6 +118,7 @@ one under `tests/` does.
 | `serve` | yes | yes, creates | **yes** | if any `@subject` | errors, a bad addr, a held lock |
 | `verify` | yes | yes, must exist | **yes** | if any `@subject` | any violation |
 | `openapi` | yes | no | no | no | not a directory, errors, nothing declared |
+| `secrets` | yes | no | no | no | not a directory, errors, a required credential unset |
 | `rewind` | yes, to name the arms | must hold `hekla.db` | **yes** | no | a held lock, an unknown effect |
 | `erase` | for the path only | must hold `hekla.db` | no | no | no database at that path |
 | `rotate` | for the path only | must hold `hekla.db` | no | **required** | no key, no database |

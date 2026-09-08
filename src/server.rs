@@ -1254,6 +1254,10 @@ async fn admin_schema(State(runtime): State<Shared>) -> Response {
             "commands": commands,
             "projectors": projectors,
             "effects": effects,
+            // A `secret` is a declaration, so it belongs in the answer to "what is this
+            // process running". The same shaper `/admin/system` uses, so the two cannot
+            // describe one credential differently: it holds no value either way.
+            "secrets": introspect::secrets(runtime.secret_report()),
             "declarations": declarations.iter().map(introspect::declaration).collect::<Vec<_>>(),
         }))
     })
@@ -1278,6 +1282,13 @@ async fn admin_system(State(runtime): State<Shared>) -> Response {
                 // means a rotation has started and not finished.
                 "master_key_ids": if keystore { runtime.master_key_ids()? } else { Vec::new() },
             },
+            // Beside the keystore because it is the same kind of thing: credentials a
+            // deployment settled before the process started. An inventory and never the
+            // material, exactly as `master_key_ids` is, and for the same reason
+            // `/admin/subjects` says outright. Every *required* one here resolved, since
+            // one that had not would have stopped this process booting; an optional one
+            // may report `resolved: false`, which is a branch and not a fault.
+            "secrets": introspect::secrets(runtime.secret_report()),
             "config": {
                 "effects": { "pool_size": config.effects.pool_size },
                 "retention": { "effect_journal_days": config.retention.effect_journal_days },

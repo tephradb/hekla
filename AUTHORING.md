@@ -214,6 +214,68 @@ value and is refused. Keep a plaintext handle beside the sealed address and fold
 `examples/orders` and the test suite's `ACCOUNT_EVENTS` both do. Erasing a subject does not reopen a
 handle it claimed, which is the property that rule exists for, and it holds with no key at all.
 
+## 5a. Deployment credentials
+
+There are **two kinds of credential** and confusing them is the mistake this section exists to
+prevent.
+
+A **per-tenant** credential is a domain fact: a shop's OAuth token arrived because that shop
+connected, and it belongs in the log as a `@subject`-sealed field an effect folds out and `reveal`s.
+Section 5 covers it and nothing here changes it.
+
+A **per-deployment** credential is not a domain fact. A Discord webhook url, a Stripe key, a SendGrid
+key: one per deployment rather than one per tenant, different in dev, staging and production, rotated
+out of band. Putting one in the log would make a permanent record of something that is not history,
+cost a fold per invocation, and leave a fresh database unable to do anything until someone posted a
+command. Putting one in a `const` is worse: it is in git, and it is in the digest hash, so rotating it
+would move `script_hash` and cost replay coverage on every invocation already recorded.
+
+So a project **declares** what it needs and hekla supplies it:
+
+```hek
+secret DISCORD_WEBHOOK
+secret SENTRY_DSN?          // this deployment may not set it
+```
+
+```toml
+[secrets]
+DISCORD_WEBHOOK = { env = "DISCORD_WEBHOOK_URL" }
+STRIPE_KEY      = { file = "/run/secrets/stripe_key" }
+# a name absent here falls back to HEKLA_SECRET_<NAME>
+```
+
+The `env` form names a variable your platform already sets, rather than making you rename it. The
+`file` form is what systemd's `LoadCredential`, Docker secrets and a Kubernetes projected volume all
+produce; a relative path resolves against the project root, and **one** trailing newline is trimmed,
+because every `echo x > secret` writes one. There is deliberately no form that holds the value:
+`hekla.toml` is committed.
+
+What the language guarantees, and what hekla adds:
+
+- **A credential may reach a url, a header value or a request body, and nothing else.** Not a `log`
+  line, not an `emit`, not a read model, not a `fold`, not a comparison, not a method. That is
+  heklang's rule 16, checked, and the fold prohibition is a correctness rule: a fold must be a pure
+  function of the log, and a credential is not in the log.
+- **`"Bearer {STRIPE_KEY}"` works**, and the whole interpolation becomes a credential. That is the
+  most common shape a credential takes, so a rule that forbade it would forbid the feature.
+- **Nothing hekla serves ever shows a value.** The journal key, the wedge message, `/status`,
+  `/admin` and the logs all get `{SECRET:NAME}` instead. `hekla secrets`, `hekla plan` and
+  `/admin/system` report a source and a short fingerprint, never a value.
+- **`hekla serve` refuses to start** when a required credential is unset, naming every missing one at
+  once. `hekla secrets` answers the same question on its own and exits non-zero, so it works as a
+  pre-deploy gate.
+- **`hekla check` never reads the environment.** It is the CI gate; needing production credentials to
+  pass would defeat it. It warns about a declared credential nothing reads and a `[secrets]` entry
+  naming no declaration, and that is all.
+- **`hekla test` never reads the environment either.** An unmentioned credential answers
+  `secret:NAME`, so no test needs setup, and `secret NAME = "..."` in a test's setup block supplies
+  one when the shape of the value matters.
+
+**Rotating is changing the source and restarting.** There is no `_PREVIOUS` list and there does not
+need to be: a master key needs one because stored data is wrapped under it, and a credential wraps
+nothing. Create the new one, deploy, revoke the old. A rotation moves no digest hash and no journal
+key, so recorded invocations stay replayable across it.
+
 ## 6. What `hekla check` catches
 
 Most static analysis is the compiler's now, and its diagnostics carry a span, a code and a hint. What

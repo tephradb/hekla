@@ -14,7 +14,7 @@
 use heklang::ir::{Command, Slice, Type};
 use heklang::{Defs, Program};
 
-use crate::loader::{Finding, LoadedProject, ProjectorUnit};
+use crate::loader::{Finding, LoadedProject, ProjectorUnit, Span};
 use crate::schema::{EventDef, FieldKind, event_type};
 use crate::tags::RESERVED_TAG_PREFIX;
 
@@ -29,6 +29,7 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
     let mut findings = Vec::new();
     check_events(&project.events, &mut findings);
     check_entities(&project.projectors, &mut findings);
+    check_secrets(project, &mut findings);
     let defs = Defs::of(&project.program);
     for command in &project.program.commands {
         let location = command.module.clone().unwrap_or_default();
@@ -141,6 +142,80 @@ fn check_boundary(
             ));
         }
     }
+}
+
+/// Two things about the credentials a project declares, and deliberately not a third.
+///
+/// **Neither of these reads the environment.** `hekla check` is the CI gate, and a gate
+/// that needed production credentials to pass would either be run with them, which is
+/// worse than the problem, or skipped. Whether a declared credential is actually *set* is
+/// `hekla plan`'s question against a target, and `Runtime::open`'s refusal at boot.
+///
+/// Both are warnings: each names a line that parses and does nothing, which is advice
+/// about a project rather than something hekla cannot serve.
+fn check_secrets(project: &LoadedProject, findings: &mut Vec<Finding>) {
+    // What runs, with local names and layout taken out. A read site renders as
+    // `(secret NAME)`, and a `secret` declaration has no entry of its own, so this
+    // answers "does anything read it" without walking the expression arena. Tests are
+    // excluded on purpose: a credential only a `test` reaches is one production never
+    // uses, which is exactly what the warning is for.
+    let packed = project.digest.packed();
+    for def in &project.program.secrets {
+        if read_somewhere(&packed, &def.name) {
+            continue;
+        }
+        let location = def.module.clone().unwrap_or_default();
+        findings.push(
+            Finding::warning(
+                location,
+                format!(
+                    "`{}` is declared and nothing reads it, so this deployment is asked for a credential the program never uses",
+                    def.name
+                ),
+            )
+            .with_span(Span {
+                line: def.span.start.line,
+                column: def.span.start.col,
+            })
+            .with_hint("delete the declaration, or use it in an effect arm"),
+        );
+    }
+    // Only when the program actually checked. `LoadedProject::load` substitutes an empty
+    // `Program` when it did not, so every configured credential would otherwise be
+    // reported as undeclared and the author would be told to write a declaration they
+    // have already written, once per credential, stacked on top of the real error.
+    if project.has_errors() {
+        return;
+    }
+    for name in project.config.secrets.keys() {
+        if project.program.secret(name).is_some() {
+            continue;
+        }
+        findings.push(
+            Finding::warning(
+                crate::config::FILE_NAME,
+                format!("[secrets] names `{name}`, which the project does not declare"),
+            )
+            .with_hint(format!(
+                "declare `secret {name}` in a .hk file, or drop the entry: nothing reads it"
+            )),
+        );
+    }
+}
+
+/// Whether the packed digest holds a read of this credential.
+///
+/// A substring search, but not a naive one: `(secret STRIPE_KEY)` must not be found by a
+/// search for `STRIPE`, and the atom has two shapes (`(secret NAME)` for a required one,
+/// `(secret NAME optional)` for the other), so the character after the name decides.
+fn read_somewhere(packed: &str, name: &str) -> bool {
+    let needle = format!("(secret {name}");
+    packed.match_indices(&needle).any(|(at, _)| {
+        matches!(
+            packed[at + needle.len()..].chars().next(),
+            Some(')') | Some(' ')
+        )
+    })
 }
 
 /// Whether narrowing on this field meaningfully narrows the log. A bool or a small

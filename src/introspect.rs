@@ -42,6 +42,7 @@ use crate::read_api::filterable_fields;
 use crate::read_model::key_kind;
 use crate::schema::EventDefs;
 use crate::schema::{EntityDef, EventDef, FieldMeta, ModuleDef, scalar_to_string};
+use crate::secrets::Resolution;
 use crate::store::Store;
 use crate::tags;
 use crate::tags::RESERVED_TAG_PREFIX;
@@ -500,6 +501,30 @@ fn field(name: &str, meta: &FieldMeta) -> Value {
         "indexed": meta.indexed,
         "subject": meta.subject,
     })
+}
+
+/// Every deployment credential the project declares, as an inventory.
+///
+/// **Never a value, and not by being careful with the printing.** A [`Resolution`]
+/// carries no credential, so this function has none to leak however it is edited. What it
+/// shows is where each was read from and a short domain-separated digest, which is enough
+/// to tell one deployment's configuration from another's and no use for anything else.
+pub fn secrets(report: &[Resolution]) -> Vec<Value> {
+    report
+        .iter()
+        .map(|one| {
+            json!({
+                "name": one.name,
+                "optional": one.optional,
+                "source": one.source,
+                "kind": one.kind,
+                "resolved": one.resolved(),
+                "fingerprint": one.fingerprint,
+                "error": one.error,
+                "module": one.module,
+            })
+        })
+        .collect()
 }
 
 /// One declared event type.

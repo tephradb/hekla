@@ -146,6 +146,18 @@ enum Command {
               value_parser = clap::value_parser!(u32).range(1..))]
         replay_limit: u32,
     },
+    /// Report every deployment credential the project declares and whether this machine
+    /// can supply it, without printing any of them.
+    ///
+    /// Reads the environment and `[secrets]` in hekla.toml, and nothing else: no data
+    /// directory, no log, no lock. Exits non-zero when a required credential is unset, so
+    /// it stands on its own as a pre-deploy gate for the thing `hekla serve` would
+    /// otherwise refuse to start over.
+    Secrets {
+        /// The project directory.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
     /// Erase a subject: delete its encryption key, making every value scoped to it
     /// unreadable and unmatchable across the log and every read model at once. This
     /// is irreversible.
@@ -220,6 +232,7 @@ pub fn run() -> ExitCode {
             replay,
             replay_limit,
         } => plan(&dir, data_dir.as_deref(), json, replay, replay_limit),
+        Command::Secrets { dir } => secrets(&dir),
         Command::Erase {
             subject_field,
             subject_value,
@@ -593,6 +606,85 @@ fn check(dir: &Path) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         println!("failed: {errors} error(s), {warnings} warning(s)");
+        ExitCode::FAILURE
+    }
+}
+
+/// `hekla secrets`: what this machine can supply for the credentials the project
+/// declares.
+///
+/// Never a value, and not because the printing is careful: it reads a
+/// [`crate::secrets::Resolution`], which does not carry one. What it shows instead is
+/// where each was looked for and a short fingerprint, which is what an operator comparing
+/// staging against production actually needs.
+///
+/// Exits non-zero when a required credential is unset, unlike `plan`, which exits zero
+/// whatever it finds. The difference is what each is for: a change is `plan`'s expected
+/// result, and an unset credential is this command's failure condition.
+fn secrets(dir: &Path) -> ExitCode {
+    // The same guard `plan` and `openapi` apply, for the same reason: `load` succeeds
+    // vacuously on a path that is not a project, and "0 credentials, all fine" for a
+    // typo'd directory is the answer this command must never give.
+    if !dir.is_dir() {
+        eprintln!("error: `{}` is not a directory", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let project = LoadedProject::load(dir);
+    let findings = collect_findings(&project);
+    for finding in &findings {
+        eprintln!("{}", render_finding(finding));
+    }
+    let errors = count_errors(&findings);
+    if errors > 0 {
+        eprintln!("refusing to report: the project has {errors} error(s)");
+        return ExitCode::FAILURE;
+    }
+    let (_, report) = crate::secrets::resolve(&project.program, &project.config, &project.root);
+    if report.is_empty() {
+        println!("this project declares no deployment credentials");
+        return ExitCode::SUCCESS;
+    }
+    let width = report
+        .iter()
+        .map(|one| one.name.len())
+        .max()
+        .unwrap_or_default();
+    for one in &report {
+        let state = match (&one.fingerprint, one.optional) {
+            (Some(fingerprint), _) => format!("set      {fingerprint}"),
+            (None, true) => "unset    (optional)".to_owned(),
+            (None, false) => "MISSING".to_owned(),
+        };
+        // A source that is there and unreadable says so. "not set" would send an
+        // operator looking for a file that is right in front of them.
+        let source = match &one.error {
+            Some(why) => format!("{} ({why})", one.source),
+            None => one.source.clone(),
+        };
+        println!(
+            "  {:<width$}  {state:<20}  {source}",
+            one.name,
+            width = width
+        );
+    }
+    let missing = report.iter().filter(|one| one.missing()).count();
+    if missing == 0 {
+        // "all set" would be a lie when an optional is deliberately unset, and that is
+        // the one line an operator skims, so it counts what it actually checked.
+        let unset = report.iter().filter(|one| !one.resolved()).count();
+        match unset {
+            0 => println!("\nok: {} credential(s), all set", report.len()),
+            _ => println!(
+                "\nok: {} credential(s), every required one set ({unset} optional unset)",
+                report.len()
+            ),
+        }
+        ExitCode::SUCCESS
+    } else {
+        println!(
+            "\nfailed: {missing} of {} credential(s) unset; serving would refuse to start",
+            report.len()
+        );
         ExitCode::FAILURE
     }
 }

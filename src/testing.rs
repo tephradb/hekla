@@ -12,7 +12,7 @@
 //! the Dynamic Consistency Boundary; and a row really round-trips through the column
 //! types the read API will serve it from.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,7 @@ use crate::loader::LoadedProject;
 use crate::opdb::OpDb;
 use crate::read_model::ReadModel;
 use crate::schema::{EntityDef, EventDefs};
+use crate::secrets::SecretStore;
 use crate::store::Store;
 
 /// Throwaway per-test stores stay small, but the segment must still clear the writer's
@@ -126,6 +127,13 @@ pub struct HeklaWorld {
     rows: TestRows,
     http: Arc<ScriptedHttp>,
     keystore: Option<Arc<KeyStore>>,
+    /// What a `secret NAME = "..."` directive supplied, collected during setup and
+    /// handed to the host at [`World::open`] because a store is immutable once built.
+    ///
+    /// **The environment is never read here.** A test that passed because the developer
+    /// happened to have `HEKLA_SECRET_X` set is worse than no test, and it would pass on
+    /// one machine and fail in CI.
+    secrets: BTreeMap<String, Option<Arc<str>>>,
 }
 
 impl HeklaWorld {
@@ -173,6 +181,9 @@ impl HeklaWorld {
             last_transport: None,
             minted: Some(0),
             sealed: false,
+            // Filled at `World::open`, once setup has said which credentials this test
+            // supplies.
+            secrets: None,
         };
         Ok(HeklaWorld {
             rows: TestRows {
@@ -190,6 +201,7 @@ impl HeklaWorld {
             host,
             http,
             keystore,
+            secrets: BTreeMap::new(),
         })
     }
 }
@@ -229,7 +241,25 @@ impl World for HeklaWorld {
             .map_err(|err| Error::new(ErrorKind::Host(err.to_string())))
     }
 
-    fn open(self) -> Result<(HeklaHost, TestRows), Error> {
+    /// Rule 16's setup lever. `Some` is a credential the test supplied, `None` is a test
+    /// declaring that this deployment does not set one, which is the only way to reach
+    /// the absent branch of a `secret NAME?` and the `MissingSecret` backstop for a
+    /// required one.
+    ///
+    /// Implemented rather than left defaulted: heklang's default refuses, so without
+    /// this a `.hk` test using the directive would pass under `hek test` and error under
+    /// `hekla test`, which is exactly the two-dialect drift this module exists to
+    /// prevent.
+    fn secret(&mut self, name: &str, value: Option<&str>) -> Result<(), Error> {
+        self.secrets.insert(name.to_owned(), value.map(Arc::from));
+        Ok(())
+    }
+
+    fn open(mut self) -> Result<(HeklaHost, TestRows), Error> {
+        // Setup is finished, so what it collected is final. Anything the test did not
+        // mention answers `secret:NAME`, matching heklang's own harness so no test needs
+        // setup to run an effect that reads a credential.
+        self.host.secrets = Some(Arc::new(SecretStore::for_tests(self.secrets)));
         Ok((self.host, self.rows))
     }
 }

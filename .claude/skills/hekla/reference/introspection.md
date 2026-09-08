@@ -163,7 +163,15 @@ kinds, and every declaration with the file it came from, its `hash` (what it doe
 not just the three module kinds. It is how to tell what a running server is actually executing.
 
 `/admin/system` reports `version`, `uptime_seconds`, `data_dir`, `opdb_schema_version`, `log_head`,
-`verify`, the keystore (`configured`, `master_key_ids`) and the **effective** `hekla.toml`.
+`verify`, the keystore (`configured`, `master_key_ids`), the declared `secrets`, and the **effective**
+`hekla.toml`.
+
+`secrets` is an inventory and never the material, exactly as `master_key_ids` is: per credential a
+`name`, whether it is `optional`, the `source` this process read it from (`env NAME` or `file PATH`),
+`resolved`, and a `fingerprint` (a short sha256 domain-separated by the declared name, enough to tell
+staging from production and no use for anything else). Every entry a running process reports is
+resolved, because a required one that was not would have stopped it booting. `/admin/schema` carries
+the same list, since a `secret` is a declaration.
 
 ## `/admin/traces/{correlation_id}`
 

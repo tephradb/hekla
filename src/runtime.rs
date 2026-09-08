@@ -49,6 +49,7 @@ use crate::opdb::{
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
 use crate::schema::{EmittedEvent, EventDef, EventDefs};
+use crate::secrets::{self, Resolution, SecretStore};
 use crate::store::Store;
 use crate::tags;
 
@@ -196,6 +197,14 @@ pub struct Runtime {
     /// The subject-key store, present when a master key is configured. Required at
     /// boot when the project uses subject-scoped encryption.
     keystore: Option<Arc<KeyStore>>,
+    /// What this deployment supplies for the project's `secret` declarations, resolved
+    /// once here rather than per invocation. Beside the keystore because the two are the
+    /// same shape of thing: credentials a deployment settles before the process starts,
+    /// which every effect's world then reads through.
+    secrets: Arc<SecretStore>,
+    /// One entry per `secret` the project declares, and what this deployment did about
+    /// it. Carries no value, so every surface that reports it is unable to print one.
+    secret_report: Vec<Resolution>,
     /// The one parsed program every thread reads. `Program` is `Send + Sync`, so this
     /// is shared rather than copied.
     program: Arc<Program>,
@@ -263,6 +272,22 @@ impl Runtime {
         // document and the dumped one cannot disagree.
         let openapi_json = openapi::build(&openapi::Surface::from_project(&project)).to_string();
 
+        // Rule 16, and **before the declaration table is written**: a boot that refuses
+        // must leave no trace of having happened. Recording the candidate and then
+        // bailing would make the next `hekla plan` compare the candidate against itself
+        // and report that nothing would change, for a deploy that has never run.
+        //
+        // A required credential this deployment has not set is a deploy that cannot
+        // work, and finding out here beats finding out when the first effect wedges
+        // hours later on a customer's order. Named all at once rather than one per
+        // restart, the way `verify_masters_present` does it.
+        let (secrets, secret_report) =
+            secrets::resolve(&project.program, &project.config, &project.root);
+        if let Some(refusal) = secrets::refusal(&secret_report, "serve") {
+            anyhow::bail!(refusal);
+        }
+        let secrets = Arc::new(secrets);
+
         // Recorded whole, and before the project is taken apart below: the digest covers
         // every declaration, not just the three kinds that become units, so this is also
         // where an event's shape is persisted. One write rather than one per module.
@@ -293,7 +318,6 @@ impl Runtime {
                 "this project uses subject-scoped encryption (a field with subject = \"...\"), so HEKLA_MASTER_KEY must be set"
             );
         }
-
         let effect_units: Vec<Arc<EffectUnit>> =
             project.effects.into_iter().map(Arc::new).collect();
 
@@ -332,6 +356,8 @@ impl Runtime {
             events: events.clone(),
             program,
             keystore,
+            secrets,
+            secret_report,
             started: Instant::now(),
             projectors,
             effects: OnceLock::new(),
@@ -390,6 +416,16 @@ impl Runtime {
                 "this project uses subject-scoped encryption (a field with subject = \"...\"), so HEKLA_MASTER_KEY must be set to verify it"
             );
         }
+        // And the same reasoning again for rule 16's credentials. A sweep whose effects
+        // read a credential this environment has not set wedges every replayed
+        // invocation on `MissingSecret` and reports a divergence for each, which is the
+        // same false alarm the guard above exists to prevent.
+        let (secrets, secret_report) =
+            secrets::resolve(&project.program, &project.config, &project.root);
+        if let Some(refusal) = secrets::refusal(&secret_report, "verify it") {
+            anyhow::bail!(refusal);
+        }
+        let secrets = Arc::new(secrets);
         let opdb = Arc::new(Mutex::new(OpDb::open(&data_dir.join("hekla.db"))?));
         let keystore = master
             .map(|master| KeyStore::new(opdb.clone(), master))
@@ -405,6 +441,8 @@ impl Runtime {
             events: events.clone(),
             program: Arc::clone(&project.program),
             keystore,
+            secrets,
+            secret_report,
             started: Instant::now(),
             projectors: HashMap::new(),
             effects: OnceLock::new(),
@@ -473,6 +511,13 @@ impl Runtime {
         let keystore = master
             .map(|master| KeyStore::new(opdb.clone(), master))
             .map(Arc::new);
+        // **Nor is an unset credential fatal here**, for the reason above: a plan whose
+        // effects read a credential this machine has not got simply cannot replay them,
+        // and `plan` counts those as coverage it did not have rather than demanding
+        // production credentials before it will diff two declaration tables. The report
+        // rides along so it can say so.
+        let (secrets, secret_report) =
+            secrets::resolve(&project.program, &project.config, &project.root);
 
         Ok(Some(Arc::new(Runtime {
             commands: HashMap::new(),
@@ -481,6 +526,8 @@ impl Runtime {
             events: Arc::clone(&project.events),
             program: Arc::clone(&project.program),
             keystore,
+            secrets: Arc::new(secrets),
+            secret_report,
             started: Instant::now(),
             projectors: HashMap::new(),
             effects: OnceLock::new(),
@@ -1057,6 +1104,18 @@ impl Runtime {
 
     pub fn keystore_shared(&self) -> Option<&Arc<KeyStore>> {
         self.keystore.as_ref()
+    }
+
+    /// The credentials an effect's world reads through. Shared rather than copied, the
+    /// way the keystore is: one resolution per process, cloned into each run's host.
+    pub fn secrets_shared(&self) -> &Arc<SecretStore> {
+        &self.secrets
+    }
+
+    /// What this deployment did about each declared `secret`, for `/admin/system`,
+    /// `hekla plan` and `hekla secrets`. Never a value.
+    pub fn secret_report(&self) -> &[Resolution] {
+        &self.secret_report
     }
 
     /// The operational database, which is where an invocation's journal lives.

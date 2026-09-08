@@ -185,7 +185,32 @@ stored degrades the same way and says so, rather than throwing away a diff that 
 
 A gate reads `--json`, where `divergences` and `coverage` are both `null` when no replay ran: an
 empty divergence list would be a clean replay result, and nothing should read one off a run that
-never opened the log.
+never opened the log. `secrets` is never null, because it is always computable, and a deploy whose
+credentials this machine cannot supply is not an empty plan.
+
+## Deployment credentials
+
+A project declares what it needs and the deployment supplies it:
+
+```hek
+secret DISCORD_WEBHOOK
+```
+
+```toml
+[secrets]
+DISCORD_WEBHOOK = { env = "DISCORD_WEBHOOK_URL" }
+# or { file = "/run/secrets/..." }; a name absent here reads HEKLA_SECRET_<NAME>
+```
+
+The language guarantees a credential reaches a url, a header value or a request body and nothing
+observable: not a log line, not an event, not a read model, not a fold. hekla adds the other half.
+Every surface it serves shows `{SECRET:NAME}` rather than a value, including the journal key and a
+wedge message, so a rotation moves no hash and leaves no journal entry orphaned. `hekla serve`
+refuses to start when a required credential is unset, naming every missing one at once, and
+`hekla secrets` answers the same question on its own for a pre-deploy gate.
+
+Rotating is changing the source and restarting. There is no `_PREVIOUS` list: a master key needs one
+because stored data is wrapped under it, and a credential wraps nothing.
 
 ## Checking the invariants
 

@@ -15,6 +15,9 @@ test "notifies the owner then records it" {
     contact: "ada@example.com",
     meta: {},
   }
+  // The setup lever, for when the shape of the value matters: this one has to read as
+  // the address the expectation names.
+  secret NOTIFY_URL = "https://notify.test/send"
   respond "https://notify.test/send" 200
   deliver NotifyOwner
   expect http.post("https://notify.test/send", {
@@ -54,9 +57,11 @@ test "a rejected notification stops before the internal command" {
     contact: "ada@example.com",
     meta: {},
   }
-  respond "https://notify.test/send" 422
+  // No setup lever here: an unmentioned credential answers `secret:NAME`, so a test of
+  // an effect that reads one needs nothing, and the stand-in is what `respond` names.
+  respond "secret:NOTIFY_URL" 422
   deliver NotifyOwner
-  expect http.post("https://notify.test/send")
+  expect http.post("secret:NOTIFY_URL")
   expect log("notification rejected with status 422")
 }
 

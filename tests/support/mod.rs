@@ -585,6 +585,9 @@ pub fn seed_event(
         unavailable: None,
         duplicated: false,
         http: None,
+        // A bare appender: it runs no handler, so it reaches neither the network nor a
+        // credential.
+        secrets: None,
         retry_after: None,
         last_transport: None,
         minted: None,

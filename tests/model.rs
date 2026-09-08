@@ -441,14 +441,20 @@ pub fn run_case(scenario: &Scenario, ops: &[Op]) -> Result<Coverage, Box<Diverge
         }
     };
     let stub = Arc::new(StubHttpClient::status(HTTP_STATUS));
-    let program = support::load_ok(&scenario.model_dir).program;
+    let loaded = support::load_ok(&scenario.model_dir);
+    // Resolved once and shared by both worlds, exactly as `Runtime::open` resolves it.
+    // A shadow with its own answer would make the two disagree over the harness rather
+    // than over the runtime, which is the one thing this comparison must not do.
+    let secrets =
+        Arc::new(hekla::secrets::resolve(&loaded.program, &loaded.config, &loaded.root).0);
+    let program = loaded.program;
 
     let mut run = Run {
         scenario,
         ops: ops.to_vec(),
         coverage: Coverage::default(),
         harness: Some(boot(scenario, data.path(), &stub)),
-        shadow: Shadow::new(&program, scenario.effect, HTTP_STATUS),
+        shadow: Shadow::new(&program, scenario.effect, HTTP_STATUS, secrets),
         stub,
         data: &data,
     };

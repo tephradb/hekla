@@ -57,7 +57,19 @@ auto_rebuild = true         # default true. Rebuild a projector whose definition
 [verify]
 enabled = false             # default false. Replay every completed invocation against a sealed
                             # journal and quarantine an effect that diverges
+
+[secrets]                   # where each `secret NAME` the project declares is read from. A name
+                            # absent here falls back to HEKLA_SECRET_<NAME>, so this table is
+                            # optional even for a project that declares credentials
+DISCORD_WEBHOOK = { env = "DISCORD_WEBHOOK_URL" }
+STRIPE_KEY = { file = "/run/secrets/stripe_key" }
 ```
+
+**`[secrets]` holds sources, never values.** `hekla.toml` is committed, so there is no third form
+that carries the credential itself and `{ value = "..." }` is a parse error. A relative `file` path
+resolves against the project root, not the working directory, and exactly one trailing newline is
+trimmed on read (every `echo x > secret` writes one). A key naming a credential the project does not
+declare is a `hekla check` warning, not a silently ignored line.
 
 `serve --verify` sets `[verify] enabled` for one run and cannot unset it. `GET /admin/system` reports
 the effective config, which is the way to check what a running process actually loaded.
