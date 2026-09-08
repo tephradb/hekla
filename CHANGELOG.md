@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://git.tqwewe.com/tephra/hekla/compare/v0.2.0...v0.3.0) - 2026-09-08
+
+### Added
+
+- [**breaking**] a project declares the deployment credentials it needs, and no surface ever shows one
+- *(ui)* the console runs a command, and /admin/commands describes every one
+- *(ui)* the console browses a projector's rows, and a row links back to the events that built it
+- [**breaking**] an on latest arm runs once per key per batch, and its invocation records the range it folded
+
+### Fixed
+
+- *(ui)* the declarations table keeps its columns, a long effect error clips, and a count reads singular at one
+
+### Other
+
+- two private items are named rather than linked, so rustdoc denies nothing
+- *(projector)* a completed rebuild logs how long it took
+
 ### Added
 
 - a project declares the deployment credentials it needs with `secret NAME`, and hekla resolves each
