@@ -105,7 +105,7 @@ impl SecretStore {
     /// if `ureq` echoed it verbatim. Scanning for the value itself catches a rendering
     /// that normalised, percent-encoded or truncated the url around it.
     ///
-    /// Skips anything shorter than [`MIN_SCRUB_LEN`]: a two-character credential appears
+    /// Skips anything shorter than `MIN_SCRUB_LEN`: a two-character credential appears
     /// inside ordinary words, and a scrubber that redacted half of every message would
     /// cost an operator more than the leak it prevents.
     pub fn redact(&self, text: &str) -> String {
@@ -139,7 +139,7 @@ pub struct Resolution {
     pub source: String,
     /// `env` or `file`, for a reader that parses rather than reads.
     pub kind: &'static str,
-    /// Present exactly when the credential resolved. See [`fingerprint`].
+    /// Present exactly when the credential resolved. See `fingerprint`.
     pub fingerprint: Option<String>,
     /// Why the source could not be read, when it was there and unreadable.
     ///
