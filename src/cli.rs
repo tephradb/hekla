@@ -6,6 +6,7 @@
 //! operational key commands: rewrapping subject keys under a new master, and
 //! irreversibly deleting one subject's key.
 
+use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,9 @@ use crate::{crypto, lock, runtime, server, testing, validate};
 /// The default HTTP bind address when `--addr` is not given.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
+/// The tracing filter when `RUST_LOG` is unset or does not parse.
+const DEFAULT_LOG_FILTER: &str = "info";
+
 #[derive(Parser)]
 #[command(
     name = "hekla",
@@ -35,6 +39,12 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Disable ANSI colors in the log output. Colors are off anyway when the output is
+    /// not a terminal, or when `NO_COLOR` is set to a non-empty value.
+    ///
+    /// Global, so it is accepted both before and after the subcommand.
+    #[arg(long, global = true)]
+    no_color: bool,
 }
 
 #[derive(Subcommand)]
@@ -212,17 +222,25 @@ enum Command {
 
 /// Parse arguments and run, returning the process exit code.
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
-    match cli.command {
+    let Cli { command, no_color } = Cli::parse();
+    // Only the two long-running commands log; `openapi` and `plan --json` write
+    // machine-readable stdout that a subscriber would interleave with.
+    match command {
         Command::Check { dir } => check(&dir),
         Command::Serve {
             dir,
             addr,
             data_dir,
             verify,
-        } => serve(&dir, addr.as_deref(), data_dir.as_deref(), verify),
+        } => {
+            init_tracing(no_color);
+            serve(&dir, addr.as_deref(), data_dir.as_deref(), verify)
+        }
         Command::Test { dir } => testing::run(&dir),
-        Command::Verify { dir, data_dir } => verify(&dir, data_dir.as_deref()),
+        Command::Verify { dir, data_dir } => {
+            init_tracing(no_color);
+            verify(&dir, data_dir.as_deref())
+        }
         Command::Rotate { dir, data_dir } => rotate(&dir, data_dir.as_deref()),
         Command::Openapi { dir } => openapi(&dir),
         Command::Plan {
@@ -770,8 +788,6 @@ fn plan(
 /// It reports what it checked even when clean, because a sweep that found nothing
 /// because it covered nothing must not read like a passing one.
 fn verify(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
-    init_tracing();
-
     let project = LoadedProject::load(dir);
     let (errors, _) = report_findings(&project);
     if errors > 0 {
@@ -806,8 +822,6 @@ fn verify(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
     }
 }
 fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) -> ExitCode {
-    init_tracing();
-
     let mut project = LoadedProject::load(dir);
     let (errors, _) = report_findings(&project);
     if errors > 0 {
@@ -899,9 +913,41 @@ fn count_errors(findings: &[Finding]) -> usize {
         .count()
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+/// Whether log lines carry ANSI colors: the operator has not opted out through
+/// `--no-color` or `NO_COLOR`, and the destination is a terminal rather than a file or
+/// a pipe.
+///
+/// `tracing_subscriber` honours `NO_COLOR` in its own default but never looks at the
+/// destination, so the whole decision is taken here instead. The redirect is the case
+/// that matters: a log captured by systemd or a CI job must come out clean without the
+/// operator having to know a flag exists.
+fn use_ansi(no_color: bool, is_terminal: bool, no_color_env: Option<&str>) -> bool {
+    !no_color && is_terminal && no_color_env.is_none_or(str::is_empty)
+}
+
+fn init_tracing(no_color: bool) {
+    let no_color_env = env::var("NO_COLOR").ok();
+    let ansi = use_ansi(
+        no_color,
+        io::stdout().is_terminal(),
+        no_color_env.as_deref(),
+    );
+    let filter = match env::var("RUST_LOG") {
+        Ok(directives) => EnvFilter::try_new(&directives).unwrap_or_else(|err| {
+            // Falling back in silence tells an operator debugging with RUST_LOG that the
+            // level they asked for revealed nothing, when it was never applied.
+            eprintln!("warning: ignoring RUST_LOG=\"{directives}\": {err}");
+            EnvFilter::new(DEFAULT_LOG_FILTER)
+        }),
+        Err(_) => EnvFilter::new(DEFAULT_LOG_FILTER),
+    };
+    if let Err(err) = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi)
+        .try_init()
+    {
+        eprintln!("warning: keeping the log subscriber already installed: {err}");
+    }
 }
 
 fn print_findings(findings: &[Finding]) {
@@ -949,5 +995,17 @@ mod tests {
         let db_path = data.join("hekla.db");
         fs::write(&db_path, b"").unwrap();
         assert_eq!(operational_db(dir.path(), None).unwrap(), db_path);
+    }
+
+    /// The redirect is the case the flag exists for, and it must not need the flag.
+    #[test]
+    fn colors_are_off_unless_the_destination_is_a_terminal_nobody_opted_out_of() {
+        assert!(use_ansi(false, true, None));
+        assert!(!use_ansi(true, true, None));
+        assert!(!use_ansi(false, false, None));
+        // An empty `NO_COLOR` is not an opt-out, the same reading tracing-subscriber
+        // and the no-color-org convention take.
+        assert!(use_ansi(false, true, Some("")));
+        assert!(!use_ansi(false, true, Some("1")));
     }
 }

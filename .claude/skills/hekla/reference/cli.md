@@ -4,7 +4,15 @@ One binary, nine subcommands, `<dir>` defaulting to `.` everywhere. `hekla --ver
 `hekla <subcommand> --help` work.
 
 Logging is `tracing` behind `RUST_LOG`, default `info`. `serve` and `verify` initialise it; the other
-subcommands print with `println!` and are unaffected.
+subcommands print with `println!` and are unaffected. An unparseable `RUST_LOG` is reported on stderr
+(`warning: ignoring RUST_LOG="...": ...`) and the run falls back to `info` rather than pretending the
+filter took.
+
+Log lines carry ANSI colors only when stdout is a terminal, so a redirect into a file, a systemd
+journal or a CI log is already clean with no flag. `--no-color` turns them off for a terminal too,
+and `NO_COLOR` set to a non-empty value does the same for an operator who cannot edit the command
+line. `--no-color` is global: it is accepted before or after the subcommand, and it only means
+anything to `serve` and `verify`, which are the two that log.
 
 ## `hekla check [DIR]`
 
@@ -51,7 +59,7 @@ store with a fixed master key, and a stubbed network driven by `respond`. The cl
 Exit is 1 on a failing test and 1 on a project with error findings. **A project with no tests prints
 `0 passed, 0 failed` and exits 0.**
 
-## `hekla serve [DIR] [--addr ADDR] [--data-dir PATH] [--verify]`
+## `hekla serve [DIR] [--addr ADDR] [--data-dir PATH] [--verify] [--no-color]`
 
 Loads the project, refuses to serve if any finding is an error (`refusing to serve: the project has
 N error(s)`), then runs the runtime and the HTTP API.
@@ -61,6 +69,7 @@ N error(s)`), then runs the runtime and the HTTP API.
 - `--data-dir` defaults to `<dir>/data`, and is created if absent.
 - `--verify` turns on the continuous invariant check for this run. It cannot turn off
   `[verify] enabled = true` from `hekla.toml`.
+- `--no-color` drops the ANSI colors from the log. Redirected output has none either way.
 
 Startup logs three lines at `info`:
 
@@ -81,7 +90,7 @@ Ctrl-C is a graceful shutdown: it stops dispatching new effect invocations and w
 for in-flight ones, then exits. An invocation abandoned that way stays `running` and replays at the
 next start.
 
-## `hekla verify [DIR] [--data-dir PATH]`
+## `hekla verify [DIR] [--data-dir PATH] [--no-color]`
 
 The offline invariant sweep. Loads the project, refuses on error findings, then takes the
 data-directory lock and checks rebuild equivalence, replay equivalence and checkpoint monotonicity
@@ -378,7 +387,8 @@ the rows are rewrapped it can no longer unwrap them: reads of a sealed column an
 | `HEKLA_MAX_ATTEMPTS` | `serve` | how many times a command re-decides after a DCB conflict before answering 409. Default 5, capped at 15, read once per process |
 | `HEKLA_UI_DIR` | `serve` | serve the admin console's assets from this directory instead of the ones compiled in |
 | `HEKLA_SECRET_<NAME>` | `serve`, `verify`, `plan`, `secrets` | the fallback source for a declared `secret NAME` that `[secrets]` does not name. Never read by `check` or `test` |
-| `RUST_LOG` | `serve`, `verify` | tracing filter, default `info` |
+| `RUST_LOG` | `serve`, `verify` | tracing filter, default `info`. An unparseable value is reported on stderr and ignored |
+| `NO_COLOR` | `serve`, `verify` | any non-empty value drops the ANSI colors from the log, the same as `--no-color`. Empty is not an opt-out |
 
 ## Every finding `hekla check` reports
 

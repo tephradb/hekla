@@ -435,7 +435,7 @@ Two things it does that the raw API does not:
 |---|---|
 | `hekla check <dir>` | Parse the project and report every finding: the compiler's diagnostics, plus what only hekla knows (section 6). For CI and pre-commit. |
 | `hekla test <dir>` | Run the scenarios under `tests/`, against real tephra, a real read model and a real key store. |
-| `hekla serve <dir>` (`--addr`, `--data-dir`) | Run the runtime and HTTP API. |
+| `hekla serve <dir>` (`--addr`, `--data-dir`, `--verify`, `--no-color`) | Run the runtime and HTTP API. Logs are colored only when stdout is a terminal; `--no-color` and `NO_COLOR` turn that off there too. |
 | `hekla openapi <dir>` | Print the generated OpenAPI 3.1 document to stdout. Reads the project only (no data directory, no master key), so a committed `openapi.json` can be diffed in CI. Findings go to stderr, so redirecting stdout gives you pure JSON. |
 | `hekla erase <field> <value> <dir>` | Delete a subject's key. Irreversible. |
 | `hekla rewind <Effect> <position> <dir>` | Take an effect back so it reprocesses, and performs, everything after that position. Refuses while a server is running, and prints what it would discard before asking. Irreversible. |
