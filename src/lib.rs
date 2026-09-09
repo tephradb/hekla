@@ -23,6 +23,7 @@ pub mod dispatch;
 pub mod effect;
 pub mod introspect;
 pub mod loader;
+pub mod metrics;
 pub mod openapi;
 pub mod plan;
 pub mod projector;

@@ -42,6 +42,7 @@ use crate::effect::{self, EffectRuntime, EffectShared};
 use crate::http::HttpClient;
 use crate::loader::{self, CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::lock::DataDirLock;
+use crate::metrics;
 use crate::opdb::{
     Activation, DeclarationRow, EffectState, InvocationAt, InvocationRow, InvocationState,
     JournalRow, OpDb, SubjectInfo, TerminalInvocation,
@@ -617,8 +618,10 @@ impl Runtime {
         now: &str,
         idem_tag: Option<&str>,
     ) -> anyhow::Result<ExecResult> {
+        let name = command.def.name();
         // Input is invariant across attempts, so validate once before the loop.
-        if let Err(err) = dispatch::validate_input(&self.program, command.def.name(), body) {
+        if let Err(err) = dispatch::validate_input(&self.program, name, body) {
+            metrics::command_outcome(name, "invalid_input");
             return Ok(ExecResult {
                 status: 400,
                 body: error_body(ctx, "invalid_input", &format!("{err}")),
@@ -629,11 +632,15 @@ impl Runtime {
             max_attempts: max_attempts(),
             backoff: &|attempt| thread::sleep(backoff_delay(attempt, jitter_roll())),
         };
+        // Every arm records exactly once, here rather than in the HTTP handler, so the
+        // effect-driven path (`execute_from_effect`) is counted on the same terms as a
+        // request. This is also the one place the mapping from outcome to status already
+        // lives, which is what stops the label from drifting away from what a caller saw.
         match dispatch::run_command(
             &self.store,
             self.program_shared(),
             self.events_shared(),
-            command.def.name(),
+            name,
             self.keystore_shared(),
             body,
             ctx,
@@ -641,30 +648,53 @@ impl Runtime {
             idem_tag,
             &retry,
         )? {
-            CommandOutcome::Conflict => Ok(ExecResult {
-                status: 409,
-                body: conflict_body(ctx),
-            }),
-            CommandOutcome::Committed { events, positions } => Ok(ExecResult {
-                status: 200,
-                body: success_body(ctx, positions, &events, &self.events),
-            }),
-            CommandOutcome::AlreadyCommitted(recovered) => Ok(ExecResult {
-                status: 200,
-                body: recovered_body(&recovered),
-            }),
-            CommandOutcome::Rejected { code, message } => Ok(ExecResult {
-                status: 422,
-                body: error_body(ctx, &code, &message),
-            }),
-            CommandOutcome::InvalidInput { message } => Ok(ExecResult {
-                status: 400,
-                body: error_body(ctx, "invalid_input", &message),
-            }),
-            CommandOutcome::Unavailable { message } => Ok(ExecResult {
-                status: 503,
-                body: error_body(ctx, "unavailable", &message),
-            }),
+            CommandOutcome::Conflict => {
+                metrics::command_outcome(name, "conflict");
+                Ok(ExecResult {
+                    status: 409,
+                    body: conflict_body(ctx),
+                })
+            }
+            CommandOutcome::Committed { events, positions } => {
+                metrics::command_outcome(name, "committed");
+                metrics::events_appended(&events);
+                Ok(ExecResult {
+                    status: 200,
+                    body: success_body(ctx, positions, &events, &self.events),
+                })
+            }
+            // Deliberately not counted as an append: the events were written by the
+            // attempt this one recovered, and counting them twice would make
+            // `hekla_events_appended_total` disagree with the log.
+            CommandOutcome::AlreadyCommitted(recovered) => {
+                metrics::command_outcome(name, "already_committed");
+                Ok(ExecResult {
+                    status: 200,
+                    body: recovered_body(&recovered),
+                })
+            }
+            CommandOutcome::Rejected { code, message } => {
+                metrics::command_outcome(name, "rejected");
+                metrics::command_refusal(name, &code);
+                Ok(ExecResult {
+                    status: 422,
+                    body: error_body(ctx, &code, &message),
+                })
+            }
+            CommandOutcome::InvalidInput { message } => {
+                metrics::command_outcome(name, "invalid_input");
+                Ok(ExecResult {
+                    status: 400,
+                    body: error_body(ctx, "invalid_input", &message),
+                })
+            }
+            CommandOutcome::Unavailable { message } => {
+                metrics::command_outcome(name, "unavailable");
+                Ok(ExecResult {
+                    status: 503,
+                    body: error_body(ctx, "unavailable", &message),
+                })
+            }
         }
     }
 

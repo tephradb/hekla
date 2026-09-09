@@ -30,6 +30,16 @@ base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
 heklang = "0.5.0"
+# The recorder and the text-format render, and nothing else: `default-features = false`
+# drops the exporter's own `http-listener` and `push-gateway`, which would pull in hyper
+# and open a second socket. hekla already has an axum router, so `/metrics` is a route
+# like any other and the exporter is used purely as a recorder plus a `render()` string.
+#
+# umari also takes `metrics-util`, for the `MetricKindMask` its gauge idle-expiry needs.
+# hekla's module set is fixed at load, so there is no series to expire and no upkeep to
+# run; see `crate::metrics` for why that also means there is no collector task.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 # `arbitrary_precision` is load-bearing, not a preference: without it a
@@ -59,5 +69,5 @@ oas3 = { version = "0.22.0", default-features = false }
 # a subprocess. Nothing here needs that: a case that hangs is caught by the harness's own
 # poll budget, which panics with a diagnostic rather than being killed by a signal.
 proptest = { version = "1.11", default-features = false, features = ["std", "bit-set"] }
-tokio = { version = "1", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "sync"] }
 tower = { version = "0.5", features = ["util"] }

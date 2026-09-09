@@ -43,8 +43,8 @@ export function OverviewView() {
       })),
   ]
 
-  /* Bucketed from the timestamps on one page of events, not from a metrics endpoint,
-   * because hekla has none. It describes the recent tail of the log and says so. */
+  /* Bucketed from the timestamps on one page of events rather than scraped: it describes
+   * the recent tail of the log and says so. A rate belongs in `/metrics`. */
   const timestamps = (recent.data?.events ?? []).map((event) => event.timestamp)
   const series = bucket(timestamps, WINDOW_MS)
   const inWindow = series.reduce((total, value) => total + value, 0)
@@ -89,7 +89,7 @@ export function OverviewView() {
               ${inWindow} in the last 5m
               <span
                 class="note"
-                title="bucketed in the browser from the last ${RECENT} events; hekla has no metrics endpoint"
+                title="bucketed in the browser from the last ${RECENT} events, not a metric; scrape /metrics for a rate"
               >
                 · from the last ${RECENT}
               </span>

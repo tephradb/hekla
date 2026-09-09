@@ -184,6 +184,11 @@ impl Boot {
     /// Boot, returning the error instead of panicking, so a test can assert that
     /// opening the runtime fails.
     pub fn try_start(self) -> anyhow::Result<Harness> {
+        // Idempotent, and here rather than in `tests/metrics.rs` so every harness boot
+        // records against a real recorder. Without it the emissions from this runtime's
+        // threads would be dropped, and a metrics test that booted after its first
+        // command would see nothing.
+        hekla::metrics::install();
         let project = load_ok(&self.project_dir);
         let (temp, data_dir) = match self.data_dir {
             Some(dir) => (None, dir),

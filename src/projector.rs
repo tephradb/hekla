@@ -28,6 +28,7 @@ use crate::crypto::KeyStore;
 use crate::heklang_host::{self, RowWriter};
 use crate::invariant::Violation;
 use crate::loader::ProjectorUnit;
+use crate::metrics;
 use crate::read_model::ReadModel;
 use crate::schema::{EntityDef, ModuleDef};
 use crate::store::Store;
@@ -84,6 +85,18 @@ impl Readiness {
         }
     }
 
+    /// Every state, beside [`Readiness::label`] rather than restated in `crate::metrics`,
+    /// because a state set built from a list that has fallen behind the enum reads zero
+    /// on every series instead of failing. `a_state_set_covers_every_readiness` is what
+    /// makes adding a variant without adding it here a compile error.
+    pub const ALL: [Readiness; 5] = [
+        Readiness::Ready,
+        Readiness::Rebuilding,
+        Readiness::Stale,
+        Readiness::Failed,
+        Readiness::Quarantined,
+    ];
+
     /// The wire word for `/status` and the read API's error body.
     pub fn label(self) -> &'static str {
         match self {
@@ -114,6 +127,10 @@ pub struct ProjectorShared {
     /// unit holding the declaration moves into the thread, and this is the
     /// introspection-facing view of the module.
     pub sources: Vec<String>,
+    /// This projector's digest hash, carried on the handle for the same reason `sources`
+    /// is. `hekla_module_info` reports it, so two replicas that disagree here are running
+    /// different code.
+    pub digest_hash: String,
     /// Stored Release and loaded Acquire: a reader that observes a position must also
     /// observe the commit that produced it, which is what read-your-writes rests on.
     /// `readiness` is ordered the same way, for the same reason (a reader that sees
@@ -364,6 +381,7 @@ fn spawn(
         db_path,
         entities: Arc::new(entities),
         sources: sources.clone(),
+        digest_hash: definition.clone(),
         position: AtomicU64::new(start.get()),
         shutdown: AtomicBool::new(false),
         replay: AtomicBool::new(false),
@@ -584,6 +602,9 @@ fn run_inner(
                 &batch,
                 sub.position(),
             )?;
+            // After the apply and its commit, so the count and the progress timestamp
+            // only ever describe work that actually landed in the read model.
+            metrics::projector_batch(&shared.name, batch.len());
             if let Err(violation) = shared.advance_position(sub.position().get()) {
                 shared.quarantine(&violation);
             }
@@ -637,6 +658,7 @@ fn rebuild_or_degrade(
             shared.set_readiness(Readiness::Ready);
             // Last, so a reader that sees the count has already seen everything above.
             shared.replays_completed.fetch_add(1, Ordering::Release);
+            metrics::projector_rebuild(&shared.name, true);
             return Ok(fresh);
         }
         Err(err) => err,
@@ -663,6 +685,7 @@ fn rebuild_or_degrade(
     }
     shared.reset_position(reopened.read_checkpoint()?.get());
     shared.replays_failed.fetch_add(1, Ordering::Release);
+    metrics::projector_rebuild(&shared.name, false);
     Ok(reopened)
 }
 
@@ -891,6 +914,29 @@ mod tests {
     use super::*;
     use crate::schema::{FieldKind, FieldMeta};
 
+    /// `Readiness::ALL` is what `crate::metrics` renders as a state set, so a variant
+    /// missing from it makes every `hekla_projector_readiness` series read zero rather
+    /// than making anything fail. The match below is exhaustive, so adding a variant
+    /// stops this compiling, and the length assertion stops it being added here alone.
+    #[test]
+    fn a_state_set_covers_every_readiness() {
+        for state in Readiness::ALL {
+            let expected = match state {
+                Readiness::Ready => "ready",
+                Readiness::Rebuilding => "rebuilding",
+                Readiness::Stale => "stale",
+                Readiness::Failed => "rebuild_failed",
+                Readiness::Quarantined => "quarantined",
+            };
+            assert_eq!(state.label(), expected);
+        }
+        assert_eq!(
+            Readiness::ALL.len(),
+            5,
+            "a new variant belongs in `ALL` as well as in the match above"
+        );
+    }
+
     fn entity() -> EntityDef {
         EntityDef {
             name: "rows".to_owned(),
@@ -1022,6 +1068,7 @@ mod tests {
             db_path: PathBuf::new(),
             entities: Arc::new(vec![entity()]),
             sources: Vec::new(),
+            digest_hash: String::new(),
             position: AtomicU64::new(at),
             shutdown: AtomicBool::new(false),
             replay: AtomicBool::new(false),

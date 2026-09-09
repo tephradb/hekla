@@ -142,6 +142,7 @@ defaults to `127.0.0.1`.
 | `POST /effects/{Name}/skip/{position}` | 202, records an operator skip request |
 | `GET /status` | per-module position, lag, readiness, effect state, failure count, last error |
 | `GET /health` | liveness only |
+| `GET /metrics` | Prometheus text format: the same state as `/status`, plus counters and rates |
 | `GET /openapi.json`, `GET /docs` | the generated document, and a reference over it |
 | `GET /admin/...` | read-only introspection, or the console when `Accept: text/html` |
 

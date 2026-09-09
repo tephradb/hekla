@@ -773,6 +773,7 @@ fn operation_paths(surface: &Surface) -> Vec<(String, Value)> {
         (server::STATUS_ROUTE.to_owned(), status_path()),
         (server::HEALTH_ROUTE.to_owned(), health_path()),
         (server::OPENAPI_ROUTE.to_owned(), openapi_path()),
+        (server::METRICS_ROUTE.to_owned(), metrics_path()),
         (server::DOCS_ROUTE.to_owned(), docs_path()),
     ]
 }
@@ -906,6 +907,29 @@ fn openapi_path() -> Value {
                 without booting a runtime.",
             "responses": {
                 "200": response("the OpenAPI document", json!({ "type": "object" })),
+            },
+        }
+    })
+}
+
+/// Described but not schema'd: the body is the Prometheus text exposition format, which
+/// is a line protocol rather than JSON, so the honest description is the media type and
+/// a pointer at what the series mean.
+fn metrics_path() -> Value {
+    json!({
+        "get": {
+            "tags": [OPERATIONS_TAG],
+            "operationId": "get_metrics",
+            "summary": "Prometheus metrics",
+            "description": "Every gauge is snapshotted from the running modules at scrape \
+                time. Series are named `hekla_*` and labelled only by declarations (a \
+                command, projector, entity, effect or event name, a refusal code, or a \
+                fixed outcome word), never by a lane key or anything else off an event.",
+            "responses": {
+                "200": {
+                    "description": "the metric families, in the text exposition format",
+                    "content": { "text/plain": { "schema": { "type": "string" } } },
+                },
             },
         }
     })

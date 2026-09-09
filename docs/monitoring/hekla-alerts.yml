@@ -1,0 +1,210 @@
+# Prometheus alerting rules for a hekla deployment.
+#
+# Scrape `GET /metrics` on the port `hekla serve` binds. Nothing there is
+# authenticated, so the scrape target is reached the same way `/admin` is: over
+# loopback, or through whatever the proxy in front of hekla allows.
+#
+# Three things shape these rules, and each one is a mistake that is easy to make:
+#
+#   1. A projector and an effect fail differently. A projector's thread does not come
+#      back on its own, so its failure is a permanent `hekla_projector_up == 0` and two
+#      minutes is long enough to be sure. An effect's driver re-subscribes with backoff
+#      capped at 60s (`BACKOFF_CAP`), so `up == 0` there would flap; what says an effect
+#      is not recovering is a wedge that outlives several of those windows.
+#   2. A lag threshold is a number nobody can pick. A healthy module reads a lag of one
+#      or two between events and drains to zero; a stuck one never drains. So the stall
+#      rules ask whether lag ever reached zero in the window rather than how big it got.
+#   3. A refusal series only exists once that refusal has fired, because heklang inlines
+#      a `refusal` and hekla cannot enumerate the codes at boot. Any expression over
+#      `hekla_command_refusals_total` needs `or vector(0)`; every other counter here is
+#      primed to zero at the first scrape and does not.
+
+groups:
+  - name: hekla
+    rules:
+      # --- the process ------------------------------------------------------
+      - alert: HeklaDown
+        expr: up{job="hekla"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "hekla is not answering scrapes"
+          description: "The instance has been unreachable for two minutes."
+
+      # --- projectors -------------------------------------------------------
+      - alert: HeklaProjectorDown
+        expr: hekla_projector_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "projector {{ $labels.name }} has stopped"
+          description: >-
+            Its thread exited or a rebuild failed. Nothing restarts it: see `last_error`
+            in /status, then POST /projectors/{{ $labels.name }}/replay.
+
+      # Deliberately not `up == 0`: the thread is alive and idling on purpose. The read
+      # API is answering 503 for this projector the whole time, which is the actual
+      # user-visible symptom.
+      - alert: HeklaProjectorNotServing
+        expr: >-
+          hekla_projector_readiness{state=~"stale|rebuild_failed|quarantined"} == 1
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "projector {{ $labels.name }} is {{ $labels.state }} and not serving reads"
+          description: >-
+            The read API answers 503 for it until an operator acts. `stale` means
+            auto-rebuild is off and the definition moved; `rebuild_failed` means a
+            rebuild was tried and did not land; `quarantined` means an invariant check
+            failed and the rows cannot be vouched for.
+
+      - alert: HeklaProjectorStalled
+        expr: min_over_time(hekla_projector_lag[15m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "projector {{ $labels.name }} has not caught up in 15 minutes"
+          description: >-
+            Its lag never reached zero in the window. A busy projector still drains
+            between events, so this is a projector that is not keeping up rather than
+            one that is merely working.
+
+      # --- effects ----------------------------------------------------------
+      - alert: HeklaEffectWedged
+        expr: hekla_effect_wedged_lanes > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "effect {{ $labels.name }} has {{ $value }} wedged lane(s)"
+          description: >-
+            At least one lane is failing and retrying; the others keep running. Ten
+            minutes is several times the 60s backoff cap, so this is a failure that is
+            not clearing itself. GET /admin/effects/{{ $labels.name }} names the lane
+            and the position, which the metric deliberately does not: a lane key is a
+            partition key, and a scrape is a copy an erasure cannot reach.
+
+      # A quarantine is not a retry. Nothing clears it but an operator, so this pages
+      # immediately rather than waiting out a backoff that will never run.
+      - alert: HeklaEffectQuarantined
+        expr: hekla_effect_state{state="quarantined"} == 1
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "effect {{ $labels.name }} is quarantined"
+          description: >-
+            A verify-mode replay did not reproduce a recorded invocation, so the effect
+            stopped rather than continued on an assumption shown to be false.
+
+      - alert: HeklaEffectBlocked
+        expr: hekla_effect_state{state="blocked"} == 1
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "effect {{ $labels.name }} refused to start"
+          description: >-
+            Its `@key` changed while lanes were still outstanding, so the rows above the
+            mark are keyed under a scheme the new key never produces. Deploy the previous
+            key and let it drain. The rest of the runtime is still serving.
+
+      - alert: HeklaEffectStalled
+        expr: min_over_time(hekla_effect_lag[15m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "effect {{ $labels.name }} has not caught up in 15 minutes"
+          description: >-
+            Its mark never reached the log head in the window. The mark is a low-water
+            mark, so one wedged lane holds it down however far the healthy ones have run.
+
+      # Restarts are the driver losing the log and re-subscribing, which a transient
+      # store error does once. A sustained rate is a different problem from a wedge.
+      - alert: HeklaEffectRestarting
+        expr: increase(hekla_effect_restarts_total[15m]) > 3
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "effect {{ $labels.name }} keeps re-subscribing"
+          description: >-
+            Its driver has restarted more than three times in fifteen minutes, so this is
+            the store or the operational database rather than the handler.
+
+      # Advancing rather than wedging, so nothing else here will fire for it. Each one
+      # is a position whose side effect never happened.
+      - alert: HeklaEffectSkippingTerminally
+        expr: increase(hekla_effect_terminal_skips_total[1h]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "effect {{ $labels.name }} abandoned {{ $value }} position(s)"
+          description: >-
+            An unrecoverable failure, typically a `reveal()` of an erased subject. These
+            advance the mark rather than wedge it, so the effect reads healthy.
+
+      # --- commands and the log --------------------------------------------
+      - alert: HeklaCommandsFailing
+        expr: >-
+          sum by (command) (rate(hekla_commands_total{outcome="error"}[5m])) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "command {{ $labels.command }} is erroring"
+          description: >-
+            A 500, which is hekla failing rather than the command deciding. A refusal is
+            `rejected` and a bad body is `invalid_input`; neither is counted here.
+
+      - alert: HeklaCommandConflictsExhausted
+        expr: >-
+          sum by (command) (rate(hekla_commands_total{outcome="conflict"}[10m])) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "command {{ $labels.command }} is returning 409s"
+          description: >-
+            Callers are seeing conflicts, so the retry budget is running out rather than
+            absorbing contention. Compare with
+            rate(hekla_command_conflict_retries_total) to see how hot the boundary is:
+            retries climbing without conflicts is the budget working.
+
+      - alert: HeklaCommandsUnavailable
+        expr: >-
+          sum by (command) (rate(hekla_commands_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "command {{ $labels.command }} cannot append"
+          description: "The write coordinator is draining or gone."
+
+      - alert: HeklaLogNotAdvancing
+        expr: delta(hekla_log_head_position[1h]) == 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "nothing has been appended in an hour"
+          description: >-
+            Expected for a quiet deployment and a real signal for a busy one. Drop this
+            rule or widen the window if the application is legitimately idle overnight.
+
+      # --- the read path ----------------------------------------------------
+      - alert: HeklaReadYourWritesTimingOut
+        expr: >-
+          sum by (projector) (rate(hekla_read_waits_total{outcome="timeout"}[10m])) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "read-your-writes waits are timing out on {{ $labels.projector }}"
+          description: >-
+            Clients passing `?after=` are waiting the full timeout and getting a 503.
+            This usually accompanies projector lag, and is what the user actually feels.
+
+      - alert: HeklaOutboundCallsFailing
+        expr: >-
+          sum(rate(hekla_effect_http_requests_total{outcome=~"5xx|error"}[10m]))
+            / sum(rate(hekla_effect_http_requests_total[10m]))
+            > 0.25
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "a quarter of outbound effect calls are failing"
+          description: >-
+            Counted at the point an effect made the call, so this covers every transport.
+            `5xx` is the far side answering badly and `error` is not reaching it at all.

@@ -1200,8 +1200,9 @@ Honest scope:
   tab is hidden. `Subscription` still makes SSE cheap, and the console is what will make it worth
   wanting, but it is a different transport with its own backpressure and shutdown story.
 - **The overview's sparkline is not a metric.** It is bucketed in the browser from the timestamps on
-  one page of events, and is labelled as such. hekla has no metrics endpoint and this does not
-  pretend to be one.
+  one page of events, and is labelled as such. Phase 31 gave hekla a metrics endpoint and this still
+  does not pretend to be one: a rate belongs in Prometheus, and what this draws is the shape of the
+  log tail the page is already showing.
 - **The schema graph does not draw effect-invokes-command, and cannot.** The targets are chosen at
   runtime inside Starlark, so reading the project does not reveal them, and the journal is no help
   either: `journaled` records each call's *result*, and an `invoke_command` result is the invoked
@@ -1881,6 +1882,124 @@ heklang shipped rule 16 (`secret NAME`, a `Secret` type that is a taint rather t
   age-encrypted file are all new variants of the same enum rather than a redesign, which is why the
   table is keyed by source rather than by value. None is built because none is asked for.
 
+## Phase 31: metrics (done)
+
+`/status` answers "how is it right now" and can answer nothing else. It cannot say when a projector
+fell behind, how often a refusal fires, or whether an effect's lag is falling or stuck, and it cannot
+wake anyone up. The deferral said "when there is something to operate at scale"; running hekla beside
+umari, whose metrics have repeatedly caught a module that was down, is that.
+
+`GET /metrics` serves the Prometheus text format on the same port, described in the generated
+OpenAPI like every other route. `metrics` and `metrics-exporter-prometheus` with
+`default-features = false`, matching umari, so the facade and the naming carry across both runtimes
+and the exporter never opens a socket of its own.
+
+- **The gauges are read at scrape time, and there is no collector task.** umari runs a 15s ticker
+  because its state lives behind actors and reaching it is an async, fallible ask. Every gauge here
+  is an atomic load on a `ProjectorShared`/`EffectShared` handle or `Store::head`, which `/status`
+  already does synchronously in an async handler. So there is no interval to configure, no missed
+  tick, and no staleness between a number and the scrape carrying it. Nor any `idle_timeout`, and so
+  none of umari's "the expiry silently does nothing without `run_upkeep`" trap: hekla's module set is
+  fixed at load, so no series ever needs expiring.
+- **A lane key is never a label, and the reason is erasure rather than cardinality.** `/status` and
+  `/admin/effects` name the pinning lane, and may: that JSON is a live view, so an erased subject
+  stops appearing in it. A scrape is a *copy*, taken into a time-series database that replicates and
+  retains it, and `hekla erase` cannot reach there. So `hekla_effect_wedged_lanes` is a count and the
+  operator follows the alert to `/admin/effects/{name}` for the key. `tests/metrics.rs` asserts the
+  absence against the rendered bytes rather than trusting the intent, because that is the change
+  someone will make later for the best of reasons.
+- **Every other label is a declaration too**: a command, projector, entity, effect or event name, a
+  refusal code, a fixed outcome or state word, or a digest hash. Nothing is computed from a request.
+  That is what makes the series count a property of the project rather than of traffic, and it is why
+  `hekla_reads_total` is recorded past `resolve_entity` and not at the two 404s above it: before
+  those, `projector` and `entity` are whatever the URL said.
+- **umari's lesson about query-aware lag does not apply, and copying it would have been waste.** A
+  narrowly-subscribed umari module legitimately trails the global head, so umari pays an event-store
+  read per module per tick to find its own head. hekla already advances both watermarks past
+  non-matching events (`projector.rs` publishes the subscription watermark when caught up;
+  `LaneState::low_water` falls back to `scanned`), so `head - position` is honest and lag is a
+  subtraction.
+- **What umari has no equivalent for is the half worth having.** Wedged lanes, consecutive failures
+  on the pinning lane, terminal skips, quarantine and blocked as distinct states, projector
+  readiness as a state set, DCB conflict retries as distinct from the 409 a caller sees, and rule
+  15's `live_suppressed` and `latest_collapsed`. umari cannot tell one wedged partition from a whole
+  effect being down; that distinction is most of what an operator needs.
+- **A counter is primed to zero from the declarations at every scrape**, so a command that has never
+  run reads `0` rather than being absent and `rate()` works from the first scrape.
+- **`docs/monitoring/hekla-alerts.yml` is the deliverable that pays for the rest.** Its thresholds
+  carry their reasoning, and two are worth naming: a projector does not auto-restart so its failure
+  is a permanent `up == 0`, while an effect's driver re-subscribes with backoff capped at 60s, so a
+  naive `up == 0` there would flap and the real signal is a wedge outliving several windows. And a
+  stall is `min_over_time(lag[15m]) > 0` rather than a threshold nobody can pick: a healthy module
+  drains to zero between events and a stuck one never does.
+
+Honest scope for this phase:
+
+- **No latency histograms.** Command execution, projector batch apply and effect invocation are where
+  a duration would earn its place, and `projector.rs` still computes a rebuild's elapsed time and
+  throws it into a log line. Left out because the chosen scope is liveness, progress and rates, and
+  because a histogram needs per-deployment bucket tuning to be worth its series.
+  `PrometheusBuilder::set_buckets_for_metric` is the hook when a slowness question arrives that a lag
+  gauge and a rate cannot answer, and no name above has to change for it.
+- **`ignored` is not an effect outcome.** heklang's `Done` and `Ignored` both settle an invocation and
+  `try_invocation` folds them into one `Ok(())`, so telling them apart would mean widening that
+  return to carry a label. `completed`, `failed`, `terminal` and `skipped` are the four that exist.
+- **The lane pool's queue depth is unmeasured**, which is the natural saturation signal and is
+  observable today. It belongs to `EffectRuntime` rather than to `Arc<Runtime>`, so a scrape cannot
+  reach it without plumbing this phase did not need.
+- **Nothing behind the op-DB mutex is a metric.** Subject-key counts and journal sizes are the
+  obvious candidates, and scrape-time refresh is only correct because every source is an atomic load.
+  A metric that took the process-wide mutex would put a scraper in contention with the effect hot
+  path.
+- **A refusal series appears on first use rather than at boot.** heklang inlines a `refusal` before a
+  program exists, so it has no declaration row and `introspect::command_detail` reports no codes;
+  hekla cannot enumerate them to prime them. Bounded by the source either way, but an alert over
+  `hekla_command_refusals_total` needs `or vector(0)` where the other counters do not, and the docs
+  say so. It is the **only** such counter: the read pair is primed from the entities on each
+  projector handle, which are as enumerable as everything else and had no business being the
+  exception.
+- **A state set is the one shape that fails silently, so neither list lives here.**
+  `Readiness::ALL` and `EFFECT_STATES` sit beside the functions that produce the words, with a test
+  apiece, because a list that falls behind its `match` makes every series read 0 and every `== 1`
+  alert quietly stop firing rather than making anything break.
+- **`EffectShared` gained a `running` flag**, mirroring the one `ProjectorShared` already had, so
+  `hekla_effect_up` can distinguish an idle effect from an absent one. The only struct change here.
+  It is cleared by a `Drop` guard rather than by a call at each exit, for the reason the projector's
+  is: a panic under `supervise` unwinds past every explicit clear, and an effect whose thread has
+  died reporting `up 1` forever is precisely the reading an operator must be able to trust. It is
+  `true` from the moment the handle is published rather than from the moment the thread runs, so a
+  blocked effect reads `1` for as long as the OS takes to schedule the thread that clears it;
+  `state()` reports `blocked` throughout that window, and starting at `false` would make every
+  healthy effect read down at boot instead, which is the same disagreement far more often.
+- **A completion that quarantines is counted `completed`.** The counter moved above the verify
+  check rather than below it: by that point the row is written and the lane is clear, so the
+  invocation is complete by every durable measure, and counting after the check would leave the one
+  invocation an incident turned on filed under no outcome at all.
+- **A sealed replay is not an outbound call.** `metrics::effect_http` sits at the `Http` trait
+  boundary so a stubbed run counts like a real one, and a verify replay crosses that same boundary
+  through `SealedHttp`. Its refusal is skipped on `HeklaHost::sealed`, because counting it would
+  report a code divergence as the network being down, in the very series the outbound-failure alert
+  divides by.
+- **`AlreadyTerminal` is counted under no outcome, deliberately.** It is a position an earlier
+  process already completed, recovered rather than invoked, so counting it would inflate an
+  invocation rate with work that never ran a handler. The cost is real and worth naming: while a
+  restart drains a backlog of them, `rate(hekla_effect_invocations_total)` reads zero for an effect
+  that is plainly making progress. `hekla_effect_position` and `_lag` are the honest progress signal
+  there, and they move.
+- **`refresh` reallocates every label on every scrape**, plus the `Vec` and sort each `*_handles()`
+  accessor does. For sixty modules at a 15s scrape that is on the order of a thousand short-lived
+  allocations a minute, against a handler that already does a `Store::head` and a render. `SharedString`
+  or `Arc<str>` names on the handles would make it free, and the trigger is a profile that shows it,
+  not the arithmetic.
+- **The integration tests serialize on a mutex.** One recorder is process-wide and a series is keyed
+  by its labels, so two harnesses booting the same example project in parallel write
+  `hekla_effect_state{name="SendWelcome"}` at each other. That is a property of running several
+  runtimes in one process, which only a test does. Counters are asserted as deltas there and exactly
+  in `src/metrics.rs`, against a recorder local to each case.
+- **The console is unchanged.** Its sparkline stays a browser-side view of the log tail rather than
+  becoming a metrics consumer, and the comments that justified it with "hekla has no metrics
+  endpoint" now say the honest thing instead.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
@@ -1889,7 +2008,6 @@ warranted.
 - **Upload API with versioning, pinning, and retention, plus hot reload** (load-graph incremental
   invalidation): when inline or live editing becomes a goal. The effect journal already records the
   script hash for this.
-- **Metrics and Prometheus**: when there is something to operate at scale.
 - **Fold library** (`event_counter`, `latest_event`, `toggle`): only after roughly fifteen real
   commands exist, and only if it compiles down to the existing `state` shape rather than becoming a
   second execution path. This is now a language question rather than hekla's.

@@ -22,7 +22,7 @@ use heklang::ir::Delivery;
 use crate::loader::{ArmRef, EffectUnit, Finding, LoadedProject, Severity};
 use crate::opdb::{self, OpDb};
 use crate::plan::Replay;
-use crate::{crypto, lock, runtime, server, testing, validate};
+use crate::{crypto, lock, metrics, runtime, server, testing, validate};
 
 /// The default HTTP bind address when `--addr` is not given.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
@@ -822,6 +822,11 @@ fn verify(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
     }
 }
 fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) -> ExitCode {
+    // Before the project loads and long before a projector or effect thread starts: a
+    // counter recorded with no recorder installed is dropped, so anything emitted ahead
+    // of this would be invisible until the process happened to do it again.
+    metrics::install();
+
     let mut project = LoadedProject::load(dir);
     let (errors, _) = report_findings(&project);
     if errors > 0 {

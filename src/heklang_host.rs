@@ -36,6 +36,7 @@ use crate::crypto::KeyStore;
 use crate::envelope;
 use crate::hash::sha256_hex;
 use crate::http::{HttpClient, HttpRequest};
+use crate::metrics;
 use crate::opdb::OpDb;
 use crate::read_api;
 use crate::read_model::ReadModel;
@@ -602,7 +603,22 @@ impl Http for HeklaHost {
             headers,
             body,
         };
-        match client.send(&sent) {
+        let attempt = client.send(&sent);
+        // Counted at the trait boundary rather than inside `UreqClient`, so the number
+        // describes the calls an effect made rather than the calls one transport made:
+        // a stubbed run counts on the same terms as a real one. This is also the only
+        // place that sees an individual attempt, since rule 5 puts the re-send loop
+        // inside the language and hands the driver a decided result.
+        //
+        // Except on a sealed host, which is the same boundary being crossed by something
+        // that is not an outbound call at all: a verify replay reaching a call the
+        // journal has no entry for is refused by `SealedHttp`, and counting that refusal
+        // as a transport failure would report a code divergence as the network being
+        // down, in the very series the outbound-failure alert divides by.
+        if !self.sealed {
+            metrics::effect_http(attempt.as_ref().ok().map(|response| response.status));
+        }
+        match attempt {
             Ok(response) => {
                 // Kept for the driver rather than acted on here. Rule 5 re-sends
                 // immediately inside the language, so a limiter that keeps refusing

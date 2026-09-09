@@ -21,6 +21,7 @@ use crate::context::CommandContext;
 use crate::crypto::KeyStore;
 use crate::envelope;
 use crate::heklang_host::{HeklaHost, timestamp_wire, to_heklang_json};
+use crate::metrics;
 use crate::schema::{EmittedEvent, EventDefs};
 use crate::store::Store;
 use crate::tags::RESERVED_TAG_PREFIX;
@@ -237,6 +238,10 @@ pub fn run_command(
     let mut interpreter = Interpreter::with_host(program, host);
     let attempts = retry.max_attempts;
     let execution = match interpreter.run_retrying(name, args, &mut |attempt| {
+        // Counted for every conflict, including the last one, which then also reports
+        // the `conflict` outcome. The two answer different questions: this one is how
+        // contended the boundary is, that one is how often a caller had to see it.
+        metrics::command_conflict_retry(name);
         if attempt + 1 >= attempts {
             return false;
         }

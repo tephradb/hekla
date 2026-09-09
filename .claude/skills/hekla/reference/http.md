@@ -157,6 +157,36 @@ re-send every notification the log has ever seen.
 
 `GET /health` is `{"status": "ok"}` and nothing else.
 
+## `GET /metrics`
+
+The Prometheus text exposition format (`text/plain; version=0.0.4`), on the same port and
+unauthenticated like everything else. Every gauge is read off the running modules at scrape time, so
+there is no collector interval and nothing to configure; there is no `[metrics]` section in
+`hekla.toml` and no flag.
+
+Series are `hekla_*`. Gauges: `log_head_position`, `uptime_seconds`, `build_info{version}`,
+`module_info{kind,name,hash}`, and per module `projector_up`/`effect_up`, `_position`, `_lag`,
+`projector_readiness{state}` and `effect_state{state}` as state sets, plus `effect_wedged_lanes`,
+`effect_consecutive_failures` and `effect_retry_backoff_seconds`. Counters: `commands_total{command,
+outcome}`, `command_refusals_total{command,code}`, `command_conflict_retries_total{command}`,
+`events_appended_total{event}`, `projector_events_total`, `projector_rebuilds_total{outcome}`,
+`effect_invocations_total{outcome}`, `effect_restarts_total`, `effect_terminal_skips_total`,
+`effect_live_suppressed_total`, `effect_collapsed_total`, `effect_http_requests_total{outcome}`,
+`reads_total{projector,entity,outcome}` and `read_waits_total{projector,outcome}`.
+
+Two things to know before writing a query against it:
+
+- **A lane key is never a label.** `/status` and `/admin/effects` name the lane pinning an effect's
+  mark; the scrape reports `hekla_effect_wedged_lanes` as a count and stops there. A lane key is a
+  partition key, and a scrape is a copy taken somewhere `hekla erase` cannot reach. Every other label
+  is a declaration for the same reason, so nothing here is computed from a request or an event.
+- **A refusal series appears on first use.** heklang inlines a `refusal`, so hekla cannot enumerate
+  the codes to prime them at boot; use `or vector(0)` over `hekla_command_refusals_total`. Every
+  other counter reads `0` from the first scrape.
+
+`docs/monitoring/hekla-alerts.yml` in the hekla repository has alerting rules with the reasoning for
+each threshold.
+
 ## `GET /openapi.json` and `GET /docs`
 
 The document is generated from the loaded project by the same code `hekla openapi` runs, so a

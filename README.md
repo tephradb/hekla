@@ -240,6 +240,30 @@ on permanently with `[verify] enabled = true` in `hekla.toml`.
 One process at a time: a runtime takes an exclusive lock on its data directory, because tephra does
 not lock the segment directory itself.
 
+## Watching it run
+
+`/status` says how things are right now. `GET /metrics` says the same in Prometheus text format, plus
+the things a snapshot cannot carry: how often a command was refused, how long a projector has been
+behind, whether an effect's lag is falling or stuck.
+
+```sh
+curl -s localhost:8080/metrics | grep hekla_effect_
+```
+
+Series are named `hekla_*` and cover the log head, each module's position, lag and state, command
+outcomes by refusal code, DCB conflict retries, projector rebuilds, and the failure modes that are
+particular to this runtime: wedged lanes, terminal skips, quarantine, and the positions rule 15
+suppressed or collapsed. [docs/monitoring/hekla-alerts.yml] has alerting rules for the ones worth
+being woken up for, with the reasoning for each threshold beside it.
+
+Every label is a **declaration**: a command, projector, entity, effect or event name, a refusal code,
+or a fixed outcome word. Never a lane key, and that is about erasure rather than cardinality: a lane
+key is a partition key, `/status` may name it because it is a live view an erasure passes through,
+and a scrape may not because it is a copy taken somewhere `hekla erase` cannot reach. So the metric
+counts wedged lanes and `/admin/effects/{name}` names them.
+
+Like the rest of the surface, `/metrics` is unauthenticated and the bind address is the boundary.
+
 ## Learn more
 
 - **[heklang/docs/]** is the language: commands, projectors, effects, folds, sealed content, tests.
@@ -254,6 +278,7 @@ not lock the segment directory itself.
 [AUTHORING.md]: AUTHORING.md
 [ARCHITECTURE.md]: ARCHITECTURE.md
 [ROADMAP.md]: ROADMAP.md
+[docs/monitoring/hekla-alerts.yml]: docs/monitoring/hekla-alerts.yml
 
 ## License
 

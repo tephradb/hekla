@@ -1,9 +1,10 @@
 /* An inline SVG sparkline.
  *
- * hekla has no metrics endpoint and this does not pretend otherwise: the series is
- * bucketed client-side from the timestamps on one page of events, so it describes the
- * recent tail of the log and nothing more. Labelled as such where it is used, because
- * a chart that looks like a metric and is not one is worse than no chart. */
+ * This is not a metric and does not pretend to be one: the series is bucketed
+ * client-side from the timestamps on one page of events, so it describes the recent
+ * tail of the log and nothing more. Labelled as such where it is used, because a chart
+ * that looks like a metric and is not one is worse than no chart. hekla does serve
+ * `/metrics`, and a rate over a real time series belongs there rather than here. */
 
 import { html } from './vendor-preact.js'
 

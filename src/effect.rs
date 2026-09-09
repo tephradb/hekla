@@ -66,6 +66,7 @@ use heklang::ir::Delivery;
 use crate::lane::LaneId;
 use crate::lanes::{LaneState, Work};
 use crate::loader::{self, EffectUnit};
+use crate::metrics;
 use crate::opdb::{InvocationState, SWEEP_CHUNK};
 use crate::runtime::{self, Runtime};
 use crate::schema::ModuleDef;
@@ -117,6 +118,12 @@ fn driver_lane() -> &'static LaneId {
     &DRIVER_LANE
 }
 
+/// Every word [`EffectShared::state`] can return, which `crate::metrics` renders as a
+/// state set. Beside that function rather than in the metrics module, because the failure
+/// mode of the two disagreeing is silent: every series reads 0 and an `== 1` alert simply
+/// stops firing. `a_state_set_covers_every_effect_state` keeps them honest.
+pub const EFFECT_STATES: [&str; 5] = ["healthy", "lagging", "wedged", "quarantined", "blocked"];
+
 /// Observable state for one effect, shared with the runtime (for `/status`) and
 /// the skip endpoint. Holds no reference to the runtime, so nothing cycles.
 ///
@@ -130,8 +137,16 @@ pub struct EffectShared {
     /// The event types this effect subscribes to. On the handle for the same reason a
     /// projector's is.
     pub sources: Vec<String>,
+    /// This effect's digest hash, on the handle for the same reason `sources` is.
+    /// `hekla_module_info` reports it, so two replicas that disagree here are running
+    /// different code.
+    pub digest_hash: String,
     position: AtomicU64,
     shutdown: AtomicBool,
+    /// Cleared when the reader thread exits, so `hekla_effect_up` distinguishes an
+    /// effect that is merely idle from one that is not there at all. The projector's
+    /// handle carries the same flag for the same reason.
+    running: AtomicBool,
     /// How many times the *pinning* lane has failed in a row. Republished from
     /// [`EffectShared::stuck`], and still zero exactly when nothing is wedged, which is
     /// what keeps `state` reading the same as it always did.
@@ -196,12 +211,20 @@ pub struct EffectShared {
 }
 
 impl EffectShared {
-    fn new(name: String, sources: Vec<String>, resume: u64, live_boundary: u64) -> EffectShared {
+    fn new(
+        name: String,
+        sources: Vec<String>,
+        digest_hash: String,
+        resume: u64,
+        live_boundary: u64,
+    ) -> EffectShared {
         EffectShared {
             name,
             sources,
+            digest_hash,
             position: AtomicU64::new(resume),
             shutdown: AtomicBool::new(false),
+            running: AtomicBool::new(true),
             consecutive_failures: AtomicU64::new(0),
             last_error: Mutex::new(None),
             terminal_skips: AtomicU64::new(0),
@@ -218,6 +241,19 @@ impl EffectShared {
             wedged_lanes: AtomicU64::new(0),
             pinning: Mutex::new(None),
         }
+    }
+
+    /// Whether the reader thread is still alive: false once it has stopped, for any
+    /// reason including a panic.
+    ///
+    /// True from the moment the handle is published rather than from the moment the
+    /// thread is scheduled, so a blocked effect reads `1` here for as long as it takes
+    /// the OS to run the thread that will clear it. That window is real and is left
+    /// alone: `state()` already reports `blocked` throughout it, and starting at `false`
+    /// would make every healthy effect read down at boot instead, which is the same
+    /// disagreement pointed the other way and far more often.
+    pub fn running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
     }
 
     /// The position `on live` arms decline at or below.
@@ -466,6 +502,10 @@ impl EffectShared {
     /// `terminal_skips` is deliberately not a state here: it is cumulative and never
     /// cleared, so a label derived from it would stick for the life of the process
     /// and hide a later wedge.
+    ///
+    /// Every word it can return is in [`EFFECT_STATES`], which `crate::metrics` renders
+    /// as a state set; the two are together here because a state set whose list has
+    /// fallen behind reads zero everywhere rather than failing.
     pub fn state(&self, head: u64) -> &'static str {
         if self.quarantined() {
             "quarantined"
@@ -953,6 +993,7 @@ fn spawn(
     let shared = Arc::new(EffectShared::new(
         name.clone(),
         sources,
+        unit.digest_hash.clone(),
         resume,
         activation.live_boundary,
     ));
@@ -990,6 +1031,11 @@ fn run(
 ) {
     // Set before the thread started, and never cleared: the recovery is to fix the code
     // and restart, so there is nothing here to supervise.
+    // A guard rather than a call at each exit, for the reason the projector's is one: a
+    // panic anywhere under `supervise` unwinds past every explicit clear, and an effect
+    // whose thread has died reporting `hekla_effect_up 1` forever is the one reading an
+    // operator must be able to trust.
+    let _running = RunningFlag(&shared);
     if shared.blocked().is_some() {
         return;
     }
@@ -1002,6 +1048,15 @@ fn run(
     // The thread is done; nothing may keep working lanes it will no longer publish for.
     if let Some(ctx) = ctx {
         ctx.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Clears [`EffectShared::running`] however the thread leaves, panic included.
+struct RunningFlag<'a>(&'a EffectShared);
+
+impl Drop for RunningFlag<'_> {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1035,6 +1090,10 @@ fn supervise(shared: &EffectShared, mut drive: impl FnMut(&mut dyn FnMut()) -> a
         }
         let (delay, next) = next_backoff(attempt, recovered);
         shared.record_failure(&format!("driver: {err:#}"), delay);
+        // The driver is about to re-subscribe, which is umari's `restarts_total`. An
+        // effect that is down rather than merely wedged shows as this climbing while
+        // `hekla_effect_lag` does not fall.
+        metrics::effect_restart(&shared.name);
         tracing::error!(
             "effect `{}` driver error (attempt {}): {err:#}",
             shared.name,
@@ -1406,6 +1465,9 @@ fn publish_mark(ctx: &Arc<EffectCtx>, name: &str) -> anyhow::Result<()> {
     }
     ctx.runtime.set_effect_watermark(name, mark)?;
     ctx.shared.position.store(mark, Ordering::Relaxed);
+    // The mark moved, which is the only thing that counts as progress for an effect: a
+    // wedged lane holds it down no matter how far the healthy ones have run ahead.
+    metrics::effect_progress(name);
     ctx.shared.forget_skips(mark);
     // Only when a row would actually be deleted. A healthy effect records none, so this
     // keeps the sweep off the per-event path rather than issuing a delete that matches
@@ -1604,6 +1666,7 @@ fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, work: Work) -> Step {
                     "effect `{effect}` skipped wedged position {position} in lane `{lane}` by \
                      operator request"
                 );
+                metrics::effect_invocation(effect, "skipped");
                 return Step::Done;
             }
             Err(err) => return defer(ctx, lane, position, tried, &format!("{err:#}"), None),
@@ -1625,6 +1688,12 @@ fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, work: Work) -> Step {
                 return defer(ctx, lane, position, tried, &format!("{err:#}"), None);
             }
             ctx.shared.clear_lane(lane);
+            // Before the verify check, not after it. The invocation is complete by every
+            // durable measure at this point: the row is written and the lane is clear. A
+            // quarantine below stops the effect and returns, so counting afterwards would
+            // leave the one invocation an incident turned on counted under no outcome at
+            // all, which is exactly the invocation someone goes looking for.
+            metrics::effect_invocation(effect, "completed");
             if ctx.runtime.verify() {
                 // `Live`: this process just watched the invocation complete, and an
                 // operator skip returned above rather than reaching here, so an empty
@@ -1667,6 +1736,7 @@ fn attempt(ctx: &Arc<EffectCtx>, lane: &LaneId, work: Work) -> Step {
             }
             ctx.shared.record_terminal_skip(&failure.message);
             ctx.shared.clear_lane(lane);
+            metrics::effect_invocation(effect, "terminal");
             Step::Done
         }
         Err(failure) => defer(
@@ -1693,6 +1763,7 @@ fn defer(
     let attempt = ctx
         .shared
         .record_lane_failure(lane, position, message, delay);
+    metrics::effect_invocation(ctx.name(), "failed");
     tracing::error!(
         "effect `{}` invocation at position {position} in lane `{lane}` failed (attempt \
          {attempt}), retrying in {delay:?}: {message}",
@@ -2552,7 +2623,52 @@ mod tests {
     use super::*;
 
     fn test_shared() -> EffectShared {
-        EffectShared::new("test".to_owned(), Vec::new(), 0, 0)
+        EffectShared::new("test".to_owned(), Vec::new(), String::new(), 0, 0)
+    }
+
+    /// `EFFECT_STATES` is what `crate::metrics` renders as a state set, so a word missing
+    /// from it makes every `hekla_effect_state` series read zero rather than making
+    /// anything fail. Each branch of `state` is exercised here against the list, and the
+    /// length assertion stops a word being added to one and not the other.
+    #[test]
+    fn a_state_set_covers_every_effect_state() {
+        let healthy = test_shared();
+        assert_eq!(healthy.state(0), "healthy");
+        assert_eq!(healthy.state(9), "lagging");
+
+        let wedged = test_shared();
+        wedged.record_failure("boom", Duration::from_millis(1));
+        assert_eq!(wedged.state(0), "wedged");
+
+        let quarantined = test_shared();
+        quarantined.quarantine(&Violation::ReplayDivergence {
+            effect: "test".to_owned(),
+            position: 1,
+            detail: "diverged".to_owned(),
+        });
+        assert_eq!(quarantined.state(0), "quarantined");
+
+        let blocked = test_shared();
+        blocked.block("the key moved".to_owned());
+        assert_eq!(blocked.state(0), "blocked");
+
+        for state in [
+            healthy.state(0),
+            healthy.state(9),
+            wedged.state(0),
+            quarantined.state(0),
+            blocked.state(0),
+        ] {
+            assert!(
+                EFFECT_STATES.contains(&state),
+                "`{state}` is a word `state` returns and is not in EFFECT_STATES"
+            );
+        }
+        assert_eq!(
+            EFFECT_STATES.len(),
+            5,
+            "a word `state` can return belongs in `EFFECT_STATES` as well"
+        );
     }
 
     fn test_lane() -> LaneId {

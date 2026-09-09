@@ -1,8 +1,8 @@
 //! The HTTP surface: `POST /commands/{name}`, the generated read API
 //! (`GET /read/{projector}/{entity}[/{key}]`), `POST /projectors/{name}/replay`,
-//! `POST /effects/{name}/skip/{position}`, `GET /status`, `GET /health`, the
-//! generated `GET /openapi.json`, a Scalar reference UI over it at `GET /docs`, and
-//! the read-only introspection surface under `GET /admin`.
+//! `POST /effects/{name}/skip/{position}`, `GET /status`, `GET /health`, the Prometheus
+//! scrape at `GET /metrics`, the generated `GET /openapi.json`, a Scalar reference UI
+//! over it at `GET /docs`, and the read-only introspection surface under `GET /admin`.
 //!
 //! Nothing here is authenticated, and that is not specific to `/admin`: a caller who
 //! can reach this port can already append events and skip an effect's work. The bind
@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::context::CommandContext;
 use crate::effect::EffectRuntime;
 use crate::introspect;
+use crate::metrics;
 use crate::projector::{ProjectorSet, ProjectorShared, Readiness};
 use crate::read_api;
 use crate::runtime::{Runtime, error_body};
@@ -89,6 +90,7 @@ pub const SKIP_ROUTE: &str = "/effects/{name}/skip/{position}";
 pub const STATUS_ROUTE: &str = "/status";
 pub const HEALTH_ROUTE: &str = "/health";
 pub const OPENAPI_ROUTE: &str = "/openapi.json";
+pub const METRICS_ROUTE: &str = "/metrics";
 pub const DOCS_ROUTE: &str = "/docs";
 
 /// The read-only introspection surface. One prefix, so a deployment that binds
@@ -133,6 +135,7 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (STATUS_ROUTE, get(status)),
         (HEALTH_ROUTE, get(health)),
         (OPENAPI_ROUTE, get(openapi_doc)),
+        (METRICS_ROUTE, get(metrics_scrape)),
         (DOCS_ROUTE, get(docs)),
         (ADMIN_ROUTE, get(admin_index)),
         (ADMIN_EVENTS_ROUTE, get(admin_events)),
@@ -224,16 +227,23 @@ async fn execute(
         }
     };
 
+    // Kept behind, because `name` moves into the closure and the two 500 paths below
+    // still have to say which command they were. `Runtime::run_with_retry` records every
+    // outcome a command reached on its own; what only this level can see is hekla
+    // failing to run one at all.
+    let attempted = name.clone();
     let task = tokio::task::spawn_blocking(move || {
         runtime.execute(&name, value, &ctx, idem_key.as_deref())
     });
     match task.await {
         Ok(Ok(result)) => json_response(result.status, result.body),
         Ok(Err(err)) => {
+            metrics::command_outcome(&attempted, "error");
             tracing::error!("command execution failed: {err:#}");
             json_response(500, error_body(&ctx, "internal", "internal error"))
         }
         Err(err) => {
+            metrics::command_outcome(&attempted, "error");
             tracing::error!("command task panicked: {err}");
             json_response(500, error_body(&ctx, "internal", "internal error"))
         }
@@ -246,6 +256,32 @@ async fn status(State(runtime): State<Shared>) -> Json<Value> {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// `GET /metrics`: the Prometheus text format.
+///
+/// Every gauge is refreshed from the runtime's handles here rather than by a background
+/// ticker, because each one is an atomic load or `Store::head` and this is the moment
+/// the numbers are read. `crate::metrics` says why that is the whole collector.
+///
+/// Unauthenticated, like everything else this process serves: the bind address is the
+/// boundary. A deployment that binds wider blocks or exposes this in its proxy exactly
+/// as it does `/admin`.
+async fn metrics_scrape(State(runtime): State<Shared>) -> Response {
+    // Install first and refresh second. The other order looks equivalent and is not: a
+    // gauge set before a recorder exists goes to the no-op one and is gone, so a process
+    // that reached here without having installed (anything driving `app` directly rather
+    // than through `cli::serve`) would serve its first scrape empty.
+    let handle = metrics::install();
+    metrics::refresh(&runtime);
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(metrics::CONTENT_TYPE),
+        )],
+        handle.render(),
+    )
+        .into_response()
 }
 
 async fn openapi_doc(State(runtime): State<Shared>) -> Response {
@@ -278,7 +314,12 @@ async fn read_one(
     };
     let wait = match parse_wait(&params) {
         Ok(wait) => wait,
-        Err(response) => return *response,
+        // A malformed `after`/`timeout_ms` is a 400 like the scan params below, and is
+        // counted the same way rather than being the one client mistake with no series.
+        Err(response) => {
+            metrics::read(&projector, &entity, "invalid_input");
+            return *response;
+        }
     };
     if let Some(response) = honor_wait(&shared, &projector, wait).await {
         return response;
@@ -290,11 +331,21 @@ async fn read_one(
     });
     match task.await {
         Ok(Ok((Some(item), position))) => {
+            metrics::read(&projector, &entity, "ok");
             json_response(200, json!({ "item": item, "position": position }))
         }
-        Ok(Ok((None, _))) => json_response(404, read_error("not_found", "no such row")),
-        Ok(Err(err)) => read_failed(err),
-        Err(err) => task_panicked(err),
+        Ok(Ok((None, _))) => {
+            metrics::read(&projector, &entity, "not_found");
+            json_response(404, read_error("not_found", "no such row"))
+        }
+        Ok(Err(err)) => {
+            metrics::read(&projector, &entity, "error");
+            read_failed(err)
+        }
+        Err(err) => {
+            metrics::read(&projector, &entity, "error");
+            task_panicked(err)
+        }
     }
 }
 
@@ -316,7 +367,12 @@ async fn read_scan(
     // validated below, so a malformed scan fails fast instead of blocking first.
     let wait = match parse_wait(&params) {
         Ok(wait) => wait,
-        Err(response) => return *response,
+        // A malformed `after`/`timeout_ms` is a 400 like the scan params below, and is
+        // counted the same way rather than being the one client mistake with no series.
+        Err(response) => {
+            metrics::read(&projector, &entity, "invalid_input");
+            return *response;
+        }
     };
 
     let mut filters: Vec<(String, String)> = Vec::new();
@@ -327,9 +383,11 @@ async fn read_scan(
             "limit" => match value.parse::<usize>() {
                 Ok(n) => limit = n.clamp(1, read_api::MAX_LIMIT),
                 Err(_) => {
-                    return json_response(
-                        400,
-                        read_error("invalid_input", "limit must be a positive integer"),
+                    return read_invalid(
+                        &projector,
+                        &entity,
+                        "invalid_input",
+                        "limit must be a positive integer",
                     );
                 }
             },
@@ -340,29 +398,29 @@ async fn read_scan(
         }
     }
     if filters.len() > 1 {
-        return json_response(
-            400,
-            read_error(
-                "unindexed_filter",
-                "only a single indexed filter field is supported",
-            ),
+        return read_invalid(
+            &projector,
+            &entity,
+            "unindexed_filter",
+            "only a single indexed filter field is supported",
         );
     }
     let filter = filters.into_iter().next();
     if let Some((field, value)) = &filter {
         if !read_api::is_filterable(&entity_def, field) {
-            return json_response(
-                400,
-                read_error(
-                    "unindexed_filter",
-                    &format!("filter field `{field}` is not indexed; declare an index on it"),
-                ),
+            return read_invalid(
+                &projector,
+                &entity,
+                "unindexed_filter",
+                &format!("filter field `{field}` is not indexed; declare an index on it"),
             );
         }
         if let Err(err) = read_api::check_filter(&entity_def, field, value) {
-            return json_response(
-                400,
-                read_error("invalid_input", &format!("filter `{field}`: {err}")),
+            return read_invalid(
+                &projector,
+                &entity,
+                "invalid_input",
+                &format!("filter `{field}`: {err}"),
             );
         }
     }
@@ -370,7 +428,7 @@ async fn read_scan(
         Some(raw) => match read_api::decode_cursor(raw) {
             Ok(key) => Some(key),
             Err(_) => {
-                return json_response(400, read_error("invalid_input", "cursor is not valid"));
+                return read_invalid(&projector, &entity, "invalid_input", "cursor is not valid");
             }
         },
         None => None,
@@ -395,16 +453,25 @@ async fn read_scan(
         )
     });
     match task.await {
-        Ok(Ok(page)) => json_response(
-            200,
-            json!({
-                "items": page.items,
-                "next_cursor": page.next_cursor,
-                "position": page.position,
-            }),
-        ),
-        Ok(Err(err)) => read_failed(err),
-        Err(err) => task_panicked(err),
+        Ok(Ok(page)) => {
+            metrics::read(&projector, &entity, "ok");
+            json_response(
+                200,
+                json!({
+                    "items": page.items,
+                    "next_cursor": page.next_cursor,
+                    "position": page.position,
+                }),
+            )
+        }
+        Ok(Err(err)) => {
+            metrics::read(&projector, &entity, "error");
+            read_failed(err)
+        }
+        Err(err) => {
+            metrics::read(&projector, &entity, "error");
+            task_panicked(err)
+        }
     }
 }
 
@@ -486,6 +553,10 @@ fn resolve_entity(
     // the shape a previous definition built. Querying across that mismatch fails on a
     // missing column, so say so plainly instead of leaking a SQLite error as a 500.
     if let Some(response) = not_servable(projector, shared.readiness()) {
+        // Counted here and not at the two 404s above, because only past them are
+        // `projector` and `entity` known to name declarations. Before that they are
+        // whatever the URL said, and a metric label is not the place to find out.
+        metrics::read(projector, entity, "not_ready");
         return Err(Box::new(response));
     }
     Ok((Arc::clone(shared), entity_def.clone()))
@@ -539,6 +610,19 @@ fn not_servable(projector: &str, readiness: Readiness) -> Option<Response> {
 
 fn read_error(code: &str, message: &str) -> Value {
     json!({ "error": { "code": code, "message": message } })
+}
+
+/// A 400 from the read surface, counted under one `invalid_input` outcome whatever the
+/// body's `code` says.
+///
+/// Every caller is past [`resolve_entity`], so `projector` and `entity` name declarations
+/// rather than whatever the URL happened to carry, which is the only reason these may be
+/// labels at all. The wire `code` stays finer-grained than the metric on purpose: a client
+/// needs to know an `unindexed_filter` from a bad cursor, and an operator watching a rate
+/// needs neither.
+fn read_invalid(projector: &str, entity: &str, code: &str, message: &str) -> Response {
+    metrics::read(projector, entity, "invalid_input");
+    json_response(400, read_error(code, message))
 }
 
 fn read_failed(err: anyhow::Error) -> Response {
@@ -604,9 +688,12 @@ async fn honor_wait(
     wait: Option<Wait>,
 ) -> Option<Response> {
     let wait = wait?;
+    // Reached only past `resolve_entity`, so `projector` names a declaration.
     if await_position(shared, wait.after, wait.timeout).await {
+        metrics::read_wait(projector, "served");
         None
     } else {
+        metrics::read_wait(projector, "timeout");
         Some(not_caught_up(projector, wait.after, wait.timeout))
     }
 }

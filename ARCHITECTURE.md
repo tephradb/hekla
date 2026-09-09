@@ -742,6 +742,12 @@ than a user chore.
 alongside how many lanes are wedged and which key holds the mark, since a partitioned effect can lag
 by thousands while every lane but one is healthy.
 
+The same state is scrapeable at `/metrics`, with one difference that is a rule rather than an
+oversight: the metric reports **how many** lanes are wedged and never **which**. A lane key is a
+partition key, so it is routinely a customer id. The status endpoint may name it because it is a live
+view that an erasure passes through; a scrape may not, because it is a copy taken into a time-series
+database that `hekla erase` cannot reach. Every metric label is a declaration for the same reason.
+
 ## 8. Runtime and concurrency
 
 - Lightweight tokio tasks with bespoke supervision. No actor framework in v1.
@@ -961,8 +967,8 @@ three lints plus what a directory means.
 
 ## 13. Non-goals
 
-**Deferred** (see the roadmap, each with a trigger): metrics and Prometheus; an upload API with
-versioning, pinning, and retention, plus hot reload; a fold library; a workspace crate split.
+**Deferred** (see the roadmap, each with a trigger): an upload API with versioning, pinning, and
+retention, plus hot reload; a fold library; a workspace crate split.
 
 **Permanent commitments** (not deferrals, and not to be reopened): **there is exactly one authoring
 surface, and it is heklang.** There is no Rust, TypeScript, or WASM SDK path now or later. This is
