@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://git.tqwewe.com/tephra/hekla/compare/v0.3.0...v0.3.1) - 2026-09-09
+
+### Added
+
+- a scrape says what /status cannot, and no label is ever a lane key
+- *(cli)* a redirected log carries no color, and --no-color drops it in a terminal too
+
 ## [0.3.0](https://git.tqwewe.com/tephra/hekla/compare/v0.2.0...v0.3.0) - 2026-09-08
 
 ### Added
