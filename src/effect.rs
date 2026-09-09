@@ -58,7 +58,7 @@ use tephra::{Position, WaitOutcome};
 use crate::config::Config;
 use crate::context::CommandContext;
 use crate::hash::sha256_hex;
-use crate::heklang_host::{HeklaHost, Journal, from_tephra, query_of_types};
+use crate::heklang_host::{HeklaHost, Journal, Stamp, from_tephra, query_of_types};
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
 use crate::invariant::Violation;
 use heklang::ir::Delivery;
@@ -1795,7 +1795,7 @@ fn try_invocation(
         // triggered it: the correlation carries across command, event, effect and
         // command, which is what makes a trace one chain rather than two.
         ctx: trigger_context(runtime, position)?,
-        now: now.clone(),
+        stamp: Stamp::Wall(now.clone()),
         idem_tag: None,
         call: Some(Arc::clone(&call)),
         appended: None,
@@ -1804,7 +1804,6 @@ fn try_invocation(
         duplicated: false,
         retry_after: None,
         last_transport: None,
-        minted: None,
         sealed: false,
         http: Some(Arc::clone(http)),
         secrets: Some(Arc::clone(runtime.secrets_shared())),
@@ -2381,7 +2380,7 @@ pub fn replay(effect: &str, position: u64, runtime: &Arc<Runtime>, asked: Asked)
         store: runtime.store().clone(),
         keystore: runtime.keystore_shared().cloned(),
         ctx: CommandContext::new(uuid::Uuid::new_v4()),
-        now: now.clone(),
+        stamp: Stamp::Wall(now.clone()),
         idem_tag: None,
         // A sealed replay reaches no unjournaled call, so nothing appends and there is
         // no tag to key.
@@ -2392,7 +2391,6 @@ pub fn replay(effect: &str, position: u64, runtime: &Arc<Runtime>, asked: Asked)
         duplicated: false,
         retry_after: None,
         last_transport: None,
-        minted: None,
         // The other half of the seal. `SealedHttp` stops a send, and this stops the
         // append an unjournaled `invoke` would make and the shred an unjournaled
         // `erase` would perform, both of which reach the store through the host.

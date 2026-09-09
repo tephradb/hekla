@@ -22,7 +22,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use hekla::context::CommandContext;
 use hekla::crypto::MasterKeys;
 use hekla::effect::{EffectRuntime, StubHttpClient};
-use hekla::heklang_host::{HeklaHost, event_from_json};
+use hekla::heklang_host::{HeklaHost, Stamp, event_from_json};
 use hekla::http::HttpClient;
 use hekla::loader::{Finding, LoadedProject, Severity};
 use hekla::projector::ProjectorSet;
@@ -51,9 +51,14 @@ pub const UUID_C: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 /// A fixed, non-secret master key for the tests.
 pub const MASTER_KEY: [u8; 32] = [0x11; 32];
 
-/// A fixed clock, matching the one `hekla test` pins, for events seeded straight
-/// into a store.
-pub const TEST_NOW: &str = "1970-01-01T00:00:00Z";
+/// A fixed clock for events seeded straight into a store.
+///
+/// The same instant `hekla test` starts from, but not the same *kind* of clock: a `.hk`
+/// test's world steps its stamp per log position, because it has to synthesise the
+/// envelope `hek test` does. Nothing here runs under two runners, so one instant is
+/// enough, and sharing the epoch is only so hekla tells one story about what its pinned
+/// clock reads.
+pub const TEST_NOW: &str = "2020-01-01T00:00:00Z";
 
 /// Segment size for a throwaway store: small, but still clear of the writer's
 /// default max batch size.
@@ -581,7 +586,7 @@ pub fn seed_event(
         store: store.clone(),
         keystore: None,
         ctx: *ctx,
-        now: TEST_NOW.to_owned(),
+        stamp: Stamp::Wall(TEST_NOW.to_owned()),
         idem_tag: None,
         // Only an effect's `invoke` keys an append on a journaled call.
         call: None,
@@ -595,7 +600,6 @@ pub fn seed_event(
         secrets: None,
         retry_after: None,
         last_transport: None,
-        minted: None,
         sealed: false,
     };
     hekla::heklang_host::append_one(&mut host, &event).expect("seeded");

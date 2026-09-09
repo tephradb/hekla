@@ -11,6 +11,17 @@
 //! none }` exercises crypto-shredding rather than a flag; an append really goes through
 //! the Dynamic Consistency Boundary; and a row really round-trips through the column
 //! types the read API will serve it from.
+//!
+//! **What stays heklang's is the synthesised envelope**, and that is the other half of
+//! "one definition, two worlds". A `given` event's id and append time are not facts
+//! about the world, they are what a runner made up, so a world that makes them up
+//! differently gives one `test` declaration two meanings: a projector writing
+//! `created_at: e.at` could then be asserted under `hek test` or under `hekla test` but
+//! never under both. [`Stamp::Pinned`] is hekla reproducing `heklang::Harness` exactly,
+//! down to the epoch and the minute it steps by, and the differential test beside it in
+//! `crate::heklang_host` is what keeps "exactly" true across a heklang release.
+//!
+//! [`Stamp::Pinned`]: crate::heklang_host::Stamp::Pinned
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -27,7 +38,7 @@ use tephra::{SegmentConfig, SegmentSet, WriteCoordinator, WriterConfig};
 use crate::cli;
 use crate::context::CommandContext;
 use crate::crypto::{KeyStore, MasterKeys};
-use crate::heklang_host::{HeklaHost, RowWriter};
+use crate::heklang_host::{HeklaHost, RowWriter, Stamp};
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
 use crate::loader::LoadedProject;
 use crate::opdb::OpDb;
@@ -39,10 +50,6 @@ use crate::store::Store;
 /// Throwaway per-test stores stay small, but the segment must still clear the writer's
 /// default max batch size.
 const SEGMENT_SIZE: usize = 16 * 1024 * 1024;
-
-/// The append time every test runs at, so a pinned `now()` is written down rather than
-/// observed.
-const TEST_NOW: &str = "1970-01-01T00:00:00Z";
 
 /// A fixed master key. Tests exercise the real encryption path, so they need a real
 /// key; making it a constant keeps a run reproducible.
@@ -166,7 +173,10 @@ impl HeklaWorld {
             store: store.clone(),
             keystore: keystore.clone(),
             ctx: CommandContext::new(uuid::Uuid::nil()),
-            now: TEST_NOW.to_owned(),
+            // The one thing here that is heklang's rather than hekla's. See the module
+            // doc: the world below the seam is real, and the envelope over it is the
+            // one `heklang::Harness` would have written.
+            stamp: Stamp::Pinned,
             idem_tag: None,
             // Only an effect's `invoke` keys an append on a journaled call.
             call: None,
@@ -175,11 +185,8 @@ impl HeklaWorld {
             unavailable: None,
             duplicated: false,
             http: Some(Arc::clone(&http) as Arc<dyn HttpClient>),
-            // Written down rather than observed, so `Uuid.derive(e.id, ..)` is
-            // something a test can spell.
             retry_after: None,
             last_transport: None,
-            minted: Some(0),
             sealed: false,
             // Filled at `World::open`, once setup has said which credentials this test
             // supplies.

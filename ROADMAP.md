@@ -375,9 +375,11 @@ Two small additions close it, and they compose:
   whole requirement. `name` is what lets one handler derive several distinct ids from one event.
 
 `build_event` now takes the event id from its caller rather than minting one, which is what lets
-`hekla test` pin it: the nth `given` event gets `00000000-0000-0000-0000-00000000000n`, alongside
-the clock and master key it already pinned. Without that, a case asserting a derived id would be
-flaky rather than failing, and the feature would be untestable in the language it ships for.
+`hekla test` pin it, alongside the clock and master key it already pinned. Without that, a case
+asserting a derived id would be flaky rather than failing, and the feature would be untestable in
+the language it ships for. *(The id it pinned was hekla's own, `…-00000000000n`, and Phase 32
+replaced it with heklang's: a pinned id that disagrees with `hek test` is reproducible and still
+unassertable, because no one case can satisfy both runners.)*
 
 **Honest scope:**
 
@@ -484,8 +486,9 @@ envelope already holds. The architecture said don't, and offered no alternative.
 
 `event.timestamp` sits beside `event.id`, `event.type` and `event.data`, threaded from the envelope
 each dispatch site already decodes. Same stability argument as `event.id`: stamped once at append, so
-a projector rebuild and an effect replay both reproduce it. `hekla test` pins it to the same fixed
-clock `now()` uses, so a column built from it is assertable.
+a projector rebuild and an effect replay both reproduce it. `hekla test` pins it, so a column built
+from it is assertable. *(It pinned it to a frozen instant, which turned out to be neither what
+`now()` reads nor what `hek test` writes; Phase 32 is the correction.)*
 
 The rule this settles, now stated in both §4 and the authoring guide: **`event.timestamp` for when
 the event was appended, `now()` for time that is genuinely domain data** (`expires_at`, `due_date`, a
@@ -1999,6 +2002,80 @@ Honest scope for this phase:
 - **The console is unchanged.** Its sparkline stays a browser-side view of the log tail rather than
   becoming a metrics consumer, and the comments that justified it with "hekla has no metrics
   endpoint" now say the honest thing instead.
+
+## Phase 32: `hekla test` synthesises the envelope `hek test` does (done)
+
+A project whose projector wrote `created_at: e.at` passed under `hek test` and failed under
+`hekla test`. Downstream, FlowWarranty's backend got `145 passed, 0 failed` from one runner and
+`132 passed, 13 failed` from the other, every failure reading `expected 1577836800000000, got 0`.
+
+Both runners share heklang's `run_tests_in` and its `World` trait, so `expect` already meant one
+thing. What they did not share is the **synthesised envelope**: the id and the append time a world
+invents for a `given` event and for whatever the action appends. Those are not facts about the
+world, they are what a runner made up, and two runners making them up differently give one `test`
+declaration two meanings. `World` has no clock hook, so only hekla could fix it.
+
+There were three divergences, not the one the report named:
+
+| | `hek test` | `hekla test`, before |
+| --- | --- | --- |
+| append time of record *n* | `2020-01-01T00:00:00Z` + *n* minutes | `1970-01-01T00:00:00Z`, frozen |
+| `now()` | the epoch + one minute per record | the same frozen instant |
+| id of record *n* | `0190d1a1-0000-7000-9000-` + *n* as twelve **decimal** digits | `00000000-…-` + *n*+1 as twelve **hex** digits |
+
+So heklang's clock **advances**, and swapping hekla's constant would have fixed only the shallowest
+row: a case asserting the second `given` event's timestamp would still have failed, and with a
+number close enough to the right one to be read as a rounding. The id row had bitten nothing yet
+only because no shipped project asserts a derived id.
+
+`HeklaHost`'s `now: String` and `minted: Option<u32>` became one `Stamp`. `Stamp::Wall(String)` is a
+live append: a v4 id and the wall clock read once per request. `Stamp::Pinned` derives **both**
+halves from the log position, exactly as `heklang::Harness` does. One field rather than two because
+the halves have to move together: a positional timestamp beside a counter-minted id is a world that
+agrees about when an event happened and disagrees about which event it was.
+
+- **Deriving from the log rather than setting a value at each seam is the point.** The alternative,
+  stamping once per invocation and writing that value in `World::given` and `World::open`, produces
+  the same answer for every case a `.hk` test can express, and needs every future seam to remember.
+  Asking the log cannot be forgotten.
+- **The counter in heklang's id is decimal, in a field that is read as hex.** `{position:012}` makes
+  position 10 `…-000000000010`, not `…-00000000000a`. Building the id from a `u128` looks equivalent
+  and diverges at the tenth event, which is deep enough into a suite to be found from the wrong end.
+  hekla formats and parses back, and a case in the differential test pins position 10 for that
+  reason alone.
+- **The differential test asks heklang rather than restating it.** `PINNED_EPOCH_MICROS` and its step
+  are copies of constants private to `heklang::Harness`, so hekla is now coupled to that crate's
+  internals. `a_pinned_envelope_is_the_one_heklangs_own_harness_writes` pushes events into a real
+  `Harness` and compares, so a heklang release that moves either number fails hekla's own suite
+  instead of surfacing later as a downstream project whose two runners disagree by an amount nobody
+  recognises.
+- **`tests/pinned_clock.rs` runs every case twice**, through `testing::run` and through
+  `heklang::run_tests`. Agreeing is the assertion. Nothing else in the tree could have caught this:
+  `e.at` appears in exactly one other `.hk` source in the repo, and no shipped example reads it.
+
+**Honest scope:**
+
+- **This is breaking for `hekla test`.** A project asserting `1970-01-01T00:00:00Z` or a
+  `00000000-…`-derived id starts failing. Those assertions never passed under `hek test`, which is
+  the whole point, but they did pass here.
+- **A `.hk` case cannot observe the stamps within one append.** heklang rejects a `run` and a
+  `project` in the same test, and an effect fires on `given` events rather than on a command's
+  output, so the only envelopes a case can read are the seeded ones, one event per append. Full
+  parity therefore buys nothing a `.hk` test can see today; it is taken because deriving from the
+  log has no seam to forget, and it is pinned from Rust instead.
+- **It asserts a shape no `hekla serve` produces.** A live append stamps one instant across the whole
+  request, and a pinned world puts a minute between two events of one append. That is heklang's
+  harness fiction, and hekla reproduces it rather than improving on it: the fiction is heklang's to
+  define, and a runtime that improved on it locally would be back to two dialects. If it is wrong it
+  is wrong upstream.
+- **`tests/support::seed_event` keeps a frozen clock.** It seeds hekla's Rust tests, which run under
+  one runner and have no parity obligation. Its constant moved to the same epoch only so hekla tells
+  one story about what a pinned clock reads.
+- **The shipped examples still never read `e.at`**, which is why nothing here caught the bug.
+  `tests/pinned_clock.rs` covers it; adding a column to `examples/users` would churn the read-API
+  tests for coverage that file already gives.
+- **`Clock::now`'s silent `unwrap_or(0)` stays** on the `Wall` arm. It is unreachable in practice,
+  since `now_rfc3339` cannot produce an unparseable string, and narrowing it is a separate change.
 
 ## Deferred, with triggers
 

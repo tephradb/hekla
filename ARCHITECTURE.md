@@ -868,9 +868,18 @@ consistent copy is not required for them.
   It also holds the rule that **a test cannot see anything a program cannot**. The only
   world-dependent assertion is a row, and it is read through the same seam `patch` reads through, so
   a case cannot assert on folded state, on an append condition, or on how many times something was
-  retried. Everything a handler can observe is pinned so a case is reproducible: the clock, the
-  master key, and each `given` event's id (counting from `…-000000000001`, so an id derived with
-  `Uuid.derive` is assertable) and timestamp.
+  retried. Everything a handler can observe is pinned so a case is reproducible: the master key, and
+  each event's id and append time.
+
+  **Those last two are pinned to heklang's numbers, not to hekla's own.** An id and an append time
+  are what a runner invents rather than what a world observes, so a world that invents them
+  differently gives one `test` declaration two meanings, and a projector writing `created_at: e.at`
+  could be asserted under `hek test` or under `hekla test` but never under both. hekla therefore
+  reproduces `heklang::Harness` exactly: the event at position *n* is stamped `2020-01-01T00:00:00Z`
+  plus *n* minutes and carries the id `0190d1a1-0000-7000-9000-` followed by *n* as twelve decimal
+  digits, and `now()` reads the instant the next append will take. A differential test asks heklang's
+  own harness for those numbers rather than restating them, so a heklang release that moves either
+  one fails hekla's suite instead of a downstream project's.
 - `hekla verify <dir>`: the runtime invariant sweep over a data directory. Section 11.2.
 - `hekla plan <dir>`: what deploying this project over a data directory would change. It reads the
   `declaration` table rather than the log, so it needs no lock and runs against a live directory.

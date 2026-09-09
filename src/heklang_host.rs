@@ -128,6 +128,67 @@ fn tag_text(value: &Value) -> String {
 // The host
 // ---------------------------------------------------------------------------
 
+/// heklang's harness epoch, `2020-01-01T00:00:00Z`, and the step it advances by per
+/// record. Both are private to `heklang::Harness`, so these are copies, and
+/// `a_pinned_envelope_is_the_one_heklangs_own_harness_writes` is what keeps them copies
+/// rather than guesses.
+const PINNED_EPOCH_MICROS: i64 = 1_577_836_800_000_000;
+const PINNED_STEP_MICROS: i64 = 60_000_000;
+
+/// Where an appended envelope's id and its timestamp come from.
+///
+/// One field rather than two, because the two halves have to move together. A
+/// positional timestamp beside a counter-minted id is a world that agrees with
+/// `hek test` about when an event happened and disagrees about which event it was, and
+/// that is not a state worth being able to spell.
+pub enum Stamp {
+    /// A live append: a fresh v4 id, and the wall clock read once per request and
+    /// pinned across every attempt (heklang's rule 11). RFC 3339.
+    Wall(String),
+    /// `heklang::Harness`, reproduced. Both halves derive from the log position, so one
+    /// `test` declaration synthesises the same envelope under `hek test` and
+    /// `hekla test`.
+    Pinned,
+}
+
+/// The instant heklang's harness stamps the record at `position`.
+///
+/// **A pinned world holds about 4.2e9 events**, and the three functions here stop in
+/// that order. A minute a record puts `time`'s year-9999 ceiling first, at roughly
+/// `4.2e9`; the multiply below overflows `i64` at about `1.5e11`; the id's twelve-digit
+/// field runs out at `1e12`. So the first limit reached is the renderable date range,
+/// and every one of them is unreachable by a log that has to be built one `given` at a
+/// time. That is the licence the two panics below run on.
+fn pinned_at(position: u64) -> i64 {
+    PINNED_EPOCH_MICROS + position as i64 * PINNED_STEP_MICROS
+}
+
+/// The same instant as RFC 3339, which is what an envelope holds.
+///
+/// Panics rather than falling back, because the only fallback worth writing is an
+/// epoch, and a stamp that silently reads `1970-01-01T00:00:00Z` is precisely the
+/// failure this whole arm exists to remove.
+fn pinned_stamp(position: u64) -> String {
+    rfc3339(pinned_at(position)).expect("a harness position renders inside the date range")
+}
+
+/// The id heklang's harness gives the record at `position`.
+///
+/// **The counter is decimal, in a field that is read as hex.** heklang writes
+/// `format!("...-{position:012}")`, so position 10 is `…-000000000010` and not
+/// `…-00000000000a`. Deriving the id arithmetically from a `u128` looks equivalent and
+/// diverges at the tenth event, which is deep enough into a test to be found from the
+/// wrong end. Formatting and parsing back is what keeps the two byte for byte.
+///
+/// The parse cannot fail on the digits, since a decimal digit is always a hex digit. It
+/// can fail on the *length*, once `position` needs more than the twelve the field
+/// holds, which is the `1e12` named on [`pinned_at`] and the last of the three limits
+/// to be reached.
+fn pinned_id(position: u64) -> uuid::Uuid {
+    uuid::Uuid::parse_str(&format!("0190d1a1-0000-7000-9000-{position:012}"))
+        .expect("a harness position fits the id's twelve digits")
+}
+
 /// One request's or one invocation's world.
 ///
 /// Built per run rather than shared: it carries the causation metadata and the pinned
@@ -141,9 +202,9 @@ pub struct HeklaHost {
     /// Causation for the events this run appends. heklang has no opinion on it, which
     /// is why it stays hekla's.
     pub ctx: CommandContext,
-    /// The append time, RFC 3339. heklang pins its own `now()` per invocation through
-    /// [`Clock`]; this is what the envelope stamps.
-    pub now: String,
+    /// Where the envelope this run appends gets its id and its append time. heklang
+    /// pins its own `now()` per invocation through [`Clock`]; this is what answers it.
+    pub stamp: Stamp,
     pub idem_tag: Option<String>,
     /// The journal identity of the call being made right now, shared with this
     /// invocation's [`Journal`].
@@ -192,10 +253,6 @@ pub struct HeklaHost {
     /// answer; an operator needs the reason, and this is the only place that still has
     /// it.
     pub last_transport: Option<String>,
-    /// A deterministic id source, for a world that has to be reproducible. The nth
-    /// event appended gets `…-00000000000n`, so an id derived from `e.id` can be
-    /// written down in a test. `None` mints a v4, which is what a live append does.
-    pub minted: Option<u32>,
     /// A replay that audits rather than acts: [`Log::append`] and [`Keys::erase`]
     /// refuse, the way a sealed replay's HTTP client refuses a send.
     ///
@@ -378,13 +435,12 @@ impl Log for HeklaHost {
         if self.sealed {
             return Err(host_error("a sealed replay tried to append to the log"));
         }
-        // Asked for before anything is lowered, not at the append itself. `lower` mints
-        // an id per event and the rewind below is what keeps those ids independent of a
-        // failed attempt; refusing after minting would leave the counter advanced for a
-        // request that wrote nothing. Nothing reaches this today, because only a sealed
-        // replay follows and the line above returns first, but a check must never be able
-        // to cause the fault it looks for, and that is a claim about what the code makes
-        // impossible rather than about what it happens to reach.
+        // Asked for before anything is lowered, not at the append itself: refusing
+        // halfway through sealing would have spent key material on a request that wrote
+        // nothing. Nothing reaches this today, because only a sealed replay follows and
+        // the line above returns first, but a check must never be able to cause the
+        // fault it looks for, and that is a claim about what the code makes impossible
+        // rather than about what it happens to reach.
         self.writer()?;
         // A command that decided to do nothing still commits, and heklang appends its
         // (empty) outcome rather than special-casing it. There is nothing to write and
@@ -392,17 +448,19 @@ impl Log for HeklaHost {
         if events.is_empty() {
             return Ok(());
         }
-        // An attempt that loses the race lowers the same events again on the next one,
-        // and `lower` mints an id per event. Rewinding the counter is what keeps the ids
-        // a run assigns independent of how many times it was beaten to the log. Nothing
-        // reaches it today (`hek test` is the only deterministic minter and it is
-        // single-threaded), and a counter that drifts on a retry is the kind of thing
-        // that is found much later, from the wrong end.
-        let minter = self.minted;
+        // Where these events land, which is what a pinned envelope is derived from.
+        // Read per attempt rather than carried on the host: an attempt that loses the
+        // race lowers the same events again from a head that has moved, so the stamps a
+        // run assigns are independent of how many times it was beaten to the log.
+        //
+        // Across attempts, not within one. The envelope is sealed here and the append
+        // happens below, so this is only the landing position if nothing commits in
+        // between; the arm at the bottom is where that stops being an assumption.
+        let base = self.head()?;
         let mut built = Vec::with_capacity(events.len());
         let mut emitted = Vec::with_capacity(events.len());
-        for event in events {
-            let (stored, reported) = self.lower(event)?;
+        for (offset, event) in events.iter().enumerate() {
+            let (stored, reported) = self.lower(event, base + offset as u64)?;
             built.push(stored);
             emitted.push(reported);
         }
@@ -421,11 +479,23 @@ impl Log for HeklaHost {
             None => boundary,
         };
         let landed = self.writer()?.append(built, Some(dcb));
-        if landed.is_err() {
-            self.minted = minter;
-        }
         match landed {
             Ok(range) => {
+                // A pinned envelope was sealed for the position it was lowered at, so a
+                // batch landing anywhere else carries an id and an append time
+                // belonging to some other record: wrong in the log, wrong forever, and
+                // silent, because nothing downstream re-derives either from where the
+                // event actually sits. One writer ever holds a pinned world (a `hekla
+                // test` case owns its store and heklang runs cases in sequence), which
+                // is what makes `base` the landing position rather than merely the
+                // likely one. This is that claim, checked rather than assumed.
+                if matches!(self.stamp, Stamp::Pinned) && from_tephra(range.first) != base {
+                    return Err(host_error(format!(
+                        "a pinned append lowered for position {base} landed at {}; \
+                         something else is writing to this world's log",
+                        from_tephra(range.first)
+                    )));
+                }
                 self.appended = Some(range);
                 self.emitted = emitted;
                 Ok(())
@@ -472,7 +542,17 @@ impl Secrets for HeklaHost {
 
 impl Clock for HeklaHost {
     fn now(&self) -> i64 {
-        value::timestamp(&self.now).unwrap_or(0)
+        match &self.stamp {
+            Stamp::Wall(text) => value::timestamp(text).unwrap_or(0),
+            // Through [`Log::head`] rather than the store directly, so the
+            // tephra-to-heklang position convention stays in the one place that states
+            // it. Spelling it again here would put `now()` a minute off the position
+            // the next append is stamped at the day that convention moves, which is the
+            // exact divergence this arm exists to remove. Infallible: `Log::head` for
+            // this host is a load wrapped in `Ok`, and heklang lowers `now()` into one
+            // slot per invocation, so it is asked once and asked cheaply.
+            Stamp::Pinned => pinned_at(Log::head(self).expect("a store head is a load")),
+        }
     }
 }
 
@@ -770,7 +850,15 @@ impl HeklaHost {
     /// One emitted event as tephra stores it: subject-scoped fields encrypted in the
     /// payload and in their tags, every other indexed field tagged in plaintext, and an
     /// envelope stamped with this run's causation.
-    fn lower(&mut self, event: &Event) -> Result<(tephra::Event, EmittedEvent), Error> {
+    ///
+    /// `position` is where the event will land, which only a [`Stamp::Pinned`] world
+    /// reads. It is passed rather than looked up because the caller is appending a
+    /// batch and this is the only place that knows which of them this is.
+    fn lower(
+        &mut self,
+        event: &Event,
+        position: u64,
+    ) -> Result<(tephra::Event, EmittedEvent), Error> {
         let ty = schema::event_type(&event.path);
         let def: EventDef = self
             .events
@@ -843,16 +931,13 @@ impl HeklaHost {
         extra.extend(self.idem_tag.as_deref());
         let tags = build_tags(&derived, &extra)?;
 
-        let event_id = match &mut self.minted {
-            Some(seen) => {
-                *seen += 1;
-                uuid::Uuid::from_u128(u128::from(*seen))
-            }
-            None => uuid::Uuid::new_v4(),
+        let (event_id, timestamp) = match &self.stamp {
+            Stamp::Wall(now) => (uuid::Uuid::new_v4(), now.clone()),
+            Stamp::Pinned => (pinned_id(position), pinned_stamp(position)),
         };
         let envelope = envelope::Envelope {
             event_id,
-            timestamp: self.now.clone(),
+            timestamp,
             correlation_id: self.ctx.correlation_id,
             causation_id: self.ctx.causation_id,
             triggering_event_id: self.ctx.triggering_event_id,
@@ -1348,9 +1433,11 @@ fn idem_item(tag: &str) -> Result<QueryItem, Error> {
 
 #[cfg(test)]
 mod tests {
+    use heklang::Harness;
+    use proptest::prelude::*;
+
     use super::*;
     use crate::propgen;
-    use proptest::prelude::*;
 
     /// The wire form of a value: rule 8's table, which is what every conversion below
     /// starts from and has to return to.
@@ -1580,5 +1667,75 @@ mod tests {
     fn a_json_object_is_ordered_by_key_and_not_by_insertion() {
         let parsed: serde_json::Value = serde_json::from_str(r#"{"b":1,"a":2}"#).unwrap();
         assert_eq!(parsed.to_string(), r#"{"a":2,"b":1}"#);
+    }
+    /// One event, since nothing here reads a payload: what is under test is the
+    /// envelope a world synthesises around it.
+    fn event(n: u64) -> Event {
+        Event::new(
+            EventPath::new(["thing", "happened"]),
+            [("n", Value::Int(n as i64))],
+        )
+    }
+
+    /// The test the whole [`Stamp::Pinned`] arm exists to satisfy, asked of the
+    /// reference implementation rather than of a number written down twice.
+    ///
+    /// `PINNED_EPOCH_MICROS` and the step beside it are copies of constants that are
+    /// private to `heklang::Harness`, so hekla is coupled to that crate's internals and
+    /// not merely to its published contract. This is the whole mitigation: a heklang
+    /// release that moves either one fails here, loudly and in hekla's own suite,
+    /// instead of surfacing much later as a downstream project whose `hek test` and
+    /// `hekla test` disagree by an amount nobody recognises.
+    #[test]
+    fn a_pinned_envelope_is_the_one_heklangs_own_harness_writes() {
+        let mut harness = Harness::default();
+        for n in 0..12 {
+            harness.push(event(n));
+        }
+
+        for position in 0..12 {
+            let record = harness
+                .record(position)
+                .expect("the harness reads its own log")
+                .expect("a record it just pushed");
+            assert_eq!(
+                record.at,
+                pinned_at(position),
+                "the append time at position {position}"
+            );
+            assert_eq!(
+                record.id,
+                pinned_id(position).to_string(),
+                "the event id at position {position}"
+            );
+        }
+
+        // Twelve rather than two, because the id's counter is decimal in a field read
+        // as hex: everything below ten agrees under either reading, and only position
+        // ten tells the two apart.
+        assert_eq!(
+            harness.record(10).unwrap().unwrap().id,
+            "0190d1a1-0000-7000-9000-000000000010"
+        );
+
+        // heklang derives `now()` from the log's length, so it reads as the instant the
+        // next append will be stamped with. That is what makes an emitted event's `at`
+        // equal to the `now()` its own command saw.
+        assert_eq!(Clock::now(&harness), pinned_at(12));
+    }
+
+    /// The stamp is what an envelope holds and `pinned_at` is what a record reads back
+    /// as, so a divergence between the two would put `e.at` a rounding away from
+    /// `now()` in a language where they are meant to meet exactly.
+    #[test]
+    fn a_pinned_stamp_reads_back_as_the_instant_it_was_written_for() {
+        for position in [0, 1, 10, 1_440] {
+            assert_eq!(
+                value::timestamp(&pinned_stamp(position)),
+                Some(pinned_at(position))
+            );
+        }
+        assert_eq!(pinned_stamp(0), "2020-01-01T00:00:00Z");
+        assert_eq!(pinned_stamp(1), "2020-01-01T00:01:00Z");
     }
 }

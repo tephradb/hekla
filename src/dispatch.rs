@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::context::CommandContext;
 use crate::crypto::KeyStore;
 use crate::envelope;
-use crate::heklang_host::{HeklaHost, timestamp_wire, to_heklang_json};
+use crate::heklang_host::{HeklaHost, Stamp, timestamp_wire, to_heklang_json};
 use crate::metrics;
 use crate::schema::{EmittedEvent, EventDefs};
 use crate::store::Store;
@@ -215,7 +215,7 @@ pub fn run_command(
         store: store.clone(),
         keystore: keystore.cloned(),
         ctx: *ctx,
-        now: now.to_owned(),
+        stamp: Stamp::Wall(now.to_owned()),
         idem_tag: idem_tag.map(str::to_owned),
         // Only an effect's `invoke` keys an append on a journaled call.
         call: None,
@@ -225,7 +225,6 @@ pub fn run_command(
         duplicated: false,
         retry_after: None,
         last_transport: None,
-        minted: None,
         sealed: false,
         // A command never reaches `http.*`: heklang's parser is what guarantees it,
         // so there is nothing to give one here.

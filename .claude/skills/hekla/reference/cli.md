@@ -52,9 +52,20 @@ FAIL: "a failing expectation": @user.registered.email: expected "wrong@example.c
 ```
 
 The world is hekla's: a real tephra log in a temporary directory, real SQLite read models, a real key
-store with a fixed master key, and a stubbed network driven by `respond`. The clock is pinned to
-`1970-01-01T00:00:00Z`, and each `given` event gets a deterministic id counting from
-`00000000-0000-0000-0000-000000000001`, so a `Uuid.derive(e.id, ...)` is assertable.
+store with a fixed master key, and a stubbed network driven by `respond`.
+
+**The envelope over that world is heklang's.** An id and an append time are what a runner invents,
+not what a world observes, so `hekla test` synthesises exactly what `hek test` does, and a case
+reading `e.at`, `e.id` or `now()` gets one answer from both:
+
+- the append time of the event at position *n* is `2020-01-01T00:00:00Z` plus *n* minutes, so
+  `given` events are a minute apart and a `created_at: e.at` column is assertable;
+- `now()` reads the instant the next append will be stamped with, which is the epoch plus one minute
+  per `given` event;
+- the id of the event at position *n* is `0190d1a1-0000-7000-9000-` followed by *n* padded to twelve
+  digits, so a `Uuid.derive(e.id, ...)` is assertable.
+
+A case that asserts one of these and passes under only one runner is a bug in hekla, not in the case.
 
 Exit is 1 on a failing test and 1 on a project with error findings. **A project with no tests prints
 `0 passed, 0 failed` and exits 0.**
