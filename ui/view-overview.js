@@ -11,6 +11,7 @@ import { useStatus } from './store.js'
 import { Empty, Resource, useResource, Skeleton } from './ui-states.js'
 import { Badge, Lag } from './ui-badge.js'
 import { Sparkline, bucket } from './ui-sparkline.js'
+import { railClass, tint } from './correlation.js'
 import { clock, count, duration, plural, shortId } from './format.js'
 
 const WINDOW_MS = 5 * 60 * 1000
@@ -198,7 +199,7 @@ export function OverviewView() {
           <table class="data">
             <tbody>
               ${data.events.slice(0, 10).map(
-                (event) => html`
+                (event, index, rows) => html`
                   <tr
                     key=${event.position}
                     class="clickable"
@@ -208,8 +209,11 @@ export function OverviewView() {
                     <td><code>${event.type}</code></td>
                     <td class="mono dim" style=${{ width: '110px' }}>${clock(event.timestamp)}</td>
                     <td class="tiny dim">${event.tags.slice(0, 2).join(' · ')}</td>
-                    <td class="mono tiny faint" style=${{ width: '110px' }}>
-                      ${shortId(event.correlation_id)}
+                    <td class="mono tiny" style=${{ width: '110px' }}>
+                      <span class="corr" style=${tint(event.correlation_id)}>
+                        <i class=${railClass(rows, index)} aria-hidden="true"></i>
+                        ${shortId(event.correlation_id)}
+                      </span>
                     </td>
                   </tr>
                 `,

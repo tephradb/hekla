@@ -12,16 +12,21 @@
 import { html, useEffect, useRef, useState } from './vendor-preact.js'
 
 /**
- * `columns` is `{ key, header, width, align, clip, render(row) }`. `clip` marks the one
- * column that holds prose rather than a value: it takes the width left over and ends in
- * an ellipsis instead of widening the table.
+ * `columns` is `{ key, header, width, align, clip, render(row, index) }`. `clip` marks
+ * the one column that holds prose rather than a value: it takes the width left over and
+ * ends in an ellipsis instead of widening the table. `render` is handed the row's index
+ * because a cell sometimes has to draw what a row means next to its neighbours rather
+ * than only what it holds.
  * `onOpen(row, index)` fires on Enter and on click.
+ * `rowClass(row, index)` decorates a row from outside, for a state the caller owns and
+ * the table has no opinion about.
  */
 export function DataTable({
   columns,
   rows,
   onOpen,
   selected,
+  rowClass,
   empty,
   keyboard = true,
   label,
@@ -98,6 +103,7 @@ export function DataTable({
                   onOpen ? 'clickable' : '',
                   index === cursor ? 'cursor' : '',
                   selected?.(row) ? 'selected' : '',
+                  rowClass?.(row, index) ?? '',
                 ]
                   .filter(Boolean)
                   .join(' ')}
@@ -113,7 +119,7 @@ export function DataTable({
                         .filter(Boolean)
                         .join(' ') || undefined}
                     >
-                      ${column.render(row)}
+                      ${column.render(row, index)}
                     </td>
                   `,
                 )}

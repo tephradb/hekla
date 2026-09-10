@@ -99,6 +99,11 @@ pub const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../ui/store.js"),
     },
     Asset {
+        name: "correlation.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/correlation.js"),
+    },
+    Asset {
         name: "format.js",
         content_type: JS,
         bytes: include_bytes!("../ui/format.js"),

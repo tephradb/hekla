@@ -18,6 +18,7 @@ import { go } from './router.js'
 import { Empty, Resource, useResource } from './ui-states.js'
 import { Badge } from './ui-badge.js'
 import { Copy } from './ui-copy.js'
+import { tint } from './correlation.js'
 import { clock, offset, plural, shortId } from './format.js'
 
 const PAGE = 200
@@ -140,6 +141,7 @@ export function TraceView({ params }) {
           <section class="card">
             <header>
               Trace
+              <span class="corr-dot" style=${tint(data.correlation_id)} aria-hidden="true"></span>
               <code class="mono" style=${{ textTransform: 'none', letterSpacing: 0 }}>
                 ${data.correlation_id}
               </code>

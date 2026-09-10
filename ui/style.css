@@ -36,6 +36,12 @@
   --info-bg: #241b3d;
   --accent-bg: #16263f;
 
+  /* Correlation colours are built from a hashed hue (`ui/correlation.js`); only the
+   * lightness and the chroma are chosen, once per theme, so all sixteen land at the
+   * same weight against this background instead of yellow shouting over blue. */
+  --corr-l: 74%;
+  --corr-c: 0.13;
+
   --s1: 4px;
   --s2: 8px;
   --s3: 12px;
@@ -87,6 +93,9 @@
   --info-bg: #efe9fd;
   --accent-bg: #e7f0fd;
 
+  --corr-l: 48%;
+  --corr-c: 0.16;
+
   --shadow: 0 8px 24px rgb(20 30 45 / 12%);
 
   color-scheme: light;
@@ -120,6 +129,9 @@
     --err-bg: #fdeaea;
     --info-bg: #efe9fd;
     --accent-bg: #e7f0fd;
+
+    --corr-l: 48%;
+    --corr-c: 0.16;
 
     --shadow: 0 8px 24px rgb(20 30 45 / 12%);
 
@@ -563,6 +575,7 @@ table.data td.clip {
 }
 
 table.data td {
+  position: relative;
   height: var(--row);
   padding: 0 var(--s3);
   border-bottom: 1px solid var(--border);
@@ -589,6 +602,74 @@ table.data tbody tr.cursor {
 
 table.data tbody tr.selected td:first-child {
   color: var(--accent);
+}
+
+/* --- correlation -------------------------------------------------------- */
+
+/* One chain, one colour, everywhere it appears. The hue is hashed from the id so it
+ * survives paging and polling; `ui/correlation.js` has the argument for why that is
+ * worth more than guaranteeing two neighbours differ, and what carries grouping
+ * instead. */
+.corr,
+.corr-dot {
+  --corr: oklch(var(--corr-l) var(--corr-c) var(--corr-hue, 0));
+}
+
+.corr {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  /* Back out over the cell's padding so the rail sits on the column's own edge, then
+   * put it back, which leaves the whole cell as the target that lights the chain. */
+  margin-left: calc(-1 * var(--s3));
+  padding-left: var(--s3);
+  color: var(--corr);
+  transition: opacity var(--motion);
+}
+
+.corr a {
+  color: var(--corr);
+}
+
+/* One capsule per run of consecutive rows under the same id. The break between two
+ * runs is what says they are different chains, which the hue cannot promise: sixteen
+ * hues over an unbounded number of ids collide, and where they do the seam is still
+ * exact. Absolute against the cell, and over the row's border, so a run reads as one
+ * unbroken bar rather than as one dash per row. */
+.corr-rail {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: -1px;
+  width: 3px;
+  background: var(--corr);
+}
+
+.corr-rail.opens {
+  top: 4px;
+  border-radius: 2px 2px 0 0;
+}
+
+.corr-rail.closes {
+  bottom: 3px;
+  border-radius: 0 0 2px 2px;
+}
+
+/* Hovering the column settles a collision outright: whatever the hues did, one chain
+ * stays lit. Bound to the correlation cell rather than the row, so it is something you
+ * ask for by pointing at it and not something the table does under a moving cursor. */
+table.data tbody tr.corr-other .corr {
+  opacity: 0.22;
+}
+
+/* The same colour on a page that is already one chain, so arriving here confirms you
+ * followed the row you meant to. */
+.corr-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--corr);
 }
 
 /* --- key/value ---------------------------------------------------------- */

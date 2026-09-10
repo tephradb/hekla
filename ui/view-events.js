@@ -18,6 +18,7 @@ import { DetailPanel } from './ui-panel.js'
 import { JsonTree } from './ui-json.js'
 import { Badge } from './ui-badge.js'
 import { Copy } from './ui-copy.js'
+import { railClass, tint } from './correlation.js'
 import { ago, clock, count, shortId, stamp } from './format.js'
 
 const PAGE = 50
@@ -29,6 +30,10 @@ export function EventsView({ params, search }) {
   /* Where we came from, so "newer" can walk back. The API's cursor is one-directional
    * per request, so the console keeps its own trail rather than pretending otherwise. */
   const [trail, setTrail] = useState([])
+  /* The correlation under the pointer, so the rest of the table can step back out of
+   * the way. See `correlation.js`: a colour that never moves is worth more than one
+   * that guarantees two neighbours differ, and this is what pays for the difference. */
+  const [peer, setPeer] = useState(null)
 
   const page = useResource(
     (signal) => api.events({ types, tags, cursor, limit: PAGE }, signal),
@@ -71,7 +76,9 @@ export function EventsView({ params, search }) {
   const openEvent = (event) =>
     go(`/admin/events/${event.position}` + window.location.search)
 
-  const columns = [
+  /* Built per page rather than once, because the correlation column is drawn from the
+   * rows around a row and not only from the row itself. */
+  const columns = (rows) => [
     {
       key: 'position',
       header: 'Pos',
@@ -117,20 +124,28 @@ export function EventsView({ params, search }) {
     {
       key: 'correlation',
       header: 'Correlation',
-      width: '120px',
-      render: (event) => html`
-        <a
-          class="mono tiny"
-          href=${`/admin/traces/${event.correlation_id}`}
-          onClick=${(clicked) => {
-            clicked.preventDefault()
-            clicked.stopPropagation()
-            go(`/admin/traces/${event.correlation_id}`)
-          }}
-          title="follow this whole causal chain"
+      width: '130px',
+      render: (event, index) => html`
+        <span
+          class="corr"
+          style=${tint(event.correlation_id)}
+          onMouseEnter=${() => setPeer(event.correlation_id)}
+          onMouseLeave=${() => setPeer(null)}
         >
-          ${shortId(event.correlation_id)} →
-        </a>
+          <i class=${railClass(rows, index)} aria-hidden="true"></i>
+          <a
+            class="mono tiny"
+            href=${`/admin/traces/${event.correlation_id}`}
+            onClick=${(clicked) => {
+              clicked.preventDefault()
+              clicked.stopPropagation()
+              go(`/admin/traces/${event.correlation_id}`)
+            }}
+            title="follow this whole causal chain"
+          >
+            ${shortId(event.correlation_id)} →
+          </a>
+        </span>
       `,
     },
   ]
@@ -180,21 +195,31 @@ export function EventsView({ params, search }) {
                 `
               : null}
         >
-          ${(data) => html`
-            <${DataTable}
-              label="Event log"
-              columns=${columns}
-              rows=${data.events}
-              selected=${(event) => String(event.position) === open}
-              onOpen=${openEvent}
-            />
-            <${Pager}
-              cursor=${data.next_cursor}
-              canGoBack=${trail.length > 0}
-              onOlder=${older}
-              onNewer=${newer}
-            />
-          `}
+          ${(data) => {
+            /* A peer this page does not hold is a pointer left over from the rows the view
+             * used to show. Preact reuses the row nodes, so replacing the page under a
+             * cursor that has not moved fires no `mouseleave` and nothing clears it; the
+             * reading that leaves is every chain dimmed and none lit, which is worse than
+             * no highlight at all. A peer that is not here is therefore no peer. */
+            const lit = data.events.some((event) => event.correlation_id === peer) ? peer : null
+            return html`
+              <${DataTable}
+                label="Event log"
+                columns=${columns(data.events)}
+                rows=${data.events}
+                rowClass=${(event) =>
+                  lit && event.correlation_id !== lit ? 'corr-other' : ''}
+                selected=${(event) => String(event.position) === open}
+                onOpen=${openEvent}
+              />
+              <${Pager}
+                cursor=${data.next_cursor}
+                canGoBack=${trail.length > 0}
+                onOlder=${older}
+                onNewer=${newer}
+              />
+            `
+          }}
         <//>
       </section>
 
