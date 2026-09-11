@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://git.tqwewe.com/tephra/hekla/compare/v0.4.0...v0.5.0) - 2026-09-11
+
+### Added
+
+- [**breaking**] a deploy that cannot read its own log does not start
+- *(ui)* the tephra mark replaces the letterform in the rail and in the tab
+- *(ui)* the browser's own chrome takes its colour from the theme the console is showing
+- *(ui)* the rail becomes a drawer on a narrow screen, and every control is sized for a thumb
+- *(ui)* a correlation keeps its colour wherever it appears, and the rail says where a chain ends
+
+### Fixed
+
+- *(ui)* a long enum kind reads as its count, and no kind can squeeze a command's inputs again
+
+### Other
+
+- hekla depends on the released heklang 0.6.0
+- a test that omits a field younger than the log waits for a handler that needs one
+
 ## [0.4.0](https://git.tqwewe.com/tephra/hekla/compare/v0.3.1...v0.4.0) - 2026-09-09
 
 ### Fixed
