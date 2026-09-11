@@ -52,6 +52,9 @@
   --radius: 6px;
   --radius-lg: 10px;
   --rail: 208px;
+  /* The drawer is wider than the column it replaces: it is over the content rather
+   * than beside it, so the space costs nothing, and a thumb needs the room. */
+  --rail-open: 260px;
   --row: 30px;
 
   --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
@@ -219,6 +222,10 @@ button {
   grid-template-columns: var(--rail) minmax(0, 1fr);
   grid-template-rows: 100%;
   height: 100%;
+  /* `height: 100%` resolves against the *large* viewport on a phone, which puts the
+   * bottom of the shell behind the address bar. `.content` is the scroller, so the
+   * dynamic unit resizes a container rather than reflowing a scrolling page. */
+  height: 100dvh;
 }
 
 .rail {
@@ -329,6 +336,10 @@ button {
 
 .topbar h1 {
   margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 15px;
   font-weight: 600;
   letter-spacing: -0.01em;
@@ -429,6 +440,15 @@ button {
 
 .btn.icon {
   padding: 4px 6px;
+}
+
+/* An icon has no line box, so a button holding one came out shorter than the button
+ * next to it holding a word. Taking the text's own line height gives the two the same
+ * height without either naming a pixel, and the viewBox keeps the glyph its own size
+ * inside the taller box. */
+.btn > svg {
+  width: 14px;
+  height: 1.5em;
 }
 
 kbd {
@@ -536,6 +556,10 @@ kbd {
 
 .table-wrap {
   overflow-x: auto;
+  /* A table is wider than a phone by design, so swiping one sideways is the normal
+   * way to read it. Without this the swipe that runs off the end of the columns
+   * becomes the browser's back gesture and leaves the view entirely. */
+  overscroll-behavior-x: contain;
 }
 
 table.data {
@@ -581,6 +605,14 @@ table.data td {
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
   vertical-align: middle;
+}
+
+/* A cell that wraps is buying room the table already has: `.table-wrap` scrolls
+ * sideways, so the width is free and the height is not. Without this a narrow view
+ * turned each event's tag list into three lines, which is a page you scroll past
+ * rather than one you scan down. */
+table.data td .wrap {
+  flex-wrap: nowrap;
 }
 
 table.data tbody tr {
@@ -1251,6 +1283,15 @@ textarea:focus {
   align-items: start;
 }
 
+/* --- responsive ---------------------------------------------------------- */
+
+/* Two controls exist only on one side of the narrow breakpoint: the drawer's own
+ * open and close buttons, which a desktop has no use for, and the ⌘K hint and event
+ * count, which a phone has no room for and no keyboard to act on. */
+.narrow-only {
+  display: none;
+}
+
 @media (max-width: 1100px) {
   .split,
   .with-detail {
@@ -1264,5 +1305,173 @@ textarea:focus {
     order: -1;
     position: static;
     max-height: none;
+  }
+}
+
+/* Below this the rail stops being a column and becomes a drawer. It is the same
+ * markup either way: it leaves the grid, sits over the content, and is opened from
+ * the topbar button that only exists here. 208px of permanent navigation is over
+ * half of a phone, which left every table reading through a 180px slot. */
+@media (max-width: 760px) {
+  /* A row is something you tap here, not something you point at. */
+  :root {
+    --row: 38px;
+  }
+
+  .narrow-only {
+    display: inline-flex;
+  }
+
+  .wide-only {
+    display: none;
+  }
+
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .rail {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 70;
+    width: min(var(--rail-open), 84vw);
+    border-right: 1px solid var(--border-strong);
+    box-shadow: var(--shadow);
+    /* Parked off the left edge, which browsers clip rather than make scrollable, so
+     * a closed drawer is never one sideways swipe from opening itself. `app.js`
+     * marks it `inert` to take it out of the tab order to match. */
+    transform: translateX(-100%);
+    transition: transform var(--motion);
+  }
+
+  .shell.nav-open .rail {
+    transform: none;
+  }
+
+  .nav-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 65;
+    background: rgb(0 0 0 / 45%);
+  }
+
+  .topbar {
+    gap: var(--s2);
+    padding: var(--s2) var(--s3);
+  }
+
+  .content {
+    padding: var(--s3);
+  }
+
+  .content > * + * {
+    margin-top: var(--s3);
+  }
+
+  .card > header,
+  .card > .body,
+  .filters,
+  .panel-head,
+  .panel-body {
+    padding: var(--s3);
+  }
+
+  .card > header {
+    flex-wrap: wrap;
+    row-gap: var(--s1);
+  }
+
+  /* One value per line rather than beside its label, for the same reason `.cmd-form`
+   * stacks. `.row` inside a value has to give up its single line with it. */
+  dl.kv dd.row {
+    flex-wrap: wrap;
+  }
+
+  /* One column per parameter: the `max-content` label column is sized by the longest
+   * name in the form, and `triggering_event_id` against a uuid leaves neither side
+   * readable on a phone. */
+  .cmd-form {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--s2);
+  }
+
+  .cmd-form > label {
+    padding-top: var(--s2);
+  }
+
+  dl.kv {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  dl.kv dt {
+    margin-top: var(--s3);
+  }
+
+  dl.kv dt:first-of-type {
+    margin-top: 0;
+  }
+
+  /* The graph reads down the page instead of across it, so the arrow has to turn
+   * with it or it points at the card's edge. */
+  .graph-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--s1);
+  }
+
+  .graph-event {
+    min-width: 0;
+  }
+
+  .graph-arrow {
+    transform: rotate(90deg);
+    width: 1em;
+  }
+
+  .modal-scrim {
+    padding: var(--s4) var(--s3) 0;
+  }
+
+  .modal {
+    padding: var(--s4);
+  }
+
+  .palette-list {
+    max-height: 52vh;
+  }
+}
+
+/* Touch, at any width: a tablet shows the rail as a column and still has no pointer
+ * to hover with, so the sizes that make a control tappable belong here rather than
+ * behind the width above. */
+@media (pointer: coarse) {
+  .btn {
+    padding: 7px 12px;
+  }
+
+  .btn.icon {
+    padding: 7px 9px;
+  }
+
+  .nav a {
+    padding: 9px var(--s2);
+  }
+
+  .palette-item {
+    padding: 10px var(--s3);
+  }
+
+  /* Safari zooms the whole page when a field under 16px takes focus, so every tap
+   * into a filter or a command parameter rescaled the layout under it. The two
+   * fields that set their own size are named again here, or they keep it. */
+  input,
+  select,
+  textarea,
+  .palette input,
+  .cmd-json {
+    font-size: 16px;
   }
 }

@@ -75,27 +75,35 @@ function suggestions(query, status) {
   return out.slice(0, 12)
 }
 
-export function Palette({ status }) {
-  const [open, setOpen] = useState(false)
+/* `open` is the shell's rather than this component's, because there are two ways in
+ * and only one of them is a key: a touch screen reaches the palette from the topbar
+ * button instead. The chord still lives here, next to what it opens. */
+export function Palette({ status, open, onOpenChange }) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const field = useRef(null)
+  /* The chord toggles, so its handler needs the current state without re-binding the
+   * listener on every open and close. */
+  const showing = useRef(open)
+  showing.current = open
 
   useEffect(() => {
     const onKey = (event) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
-        setOpen((was) => !was)
-        setQuery('')
-        setActive(0)
+        onOpenChange(!showing.current)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [])
+  }, [onOpenChange])
 
+  /* Every opening starts blank, whichever way it was opened. */
   useEffect(() => {
-    if (open) field.current?.focus()
+    if (!open) return
+    setQuery('')
+    setActive(0)
+    field.current?.focus()
   }, [open])
 
   const items = useMemo(() => (open ? suggestions(query, status) : []), [open, query, status])
@@ -103,12 +111,12 @@ export function Palette({ status }) {
   if (!open) return null
 
   const choose = (item) => {
-    setOpen(false)
+    onOpenChange(false)
     go(item.href)
   }
 
   const onKeyDown = (event) => {
-    if (event.key === 'Escape') setOpen(false)
+    if (event.key === 'Escape') onOpenChange(false)
     else if (event.key === 'ArrowDown') {
       event.preventDefault()
       setActive((index) => Math.min(index + 1, items.length - 1))
@@ -122,7 +130,7 @@ export function Palette({ status }) {
   }
 
   return html`
-    <div class="modal-scrim" onClick=${() => setOpen(false)}>
+    <div class="modal-scrim" onClick=${() => onOpenChange(false)}>
       <div
         class="palette"
         role="dialog"
@@ -142,6 +150,7 @@ export function Palette({ status }) {
           aria-label="Jump to"
           spellcheck="false"
           autocomplete="off"
+          autocapitalize="off"
         />
         <div class="palette-list">
           ${items.length === 0 &&
