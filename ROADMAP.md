@@ -2159,7 +2159,9 @@ Honest scope:
 
 - **A `.hk` test still cannot build a payload from before a field existed.** `given` writes an event
   whole, so the read-time fallback is reachable from hekla's own suite and not from a project's.
-  Letting `given` omit a field that answers absence is a heklang change and is deferred.
+  Letting `given` omit a field that answers absence is a heklang change; deferred with a trigger
+  rather than left open, because what it buys is testing a *handler* against old events, and no
+  project has one of those yet.
 - **The sampled half reads only the oldest event of each type**, so drift that is wrong on only some
   events of a type is caught only when it samples one of them. A value mismatch also masks an absence
   deeper in the same field, because the decode returns its first error; the deploy is refused either
@@ -2177,6 +2179,13 @@ Honest scope:
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
 warranted.
 
+- **A `.hk` test that can omit a field younger than the log**: when a project has a handler whose
+  behaviour differs for events written before a field existed and wants that difference under test.
+  `given` writes an event whole, so today a project cannot build such a payload at all. The gap is
+  not testing `@absent` itself, which heklang's suite and hekla's `tests/absent.rs` both pin: it is
+  testing a fold arm or a projector arm *against old events*, which is project logic and has no
+  other way in. Letting `given` omit a field that answers absence is a heklang parser and
+  interpreter change, and it is additive, so nothing Phase 33 built has to anticipate it.
 - **Upload API with versioning, pinning, and retention, plus hot reload** (load-graph incremental
   invalidation): when inline or live editing becomes a goal. The effect journal already records the
   script hash for this.
