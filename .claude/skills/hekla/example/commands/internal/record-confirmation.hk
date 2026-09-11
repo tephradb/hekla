@@ -15,5 +15,5 @@ command RecordConfirmation(booking_id: Uuid) {
     return reject AlreadyConfirmed
   }
 
-  emit @booking.confirmed { booking_id }
+  emit @booking.confirmed { booking_id, channel: "email" }
 }

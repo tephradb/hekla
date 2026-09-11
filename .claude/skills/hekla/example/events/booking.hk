@@ -29,4 +29,9 @@ event @booking.cancelled {
 // Appended by the internal command an effect invokes, never by a client.
 event @booking.confirmed {
   booking_id: Uuid,
+  // Younger than the log: confirmations were appended before anyone recorded how they
+  // were sent. `@absent` says what those older events read as, which is what lets this
+  // field be added at all. Without it the deploy is refused, because every stored
+  // `@booking.confirmed` would stop being readable.
+  channel: String @max(20) @absent("email"),
 }

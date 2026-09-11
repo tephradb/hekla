@@ -107,6 +107,11 @@ The offline invariant sweep. Loads the project, refuses on error findings, then 
 data-directory lock and checks rebuild equivalence, replay equivalence and checkpoint monotonicity
 (see `operations.md`).
 
+It makes the same three refusals `serve` does before sweeping anything, and for one reason: each
+would otherwise turn into findings about a directory that is fine. A missing master key, an unset
+credential, and a declaration that cannot read the log all produce a failed rebuild or a divergence
+per invocation, which reads as corruption that is not there.
+
 ```
 checked 1 projector(s) and 0 invocation(s); skipped 1 (1 edited, 0 erased, 0 without a
 journal, 0 reclaimed, 0 without their event)
@@ -157,10 +162,32 @@ did not move) or `contract` (what is visible outside changed). `const`, `refusal
 inlined and have no row of their own, so an edit to one shows as a fan-out with the cause named
 under it.
 
-Without `--replay` it opens no event log at all. Either way it takes **no data-directory lock**, so
-it runs against a directory a server has open. It changes no database: the operational DB is opened
-only after its schema version is read separately and found to match, and read models are opened
-read-only.
+A type this program could not read is reported beside the credentials it has not got, in the same
+words, because both are a deploy that would refuse to start rather than one that would change
+something:
+
+```
+  event @booking.confirmed cannot be read here (no stored event can carry `channel`), so serving would refuse to start
+    A field was added to an event that already has instances, and no payload written before it can carry one: say what it reads as with `@absent(<value>)`, or make it optional so the type itself says absence is possible.
+```
+
+In `--json` this is `unreadable`. It is `null` rather than `[]` when no event, record or enum moved
+and the log was never opened, so a gate cannot read "not asked" as "asked and clean". Each entry
+carries a `position` only when an event was actually decoded; the complete half of the check settles
+from the recorded declarations and reads none, and reports `null` there.
+
+**It answers a narrower question than the boot does.** Plan asks what *this deploy* would newly
+break, from the diff; the boot asks whether the program can read the log at all, and asks it every
+time. A directory an earlier deploy already broke plans clean and still refuses to boot. Exit is 1 if
+the event log itself cannot be read, rather than reporting the diff and staying quiet about the
+history question: a deploy gate that cannot answer "would this boot" should stop.
+
+Without `--replay` it opens no event log at all, with one exception: the check above, which reads
+the oldest stored event of each declared type when the diff says an `event`, `record` or `enum`
+moved. That read goes through the same read-only follower `--replay` uses. Either way it takes **no
+data-directory lock**, so it runs against a directory a server has open. It changes no database: the
+operational DB is opened only after its schema version is read separately and found to match, and
+read models are opened read-only.
 
 Exit is 0 whenever the plan was computed, whether or not anything would change; a change is the
 answer, not a fault. It is 1 on error findings, on a directory nothing was ever deployed to, on a
@@ -427,6 +454,7 @@ Warnings, which never fail the check:
 | --- | --- |
 | ``X folds `t` with no constraint on a high-cardinality field, so it guards a broad set of events; a boundary is best keyed on an entity id`` | a slice whose filters name no `Uuid`, `Int`, `String`, `Money` or `Timestamp` field |
 | ``X constrains most of `t`'s fields, which looks like a copied `emit`; a slice is a subset match and over-constraining can match nothing`` | on an event of 4 or more fields, filters on 75% or more of them |
+| ``X folds `t` on `f`, which carries `@absent`; an event written before that field existed has no tag for it, so this slice can only ever match events appended since`` | a slice filtering on a field that declares `@absent` |
 | ``N is declared and nothing reads it, so this deployment is asked for a credential the program never uses`` | a `secret` no effect reads. Answered from the digest, so a credential only a `test` reaches counts as unread |
 | ``[secrets] names `N`, which the project does not declare`` | a `hekla.toml` entry naming no `secret` declaration: a line that parses and does nothing |
 

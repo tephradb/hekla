@@ -2077,6 +2077,101 @@ agrees about when an event happened and disagrees about which event it was.
 - **`Clock::now`'s silent `unwrap_or(0)` stays** on the `Wall` arm. It is unreachable in practice,
   since `now_rfc3339` cannot produce an unparseable string, and narrowing it is a separate change.
 
+## Phase 33: a deploy that cannot read its own log does not start (done)
+
+Adding a non-optional field to an event that already had instances made every stored one
+undecodable, and nothing said so. `record_of` fed `Json::Null` for a key the payload did not hold,
+and the only arm of heklang's table that accepts null is `Type::Opt`, so a fold answered
+`expected String, stored null` as an HTTP 500, a projector rebuild went `rebuild_failed` and retried
+forever, and an effect lane wedged in `LaneId::unreadable` on capped backoff, pinning the watermark
+and the journal retention behind it. `hekla check` reported `ok`, `hekla test` could not express an
+old payload at all, and `hekla plan` said `contract` without saying history stops being readable.
+
+heklang gained `@absent(<literal>)` first: what a field reads as in a payload written before it
+existed, honoured by `value::stored_field` and by nothing else, so an inbound request body still has
+to satisfy the declaration as it stands. This phase is hekla's half.
+
+- **Two checks, with two different reaches, and the first draft had only the second.** The sampled
+  check is `record_of` itself on the oldest stored event of each declared type: not a walk of its
+  own, which is the whole argument for trusting what it catches, because a failure there is one of
+  those three readers breaking one event early rather than a forecast that it would. One bounded,
+  `limit`-1 read per type, with the cap pushed into tephra's planning.
+- **"The oldest event is enough" was wrong, and a review caught it.** The claim rested on a field a
+  declaration did not have being absent from *every* payload written under it, which is true, and on
+  a field whose type changed being wrong on *every* event of that type, which is not: narrowing an
+  enum breaks only the events that stored a variant it lost. The absence half had a second hole of
+  the same shape, since a field removed in one deploy and put back in the next leaves events in
+  between that the two ends do not resemble. Both were reproduced before anything was changed.
+- **The complete half reads no event, and comes out of the declaration table.** Every deploy records
+  every declaration and the rows are kept rather than replaced, so "which fields does this program
+  have that some version it deployed did not" is answerable without opening the log; one existence
+  read per affected type then says whether anything was written under such a version. Keeping every
+  version rather than only the current one is exactly what closes the remove-and-re-add hole.
+  `Entry::field_names` is heklang's, because the shape of an `(f ..)` node is the digest format's and
+  a host picking it apart from outside would be a second copy free to drift.
+- **The sampled half keeps its place, with its reach written down.** It is what catches a value that
+  no longer fits its field, which no declaration diff can see, and it costs one read. What it misses
+  is drift that is wrong on only some events of a type; `a_narrowed_enum_is_missed_when_the_oldest_event_kept_a_surviving_variant` pins that limit so closing it cannot happen silently. A complete
+  answer means decoding every event at every boot, which is work proportional to history on a path
+  that runs before the port is open.
+- **Rejected: narrowing the refusal to absences.** The rule as first stated was about a field the
+  payload has no key for, which is the case an annotation can answer. But the same decode also
+  catches a stored value that no longer fits its field, at no cost, and that breaks the same three
+  readers just as permanently. Shipping the narrow rule would have meant matching on the mismatch and
+  *discarding* every kind but absence: code whose only purpose is to look at a stored event hekla
+  knows it cannot read and boot anyway. The two faults keep separate guidance instead, because only
+  one of them has an annotation that answers it, and the other's repair is a rule worth stating:
+  **a field's type is part of the fact, so a new type is a new field.** Remove the old field and
+  declare the new shape under a new name carrying `@absent`; a field nothing declares is a field
+  nothing decodes.
+- **Rejected: the `blocked` latch Phase 26 used for a lane repartition.** That one stops one effect
+  and is recoverable by redeploying the previous key and letting it drain, so an operator signal is
+  the right weight. This has no drain and no partial mode: every reader of the type is broken. It
+  refuses the process, in the window the credential check already occupies, which is after the store
+  and the op-DB are open and **before the declaration table is written**. A boot that refuses leaves
+  no trace, so the repair is a source edit and nothing else.
+- **`hekla verify` refuses too**, in the window where `open_quiescent` already repeats `open`'s
+  master-key and credential guards, and with the same reasoning written there twice already: a sweep
+  that replays a program which cannot read the log reports a failed rebuild and a divergence per
+  invocation, so a healthy directory exits non-zero naming corruption that is not there.
+- **Plan answers a narrower question than the boot, and the two are allowed to differ.** Plan asks
+  what *this deploy* would newly break, off the diff it already computes; the boot asks whether the
+  program can read the log at all, unconditionally, which is what catches a directory an earlier
+  deploy already broke. That one plans clean and refuses to boot, and that is the right way round:
+  plan reports changes, and there is no change.
+- **`hekla plan` now opens the event log, conditionally, and that is a documented property moving.**
+  It did so only under `--replay` before. The gate is the diff it already computes: when an `event`,
+  `record` or `enum` moved, it reads the log through the same read-only follower `--replay` uses. A
+  deploy that moves none of those three still opens nothing. `unreadable` is `null` when the question
+  was never asked and `[]` when it was asked and the log was readable, following `divergences` rather
+  than `secrets`, because a gate must not read one as the other.
+- **`enum` is in that gate and is the reason it is not just `event` and `record`.** Narrowing an enum
+  breaks history exactly as a type change does, and nothing about a field's *name* would have found
+  it. `a_widened_enum_boots` beside `an_enum_that_loses_a_stored_variant_refuses` is what keeps the
+  check empirical rather than a diff wearing a probe's clothes.
+- **One warning, not an error: a boundary keyed on a field carrying `@absent`.** Every field is
+  auto-tagged, so an event written before the field existed has no tag for it and the slice can only
+  match events appended since. The absent value does not help, because it is read from the decoded
+  payload and a slice never gets that far. A judgement about a design rather than something hekla can
+  refuse, so it sits with the other two boundary warnings.
+
+Honest scope:
+
+- **A `.hk` test still cannot build a payload from before a field existed.** `given` writes an event
+  whole, so the read-time fallback is reachable from hekla's own suite and not from a project's.
+  Letting `given` omit a field that answers absence is a heklang change and is deferred.
+- **The sampled half reads only the oldest event of each type**, so drift that is wrong on only some
+  events of a type is caught only when it samples one of them. A value mismatch also masks an absence
+  deeper in the same field, because the decode returns its first error; the deploy is refused either
+  way, and the next boot after the first repair names the second.
+- **The complete half is only as complete as the declaration table.** A data directory whose
+  `hekla.db` was deleted, or one written under a digest version this build cannot reproduce, has no
+  recorded shapes to compare against, and the sampled half is all that is left. A row whose form does
+  not reproduce its own hash is skipped rather than guessed at.
+- **The probe reads every declared type, every boot.** N indexed `limit`-1 reads, which is small
+  beside opening the op-DB, and unconditional on purpose: it catches a directory an earlier deploy
+  already broke, not only the deploy that would break one.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

@@ -29,6 +29,7 @@
 //! key.
 
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 use hekla::loader::{LoadedProject, Severity};
@@ -90,6 +91,27 @@ fn orders_example_checks_clean() {
     assert_eq!(project.commands.len(), 1);
     assert_eq!(project.projectors.len(), 1);
     assert_eq!(project.effects.len(), 1);
+}
+
+/// The worked example the hekla skill ships is documentation a reader will paste, so it
+/// has to compile against this build. CI runs the binary over it; this runs in
+/// `cargo test`, which is where a change to the language or the loader is felt first.
+#[test]
+fn the_skill_example_checks_clean() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude/skills/hekla/example");
+    let project = LoadedProject::load(&dir);
+    assert!(
+        findings(&project)
+            .iter()
+            .all(|one| one.severity != Severity::Error),
+        ".claude/skills/hekla/example must check clean: {:?}",
+        errors(&project)
+    );
+    assert!(
+        findings(&project).is_empty(),
+        "and warn about nothing, since it is what a reader copies: {:?}",
+        findings(&project)
+    );
 }
 
 // --- where a declaration may live ------------------------------------------

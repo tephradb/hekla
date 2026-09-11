@@ -99,7 +99,57 @@ A wedge outranks lag because a wedged effect lags precisely because it is wedged
 - `retry_in_ms` is how long until the next attempt.
 
 
+### When the process will not start at all
+
+Distinct from everything below, which is one module declining to run while the server serves. This
+one is the server refusing to come up, printed as a single `error:` line on stderr with a non-zero
+exit, and it means the program cannot read events that are already in the log.
+
+```
+error: this program cannot read events that are already in the log, so it cannot serve:
+`@booking.confirmed` at position 1 (the stored payload has no `channel`). Nothing has been
+recorded, so correcting the declaration and deploying again is the whole of the repair. ...
+```
+
+Two checks produce this. The recorded declarations say which fields this program has that a version
+it once deployed did not, and one existence read per type settles whether the log holds anything
+written under that version: complete, and it opens no event. Then the oldest stored event of each
+type is decoded through the same function a fold, a projector and an effect lane each use: a sample,
+so what it catches is never a false alarm but what it misses is real. Drift that is wrong on only
+some events of a type (a narrowed enum, say) is caught only when the oldest event is one of them.
+
+Serving anyway would mean 500s on every command whose boundary touches that type, a projector stuck
+at `rebuild_failed`, and an effect lane wedged on capped backoff pinning the watermark and the
+journal retention behind it. None of those clears by waiting.
+
+**The repair is in the source, and it is free.** The check runs before the declaration table is
+written, so a refused boot changes nothing at all: fix the `.hk` file and deploy again. There is
+nothing to rewind and no data directory to repair.
+
+Two faults, with two different repairs:
+
+- **The payload has no key for the field.** A field was added to an event that already has instances.
+  Give it `@absent(<value>)`, which says what those older events read as, or make it optional so the
+  type itself says absence is possible. A `@subject` field has only the second: sealed content has no
+  plaintext literal to put in an annotation, and heklang refuses one there.
+- **The payload could not be read at all**, which is a corrupt envelope or a timestamp that is not
+  RFC 3339 rather than a declaration that outran its log. No `.hk` edit repairs it; take a copy of the
+  directory and look with `hekla verify` and `GET /admin/events`.
+- **A stored value no longer fits its field.** `@absent` cannot answer this, because the field is
+  there. A field's type is part of the fact, so declare the new shape under a new name carrying
+  `@absent` and drop the old field, which stops being decoded the moment nothing declares it.
+
+`hekla plan` reports these before the deploy, beside the credentials the target has not got, for the
+same reason: each is a deploy that would refuse to start rather than one that would change something.
+It answers the narrower question, though: what *this deploy* would newly break. A directory an
+earlier deploy already broke plans clean and still refuses to boot, because there is no change to
+report.
+`hekla verify` refuses too, before it sweeps anything: replaying a program that cannot read the log
+would report a failed rebuild and a divergence per invocation, which is corruption findings for a
+directory that has none.
+
 ### When an effect will not start (`blocked`)
+
 
 An arm's `@key` changed while lanes were still outstanding, so the per-lane rows above the
 watermark are keyed under a scheme the new key never produces. `last_error` names the event types

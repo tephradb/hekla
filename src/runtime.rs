@@ -39,6 +39,7 @@ use crate::context::CommandContext;
 use crate::crypto::{KeyStore, MasterKeys};
 use crate::dispatch::{self, CommandOutcome};
 use crate::effect::{self, EffectRuntime, EffectShared};
+use crate::heklang_host;
 use crate::http::HttpClient;
 use crate::loader::{self, CommandUnit, EffectUnit, LoadedProject, ProjectorUnit};
 use crate::lock::DataDirLock;
@@ -238,6 +239,32 @@ pub struct Runtime {
     data_dir: PathBuf,
 }
 
+/// The log as a reader that must not disturb it sees it, or `None` when the directory
+/// holds no log yet.
+///
+/// A [`Follower`] takes no data-directory lock, creates nothing and deletes nothing, so
+/// this runs against a deployment that is serving traffic. It pins one committed prefix
+/// at the moment it opens and never refreshes, which is what makes it safe and also what
+/// makes it blind to anything appended afterwards.
+pub fn follow(data_dir: &Path) -> anyhow::Result<Option<Store>> {
+    let events_dir = data_dir.join("events");
+    // Absent and present-but-empty are the same answer, and only the second reaches
+    // tephra: `SegmentSet::open_read_only` lists the directory before it can decide
+    // there is nothing in it, so a missing one surfaces as a bare i/o error.
+    if !events_dir.exists() {
+        return Ok(None);
+    }
+    let config = FollowerConfig::new(SegmentConfig::new(SEGMENT_SIZE));
+    match Follower::open(&events_dir, config) {
+        Ok(follower) => Ok(Some(Store::following(Arc::new(follower)))),
+        Err(FollowerError::Log(LogError::Uninitialized { .. })) => Ok(None),
+        Err(err) => Err(anyhow::anyhow!(
+            "following the event store at {}: {err}",
+            events_dir.display()
+        )),
+    }
+}
+
 impl Runtime {
     /// Open the store and operational DB under `data_dir`, start one thread per
     /// projector and per effect (plus the retention sweeper), and build the runtime
@@ -288,6 +315,25 @@ impl Runtime {
             anyhow::bail!(refusal);
         }
         let secrets = Arc::new(secrets);
+
+        // And in the same window, for the same reason. A log outlives the program that
+        // wrote it, so a declaration that has moved on from what is stored breaks every
+        // reader of that type at once: a fold answers 500, a projector rebuild fails and
+        // retries forever, and an effect lane wedges pinning the watermark. None of
+        // those is recoverable by waiting, and all three are avoidable by asking here.
+        //
+        // After the credential check, so a deploy that was never going to work is not
+        // made to read the log first.
+        let recorded = opdb.recorded_entries()?;
+        let unreadable = heklang_host::history_faults(&project.program, &recorded, &store)?;
+        if let Some(refusal) = heklang_host::unreadable_refusal(
+            &unreadable,
+            "serve",
+            "nothing has been recorded and correcting the declaration and deploying again is the \
+             whole of the repair",
+        ) {
+            anyhow::bail!(refusal);
+        }
 
         // Recorded whole, and before the project is taken apart below: the digest covers
         // every declaration, not just the three kinds that become units, so this is also
@@ -428,6 +474,24 @@ impl Runtime {
         }
         let secrets = Arc::new(secrets);
         let opdb = Arc::new(Mutex::new(OpDb::open(&data_dir.join("hekla.db"))?));
+        // And once more, after the operational DB the history check reads from. A sweep
+        // replays every projector and every effect against the log, so a program that
+        // cannot read it reports a rebuild failure and a divergence per invocation,
+        // which reads as corruption in a directory that has none. Refusing names the
+        // declaration instead.
+        let recorded = opdb
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recorded_entries()?;
+        let unreadable = heklang_host::history_faults(&project.program, &recorded, &store)?;
+        if let Some(refusal) = heklang_host::unreadable_refusal(
+            &unreadable,
+            "verify it",
+            "nothing here has been changed and the sweep can be re-run once the declaration is \
+             corrected",
+        ) {
+            anyhow::bail!(refusal);
+        }
         let keystore = master
             .map(|master| KeyStore::new(opdb.clone(), master))
             .map(Arc::new);
@@ -489,23 +553,8 @@ impl Runtime {
         data_dir: &Path,
         master: Option<MasterKeys>,
     ) -> anyhow::Result<Option<Arc<Runtime>>> {
-        let events_dir = data_dir.join("events");
-        // Absent and present-but-empty are the same answer, and only the second reaches
-        // tephra: `SegmentSet::open_read_only` lists the directory before it can decide
-        // there is nothing in it, so a missing one surfaces as a bare i/o error.
-        if !events_dir.exists() {
+        let Some(store) = follow(data_dir)? else {
             return Ok(None);
-        }
-        let config = FollowerConfig::new(SegmentConfig::new(SEGMENT_SIZE));
-        let follower = match Follower::open(&events_dir, config) {
-            Ok(follower) => Arc::new(follower),
-            Err(FollowerError::Log(LogError::Uninitialized { .. })) => return Ok(None),
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "following the event store at {}: {err}",
-                    events_dir.display()
-                ));
-            }
         };
 
         let opdb = Arc::new(Mutex::new(OpDb::open(&data_dir.join("hekla.db"))?));
@@ -522,7 +571,7 @@ impl Runtime {
 
         Ok(Some(Arc::new(Runtime {
             commands: HashMap::new(),
-            store: Store::following(follower),
+            store,
             opdb,
             events: Arc::clone(&project.events),
             program: Arc::clone(&project.program),

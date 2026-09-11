@@ -99,8 +99,9 @@ fn check_entities(projectors: &[ProjectorUnit], findings: &mut Vec<Finding>) {
     }
 }
 
-/// Two judgements about a command's boundary: that it is narrow enough to be worth
-/// having, and that it is not so narrow it can never match.
+/// Three judgements about a command's boundary: that it is narrow enough to be worth
+/// having, that it is not so narrow it can never match, and that it is not keyed on a
+/// field the log's older events were never tagged with.
 fn check_boundary(
     command: &Command,
     program: &Program,
@@ -127,6 +128,46 @@ fn check_boundary(
                     "`{}` folds `{path}` with no constraint on a high-cardinality field, so it \
                      guards a broad set of events; a boundary is best keyed on an entity id",
                     command.name
+                ),
+            ));
+        }
+
+        // Every field is auto-tagged, so an event written before a field existed carries
+        // no tag for it and a filter on it matches none of them. The absent value does
+        // not help: it is read from the decoded payload, and a slice never gets that far.
+        //
+        // Keyed on the annotation because it is the only thing in the source that says a
+        // field is younger than the log; whether the log *has* older events is a question
+        // this pass has no data directory to ask. So it can say so about a field that has
+        // always been there and carries `@absent` against a future it never needed, and
+        // it cannot say so about one added later as `T?`, which has the same defect and
+        // no annotation to give it away.
+        let younger: Vec<&str> = slice
+            .filters
+            .iter()
+            .filter(|filter| {
+                declared
+                    .fields
+                    .iter()
+                    .any(|field| field.name == filter.field && field.absent.is_some())
+            })
+            .map(|filter| filter.field.as_str())
+            .collect();
+        // One finding per slice, not per filter: two such filters are one design and one
+        // thing to say about it.
+        if !younger.is_empty() {
+            findings.push(Finding::warning(
+                location,
+                format!(
+                    "`{}` folds `{path}` on {}, which `@absent` marks as younger than the log; an \
+                     event written before that existed carries no tag for it, so this slice can \
+                     only ever match events appended since",
+                    command.name,
+                    younger
+                        .iter()
+                        .map(|field| format!("`{field}`"))
+                        .collect::<Vec<_>>()
+                        .join(" and "),
                 ),
             ));
         }

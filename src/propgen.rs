@@ -48,21 +48,25 @@ static RECORDS: LazyLock<Vec<RecordDef>> = LazyLock::new(|| {
                 name: "sku".to_owned(),
                 ty: Type::String,
                 max_len: Some(20),
+                absent: None,
             },
             RecordField {
                 name: "qty".to_owned(),
                 ty: Type::Int,
                 max_len: None,
+                absent: None,
             },
             RecordField {
                 name: "price".to_owned(),
                 ty: Type::Money(3),
                 max_len: None,
+                absent: None,
             },
             RecordField {
                 name: "note".to_owned(),
                 ty: Type::opt(Type::String),
                 max_len: None,
+                absent: None,
             },
         ],
     }]

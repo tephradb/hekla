@@ -195,10 +195,20 @@ right by construction. `reference/introspection.md` covers it.
     (the default) it rebuilds at startup and reads answer 503 meanwhile; with it off the projector
     goes `stale` and every read of it is a 503 until someone posts a replay. Reformatting, adding a
     comment or renaming a local is *not* a change: the hash is over what runs, not over the text.
-13. **Directory placement is checked per declaration, not per file.** `hekla check` reads every `.hk`
+13. **A deployment that cannot read its own log will not start**, and `hekla verify` refuses the
+    same directory rather than sweeping it. Two checks: the recorded declarations say which fields
+    are younger than the log and one existence read per type settles them, which is complete; and
+    the oldest stored event of each type is decoded through the same function a fold, a projector
+    and an effect lane each use, which is a sample and catches drift that is wrong on only some
+    events only when it samples one. Repairs: a field the payload has no key for takes
+    `@absent(<value>)` or `?` (a `@subject` field takes only `?`); a stored value that no longer
+    fits its field is not answerable at all, so declare the new shape under a new name and drop the
+    old field. A refused boot records nothing. `hekla plan` reports what *this deploy* would newly
+    break, so a directory an earlier deploy already broke plans clean and still refuses to boot.
+14. **Directory placement is checked per declaration, not per file.** `hekla check` reads every `.hk`
     file wherever it is, so a scratch module that is not meant to compile belongs under a
     dot-directory or it fails the whole project.
-14. **`hekla check` is not `hek check` plus nothing.** It is the compiler's diagnostics plus what only
+15. **`hekla check` is not `hek check` plus nothing.** It is the compiler's diagnostics plus what only
     hekla knows: directory placement, an index over a sealed column, a filterable column
     named like a read query parameter, a sealed column that cannot say it is absent, and the reserved
     `_hekla_` tag namespace. The entity *key* rules are heklang's and report with a span.

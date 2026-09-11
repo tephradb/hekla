@@ -17,7 +17,9 @@
 //! field stayed *present* and heklang's rule 12 could keep absent and erased apart.
 //! Carrying the ciphertext deletes both.
 
-use std::collections::BTreeMap;
+use anyhow::anyhow;
+use std::collections::{BTreeMap, BTreeSet};
+use std::slice;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,9 +28,9 @@ use heklang::host::{
     Secrets,
 };
 use heklang::interp::{Error, ErrorKind};
-use heklang::ir::EventPath;
+use heklang::ir::{EventPath, RecordDef, Type};
 use heklang::value::{self, Defs};
-use heklang::{Event, Json, Program, Record, Value};
+use heklang::{Entry, Event, Json, Kind, Program, Record, Value};
 use tephra::{Position, QueryItem, Tag, Tags};
 
 use crate::context::CommandContext;
@@ -271,8 +273,9 @@ impl HeklaHost {
     }
 }
 
-/// One stored event as heklang reads it: every field typed by its declaration, and a
-/// subject-scoped one still sealed.
+/// One stored event as heklang reads it: every field typed by its declaration, a
+/// subject-scoped one still sealed, and one the payload predates read as whatever its
+/// declaration says absence means.
 ///
 /// Free rather than a method because a projector thread reads the log without a
 /// [`HeklaHost`]: it has no clock, no network and nothing to append. **It no longer
@@ -303,13 +306,16 @@ pub fn record_of(
         // left nothing to put in a present field, and rule 12 needs absent and erased to
         // stay different rows. Carrying the ciphertext means there is always something
         // to carry and nothing to stand in for it.
-        let value = match data.get(&field.name) {
-            Some(stored) => Value::from_json(&to_heklang_json(stored), &field.ty, defs)
-                .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?,
-            None => Value::from_json(&Json::Null, &field.ty, defs)
-                .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?,
-        };
-        fields.insert(field.name.clone(), value);
+        //
+        // The `Option` is the whole of the second reading. A key that is there holding
+        // `null` is a value a producer wrote; a key that is not there is a field this
+        // payload predates, which the declaration may answer with `@absent`. Passing
+        // `Json::Null` for both, as this did, collapsed them and made every `@absent`
+        // unreachable from the one place that reads history.
+        let stored = data.get(&field.name).map(to_heklang_json);
+        let read = value::stored_field(field, stored.as_ref(), defs)
+            .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?;
+        fields.insert(field.name.clone(), read);
     }
 
     let at = value::timestamp(&envelope.timestamp).ok_or_else(|| {
@@ -323,6 +329,383 @@ pub fn record_of(
         from_tephra(position),
         at,
         Event { path, fields },
+    ))
+}
+
+/// Why a declared event type's history cannot be read.
+#[derive(Debug)]
+pub enum Fault {
+    /// A field this program declares that a recorded declaration of the same shape did
+    /// not, for an event type the log holds. No payload written under that declaration
+    /// can carry the field, because an `emit` writes an event whole.
+    ///
+    /// **Complete**, unlike [`Fault::Undecodable`]: it is settled from the declaration
+    /// table and one existence read rather than from a sampled event, so which events
+    /// the log happens to hold cannot hide it.
+    Unanswered {
+        /// The dotted path, `note` or `detail.weight`.
+        path: String,
+        /// Sealed content has no plaintext literal, so heklang refuses `@absent` on it
+        /// and being optional is the only repair there is.
+        sealed: bool,
+    },
+    /// A stored event this program could not decode. One event per type, so this catches
+    /// what it samples and promises nothing about the rest: see [`unreadable_history`].
+    Undecodable { position: u64, detail: Error },
+}
+
+/// One declared event type whose history this deployment cannot read, and why.
+#[derive(Debug)]
+pub struct Unreadable {
+    /// The event type as the store holds it, with no leading `@`.
+    pub event_type: String,
+    pub fault: Fault,
+}
+
+/// The repair a fault calls for. Grouped rather than repeated per event, because ten
+/// events failing the same way call for one instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Advice {
+    /// A field younger than the log, which a declaration can answer for itself.
+    Absent,
+    /// The same, sealed, where the annotation is not available.
+    SealedOptional,
+    /// A value that never fitted, which no annotation answers.
+    Retype,
+    /// A payload hekla could not read at all, which no declaration edit repairs.
+    Corrupt,
+}
+
+impl Unreadable {
+    /// A tephra position when an event was actually read, which is what `/admin/events`
+    /// lists. `None` when the declaration table settled it and no event was opened.
+    pub fn position(&self) -> Option<u64> {
+        match &self.fault {
+            Fault::Unanswered { .. } => None,
+            Fault::Undecodable { position, .. } => Some(*position),
+        }
+    }
+
+    /// Whether the stored payload has no key for the field, rather than a key holding
+    /// something that no longer fits.
+    ///
+    /// The one fault a declaration can answer for itself, so it is the one that gets
+    /// told to add `@absent`. Offering an annotation that cannot help would send an
+    /// author the wrong way.
+    pub fn is_absence(&self) -> bool {
+        matches!(self.advice(), Advice::Absent | Advice::SealedOptional)
+    }
+
+    /// What could not be read, in one clause.
+    pub fn reason(&self) -> String {
+        match &self.fault {
+            Fault::Unanswered { path, .. } => {
+                format!("no stored event can carry `{path}`")
+            }
+            Fault::Undecodable { detail, .. } => match &detail.kind {
+                ErrorKind::Mismatch(why) if why.is_absence() => {
+                    format!("the stored payload has no `{}`", why.path.join("."))
+                }
+                _ => detail.to_string(),
+            },
+        }
+    }
+
+    fn advice(&self) -> Advice {
+        match &self.fault {
+            Fault::Unanswered { sealed: true, .. } => Advice::SealedOptional,
+            Fault::Unanswered { .. } => Advice::Absent,
+            Fault::Undecodable { detail, .. } => match &detail.kind {
+                ErrorKind::Mismatch(why) if !why.is_absence() => Advice::Retype,
+                ErrorKind::Mismatch(why) if matches!(why.expected, Type::Sealed(..)) => {
+                    Advice::SealedOptional
+                }
+                ErrorKind::Mismatch(_) => Advice::Absent,
+                // `record_of` also fails on a payload `envelope::decode` cannot parse and
+                // on a timestamp that is not RFC 3339. Neither is a declaration that
+                // outran its log, and neither is repaired by editing one.
+                _ => Advice::Corrupt,
+            },
+        }
+    }
+}
+
+/// What to do about a set of unreadable events, one sentence per distinct repair.
+///
+/// Shared between the boot refusal and `hekla plan`, so the two cannot come to say
+/// different things about the same log.
+pub fn unreadable_guidance(unreadable: &[Unreadable]) -> Vec<&'static str> {
+    let mut wanted: Vec<Advice> = unreadable.iter().map(Unreadable::advice).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    wanted
+        .into_iter()
+        .map(|advice| match advice {
+            Advice::Absent => {
+                "A field was added to an event that already has instances, and no payload written before it can carry one: say what it reads as with `@absent(<value>)`, or make it optional so the type itself says absence is possible."
+            }
+            Advice::SealedOptional => {
+                "A subject-scoped field cannot take `@absent`, because sealed content has no plaintext literal to give: make it optional, which is what an erased subject's value needs anyway."
+            }
+            Advice::Retype => {
+                "A stored value that no longer fits its field cannot be answered by `@absent`, because the field is there: a field's type is part of the fact, so declare the new shape under a new name carrying `@absent` and drop the old field, which stops being decoded once nothing declares it."
+            }
+            Advice::Corrupt => {
+                "One stored event could not be read at all, which is a payload rather than a declaration: no edit to a `.hk` file repairs it, and `hekla verify` against a copy of the directory is where to look next."
+            }
+        })
+        .collect()
+}
+
+/// Every field this program declares that a recorded declaration of the same shape did
+/// not, for an event type the log actually holds.
+///
+/// **This is the complete half of the check.** An `emit` writes an event whole, so a
+/// field a declaration did not have cannot be in any payload written under it; and every
+/// deploy records its declarations, so every shape the log was written under is on hand
+/// here. What the log holds then needs one existence read per affected type, which is a
+/// question about the type and not about any particular event.
+///
+/// It answers nothing about a value that no longer fits its field. That is
+/// [`unreadable_history`]'s half, and that one is a sample.
+///
+/// A record is reported at the path an event carries it (`detail.weight`), because a
+/// record has no history of its own: it is only ever reached from an event.
+pub fn unanswered_history(
+    program: &Program,
+    recorded: &[Entry],
+    store: &Store,
+) -> anyhow::Result<Vec<Unreadable>> {
+    let younger = fields_younger_than_the_log(program, recorded);
+    if younger.is_empty() {
+        return Ok(Vec::new());
+    }
+    let records: BTreeMap<&str, &RecordDef> = program
+        .records
+        .iter()
+        .map(|def| (def.name.as_str(), def))
+        .collect();
+
+    let mut found = Vec::new();
+    for declared in &program.events {
+        let path = declared.path.to_string();
+        let mut paths: Vec<(String, bool)> = Vec::new();
+        for field in &declared.fields {
+            if !field.answers_absence()
+                && younger
+                    .get(&(Kind::Event, path.clone()))
+                    .is_some_and(|names| names.contains(&field.name))
+            {
+                paths.push((field.name.clone(), matches!(field.ty, Type::Sealed(..))));
+            }
+            let mut reached = Vec::new();
+            records_under(
+                &field.ty,
+                &field.name,
+                &records,
+                &mut Vec::new(),
+                &mut reached,
+            );
+            for (prefix, name) in reached {
+                let Some(def) = records.get(name.as_str()) else {
+                    continue;
+                };
+                for nested in &def.fields {
+                    if !nested.answers_absence()
+                        && younger
+                            .get(&(Kind::Record, name.clone()))
+                            .is_some_and(|names| names.contains(&nested.name))
+                    {
+                        paths.push((format!("{prefix}.{}", nested.name), false));
+                    }
+                }
+            }
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        // One question per type, asked once however many fields it owes for: has
+        // anything of this type ever been written? Whatever it was, it was written
+        // under a declaration that lacked these.
+        if !holds_any(store, &declared.path.segments.join("."))? {
+            continue;
+        }
+        paths.sort();
+        paths.dedup();
+        for (path, sealed) in paths {
+            found.push(Unreadable {
+                event_type: declared.path.segments.join("."),
+                fault: Fault::Unanswered { path, sealed },
+            });
+        }
+    }
+    Ok(found)
+}
+
+/// Every declared event type whose oldest stored event this program cannot read.
+///
+/// **A sample, and deliberately one.** A complete answer means decoding every event in
+/// the log, which is work proportional to history at every boot. One event per type is
+/// bounded and catches the drift that is wrong on every event of its type; it does not
+/// catch drift that is wrong on only some of them, and a narrowed enum whose oldest
+/// event happens to hold a surviving variant is the case to have in mind.
+///
+/// Decoded with [`record_of`] itself rather than a walk of its own, so what it does
+/// catch cannot be a false alarm: a failure here **is** a fold, a projector or an effect
+/// lane failing, one event early.
+///
+/// The complete half of the check is [`unanswered_history`], which needs no event.
+pub fn unreadable_history(program: &Program, store: &Store) -> anyhow::Result<Vec<Unreadable>> {
+    let mut found = Vec::new();
+    for declared in &program.events {
+        let event_type = declared.path.segments.join(".");
+        let query = query_of_types(slice::from_ref(&event_type)).map_err(|err| anyhow!("{err}"))?;
+        // The cap reaches tephra's planning, so a type with no events costs an index
+        // probe rather than a scan.
+        let mut reads = store.read(&query, Position::ZERO, Some(1));
+        let Some(item) = reads.next() else { continue };
+        let seq = item.map_err(|err| anyhow!("reading the event log: {err}"))?;
+        let position = seq.position.get();
+        if let Err(detail) = record_of(program, seq.position, seq.event) {
+            found.push(Unreadable {
+                event_type,
+                fault: Fault::Undecodable { position, detail },
+            });
+        }
+    }
+    Ok(found)
+}
+
+/// Both halves, with the sampled one silent about a type the complete one has already
+/// answered for: the same event would only be reported twice, once with worse advice.
+pub fn history_faults(
+    program: &Program,
+    recorded: &[Entry],
+    store: &Store,
+) -> anyhow::Result<Vec<Unreadable>> {
+    let mut found = unanswered_history(program, recorded, store)?;
+    let answered: BTreeSet<&str> = found.iter().map(|one| one.event_type.as_str()).collect();
+    let sampled: Vec<Unreadable> = unreadable_history(program, store)?
+        .into_iter()
+        .filter(|one| !answered.contains(one.event_type.as_str()))
+        .collect();
+    found.extend(sampled);
+    Ok(found)
+}
+
+/// Whether the log holds any event of this type at all.
+fn holds_any(store: &Store, event_type: &str) -> anyhow::Result<bool> {
+    let query =
+        query_of_types(slice::from_ref(&event_type.to_owned())).map_err(|err| anyhow!("{err}"))?;
+    let mut reads = store.read(&query, Position::ZERO, Some(1));
+    match reads.next() {
+        Some(item) => {
+            item.map_err(|err| anyhow!("reading the event log: {err}"))?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// The field names this program declares that some recorded version of the same
+/// declaration did not, keyed by kind and the name the digest knows it by.
+///
+/// Every recorded version, not only the current one: a field removed in one deploy and
+/// put back in the next leaves events in the middle that carry neither, and comparing
+/// against the current declaration alone would see the two ends agree and miss them.
+fn fields_younger_than_the_log(
+    program: &Program,
+    recorded: &[Entry],
+) -> BTreeMap<(Kind, String), BTreeSet<String>> {
+    let mut candidate: BTreeMap<(Kind, String), BTreeSet<String>> = BTreeMap::new();
+    for def in &program.events {
+        candidate.insert(
+            (Kind::Event, def.path.to_string()),
+            def.fields.iter().map(|field| field.name.clone()).collect(),
+        );
+    }
+    for def in &program.records {
+        candidate.insert(
+            (Kind::Record, def.name.clone()),
+            def.fields.iter().map(|field| field.name.clone()).collect(),
+        );
+    }
+
+    let mut younger: BTreeMap<(Kind, String), BTreeSet<String>> = BTreeMap::new();
+    for entry in recorded {
+        let key = (entry.kind, entry.name.clone());
+        let Some(now) = candidate.get(&key) else {
+            continue;
+        };
+        let then: BTreeSet<&str> = entry.field_names().into_iter().collect();
+        let added = now.iter().filter(|name| !then.contains(name.as_str()));
+        younger.entry(key).or_default().extend(added.cloned());
+    }
+    younger.retain(|_, names| !names.is_empty());
+    younger
+}
+
+/// Every `(path, record name)` a declared field reaches, so a field added to a record is
+/// reported where an event actually carries it.
+fn records_under(
+    ty: &Type,
+    prefix: &str,
+    records: &BTreeMap<&str, &RecordDef>,
+    stack: &mut Vec<String>,
+    out: &mut Vec<(String, String)>,
+) {
+    match ty {
+        // A container does not add a path segment: which element of a list carries the
+        // field is a fact about one payload, and this is a question about every one.
+        Type::Opt(inner) | Type::List(inner) | Type::Sealed(inner, _) => {
+            records_under(inner, prefix, records, stack, out);
+        }
+        Type::Map(_, value) => records_under(value, prefix, records, stack, out),
+        Type::Record(name) => {
+            if stack.iter().any(|seen| seen == name) {
+                return;
+            }
+            out.push((prefix.to_owned(), name.clone()));
+            let Some(def) = records.get(name.as_str()) else {
+                return;
+            };
+            stack.push(name.clone());
+            for field in &def.fields {
+                let nested = format!("{prefix}.{}", field.name);
+                records_under(&field.ty, &nested, records, stack, out);
+            }
+            stack.pop();
+        }
+        _ => {}
+    }
+}
+
+/// The message a runtime refuses to start with, or `None` when it can read its history.
+///
+/// Every unreadable type at once rather than the first, matching [`crate::secrets`]: an
+/// operator fixing one declaration per restart is the failure mode that shape exists to
+/// avoid. `repair` completes "…, so `<repair>`", because what there is to do about it is
+/// the caller's to know: `serve` has written nothing yet, and a sweep was never going to
+/// write anything.
+pub fn unreadable_refusal(unreadable: &[Unreadable], verb: &str, repair: &str) -> Option<String> {
+    if unreadable.is_empty() {
+        return None;
+    }
+    let named = unreadable
+        .iter()
+        .map(|one| match one.position() {
+            Some(position) => format!(
+                "`@{}` at position {position} ({})",
+                one.event_type,
+                one.reason()
+            ),
+            None => format!("`@{}` ({})", one.event_type, one.reason()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let guidance = unreadable_guidance(unreadable).join(" ");
+    Some(format!(
+        "this program cannot read events that are already in the log, so it cannot {verb}: {named}, so {repair}. {guidance}"
     ))
 }
 
@@ -1337,7 +1720,7 @@ pub fn event_from_json(
 pub fn append_one(host: &mut HeklaHost, event: &Event) -> Result<(), Error> {
     Log::append(
         host,
-        std::slice::from_ref(event),
+        slice::from_ref(event),
         &AppendCondition {
             after: 0,
             slices: Vec::new(),
@@ -1438,6 +1821,86 @@ mod tests {
 
     use super::*;
     use crate::propgen;
+
+    fn undecodable(expected: Type, found: &str) -> Unreadable {
+        Unreadable {
+            event_type: "order.placed".to_owned(),
+            fault: Fault::Undecodable {
+                position: 1,
+                detail: Error::new(ErrorKind::Mismatch(heklang::Mismatch {
+                    path: vec!["note".to_owned()],
+                    expected,
+                    found: found.to_owned(),
+                })),
+            },
+        }
+    }
+
+    fn unanswered(sealed: bool) -> Unreadable {
+        Unreadable {
+            event_type: "order.placed".to_owned(),
+            fault: Fault::Unanswered {
+                path: "note".to_owned(),
+                sealed,
+            },
+        }
+    }
+
+    /// One sentence per distinct repair, not per event. A deploy that broke two event
+    /// types the same way has one thing to fix; `tests/absent.rs` pins each repair
+    /// alone, and this pins the combinations a fixture cannot easily produce.
+    #[test]
+    fn guidance_is_one_sentence_per_repair_however_many_events_call_for_it() {
+        let absences = [unanswered(false), undecodable(Type::String, "nothing")];
+        let guidance = unreadable_guidance(&absences);
+        assert_eq!(guidance.len(), 1, "both are the same repair: {guidance:?}");
+        assert!(guidance[0].contains("@absent(<value>)"), "{guidance:?}");
+
+        let four = [
+            unanswered(false),
+            unanswered(true),
+            undecodable(Type::String, "a number"),
+            Unreadable {
+                event_type: "order.placed".to_owned(),
+                fault: Fault::Undecodable {
+                    position: 1,
+                    detail: host_error("envelope timestamp `x` is not RFC 3339"),
+                },
+            },
+        ];
+        let guidance = unreadable_guidance(&four);
+        assert_eq!(guidance.len(), 4, "{guidance:?}");
+        assert!(
+            guidance[1].contains("cannot take `@absent`"),
+            "{guidance:?}"
+        );
+        assert!(guidance[2].contains("under a new name"), "{guidance:?}");
+        assert!(
+            guidance[3].contains("no edit to a `.hk` file repairs it"),
+            "a payload hekla could not read at all is not a declaration fault: {guidance:?}"
+        );
+
+        assert!(unreadable_guidance(&[]).is_empty());
+    }
+
+    /// A field added as `@subject(...)` is an absence like any other, but the repair the
+    /// plain absence gets is one heklang refuses outright on sealed content, so it must
+    /// not be the one offered.
+    #[test]
+    fn a_sealed_field_is_never_told_to_take_an_absent_value() {
+        for one in [
+            unanswered(true),
+            undecodable(Type::sealed(Type::String, "guest_id".to_owned()), "nothing"),
+        ] {
+            assert!(one.is_absence(), "it is still an absence");
+            let guidance = unreadable_guidance(std::slice::from_ref(&one));
+            assert!(guidance[0].contains("make it optional"), "{guidance:?}");
+            assert!(
+                !guidance[0].contains("`@absent(<value>)`"),
+                "heklang refuses `@absent` on sealed content: {guidance:?}"
+            );
+        }
+    }
 
     /// The wire form of a value: rule 8's table, which is what every conversion below
     /// starts from and has to return to.

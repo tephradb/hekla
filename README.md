@@ -131,9 +131,15 @@ one moves every hash that reaches it. The report groups those and names the caus
 leaving a wall of diffs.
 
 Without `--replay` it reads the recorded declarations and the read models and nothing else, so it
-opens no event log at all. Either way it takes **no data-directory lock**, so it runs against a
-directory a server has open. It exits 0 whether or not anything would change, and `--json` carries
-the whole plan for a deploy gate.
+opens no event log at all, with one exception: when the diff says an event, record or enum moved it
+reads the oldest stored event of each declared type, to answer whether the deploy could still read
+its own history. Either way it takes **no data-directory lock**, so it runs against a directory a
+server has open. It exits 0 whether or not anything would change, and `--json` carries the whole
+plan for a deploy gate.
+
+A declaration this program could not read is reported with the credentials it has not got, in the
+same words, because both are a deploy that would refuse to start rather than a deploy that would
+change something.
 
 ### Would it still do the same thing?
 

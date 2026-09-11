@@ -296,6 +296,14 @@ Warnings, which never fail the check, because each is a judgement call:
 - a boundary with no filter on a high-cardinality field, so it defeats the append's fast reject
 - a boundary pinning most of an event's fields, which looks like a copied `emit`: a slice is a subset
   match, so over-constraining can match nothing
+- a boundary keyed on a field carrying `@absent`, which can only ever match events appended since
+  that field existed: an older one carries no tag for it, and the absent value is read from the
+  payload, which a slice never gets as far as
+
+**What `hekla check` cannot catch, and where it is caught instead.** Whether this program can still
+read the events already in the log is not a question about the source, so `check` has no data
+directory and no answer. `hekla serve` refuses to start when it cannot, before it records anything,
+and `hekla plan` reports the same thing before the deploy. See ARCHITECTURE.md section 4.
 
 Everything else the old validation pass did is now a parse error with the offending field's own span:
 a filter on an undeclared, `@no_index` or sealed field; an ill-typed filter value; an `emit` missing a

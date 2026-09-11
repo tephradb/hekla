@@ -70,11 +70,12 @@ use heklang::{Entry, Kind, Program};
 
 use crate::crypto::MasterKeys;
 use crate::effect::{self, Asked, Replayed, Uncovered};
+use crate::heklang_host::{self, Unreadable};
 use crate::loader::{self, EffectUnit, LoadedProject};
 use crate::opdb::{self, DeclarationRow, OpDb, SCHEMA_VERSION};
 use crate::projector::{Reconcile, reconcile_from};
 use crate::read_model::ReadModel;
-use crate::runtime::Runtime;
+use crate::runtime::{self, Runtime};
 use crate::secrets::{self, Resolution};
 
 /// How one declaration differs from what is deployed.
@@ -310,6 +311,15 @@ pub struct Plan {
     /// it is a fact about the environment the deploy lands in, not an inference from the
     /// diff, so it stands whether or not the digest versions line up.
     pub secrets: Vec<Resolution>,
+    /// The oldest stored event of each type this candidate cannot read, or `None` when
+    /// no event, record or enum declaration moved and there was nothing to ask.
+    ///
+    /// Appended rather than attributed, like [`Plan::secrets`]: it is a fact about the
+    /// log this would deploy over, not an inference from the diff. `None` and
+    /// `Some(vec![])` follow [`Plan::divergences`]'s contract rather than `secrets`':
+    /// this one is not always computed, and a gate must not read "not asked" as "asked
+    /// and clean".
+    pub unreadable: Option<Vec<Unreadable>>,
 }
 
 impl Plan {
@@ -321,6 +331,9 @@ impl Plan {
             // "nothing would change" about a process that will not start is the one
             // answer this command must never give.
             && !self.secrets.iter().any(Resolution::missing)
+            // And for the same reason: a deploy that would refuse to boot is never
+            // "nothing would change".
+            && self.unreadable.as_deref().unwrap_or_default().is_empty()
             && self
                 .projectors
                 .iter()
@@ -339,6 +352,20 @@ impl Plan {
         serde_json::json!({
             "declarations_compared": self.declarations_compared,
             "digest_version_mismatch": self.digest_version_mismatch,
+            // Null when no event, record or enum moved, so this was never asked. An
+            // empty array is a log that was read and found readable, which is the
+            // other answer and a different one, as `divergences` has it.
+            "unreadable": match &self.unreadable {
+                Some(found) => serde_json::Value::Array(found.iter().map(|one| serde_json::json!({
+                    "event_type": one.event_type,
+                    // Null where the declaration table settled it and no event was
+                    // opened, which is the complete half of the check.
+                    "position": one.position(),
+                    "absence": one.is_absence(),
+                    "reason": one.reason(),
+                })).collect()),
+                None => serde_json::Value::Null,
+            },
             // Always present, never null, unlike `divergences`: this one is always
             // computable, so an absent key would let a gate pass on the strength of a
             // check that was made and simply not reported.
@@ -455,6 +482,34 @@ impl fmt::Display for Plan {
                     one.name, one.source
                 )?;
             }
+        }
+
+        // Beside the credentials, and before the bail below, for the reason they give:
+        // whether this program can read the log is a fact about the directory, not a
+        // comparison, so it stands whether or not the recorded hashes line up.
+        for one in self.unreadable.iter().flatten() {
+            match one.position() {
+                Some(position) => writeln!(
+                    f,
+                    "  event @{} at position {position} cannot be read here ({}), so serving would refuse to start",
+                    one.event_type,
+                    one.reason()
+                )?,
+                None => writeln!(
+                    f,
+                    "  event @{} cannot be read here ({}), so serving would refuse to start",
+                    one.event_type,
+                    one.reason()
+                )?,
+            }
+        }
+        for sentence in self
+            .unreadable
+            .as_deref()
+            .map(heklang_host::unreadable_guidance)
+            .unwrap_or_default()
+        {
+            writeln!(f, "    {sentence}")?;
         }
 
         // Every hash differs for one reason, so listing them all would bury it.
@@ -829,6 +884,9 @@ pub fn compute_with(
     // The hash each effect is *running* under, which is the only baseline a replay may
     // use: see `OpDb::recent_terminal_invocations`.
     let deployed_effects: BTreeMap<String, String>;
+    // Every version ever deployed here, not only the current one, which is what makes
+    // the "no stored event can carry this field" half of the history check complete.
+    let recorded_entries: Vec<Entry>;
     // Which effects would land on a lane scheme their recorded rows do not describe.
     let repartitions: Vec<Cause>;
     // Scoped, so the connection closes before a replay opens its own. Two connections to
@@ -842,8 +900,28 @@ pub fn compute_with(
             .filter(|row| Kind::lookup(&row.kind) == Some(Kind::Effect))
             .map(|row| (row.name.clone(), row.hash.clone()))
             .collect();
+        recorded_entries = db.recorded_entries()?;
         plan.changes = diff(project, &recorded, &mut plan)?;
         repartitions = lane_repartitions(project, &db)?;
+    }
+    // The one thing here that opens the event log without `--replay`, and it does so
+    // only when the diff says a declaration that decodes one moved: a deploy that
+    // changes no event, record or enum cannot newly fail to read history. Through a
+    // follower, so this keeps every property the rest of the command has: no lock,
+    // nothing created, and a directory a server is serving from is fine.
+    if plan
+        .changes
+        .iter()
+        .any(|change| matches!(change.kind, Kind::Event | Kind::Record | Kind::Enum))
+    {
+        plan.unreadable = Some(match runtime::follow(data_dir)? {
+            Some(store) => {
+                heklang_host::history_faults(&project.program, &recorded_entries, &store)?
+            }
+            // No log at all, so there is no history to fail to read. Asked and clean
+            // rather than unasked.
+            None => Vec::new(),
+        });
     }
     plan.projectors = forecast(project, data_dir)?;
     if !plan.digest_version_mismatch {

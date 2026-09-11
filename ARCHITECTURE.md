@@ -134,6 +134,8 @@ event @order.placed {
   `Invalid` rather than a crash.
 - `@subject(sibling_field)` encrypts the field under a key scoped to that sibling's value; see
   section 15.
+- `@absent(<literal>)` says what the field reads as in an event stored before the field existed. It
+  is a read-time answer, never a write-time default: see below.
 
 **Field types** are heklang's, and the same set describes an event field, a command parameter and an
 entity column: `Bool`, `Int`, `Decimal(n)`, `String`, `Uuid`, `Timestamp`, `Money(n)`, an enum, a
@@ -216,6 +218,47 @@ declares `@no_index`, is a parse error with the field's own span. So is a filter
 an `emit` missing a field, an `invoke` with an unknown argument, and an index over a column the
 entity does not have. The Starlark version re-derived each of these in a validation pass over a
 `query()` evaluated against a stub input, which could only see the branch the stub happened to take.
+
+**A deployment must be able to read its own log, and hekla refuses to start when it cannot.** A log
+outlives the program that wrote it, so a declaration that has moved on from what is stored breaks
+every reader of that type at once: a fold answers 500, a projector rebuild fails and retries forever,
+and an effect lane wedges pinning the watermark. The check runs after the credential refusal and
+*before* the declaration table is written, so a refused boot leaves no trace of having happened.
+`hekla verify` refuses for the same reason it refuses a missing master key: a sweep replaying a
+program that cannot read the log reports a failed rebuild and a divergence per invocation, which is
+corruption findings for a directory that has none.
+
+**It is two checks with two different reaches, and the difference is worth knowing.**
+
+The first is **complete** and reads no event at all. Every deploy records every declaration, and
+those rows are kept rather than replaced, so hekla can ask which fields this program declares that
+*some* version it has deployed did not. An `emit` writes an event whole, so no payload written under
+that version can carry such a field. One existence read per affected type ("does the log hold any
+`@order.placed`?") settles it. Keeping every version rather than only the current one is what catches
+a field removed in one deploy and put back in the next, where the two ends agree and every event in
+between carries neither.
+
+The second is a **sample**: the oldest stored event of every declared type, decoded through
+`record_of`, the same function all three readers call. A failure there is not a forecast that a
+reader would break, it is the reader breaking one event early, so what it catches cannot be a false
+alarm. What it does not catch is drift that is wrong on only *some* events of a type: narrowing an
+enum breaks only the events that stored a variant it lost, and if the oldest one kept a surviving
+variant the sample says nothing. A complete answer to that means decoding every event in the log at
+every boot, which is work proportional to history on a path that runs before the port is even open,
+and hekla declines to pay it.
+
+Two faults, with two different repairs. A field the payload has no key for is the one a declaration
+can answer for itself, with `@absent(<literal>)` or by being optional; a subject-scoped field has no
+plaintext literal to give, so optional is its only repair. A stored value that no longer fits its
+field cannot be answered either way, because the field is there: **a field's type is part of the
+fact, so a new type is a new field.** Declare the new shape under a new name carrying `@absent` and
+drop the old one, which stops being decoded the moment nothing declares it.
+
+**`hekla plan` answers a narrower question than the boot does**, and the two can differ. Plan asks
+what *this deploy* would newly break, from the diff it already computes; the boot asks whether this
+program can read the log at all, and asks it every time. A directory an earlier deploy already broke
+is therefore a clean plan and a refused boot, which is the right way round: plan reports a change,
+and there is no change.
 
 **Two host tags sit in a reserved `_hekla_` namespace** an author can neither emit nor query: a keyed
 command's idempotency tag, and the correlation tag every event carries. The correlation id lives in
@@ -882,7 +925,11 @@ consistent copy is not required for them.
   one fails hekla's suite instead of a downstream project's.
 - `hekla verify <dir>`: the runtime invariant sweep over a data directory. Section 11.2.
 - `hekla plan <dir>`: what deploying this project over a data directory would change. It reads the
-  `declaration` table rather than the log, so it needs no lock and runs against a live directory.
+  `declaration` table rather than the log, so it needs no lock and runs against a live directory. The
+  one exception is the history check of section 4: when the diff says an event, record or enum moved,
+  it opens the log through a follower for one bounded read per declared type, because whether the
+  deploy would boot at all is the answer a gate most needs. Every other property holds, and a deploy
+  that moves none of those three still opens no log.
   `--replay` adds the other half: recorded invocations of every affected effect are re-run against
   the candidate code and the journal the original run left, which says not just that an effect
   changed but whether the change would move a single call. That half does open the log, and reaches

@@ -954,6 +954,45 @@ impl OpDb {
             .context("collecting current declarations")
     }
 
+    /// Every version of every declaration this directory has ever had deployed, in
+    /// `(kind, name)` order.
+    ///
+    /// Not only the current ones, and the difference is the whole reason this exists: a
+    /// field removed in one deploy and put back in the next leaves events in between
+    /// that carry neither, and a comparison against the current declaration alone sees
+    /// the two ends agree and misses them.
+    pub fn all_declarations(&self) -> anyhow::Result<Vec<DeclarationRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "{DECLARATION_COLUMNS} ORDER BY kind, name, first_seen"
+            ))
+            .context("preparing the declaration history query")?;
+        let rows = stmt
+            .query_map([], row_to_declaration)
+            .context("querying every declaration")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting every declaration")
+    }
+
+    /// Every recorded declaration, read back as the digest entry it was written from.
+    ///
+    /// A row whose packed form does not reproduce its own hash is skipped rather than
+    /// failing the call: it was written under a different `heklang::digest::VERSION`, so
+    /// what it declared cannot be read off it by this build, and a caller asking what a
+    /// past deployment's fields were is better off knowing less than guessing.
+    pub fn recorded_entries(&self) -> anyhow::Result<Vec<heklang::Entry>> {
+        Ok(self
+            .all_declarations()?
+            .iter()
+            .filter_map(|row| {
+                let entry =
+                    heklang::Entry::from_packed(&row.form, row.signature.as_deref()).ok()?;
+                (entry.hash.to_string() == row.hash).then_some(entry)
+            })
+            .collect())
+    }
+
     /// One recorded version of a declaration, by its hash.
     ///
     /// `None` means hekla has no record of that hash at all, which is a different fact
