@@ -12,6 +12,7 @@ import { html } from './vendor-preact.js'
 import { api } from './api.js'
 import { Empty, Resource, useResource } from './ui-states.js'
 import { Copy } from './ui-copy.js'
+import { shortKind } from './kinds.js'
 import { plural, shortHash, sources, stamp } from './format.js'
 
 export function SchemaView() {
@@ -68,6 +69,11 @@ export function SchemaView() {
                         </div>
                         <details class="graph-fields">
                           <summary class="tiny dim">fields</summary>
+                          ${/* The one place a union is written out in full rather than
+                              summarised by `shortKind`. The wire form carries no name
+                              for one, so somewhere has to hold the variants, and a
+                              `dl.kv` value is the flexible column of a two-column grid
+                              and has the room for them. */ ''}
                           <dl class="kv tiny">
                             ${event.fields.map(
                               (field) => html`
@@ -100,8 +106,12 @@ export function SchemaView() {
                 </tr>
               </thead>
               <tbody>
-                ${schema.commands.map(
-                  (command) => html`
+                ${schema.commands.map((command) => {
+                  const input = (describe) =>
+                    command.input.map((field) => `${field.name}: ${describe(field.kind)}`).join(', ')
+                  const shown = input(shortKind)
+                  const whole = input((kind) => kind)
+                  return html`
                     <tr key=${command.name}>
                       <td><code>${command.name}</code></td>
                       <td>
@@ -111,14 +121,13 @@ export function SchemaView() {
                             </span>`
                           : html`<span class="pill ok">public</span>`}
                       </td>
-                      <td class="tiny dim mono">
-                        ${command.input.map((field) => `${field.name}: ${field.kind}`).join(', ') ||
-                        '-'}
+                      <td class="tiny dim mono" title=${shown === whole ? undefined : whole}>
+                        ${shown || '-'}
                       </td>
                       <td class="tiny dim mono">${shortHash(command.hash)}</td>
                     </tr>
-                  `,
-                )}
+                  `
+                })}
               </tbody>
             </table>
           </section>

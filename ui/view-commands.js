@@ -18,7 +18,7 @@ import { Empty, Resource, useResource } from './ui-states.js'
 import { DataTable } from './ui-table.js'
 import { DetailPanel } from './ui-panel.js'
 import { Copy } from './ui-copy.js'
-import { baseKind, enumVariants, maxLength } from './kinds.js'
+import { baseKind, enumVariants, maxLength, shortKind } from './kinds.js'
 import { count, plural } from './format.js'
 
 export function CommandsView({ params }) {
@@ -27,8 +27,18 @@ export function CommandsView({ params }) {
 }
 
 /** `user_id: Uuid, email: String @max(200)`, the same summary the schema view renders. */
-function signature(command) {
-  return command.input.map((field) => `${field.name}: ${field.kind}`).join(', ') || '-'
+function signature(command, describe = shortKind) {
+  return command.input.map((field) => `${field.name}: ${describe(field.kind)}`).join(', ') || '-'
+}
+
+/**
+ * The unabridged text for a `title`, or nothing when the two read the same.
+ *
+ * A tooltip that repeats what is already on screen is a tooltip you learn to ignore,
+ * and the one case that matters here is the one where `shortKind` dropped something.
+ */
+function whole(text, short = shortKind(text)) {
+  return text === short ? undefined : text
 }
 
 function CommandList() {
@@ -50,7 +60,13 @@ function CommandList() {
     {
       key: 'input',
       header: 'Parameters',
-      render: (row) => html`<span class="tiny dim mono">${signature(row)}</span>`,
+      render: (row) =>
+        html`<span
+          class="tiny dim mono"
+          title=${whole(signature(row, (kind) => kind), signature(row))}
+        >
+          ${signature(row)}
+        </span>`,
     },
     {
       key: 'path',
@@ -388,7 +404,11 @@ function Parameters({ command }) {
           (field) => html`
             <tr key=${field.name}>
               <td><code>${field.name}</code></td>
-              <td><span class="mono tiny dim">${field.kind}</span></td>
+              <td>
+                <span class="mono tiny dim" title=${whole(field.kind)}>
+                  ${shortKind(field.kind)}
+                </span>
+              </td>
               <td>${field.optional ? '✓' : html`<span class="faint">·</span>`}</td>
             </tr>
           `,
@@ -413,8 +433,8 @@ function Form({ command, values, errors, onChange }) {
         (field) => html`
           <label key=${field.name} for=${`cmd-${field.name}`}>
             <code>${field.name}</code>
-            <span class="tiny faint mono">
-              ${field.kind}${field.optional ? '' : ' · required'}
+            <span class="tiny faint mono" title=${whole(field.kind)}>
+              ${shortKind(field.kind)}${field.optional ? '' : ' · required'}
             </span>
           </label>
           <div>

@@ -966,11 +966,17 @@ textarea:focus {
   padding: var(--s4);
 }
 
+/* Capped, because a `max-content` track is sized by its longest line and a declared
+ * kind has no length limit: one twelve-variant union wrote a 200-character label that
+ * took the whole card and left every input in the form a few pixels wide. `shortKind`
+ * keeps that out of the text; this keeps it out of the layout whatever the text says. */
 .cmd-form > label {
   display: flex;
   flex-direction: column;
   gap: 2px;
   padding-top: 5px;
+  max-width: 18rem;
+  overflow-wrap: anywhere;
 }
 
 .cmd-field {

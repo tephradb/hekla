@@ -51,6 +51,33 @@ export function enumVariants(kind) {
     .filter(Boolean)
 }
 
+/* Past this many characters a kind has stopped being a label and become a sentence. */
+const INLINE = 40
+
+/**
+ * A kind short enough to sit inline, next to a name or inside a table cell.
+ *
+ * A union's rendering *is* its variant list, because the wire form carries no name to
+ * show instead, and that is right until the list is twelve long: `title:
+ * DistributedSystems | ProgrammingLanguages | …` is 200 characters that push every
+ * column after it off the page and squeeze a command's own inputs to nothing.
+ *
+ * Past the cap the list becomes its count. Nothing is lost, only moved: the form beside
+ * it is a `select` holding every variant, the schema view still writes them out in
+ * full, and every caller here keeps the whole string on the element's `title`.
+ */
+export function shortKind(kind) {
+  const text = String(kind ?? '').trim()
+  if (text.length <= INLINE) return text
+  const variants = enumVariants(kind)
+  // Nothing to summarise: a long non-union kind is long because it says something.
+  if (!variants || variants.length < 2) return text
+  const summary = `one of ${variants.length}`
+  // The same bracket an optional union already needs, for the same reason: the marker
+  // has to bind to the whole thing and not to the last word of it.
+  return text.endsWith('?') ? `(${summary})?` : summary
+}
+
 /** The `@max(n)` a string kind declares, or `null` when it declares none. */
 export function maxLength(kind) {
   const found = /@max\((\d+)\)/.exec(String(kind ?? ''))
