@@ -25,6 +25,23 @@ function stored() {
 function apply(mode) {
   if (mode === 'system') delete document.documentElement.dataset.theme
   else document.documentElement.dataset.theme = mode
+  tint()
+}
+
+/* A phone's address bar takes its colour from this meta tag and from nothing else, so
+ * without it the console sits under a white strip that no palette here chose. The
+ * value is read back off `--bg` rather than written out as a literal, which is what
+ * keeps three modes and two palettes from needing a fourth copy of the same hex. */
+function tint() {
+  const color = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
+  if (!color) return
+  let meta = document.head.querySelector('meta[name="theme-color"]')
+  if (!meta) {
+    meta = document.createElement('meta')
+    meta.name = 'theme-color'
+    document.head.append(meta)
+  }
+  meta.content = color
 }
 
 /** The theme mode and a cycler through the three states. */
@@ -39,6 +56,14 @@ export function useTheme() {
       /* The choice still applies to this page; it just will not survive a reload. */
     }
   }, [mode])
+
+  /* Following the system means following it while the page is open: the palette
+   * swaps under `mode === 'system'` with no render to hang the repaint off. */
+  useEffect(() => {
+    const query = window.matchMedia('(prefers-color-scheme: dark)')
+    query.addEventListener('change', tint)
+    return () => query.removeEventListener('change', tint)
+  }, [])
 
   const cycle = () => setMode((current) => MODES[(MODES.indexOf(current) + 1) % MODES.length])
   return [mode, cycle]
