@@ -781,7 +781,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hekla"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes-gcm",
  "aes-siv",
@@ -815,9 +815,9 @@ dependencies = [
 
 [[package]]
 name = "heklang"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4e39dd188686d19ec9554d24e7fbf622a9eb36c350b3a4d51f60f6959c87ecf"
+checksum = "27a0be421f148a99e621bfc9752e7604ca7090e7ebd636c6d727d3a091d30d9b"
 dependencies = [
  "sha2",
  "uuid",
