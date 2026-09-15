@@ -114,7 +114,7 @@ pub fn get_one(
     let mut item = model.get(entity, key)?;
     drop(snapshot);
     if let (Some(row), Some(ks)) = (item.as_mut(), keystore) {
-        decrypt_row(entity, row, &ks.row_decryptor())?;
+        decrypt_row(entity, row, &ks.row_decryptor(), None)?;
     }
     Ok((item, position))
 }
@@ -126,10 +126,11 @@ pub fn get_one(
 /// decrypt under the present key (a stale row left under a superseded key). Only a key
 /// that cannot be obtained at all (a missing or rotated-away master) is an error, so a
 /// misconfigured master surfaces loudly instead of silently blanking every column.
-fn decrypt_row(
+pub(crate) fn decrypt_row(
     entity: &EntityDef,
     row: &mut Value,
     decryptor: &RowDecryptor<'_>,
+    mut tally: Option<&mut Revealed>,
 ) -> anyhow::Result<()> {
     let Some(obj) = row.as_object_mut() else {
         return Ok(());
@@ -141,23 +142,51 @@ fn decrypt_row(
         let Some(ciphertext) = obj.get(name).and_then(Value::as_str).map(str::to_owned) else {
             continue; // absent / null column
         };
-        let plaintext = match obj.get(subject_field).and_then(scalar_to_string) {
+        let subject_value = obj.get(subject_field).and_then(scalar_to_string);
+        let plaintext = match &subject_value {
             Some(subject_value) => decryptor
-                .decrypt(subject_field, &subject_value, name, &ciphertext)
+                .decrypt(subject_field, subject_value, name, &ciphertext)
                 .with_context(|| format!("decrypting column `{name}`"))?,
             // No subject id to key on: the value is unreadable.
             None => None,
         };
         match plaintext {
             Some(text) => {
+                if let Some(tally) = tally.as_deref_mut() {
+                    tally.decrypted += 1;
+                }
                 obj.insert(name.clone(), typed_from_string(&meta.kind, text));
             }
             None => {
+                // The key is live and this value still will not open: it was written
+                // under one that has since been superseded. Worth separating from an
+                // erasure, which is permanent, for a caller that reports rather than
+                // serves.
+                if let Some(tally) = tally.as_deref_mut()
+                    && subject_value
+                        .is_some_and(|id| decryptor.key_present(subject_field, &id) == Some(true))
+                {
+                    tally.stale += 1;
+                }
                 obj.remove(name);
             }
         }
     }
     Ok(())
+}
+
+/// What one decrypting pass found, for a caller that has to report on it.
+///
+/// The read API serves rows and wants none of this: a reader of a read model wants the
+/// row, not an account of it. A one-off projection *is* the account, and it audits what
+/// it revealed, so it asks for the counts rather than keeping a second copy of the loop
+/// that would drift from this one.
+#[derive(Debug, Default)]
+pub(crate) struct Revealed {
+    /// Cells opened.
+    pub decrypted: usize,
+    /// Cells that would not open under a key that is still live.
+    pub stale: usize,
 }
 
 /// Re-type a decrypted **read-model column** back to the field's declared kind, so an
@@ -219,7 +248,7 @@ pub fn scan(
     if let Some(ks) = keystore {
         let decryptor = ks.row_decryptor();
         for row in &mut items {
-            decrypt_row(entity, row, &decryptor)?;
+            decrypt_row(entity, row, &decryptor, None)?;
         }
     }
     Ok(Page {

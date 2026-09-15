@@ -330,6 +330,17 @@ impl KeyStore {
         self.opdb.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The masters this store wraps subject keys under.
+    ///
+    /// For building a second store over a *different* connection, which is the one
+    /// reason to want them: [`KeyStore::encrypt_subject_existing`] takes this store's
+    /// opdb mutex on every sealed write, and that mutex is shared with every effect's
+    /// hot path. A reader folding a whole log through it would stall live work, so it
+    /// opens its own connection and rewraps under the same masters instead.
+    pub(crate) fn masters(&self) -> &MasterKeys {
+        &self.masters
+    }
+
     /// A decryptor that caches unwrapped subject secrets for the life of one request,
     /// so a scan of many rows sharing a subject unwraps that key once, not per row.
     /// Bounded to a request and dropped after, so it never outlives an erasure.

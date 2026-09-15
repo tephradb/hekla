@@ -51,10 +51,13 @@ sha2 = "0.11"
 tempfile = "3"
 tephra = { version = "0.4.0", features = ["async", "tracing"] }
 time = { version = "0.3", features = ["formatting"] }
-# `full` pulled in fs, process, io-std and the rest; these four are what the code
+# `full` pulled in fs, process, io-std and the rest; these five are what the code
 # actually reaches for. `macros` is test-only (`#[tokio::test]`), so it sits in
 # dev-dependencies: there is no `#[tokio::main]`, cli.rs builds the runtime by hand.
-tokio = { version = "1", features = ["net", "rt-multi-thread", "signal", "time"] }
+# `sync` is named rather than left to arrive through another feature: `server.rs` holds
+# the projection semaphore, and a feature reached by accident is one a dependency bump
+# can take away.
+tokio = { version = "1", features = ["net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

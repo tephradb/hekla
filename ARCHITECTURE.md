@@ -846,8 +846,10 @@ consistent copy is not required for them.
 - **`GET /admin/*`: read-only introspection.** Page and filter the event log, follow a
   `correlation_id` through the whole causal chain it set off, read an effect invocation's journaled
   calls and their recorded results, inspect a projector's entities and definition hash, and read back
-  the loaded project and effective configuration. Every route is a `GET`; the mutating operator
-  routes stay outside the prefix. Always served, because the bind address is already the boundary for
+  the loaded project and effective configuration. **Nothing under the prefix changes the
+  deployment**; the mutating operator routes stay outside it. All of it is a `GET` but one, and that
+  one, `POST /admin/projections`, writes nothing either: it folds a projector that is never deployed
+  into a read model that is thrown away. Always served, because the bind address is already the boundary for
   a surface that appends events without authentication, and one prefix is what a proxy can deny.
   Subject-scoped fields decrypt by default: the same kind of boundary the read API already crosses,
   over a wider surface (every field of every event, rather than the columns one projector chose to
@@ -862,7 +864,35 @@ consistent copy is not required for them.
   page. Responses carry `Vary: Accept`, because one URL with two representations behind a proxy is
   otherwise a poisoned cache. `GET /admin/assets/{file}` serves the console's own files from a table
   compiled into the binary, and is the one path under the prefix that is not negotiated.
-- An admin-only, read-only SQL endpoint behind a flag, off in production, for debugging.
+- **`POST /admin/projections`: an ad-hoc projection, behind `[admin] projections`, off by default.**
+  The body is a heklang `projector`; it is compiled against the project this process booted with,
+  folded over the log through the same read-only follower `hekla project` uses, and thrown away. The
+  response is exactly what `hekla project --json` prints, so one shape reaches two transports, and
+  the `GET` on the same path reports the limits and whether the `POST` is served, so a client learns
+  the ceiling without spending a fold to find it.
+
+  **It is compiled from the sources the runtime kept, never re-read from disk.** A module edited
+  under a live process would typecheck a projection against declarations this process is not
+  running, and `record_of` would then read stored payloads against a schema the log has never seen.
+
+  **The server bounds it, not the caller.** Every other reader here takes a caller-supplied limit;
+  this one folds a log rather than reading a page, so the event budget defaults well below its
+  ceiling and is clamped to it whatever is asked for. A whole-log fold is `hekla project`'s job,
+  which holds no request open while it runs one. That division is what keeps the two from being
+  redundant.
+
+  **Off by default**, and the reason is narrower than "introspection is dangerous". Appending an
+  event without authentication is already possible, but an append goes through a *declared* command
+  with a *declared* boundary, so the deployer chose what the port can do. Submitted heklang is the
+  first thing on this surface not fenced by what the project declares. What bounds it once enabled
+  is the language: heklang is total, so a projection terminates, and a projector holds no host, so
+  it has no clock, no network, no general read, and cannot append. Disabled, the route still answers
+  `403` naming the setting rather than vanishing, because a refusal an operator cannot ask about is
+  worse than one they can.
+
+  This is what the deferred admin-only SQL endpoint wanted to be, and it supersedes it: heklang
+  rather than SQL, the log rather than the derived read models, and none of the private table layout
+  below.
 - Direct SQLite file access is not a supported surface. The table layout stays private behind the
   generated read API.
 - `GET /openapi.json` and a Scalar reference over it at `GET /docs`. The document is generated from

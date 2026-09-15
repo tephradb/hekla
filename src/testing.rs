@@ -35,7 +35,6 @@ use heklang::{Event, Program, Reply, Row, TestOutcome, World};
 use tempfile::TempDir;
 use tephra::{SegmentConfig, SegmentSet, WriteCoordinator, WriterConfig};
 
-use crate::cli;
 use crate::context::CommandContext;
 use crate::crypto::{KeyStore, MasterKeys};
 use crate::heklang_host::{HeklaHost, RowWriter, Stamp};
@@ -46,6 +45,7 @@ use crate::read_model::ReadModel;
 use crate::schema::{EntityDef, EventDefs};
 use crate::secrets::SecretStore;
 use crate::store::Store;
+use crate::validate;
 
 /// Throwaway per-test stores stay small, but the segment must still clear the writer's
 /// default max batch size.
@@ -58,10 +58,10 @@ const TEST_MASTER_KEY: [u8; 32] = [0x2a; 32];
 /// Run every `test` declaration under a project directory.
 pub fn run(dir: &Path) -> ExitCode {
     let project = LoadedProject::load(dir);
-    let findings = cli::collect_findings(&project);
+    let findings = validate::findings(&project);
     let mut failed = false;
     for finding in &findings {
-        eprintln!("{}", cli::render_finding(finding));
+        eprintln!("{}", validate::render(finding));
         failed |= matches!(finding.severity, crate::loader::Severity::Error);
     }
     if failed {

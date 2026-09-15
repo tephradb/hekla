@@ -1130,7 +1130,9 @@ Honest scope:
 - **No live tail.** `Subscription` makes an SSE stream cheap and it is the obvious next step, but it
   is a different transport with its own backpressure and shutdown story.
 - **The admin read-only SQL endpoint deferred in Phase 3 is still deferred.** This makes it less
-  necessary rather than delivering it.
+  necessary rather than delivering it. (It was later closed rather than delivered: `hekla project`
+  and `POST /admin/projections` answer the arbitrary-query case in heklang over the log, which is a
+  better answer than SQL over the read models would have been.)
 - Every reader over a table that grows with traffic takes a caller-supplied limit, because the
   operational database is one mutex shared with each effect's hot path. Three do not, and say so:
   the module inventory and the per-effect runtime state are bounded by the module count, fixed at
@@ -2202,9 +2204,13 @@ warranted.
 Deferrals recorded in the "honest scope" of a completed phase that no trigger above already pulls
 forward. Collected here so they are not lost in the prose of the phase that introduced them.
 
-- **Admin read-only SQL endpoint** (Phase 3): a read-only query surface over the projector databases.
-  Phase 19 delivered structured introspection over the same state, which lowers the pressure for it
-  without answering the arbitrary-query case.
+- **Admin read-only SQL endpoint** (Phase 3): **closed, superseded.** It wanted a read-only query
+  surface over the projector databases, and Phase 19's structured introspection lowered the pressure
+  for it without answering the arbitrary-query case. `hekla project` and `POST /admin/projections`
+  answer that case, and answer it better than SQL would have: the question is written in heklang, so
+  it is total and typechecked against the deployed declarations; it folds the *log* rather than the
+  derived read models, so it can ask things no read model materialised; and it needs none of the
+  private table layout, which stays behind the generated read API as section 10 says it must.
 - **Multi-field (composite-prefix) scan filters** (Phase 3): a scan supports a single indexed filter
   field only.
 - **Automatic dead-lettering** (Phase 4): the manual `POST /effects/{name}/skip/{position}` is the only

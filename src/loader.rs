@@ -239,6 +239,10 @@ pub struct EffectUnit {
 pub struct LoadedProject {
     pub root: PathBuf,
     pub config: Config,
+    /// What this was compiled from, so one more module can be compiled against exactly
+    /// the same inputs later. Shared rather than copied: a `Runtime` keeps this alive
+    /// for the process, and it is the project's whole source text.
+    sources: Arc<Sources>,
     /// The one program every declaration lives in. Parsed once and shared: heklang's
     /// `Program` is `Send + Sync`, so every thread reads this one, and an `Arc` rather
     /// than a `Program` so a `Runtime` built from this project shares it instead of
@@ -321,14 +325,29 @@ fn digest_hashes(digest: &Digest) -> HashMap<(Kind, &str), String> {
         .collect()
 }
 
-impl LoadedProject {
-    pub fn load(root: &Path) -> LoadedProject {
-        LoadedProject::load_with(root, None)
-    }
+/// A project's compilable inputs: what was read off disk, and nothing more.
+///
+/// Read once, then compiled as often as asked. That split is what lets a running server
+/// compile an ad-hoc projector against the project it booted with, rather than against
+/// whatever is on disk when the request arrives. The difference is not a convenience: a
+/// module edited under a live process would typecheck a projection against declarations
+/// this process is not running, and [`crate::heklang_host::record_of`] would then read
+/// stored payloads against a schema the log has never seen.
+pub struct Sources {
+    root: PathBuf,
+    config: Config,
+    /// The project's own modules, by project-relative path, sorted so a finding's order
+    /// does not depend on the order a directory walk happened to return.
+    modules: Vec<(String, String)>,
+    /// What reading them cost: a `hekla.toml` that would not parse, a file that would
+    /// not read. Carried rather than reported at read time, because every compile owes
+    /// the same findings however it was reached.
+    findings: Vec<Finding>,
+}
 
-    /// [`LoadedProject::load`], plus one module that is not on disk. See [`Scratch`].
-    pub fn load_with(root: &Path, scratch: Option<Scratch<'_>>) -> LoadedProject {
-        let scratch_name = scratch.as_ref().map(|one| one.name.to_owned());
+impl Sources {
+    /// Read a project directory. The only function here that touches the filesystem.
+    pub fn read(root: &Path) -> Arc<Sources> {
         let mut findings = Vec::new();
         let config = match Config::load(root) {
             Ok(config) => config,
@@ -340,38 +359,63 @@ impl LoadedProject {
             }
         };
 
-        let mut sources: Vec<(String, String)> = Vec::new();
+        let mut modules: Vec<(String, String)> = Vec::new();
         for path in hek_files(root, &mut findings) {
             let rel = rel_to_string(root, &path);
             match fs::read_to_string(&path) {
-                Ok(text) => sources.push((rel, text)),
+                Ok(text) => modules.push((rel, text)),
                 Err(err) => findings.push(Finding::error(rel, format!("reading: {err}"))),
             }
         }
-        // A scratch file written inside the project is the most natural invocation there
-        // is (`hekla project question.hk` from the root), and the walk above has already
-        // read it. Handing heklang the same source twice is `projector X is declared
-        // twice` for a file the operator did nothing wrong with.
-        if let Some(one) = &scratch {
-            let same = fs::canonicalize(one.name).ok();
-            sources.retain(|(rel, _)| {
-                same.as_ref()
-                    .zip(fs::canonicalize(root.join(rel)).ok())
-                    .is_none_or(|(scratch, walked)| scratch != &walked)
-            });
-        }
-        sources.sort_by(|left, right| left.0.cmp(&right.0));
-        // After the sort, not in it. heklang reports a duplicate declaration against the
-        // *second* file it sees, so a scratch module that sorts early would make a name
-        // collision read as the project's fault rather than as this file's.
-        if let Some(one) = &scratch {
-            sources.push((one.name.to_owned(), one.source.to_owned()));
-        }
+        modules.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let borrowed: Vec<(&str, &str)> = sources
+        Arc::new(Sources {
+            root: root.to_path_buf(),
+            config,
+            modules,
+            findings,
+        })
+    }
+
+    /// The effective configuration these sources were read with.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Compile these modules, plus one that is not on disk. See [`Scratch`].
+    pub fn compile(self: &Arc<Sources>, scratch: Option<Scratch<'_>>) -> LoadedProject {
+        let scratch_name = scratch.as_ref().map(|one| one.name.to_owned());
+        let mut findings = self.findings.clone();
+        let root = &self.root;
+        let config = self.config.clone();
+
+        // A scratch file written inside the project is the most natural invocation there
+        // is (`hekla project question.hk` from the root), and the read above has already
+        // taken it. Handing heklang the same source twice is `projector X is declared
+        // twice` for a file the operator did nothing wrong with.
+        let same = scratch
+            .as_ref()
+            .and_then(|one| fs::canonicalize(one.name).ok());
+        let mut borrowed: Vec<(&str, &str)> = self
+            .modules
             .iter()
+            // Matched rather than zipped: `Option::zip` takes its argument by value, so
+            // zipping would canonicalize every module on every compile, including the
+            // compiles with no scratch at all, which is every boot and every `check`.
+            .filter(|(rel, _)| match &same {
+                None => true,
+                Some(scratch) => fs::canonicalize(root.join(rel))
+                    .ok()
+                    .is_none_or(|walked| scratch != &walked),
+            })
             .map(|(rel, text)| (rel.as_str(), text.as_str()))
             .collect();
+        // Last, never sorted in. heklang reports a duplicate declaration against the
+        // *second* file it sees, so a scratch module ordered among the rest would make a
+        // name collision read as the project's fault rather than as this file's.
+        if let Some(one) = &scratch {
+            borrowed.push((one.name, one.source));
+        }
 
         // Every mistake rather than only the first: `check_files` reports a pass at a
         // time, which is what lets one bad declaration not hide the rest.
@@ -380,8 +424,9 @@ impl LoadedProject {
             Err(diagnostics) => {
                 findings.extend(diagnostics.iter().map(Finding::from_diagnostic));
                 return LoadedProject {
-                    root: root.to_path_buf(),
+                    root: root.clone(),
                     config,
+                    sources: Arc::clone(self),
                     program: Arc::new(Program::default()),
                     // A program that did not check has no digest form, so there is
                     // nothing to take one of. `Digest` has no `Default`; an empty
@@ -506,8 +551,9 @@ impl LoadedProject {
         }
 
         LoadedProject {
-            root: root.to_path_buf(),
+            root: root.clone(),
             config,
+            sources: Arc::clone(self),
             program,
             digest,
             events,
@@ -517,6 +563,24 @@ impl LoadedProject {
             findings,
             scratch: scratch_name,
         }
+    }
+}
+
+impl LoadedProject {
+    /// Read a project directory and compile it.
+    pub fn load(root: &Path) -> LoadedProject {
+        Sources::read(root).compile(None)
+    }
+
+    /// The same project with one more module, recompiled from the sources this load
+    /// read. Touches no file, which is the whole point: see [`Sources`].
+    pub fn with_scratch(&self, scratch: Scratch<'_>) -> LoadedProject {
+        self.sources.compile(Some(scratch))
+    }
+
+    /// What this project was compiled from, for a caller that will compile again.
+    pub fn sources(&self) -> &Arc<Sources> {
+        &self.sources
     }
 
     pub fn has_errors(&self) -> bool {

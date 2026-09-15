@@ -460,6 +460,13 @@ effect_journal_days = 7     # completed invocation journals are swept after this
 
 [projectors]
 auto_rebuild = true         # rebuild on a definition change, or leave it to an operator
+
+[admin]
+projections = false         # serve POST /admin/projections: fold an ad-hoc projector over
+                            # the log and return its rows, deploying nothing. Off by
+                            # default because it is the one route that runs code a caller
+                            # supplied rather than code the project declares. `hekla
+                            # project` does the same from a shell and needs no setting.
 ```
 
 Environment: `HEKLA_MASTER_KEY`, a base64-encoded 32-byte key, required only if any field declares a

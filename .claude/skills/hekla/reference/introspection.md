@@ -1,8 +1,11 @@
 # Introspection: `/admin` and the console
 
-Read-only. Every route is a `GET` and none of them writes; `replay` and `skip` stay outside the
-prefix. Always served, because the bind address is already the boundary for a surface that appends
-events without authentication, and one prefix is what a proxy can deny.
+Nothing here changes the deployment; `replay` and `skip` stay outside the prefix. All of it is a
+`GET` but one, and that one, `POST /admin/projections`, writes nothing either: it folds a projector
+that is never deployed into a read model that is thrown away. Always served, because the bind
+address is already the boundary for a surface that appends events without authentication, and one
+prefix is what a proxy can deny. The one exception to "always served" is the projections `POST`,
+which needs `[admin] projections = true` and answers `403` otherwise.
 
 `GET /admin` is an index of everything below, and `hekla serve` prints the URL at startup.
 
@@ -21,6 +24,7 @@ events without authentication, and one prefix is what a proxy can deny.
 | `/admin/schema` | the loaded project: every declaration with its hash and signature hash |
 | `/admin/system` | version, uptime, data directory, op-DB schema version, keystore, effective config |
 | `/admin/subjects`, `/admin/subjects/{field}/{value}` | which subjects still hold key material, never the material |
+| `/admin/projections` | `GET`: the limits, and whether the `POST` is served. `POST`: fold an ad-hoc projector over the log |
 | `/admin/assets/{file}` | the console's own files; the one path under the prefix that is not negotiated |
 
 ## `/admin/events`
@@ -181,6 +185,54 @@ page reports `complete: false` with a cursor.
 
 Only events appended by a version of hekla that stamps the correlation tag are findable: a query
 filters on tags, and the id has always been in the envelope but not always in a tag.
+
+## `/admin/projections`
+
+Fold an ad-hoc projector over the log and get its rows back, deploying nothing. The same thing
+`hekla project` does from a shell, for a caller that has no shell.
+
+`GET` always answers, whether or not the `POST` is served:
+
+```json
+{ "enabled": true,
+  "max_events": { "default": 100000, "limit": 5000000 },
+  "rows": { "default": 50, "limit": 500 },
+  "log_head": 412903 }
+```
+
+`POST` takes the heklang source as the body and its knobs as query parameters:
+
+```sh
+curl --data-binary @question.hk \
+  'localhost:8080/admin/projections?max_events=100000&rows=20'
+```
+
+`projector` (when the body declares more than one), `entity`, `from`, `upto`, `max_events`, `rows`,
+`decrypt`. An unknown parameter is a 400 rather than ignored, because a typo in `max_events` costs
+the bound the caller was trying to impose. The response body is **exactly** what
+`hekla project --json` prints, so one shape reaches both.
+
+**Off by default.** Set `[admin] projections = true` in `hekla.toml`; otherwise the `POST` is a 403
+naming the setting. It is the one route that runs code a caller supplied rather than code the
+project declares, which is why a deployment has to say yes to it. What bounds it once on: heklang is
+total, so a projection terminates, and a projector holds no clock, no network, no general read and
+no way to append.
+
+**Bounded by the server.** `max_events` defaults to 100,000 and is clamped to 5,000,000 whatever is
+asked for, because this folds a log where the rest of `/admin` reads a page. A run that spends its
+budget reports `scanned.stopped: "max-events"` and its rows are part of the answer, not all of it.
+Folding a whole log is `hekla project`'s job, which holds no request open while it does one.
+
+**Compiled against what the process booted with**, never re-read from disk. A module edited under a
+running server is not visible to a projection, which is deliberate: it would otherwise typecheck
+against declarations the process is not running and then misread stored payloads.
+
+A compile failure is a 400 carrying the compiler's own diagnostics:
+
+```json
+{ "error": { "code": "invalid_input", "message": "the projector does not compile" },
+  "findings": ["error: <projection>:3:5: event @user.nope is not declared"] }
+```
 
 ## The console
 

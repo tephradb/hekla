@@ -32,6 +32,7 @@ pub struct Config {
     pub retention: Retention,
     pub projectors: Projectors,
     pub verify: Verify,
+    pub admin: Admin,
     /// Where each `secret` the project declares is read from. A name absent here falls
     /// back to `HEKLA_SECRET_<NAME>`, so a project needs no entry at all; the table is
     /// for naming a variable a platform already sets, or a file an orchestrator mounts.
@@ -118,6 +119,30 @@ pub struct Verify {
     /// the data directory to itself, so `hekla verify` is where that one lives.
     pub enabled: bool,
 }
+
+/// What the `/admin` surface will do beyond reading.
+///
+/// Off by default, and the reason is narrower than "introspection is dangerous". The
+/// whole surface is already unauthenticated behind its bind address, and the standing
+/// argument for that is that appending an event is worse and is already possible. But
+/// an append goes through a *declared* command with a *declared* boundary, so the
+/// deployer chose what the port can do. Submitted heklang is the first thing here that
+/// is not fenced by what the project declares, which is a different sentence to put in
+/// front of an operator, so it is one they have to say yes to.
+///
+/// What bounds it once enabled: heklang is total, so a projection terminates, and a
+/// projector holds no host, so it has no clock, no network, no general read, and cannot
+/// append. What is left is CPU and a temporary directory, which is what the served
+/// event ceiling is for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Admin {
+    /// Serve `POST /admin/projections`: fold an ad-hoc projector over the log and
+    /// return its rows, deploying nothing. `hekla project` does the same from a shell
+    /// and needs no setting, because a shell is already a stronger thing to hold.
+    pub projections: bool,
+}
+
 impl Default for Projectors {
     fn default() -> Projectors {
         Projectors { auto_rebuild: true }
@@ -222,6 +247,23 @@ mod tests {
     #[test]
     fn unknown_field_is_rejected() {
         assert!(Config::parse("[effects]\nnope = 1\n").is_err());
+        assert!(Config::parse("[admin]\nprojection = true\n").is_err());
+    }
+
+    /// The default is what a deployment gets by saying nothing, and for this one that
+    /// has to be off: it is the only route that runs code a caller supplied.
+    #[test]
+    fn ad_hoc_projections_are_off_until_a_deployment_says_otherwise() {
+        assert!(!Config::default().admin.projections);
+        assert!(
+            !Config::parse("[effects]\npool_size = 4\n")
+                .unwrap()
+                .admin
+                .projections
+        );
+        let config = Config::parse("[admin]\nprojections = true\n").unwrap();
+        assert!(config.admin.projections);
+        assert_eq!(config.effects.pool_size, 16, "and the rest still defaults");
     }
 
     #[test]

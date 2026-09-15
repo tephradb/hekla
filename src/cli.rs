@@ -20,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 use crate::http::{HttpClient, UreqClient};
 use heklang::ir::Delivery;
 
-use crate::loader::{ArmRef, EffectUnit, Finding, LoadedProject, Scratch, Severity};
+use crate::loader::{ArmRef, EffectUnit, Finding, LoadedProject, Scratch, Sources};
 use crate::opdb::{self, OpDb};
 use crate::plan::Replay;
 use crate::progress::Progress;
@@ -390,11 +390,11 @@ fn openapi(dir: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let project = LoadedProject::load(dir);
-    let findings = collect_findings(&project);
+    let findings = validate::findings(&project);
     for finding in &findings {
-        eprintln!("{}", render_finding(finding));
+        eprintln!("{}", validate::render(finding));
     }
-    let errors = count_errors(&findings);
+    let errors = validate::errors(&findings);
     if errors > 0 {
         eprintln!("refusing to generate: the project has {errors} error(s)");
         return ExitCode::FAILURE;
@@ -790,18 +790,19 @@ fn project(file: &Path, dir: &Path, data_dir: Option<&Path>, ask: Ask<'_>) -> Ex
     };
 
     let name = file.display().to_string();
-    let project = LoadedProject::load_with(
-        dir,
-        Some(Scratch {
-            name: &name,
-            source: &source,
-        }),
-    );
-    let findings = collect_findings(&project);
+    // Read the tree, then compile it once with this file in it. `load().with_scratch()`
+    // would reach the same place having compiled the project twice and thrown the first
+    // one away; the sources are what is expensive to gather, not what is expensive to
+    // hold.
+    let project = Sources::read(dir).compile(Some(Scratch {
+        name: &name,
+        source: &source,
+    }));
+    let findings = validate::findings(&project);
     for finding in &findings {
-        eprintln!("{}", render_finding(finding));
+        eprintln!("{}", validate::render(finding));
     }
-    let errors = count_errors(&findings);
+    let errors = validate::errors(&findings);
     if errors > 0 {
         eprintln!("refusing to project: the project has {errors} error(s)");
         return ExitCode::FAILURE;
@@ -828,10 +829,33 @@ fn project(file: &Path, dir: &Path, data_dir: Option<&Path>, ask: Ask<'_>) -> Ex
         rows: ask.rows,
         master,
     };
+    // A follower, because this runs in its own process and the writer is elsewhere:
+    // read-only descriptors, no lock, a prefix pinned at open. A served projection is in
+    // the writer's own process and passes that writer's read handle instead.
+    let store = match runtime::follow(&data) {
+        Ok(Some(store)) => store,
+        Ok(None) => {
+            eprintln!(
+                "error: no event log at {}, so there is nothing to project over",
+                data.join("events").display()
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
     let ticker = Progress::stderr(ask.progress);
-    let result = projection::run(&project, &data, &request, &mut |position, upto, matched| {
-        ticker.tick(position.get(), upto.get(), matched);
-    });
+    let result = projection::run(
+        &project,
+        &store,
+        &data,
+        &request,
+        &mut |position, upto, matched| {
+            ticker.tick(position.get(), upto.get(), matched);
+        },
+    );
     // Before either arm writes, so half a progress line can never sit under a result or
     // under a diagnostic.
     ticker.clear();
@@ -875,11 +899,11 @@ fn secrets(dir: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let project = LoadedProject::load(dir);
-    let findings = collect_findings(&project);
+    let findings = validate::findings(&project);
     for finding in &findings {
-        eprintln!("{}", render_finding(finding));
+        eprintln!("{}", validate::render(finding));
     }
-    let errors = count_errors(&findings);
+    let errors = validate::errors(&findings);
     if errors > 0 {
         eprintln!("refusing to report: the project has {errors} error(s)");
         return ExitCode::FAILURE;
@@ -959,11 +983,11 @@ fn plan(
         return ExitCode::FAILURE;
     }
     let project = LoadedProject::load(dir);
-    let findings = collect_findings(&project);
+    let findings = validate::findings(&project);
     for finding in &findings {
-        eprintln!("{}", render_finding(finding));
+        eprintln!("{}", validate::render(finding));
     }
-    let errors = count_errors(&findings);
+    let errors = validate::errors(&findings);
     if errors > 0 {
         eprintln!("refusing to plan: the project has {errors} error(s)");
         return ExitCode::FAILURE;
@@ -1113,36 +1137,12 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) 
     }
 }
 
-/// The loader findings plus the semantic checks, sorted by location. Shared with
-/// `hekla test` so every command reports the same findings in the same order.
-pub(crate) fn collect_findings(project: &LoadedProject) -> Vec<Finding> {
-    let mut findings = project.findings.clone();
-    findings.extend(validate::check(project));
-    findings.sort_by(|left, right| {
-        let position = |finding: &Finding| finding.span.map(|span| (span.line, span.column));
-        left.location
-            .cmp(&right.location)
-            .then_with(|| position(left).cmp(&position(right)))
-    });
-    findings
-}
-
 /// Print every finding and return the (error, warning) counts.
 fn report_findings(project: &LoadedProject) -> (usize, usize) {
-    let findings = collect_findings(project);
+    let findings = validate::findings(project);
     print_findings(&findings);
-    let errors = count_errors(&findings);
+    let errors = validate::errors(&findings);
     (errors, findings.len() - errors)
-}
-
-/// How many findings are errors, which is what every load-and-refuse path branches on.
-/// Shared with `openapi`, which reports to stderr instead and so cannot use
-/// [`report_findings`] wholesale.
-fn count_errors(findings: &[Finding]) -> usize {
-    findings
-        .iter()
-        .filter(|finding| finding.severity == Severity::Error)
-        .count()
 }
 
 /// Whether log lines carry ANSI colors: the operator has not opted out through
@@ -1184,28 +1184,7 @@ fn init_tracing(no_color: bool) {
 
 fn print_findings(findings: &[Finding]) {
     for finding in findings {
-        println!("{}", render_finding(finding));
-    }
-}
-
-/// One finding as a line. Shared with `hekla openapi`, which writes the same lines to
-/// stderr so its stdout stays parseable JSON.
-pub(crate) fn render_finding(finding: &Finding) -> String {
-    let severity = match finding.severity {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-    };
-    // Spans are 0-based; editors and humans count from one.
-    let at = match finding.span {
-        Some(span) => format!(":{}:{}", span.line + 1, span.column + 1),
-        None => String::new(),
-    };
-    let line = format!("{severity}: {}{at}: {}", finding.location, finding.message);
-    // heklang carries the fix on a separate hint, and a diagnostic that names the
-    // problem without it is the worse half of the message.
-    match &finding.hint {
-        Some(hint) => format!("{line}\n  = {hint}"),
-        None => line,
+        println!("{}", validate::render(finding));
     }
 }
 

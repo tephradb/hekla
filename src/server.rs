@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::future;
 use std::io;
 use std::net::SocketAddr;
+use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,12 +39,15 @@ use uuid::Uuid;
 use crate::context::CommandContext;
 use crate::effect::EffectRuntime;
 use crate::introspect;
+use crate::loader;
 use crate::metrics;
+use crate::projection;
 use crate::projector::{ProjectorSet, ProjectorShared, Readiness};
 use crate::read_api;
-use crate::runtime::{Runtime, error_body};
+use crate::runtime::{self, Runtime, error_body};
 use crate::schema::{EntityDef, EventDef};
 use crate::ui;
+use crate::validate;
 
 type Shared = Arc<Runtime>;
 
@@ -112,6 +116,30 @@ pub const ADMIN_SYSTEM_ROUTE: &str = "/admin/system";
 pub const ADMIN_SUBJECTS_ROUTE: &str = "/admin/subjects";
 pub const ADMIN_SUBJECT_ROUTE: &str = "/admin/subjects/{field}/{value}";
 
+/// Ad-hoc projections. The one `/admin` path that answers a `POST`, and the one that
+/// runs code a caller supplied rather than reading what the project declared, which is
+/// why `[admin] projections` has to be turned on before the `POST` does anything. The
+/// `GET` always answers: it reports the limits and whether the `POST` is enabled, so a
+/// client discovers the ceiling before it spends one.
+pub const ADMIN_PROJECTIONS_ROUTE: &str = "/admin/projections";
+
+/// The module name a posted projector is compiled under, and so the location every
+/// diagnostic about it names. Deliberately not a path: it must never canonicalize onto
+/// a file in the project, which is how the in-tree dedupe decides a module is a
+/// duplicate of one already read.
+const PROJECTION_MODULE: &str = "<projection>";
+
+/// Every query parameter `POST /admin/projections` accepts.
+const PROJECTION_PARAMS: [&str; 7] = [
+    "projector",
+    "entity",
+    "from",
+    "upto",
+    "max_events",
+    "rows",
+    "decrypt",
+];
+
 /// The admin console's own files. Flat, because `{file}` captures a single segment: a
 /// nested asset would be unroutable, and worse, undescribable, since the drift test's
 /// matcher compares segment counts exactly. It is the one `/admin` route that is not
@@ -153,6 +181,10 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (ADMIN_SYSTEM_ROUTE, get(admin_system)),
         (ADMIN_SUBJECTS_ROUTE, get(admin_subjects)),
         (ADMIN_SUBJECT_ROUTE, get(admin_subject)),
+        (
+            ADMIN_PROJECTIONS_ROUTE,
+            get(admin_projections).post(admin_project),
+        ),
         (ADMIN_ASSETS_ROUTE, get(admin_asset)),
     ]
 }
@@ -920,6 +952,7 @@ async fn admin_index() -> Json<Value> {
             { "path": ADMIN_SYSTEM_ROUTE, "description": "version, uptime, configuration and storage" },
             { "path": ADMIN_SUBJECTS_ROUTE, "description": "the subject-key inventory" },
             { "path": ADMIN_SUBJECT_ROUTE, "description": "whether one subject still has a key" },
+            { "path": ADMIN_PROJECTIONS_ROUTE, "description": "fold an ad-hoc projector over the log (POST), and the limits one may ask for (GET)" },
         ]
     }))
 }
@@ -1381,10 +1414,211 @@ async fn admin_system(State(runtime): State<Shared>) -> Response {
                 "retention": { "effect_journal_days": config.retention.effect_journal_days },
                 "projectors": { "auto_rebuild": config.projectors.auto_rebuild },
                 "verify": { "enabled": config.verify.enabled },
+                "admin": { "projections": config.admin.projections },
             },
         }))
     })
     .await
+}
+
+/// `GET /admin/projections`: whether ad-hoc projections are served, and within what.
+///
+/// Always answers, even with the feature off, because a 403 an operator cannot ask
+/// about is worse than one they can. It is also how a client learns the ceiling before
+/// spending a request on it, which matters most for the client this endpoint is for: a
+/// program generating a projector will otherwise ask for the whole log every time.
+async fn admin_projections(State(runtime): State<Shared>) -> Response {
+    json_response(
+        200,
+        json!({
+            "enabled": runtime.config().admin.projections,
+            "max_events": {
+                "default": projection::SERVED_DEFAULT_EVENTS,
+                "limit": projection::SERVED_MAX_EVENTS,
+            },
+            "rows": { "default": projection::DEFAULT_ROWS, "limit": read_api::MAX_LIMIT },
+            "log_head": runtime.log_head(),
+        }),
+    )
+}
+
+/// `POST /admin/projections`: fold an ad-hoc projector over the log and return its rows.
+///
+/// The body is the heklang source and the query parameters are the knobs, the way
+/// `/admin/events` takes its filters. The response is exactly what `hekla project --json`
+/// prints, so a client learns one shape and reaches it two ways.
+///
+/// **Bounded by the server, not by the caller.** Every other reader here takes a
+/// caller-supplied limit because the operational database is one mutex shared with each
+/// effect's hot path; this one folds a log rather than reading a page, so the budget is
+/// clamped to [`projection::SERVED_MAX_EVENTS`] whatever is asked for, and defaults well
+/// below it. A whole-log fold is `hekla project`'s job, and it has no request to hold
+/// open while it does one.
+async fn admin_project(
+    State(runtime): State<Shared>,
+    Query(params): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> Response {
+    if !runtime.config().admin.projections {
+        return json_response(
+            403,
+            read_error(
+                "projections_disabled",
+                "this deployment does not serve ad-hoc projections; set `[admin] \
+                 projections = true` in hekla.toml to enable them",
+            ),
+        );
+    }
+    // Rejected rather than ignored, unlike the filters on `/admin/events`. A typo in
+    // `max_events` there costs a default page; here it costs the bound the caller asked
+    // for and folds the log they were trying not to.
+    if let Some((key, _)) = params
+        .iter()
+        .find(|(key, _)| !PROJECTION_PARAMS.contains(&key.as_str()))
+    {
+        return *bad_request(&format!(
+            "unknown query parameter `{key}`; this endpoint takes {}",
+            PROJECTION_PARAMS.join(", ")
+        ));
+    }
+    let source = match str::from_utf8(&body) {
+        Ok(source) if !source.trim().is_empty() => source.to_owned(),
+        Ok(_) => return *bad_request("the body is the projector to fold, and it is empty"),
+        Err(err) => return *bad_request(&format!("the body is not valid UTF-8: {err}")),
+    };
+
+    let from = match parse_u64(&params, "from") {
+        Ok(from) => from,
+        Err(response) => return *response,
+    };
+    let upto = match parse_u64(&params, "upto") {
+        Ok(upto) => upto,
+        Err(response) => return *response,
+    };
+    let decrypt = match parse_flag(&params, "decrypt", true) {
+        Ok(decrypt) => decrypt,
+        Err(response) => return *response,
+    };
+    // Both clamped, never rejected, the way a page size is: a caller asking for more
+    // than this deployment serves gets what it serves, and `stopped` says so.
+    let max_events = match parse_u64(&params, "max_events") {
+        Ok(asked) => asked
+            .unwrap_or(projection::SERVED_DEFAULT_EVENTS)
+            .clamp(1, projection::SERVED_MAX_EVENTS),
+        Err(response) => return *response,
+    };
+    let rows = match parse_u64(&params, "rows") {
+        Ok(asked) => asked
+            .map_or(projection::DEFAULT_ROWS, |rows| rows as usize)
+            .clamp(1, read_api::MAX_LIMIT),
+        Err(response) => return *response,
+    };
+    let projector = single(&params, "projector").map(str::to_owned);
+    let entity = single(&params, "entity").map(str::to_owned);
+
+    // Refused rather than queued: a projection is an interactive act, and holding the
+    // request open while two others fold five million events each answers nobody. The
+    // permit is held for the whole fold and released by its guard on every path out.
+    let Some(_slot) = runtime.projection_slot() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "1")],
+            Json(read_error(
+                "projections_busy",
+                &format!(
+                    "this deployment already has {} projection(s) folding; retry, or use \
+                     `hekla project` for work this size",
+                    runtime::PROJECTION_SLOTS
+                ),
+            )),
+        )
+            .into_response();
+    };
+
+    let sources = Arc::clone(runtime.sources());
+    let data_dir = runtime.data_dir().to_path_buf();
+    // The writer's own read handle, not a second follower: this is in the process that
+    // owns the log, so a follower would rescan the segment directory and rebuild an
+    // index per request for a snapshot it already has.
+    let store = runtime.store().clone();
+    let master = runtime.keystore().map(|keys| keys.masters().clone());
+    match tokio::task::spawn_blocking(move || {
+        let project = sources.compile(Some(loader::Scratch {
+            name: PROJECTION_MODULE,
+            source: &source,
+        }));
+        let findings = validate::findings(&project);
+        if validate::errors(&findings) > 0 {
+            // The compiler's own diagnostics, not a summary of them: a caller that sent
+            // source gets back the line and column it has to fix, which is the whole
+            // difference between this and a 500 saying something went wrong.
+            return Err(findings.iter().map(validate::render).collect::<Vec<_>>());
+        }
+        let request = projection::Request {
+            projector: projector.as_deref(),
+            entity: entity.as_deref(),
+            from,
+            upto,
+            max_events: Some(max_events),
+            decrypt,
+            rows,
+            master,
+        };
+        Ok(projection::run(
+            &project,
+            &store,
+            &data_dir,
+            &request,
+            &mut |_, _, _| {},
+        ))
+    })
+    .await
+    {
+        Ok(Ok(Ok(projection))) => {
+            audit_projection(&projection);
+            json_response(200, projection.json())
+        }
+        // A projection that did not compile, or one refused for a reason the caller
+        // chose (no projector in the source, a window that holds nothing, a sealed
+        // column with no master key): all of them are about the request.
+        Ok(Ok(Err(err))) => json_response(400, read_error("invalid_input", &format!("{err:#}"))),
+        Ok(Err(findings)) => json_response(
+            400,
+            json!({
+                "error": { "code": "invalid_input", "message": "the projector does not compile" },
+                "findings": findings,
+            }),
+        ),
+        Err(err) => task_panicked(err),
+    }
+}
+
+/// Record that a projection ran, and what it revealed.
+///
+/// **Unconditional**, unlike `introspect::Renderer::audit`, which logs only when it
+/// decrypted something. That is the right rule there, where the alternative is a line
+/// per page of a read-only browse. It is the wrong rule here: this is the one route
+/// that executes code a caller supplied over the whole log, and a projection that
+/// reveals nothing still read every event its handlers selected. A deployment that
+/// turned this on should be able to see, afterwards, that it was used and for what.
+///
+/// The digest is what makes the line worth keeping: it names the exact code that ran,
+/// though nothing about it was deployed or recorded anywhere else.
+fn audit_projection(projection: &projection::Projection) {
+    let revealed: usize = projection
+        .entities
+        .iter()
+        .map(|entity| entity.decrypted)
+        .sum();
+    tracing::info!(
+        "a projection ran `projector {}` ({}) over positions {}..={}, folding {} event(s) \
+         and revealing {revealed} subject field(s)",
+        projection.projector,
+        projection.digest,
+        projection.from,
+        projection.position,
+        projection.events,
+    );
 }
 
 /// `GET /admin/subjects`: which subjects still hold key material.

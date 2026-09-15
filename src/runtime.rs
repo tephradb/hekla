@@ -31,6 +31,7 @@ use tephra::{
 use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use heklang::Program;
 
@@ -58,6 +59,19 @@ use crate::tags;
 /// Individual event segments before rolling to a new file. 256 MiB matches
 /// tephra's own default sizing.
 const SEGMENT_SIZE: usize = 256 * 1024 * 1024;
+
+/// How many ad-hoc projections one runtime folds at once.
+///
+/// The per-request event budget bounds one fold; this bounds the endpoint. Without it a
+/// few concurrent requests at the ceiling would own tokio's blocking pool for minutes,
+/// and every other `/admin` read runs on that same pool, so browsing the log would stall
+/// behind somebody's question about it. Two, because a projection is an interactive act
+/// and neither an operator nor an agent needs three answers at once; queueing would hold
+/// the request open, so the third is refused and told to retry.
+///
+/// Per runtime rather than per process: two runtimes in one process are two deployments
+/// that share nothing else either.
+pub const PROJECTION_SLOTS: usize = 2;
 
 /// How many times a command re-runs its whole decision cycle on a DCB conflict
 /// before the runtime gives up and returns a concurrency conflict.
@@ -237,6 +251,11 @@ pub struct Runtime {
     config: Config,
     /// The resolved data directory, for the same reason.
     data_dir: PathBuf,
+    /// What the project was compiled from, so `POST /admin/projections` can compile one
+    /// more module against exactly what booted. See [`crate::loader::Sources`].
+    sources: Arc<loader::Sources>,
+    /// How many ad-hoc projections may fold at once. See [`PROJECTION_SLOTS`].
+    projections: Semaphore,
 }
 
 /// The log as a reader that must not disturb it sees it, or `None` when the directory
@@ -280,6 +299,10 @@ impl Runtime {
         master: Option<MasterKeys>,
     ) -> anyhow::Result<(Arc<Runtime>, WriteCoordinator, ProjectorSet, EffectRuntime)> {
         refuse_scratch(&project)?;
+        // Taken before the project is taken apart below, and kept for the process: an
+        // ad-hoc projection compiles against what booted rather than against whatever is
+        // on disk when a request arrives. See [`loader::Sources`].
+        let sources = Arc::clone(project.sources());
         // Taken before anything opens the log. tephra does not lock its segment
         // directory, so a second process here would corrupt it rather than fail.
         fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
@@ -414,6 +437,8 @@ impl Runtime {
             verify,
             config,
             data_dir: data_dir.to_path_buf(),
+            sources,
+            projections: Semaphore::new(PROJECTION_SLOTS),
         });
 
         // Effects need `Arc<Runtime>` (for `invoke_command` and the boundary fold), so they
@@ -515,6 +540,8 @@ impl Runtime {
             effects: OnceLock::new(),
             openapi_json: String::new(),
             config: project.config.clone(),
+            sources: Arc::clone(project.sources()),
+            projections: Semaphore::new(PROJECTION_SLOTS),
             data_dir: data_dir.to_path_buf(),
             _lock: Some(lock),
             // The sweep calls the checks directly. Leaving this off keeps a replay it
@@ -586,6 +613,8 @@ impl Runtime {
             effects: OnceLock::new(),
             openapi_json: String::new(),
             config: project.config.clone(),
+            sources: Arc::clone(project.sources()),
+            projections: Semaphore::new(PROJECTION_SLOTS),
             data_dir: data_dir.to_path_buf(),
             _lock: None,
             // Nothing here schedules work, so there is nothing for a continuous check to
@@ -1007,6 +1036,24 @@ impl Runtime {
     /// The effective configuration this process is running under.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// What this process compiled its project from.
+    ///
+    /// For compiling one more module against it. Deliberately the sources this runtime
+    /// booted with rather than the directory they came from: see [`loader::Sources`].
+    pub fn sources(&self) -> &Arc<loader::Sources> {
+        &self.sources
+    }
+
+    /// Claim one of this runtime's [`PROJECTION_SLOTS`], or `None` when they are taken.
+    ///
+    /// A permit rather than a counter, so a slot comes back even if the handler unwinds.
+    /// Public because holding the slots is the only honest way to watch the endpoint
+    /// refuse: racing two real folds to overlap would be a test that passes for timing
+    /// reasons.
+    pub fn projection_slot(&self) -> Option<SemaphorePermit<'_>> {
+        self.projections.try_acquire().ok()
     }
 
     /// The resolved data directory.

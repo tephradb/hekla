@@ -25,6 +25,7 @@ use serde_json::{Map, Value, json};
 
 use crate::introspect;
 use crate::loader::LoadedProject;
+use crate::projection;
 use crate::read_api;
 use crate::read_model::key_kind;
 use crate::schema::{EntityDef, EventDef, FieldKind, FieldMeta, InputSchema, ModuleDef};
@@ -178,8 +179,10 @@ actions, never automatic.";
 const INTROSPECTION_TAG_DESCRIPTION: &str = "\
 Read-only introspection: browse the event log, follow a request through the causal \
 chain it set off, see what a wedged effect actually did, and read back what this \
-process loaded and is configured with. Every endpoint here is a `GET` and none of \
-them writes; replaying a projector and skipping an effect stay under `operations`.\n\n\
+process loaded and is configured with. Nothing here changes the deployment: replaying \
+a projector and skipping an effect stay under `operations`. All of it is a `GET` but \
+one, and that one, `POST /admin/projections`, writes nothing either: it folds a \
+projector that is never deployed into a read model that is thrown away.\n\n\
 Like the rest of this API, none of it is authenticated. The bind address is the \
 boundary, and it defaults to loopback. A single prefix is what lets a deployment that \
 binds wider deny it in a proxy.";
@@ -289,7 +292,7 @@ impl ComponentNames {
 }
 
 /// The schemas that are always present, whatever the project declares.
-const FIXED_SCHEMAS: [&str; 23] = [
+const FIXED_SCHEMAS: [&str; 24] = [
     "ErrorDetail",
     "Error",
     "CommandError",
@@ -313,6 +316,7 @@ const FIXED_SCHEMAS: [&str; 23] = [
     "DeclarationSummary",
     "SystemInfo",
     "SubjectEntry",
+    "Projection",
 ];
 
 /// Every kind a `declaration` row can carry: heklang's set minus `test`.
@@ -991,8 +995,157 @@ fn introspection_paths(surface: &Surface) -> Vec<(String, Value)> {
         (server::ADMIN_SYSTEM_ROUTE.to_owned(), system_path()),
         (server::ADMIN_SUBJECTS_ROUTE.to_owned(), subjects_path()),
         (server::ADMIN_SUBJECT_ROUTE.to_owned(), subject_path()),
+        (
+            server::ADMIN_PROJECTIONS_ROUTE.to_owned(),
+            projections_path(),
+        ),
         (server::ADMIN_ASSETS_ROUTE.to_owned(), assets_path()),
     ]
+}
+
+/// `/admin/projections`: the limits, and folding one.
+///
+/// The one path here that answers a `POST`, and the reason the `GET` exists at all: a
+/// caller has to be able to ask what this deployment serves, and whether it serves this
+/// at all, without spending a fold to find out.
+fn projections_path() -> Value {
+    let limits = json!({
+        "type": "object",
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": "Whether `POST` is served. `[admin] projections` in hekla.toml, \
+                    off by default.",
+            },
+            "max_events": {
+                "type": "object",
+                "properties": {
+                    "default": { "type": "integer" },
+                    "limit": { "type": "integer" },
+                },
+                "required": ["default", "limit"],
+                "additionalProperties": false,
+            },
+            "rows": {
+                "type": "object",
+                "properties": {
+                    "default": { "type": "integer" },
+                    "limit": { "type": "integer" },
+                },
+                "required": ["default", "limit"],
+                "additionalProperties": false,
+            },
+            "log_head": position_schema("The log's head position, which bounds `upto`."),
+        },
+        "required": ["enabled", "max_events", "rows", "log_head"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "projection_limits",
+            "summary": "whether ad-hoc projections are served, and within what",
+            "description": "Always answers, including when the `POST` is disabled, so a \
+                refusal is discoverable rather than a bare 403. It is also how a client \
+                learns the event budget before spending one.",
+            "responses": { "200": response("the limits", limits) },
+        },
+        "post": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "run_projection",
+            "summary": "fold an ad-hoc projector over the log",
+            "description": "The request body is a heklang `projector` declaration, as \
+                text. It is compiled against the project this process booted with, folded \
+                over the log through a read-only follower, and thrown away: nothing is \
+                deployed, no declaration is recorded, no read model is written, and no \
+                data-directory lock is taken. The response is what `hekla project --json` \
+                prints.\n\nBounded by the server rather than by the caller: `max_events` \
+                defaults well below its limit and is clamped to it, because this folds a \
+                log where every other endpoint here reads a page. A whole-log fold is \
+                `hekla project`'s job, which holds no request open while it runs one.\n\n\
+                Disabled by default. Submitted heklang is the only thing on this surface \
+                not fenced by what the project declares, so a deployment has to say yes \
+                to it; what bounds it once enabled is that heklang is total and a \
+                projector holds no clock, no network and no way to append.",
+            "parameters": [
+                query_param(
+                    "projector",
+                    "Which projector to fold, when the body declares more than one.",
+                    json!({ "type": "string" }),
+                ),
+                query_param(
+                    "entity",
+                    "Report only this entity. The default reports every one declared.",
+                    json!({ "type": "string" }),
+                ),
+                query_param(
+                    "from",
+                    "Fold only from this position, inclusive. A narrowed window narrows \
+                     the answer: a row whose first event is below it is missing or partial.",
+                    json!({ "type": "integer", "minimum": 0 }),
+                ),
+                query_param(
+                    "upto",
+                    "Stop at this position instead of the log's tip. Clamped to the tip, \
+                     which a follower cannot read past.",
+                    json!({ "type": "integer", "minimum": 0 }),
+                ),
+                query_param(
+                    "max_events",
+                    &format!(
+                        "Matching events to fold. Larger values are clamped to {} rather \
+                         than rejected, and a run that spends its budget says so in \
+                         `scanned.stopped`.",
+                        projection::SERVED_MAX_EVENTS
+                    ),
+                    json!({
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": projection::SERVED_DEFAULT_EVENTS,
+                    }),
+                ),
+                query_param(
+                    "rows",
+                    &format!(
+                        "Rows to return per entity. Clamped to {}; each entity reports \
+                         its full `row_count` either way.",
+                        read_api::MAX_LIMIT
+                    ),
+                    json!({
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": projection::DEFAULT_ROWS,
+                    }),
+                ),
+                decrypt_param(),
+            ],
+            "requestBody": {
+                "required": true,
+                "content": {
+                    "text/plain": {
+                        "schema": {
+                            "type": "string",
+                            "description": "A heklang `projector` declaration.",
+                        },
+                    },
+                },
+            },
+            "responses": {
+                "200": response("the rows the projector built", schema_ref("Projection")),
+                "400": response(
+                    "the projector does not compile, or the request asks for something \
+                     this projection cannot answer. A compile failure carries a \
+                     `findings` array of the compiler's own diagnostics.",
+                    schema_ref("Error"),
+                ),
+                "403": response(
+                    "this deployment does not serve ad-hoc projections",
+                    schema_ref("Error"),
+                ),
+                "500": response("internal error", schema_ref("Error")),
+            },
+        }
+    })
 }
 
 /// `GET /admin/assets/{file}`: one file of the bundled console.
@@ -1704,6 +1857,7 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     );
     out.insert("SystemInfo".to_owned(), system_info_schema());
     out.insert("SubjectEntry".to_owned(), subject_entry_schema());
+    out.insert("Projection".to_owned(), projection_schema());
     for (event_type, def) in &surface.events {
         out.insert(
             names.event(event_type).to_owned(),
@@ -1723,6 +1877,124 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
         "FIXED_SCHEMAS seeds the name assignment, so it must list exactly what is inserted above"
     );
     Value::Object(out)
+}
+
+/// What one ad-hoc projection found.
+///
+/// The same value `hekla project --json` prints, so the two transports carry one shape.
+/// A row is an object of the entity's own columns, which vary per submitted projector,
+/// so rows are `additionalProperties: true` where every other schema here is closed.
+fn projection_schema() -> Value {
+    let subject = json!({
+        "type": "object",
+        "properties": { "column": { "type": "string" }, "subject": { "type": "string" } },
+        "required": ["column", "subject"],
+        "additionalProperties": false,
+    });
+    let entity = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string", "description": "The `@key` column, which rows order by." },
+            "columns": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Declared columns in declaration order.",
+            },
+            "sealed": {
+                "type": "array",
+                "items": subject,
+                "description": "Subject-scoped columns and the sibling naming their key. \
+                    A blank cell in one of these may be an erasure; a blank cell anywhere \
+                    else cannot be.",
+            },
+            "row_count": { "type": "integer", "description": "Rows the fold built, not rows returned." },
+            "truncated": { "type": "boolean", "description": "Whether `rows` is a prefix of them." },
+            "stale": {
+                "type": "object",
+                "description": "Cells that would not open under a live key, counted over the \
+                    rows returned rather than over the entity.",
+                "properties": {
+                    "cells": { "type": "integer" },
+                    "of_rows_shown": { "type": "integer" },
+                },
+                "required": ["cells", "of_rows_shown"],
+                "additionalProperties": false,
+            },
+            "rows": {
+                "type": "array",
+                "items": { "type": "object", "additionalProperties": true },
+                "description": "One object per row, keyed by column. A column the row does \
+                    not carry is absent: an unset optional, or a value whose subject key is \
+                    gone.",
+            },
+        },
+        "required": ["name", "key", "columns", "sealed", "row_count", "truncated", "stale", "rows"],
+        "additionalProperties": false,
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "projector": { "type": "string" },
+            "source": { "type": "string", "description": "The module name it was compiled under." },
+            "digest": {
+                "type": "string",
+                "description": "The projector's heklang digest hash, so a result is \
+                    attributable to exact code though nothing about it was deployed.",
+            },
+            "sources": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The event types its handlers select: its whole subscription.",
+            },
+            "window": {
+                "type": "object",
+                "properties": {
+                    "from": position_schema("The first position folded, inclusive."),
+                    "upto": position_schema("The last, after clamping to the tip."),
+                    "head": position_schema("The tip the follower pinned when it opened."),
+                },
+                "required": ["from", "upto", "head"],
+                "additionalProperties": false,
+            },
+            "scanned": {
+                "type": "object",
+                "properties": {
+                    "events": { "type": "integer", "description": "Matching events folded." },
+                    "position": position_schema("The position these rows are the answer as of."),
+                    "stopped": {
+                        "type": ["string", "null"],
+                        "enum": ["max-events", null],
+                        "description": "Null when the window was covered. Anything else means \
+                            these rows are part of the answer and not all of it.",
+                    },
+                },
+                "required": ["events", "position", "stopped"],
+                "additionalProperties": false,
+            },
+            "shredded": {
+                "type": "object",
+                "description": "Sealed column writes the fold dropped because the subject's \
+                    key is gone, counted where the decision was taken. An optional the \
+                    handler never wrote is never counted here.",
+                "properties": {
+                    "writes": { "type": "integer" },
+                    "subjects": { "type": "integer" },
+                },
+                "required": ["writes", "subjects"],
+                "additionalProperties": false,
+            },
+            "decrypt": { "type": "boolean" },
+            "row_limit": { "type": "integer" },
+            "truncated": { "type": "boolean", "description": "Whether any entity held back rows." },
+            "entities": { "type": "array", "items": entity },
+        },
+        "required": [
+            "projector", "source", "digest", "sources", "window", "scanned",
+            "shredded", "decrypt", "row_limit", "truncated", "entities"
+        ],
+        "additionalProperties": false,
+    })
 }
 
 fn error_detail_schema() -> Value {
@@ -2860,8 +3132,14 @@ fn system_info_schema() -> Value {
                         "required": ["enabled"],
                         "additionalProperties": false,
                     },
+                    "admin": {
+                        "type": "object",
+                        "properties": { "projections": { "type": "boolean" } },
+                        "required": ["projections"],
+                        "additionalProperties": false,
+                    },
                 },
-                "required": ["effects", "retention", "projectors", "verify"],
+                "required": ["effects", "retention", "projectors", "verify", "admin"],
                 "additionalProperties": false,
             },
         },

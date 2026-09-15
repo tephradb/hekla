@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -459,7 +459,12 @@ pub fn serve(asset: &'static Asset, headers: &HeaderMap) -> Response {
 /// URL as JSON and reports the 404 itself, rather than the browser showing a bare
 /// error document.
 pub async fn negotiate(request: Request, next: Next) -> Response {
-    if wants_html(request.headers()) {
+    // A view is something you can open, so only a `GET` can be one. Without this a
+    // `POST /admin/projections` from an HTML form, or from any client that lists
+    // `text/html` first, would short-circuit into the console shell: 200, a web page,
+    // and the projector never compiled or folded. The 405 this used to guard against is
+    // unaffected, because a method the route does not serve never reaches this layer.
+    if request.method() == Method::GET && wants_html(request.headers()) {
         // Only a development override touches the disk. With none configured this is a
         // table lookup and a refcount bump, so dispatching to the blocking pool would
         // cost more than the work it moves off the runtime.

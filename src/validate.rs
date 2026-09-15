@@ -14,7 +14,7 @@
 use heklang::ir::{Command, Slice, Type};
 use heklang::{Defs, Program};
 
-use crate::loader::{Finding, LoadedProject, ProjectorUnit, Span};
+use crate::loader::{Finding, LoadedProject, ProjectorUnit, Severity, Span};
 use crate::schema::{EventDef, FieldKind, event_type};
 use crate::tags::RESERVED_TAG_PREFIX;
 
@@ -22,6 +22,58 @@ use crate::tags::RESERVED_TAG_PREFIX;
 /// boundary is a subset match, and one that names nearly every field usually matches
 /// nothing.
 const OVER_CONSTRAINT_RATIO: f64 = 0.75;
+
+/// Everything wrong with a loaded project: the loader's findings plus [`check`]'s,
+/// sorted by location and then by position.
+///
+/// Here rather than in `cli`, because it is not a CLI concern. `hekla check` reports
+/// these, `hekla test` refuses over them, and `POST /admin/projections` hands them back
+/// to whoever posted the source; a server reaching into the CLI module to format a
+/// diagnostic would have the dependency the wrong way round.
+pub fn findings(project: &LoadedProject) -> Vec<Finding> {
+    let mut findings = project.findings.clone();
+    findings.extend(check(project));
+    findings.sort_by(|left, right| {
+        let position = |finding: &Finding| finding.span.map(|span| (span.line, span.column));
+        left.location
+            .cmp(&right.location)
+            .then_with(|| position(left).cmp(&position(right)))
+    });
+    findings
+}
+
+/// One finding as a line: `<severity>: <location>[:line:col]: <message>`, with the
+/// compiler's hint on a following `  = ` line when there is one.
+///
+/// One rendering, wherever a finding surfaces: `hekla check` on stdout, `hekla openapi`
+/// and `hekla project` on stderr so their stdout stays parseable, and the `findings`
+/// array of a 400 from `POST /admin/projections`.
+pub fn render(finding: &Finding) -> String {
+    let severity = match finding.severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+    };
+    // Spans are 0-based; editors and humans count from one.
+    let at = match finding.span {
+        Some(span) => format!(":{}:{}", span.line + 1, span.column + 1),
+        None => String::new(),
+    };
+    let line = format!("{severity}: {}{at}: {}", finding.location, finding.message);
+    // heklang carries the fix on a separate hint, and a diagnostic that names the
+    // problem without it is the worse half of the message.
+    match &finding.hint {
+        Some(hint) => format!("{line}\n  = {hint}"),
+        None => line,
+    }
+}
+
+/// How many findings are errors, which is what every load-and-refuse path branches on.
+pub fn errors(findings: &[Finding]) -> usize {
+    findings
+        .iter()
+        .filter(|finding| finding.severity == Severity::Error)
+        .count()
+}
 
 /// Every finding for a loaded project. The loader has already reported anything that
 /// stopped a declaration parsing; these are the ones that need the whole picture.

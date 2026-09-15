@@ -109,6 +109,7 @@ one under `tests/` does.
 | pin the API in CI | `hekla openapi . > openapi.json` and diff it |
 | see what the log actually holds | `GET /admin/events`, or open `/admin` in a browser |
 | count or group the log once, without deploying | write a `projector` in a scratch `.hk` and `hekla project <file> <dir>` |
+| ask the same thing of a server you have no shell on | `[admin] projections = true`, then `POST /admin/projections` with the source as the body |
 | back up | copy the data directory of a stopped process |
 
 ## What each subcommand needs
@@ -149,6 +150,7 @@ defaults to `127.0.0.1`.
 | `GET /metrics` | Prometheus text format: the same state as `/status`, plus counters and rates |
 | `GET /openapi.json`, `GET /docs` | the generated document, and a reference over it |
 | `GET /admin/...` | read-only introspection, or the console when `Accept: text/html` |
+| `POST /admin/projections` | folds an ad-hoc `projector` (body: the source) over the log. Needs `[admin] projections = true`, else 403 |
 
 A command's success body is `{correlation_id, causation_id, positions: {first, last}, events: [...]}`,
 and every error body is `{correlation_id, causation_id, error: {code, message}}` (the two ids are

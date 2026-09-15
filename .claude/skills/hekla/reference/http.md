@@ -205,7 +205,12 @@ Internal commands are absent, because they are not routed.
 
 ## `/admin` and the console
 
-Read-only, `GET` only, and served from the same URLs as the JSON: a request whose `Accept` names
-`text/html` gets the console, anything else (including `*/*`, which is what curl and a bare `fetch()`
-send) gets the JSON byte for byte. Responses carry `Vary: Accept`. An unrouted `/admin/...` is a 404
-even for a browser. See `introspection.md`.
+Nothing here changes the deployment, and it is served from the same URLs as the JSON: a request whose
+`Accept` names `text/html` gets the console, anything else (including `*/*`, which is what curl and a
+bare `fetch()` send) gets the JSON byte for byte. Responses carry `Vary: Accept`. An unrouted
+`/admin/...` is a 404 even for a browser. See `introspection.md`.
+
+All of it is a `GET` but one. `POST /admin/projections` folds an ad-hoc heklang `projector` over the
+log and returns its rows, deploying nothing and writing nothing; it needs `[admin] projections =
+true` in `hekla.toml` and answers 403 otherwise. The body is the source as `text/plain`, the knobs
+are query parameters, and the response is what `hekla project --json` prints.

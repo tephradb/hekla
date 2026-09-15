@@ -8,9 +8,26 @@
 //!
 //! It sits beside [`crate::plan`] rather than under the runtime, for the same reason:
 //! both run code that has not been deployed against a directory that may be serving
-//! traffic. The log is read through a tephra follower, so no lock is taken and nothing is
-//! created; the rows land in a throwaway read model in a temporary directory, the way
-//! `hekla test` and [`crate::verify`] already build one.
+//! traffic. No data-directory lock is taken either way, and the rows land in a throwaway
+//! read model in a temporary directory, the way `hekla test` and [`crate::verify`]
+//! already build one.
+//!
+//! **The caller supplies the log handle**, because only the caller knows where the
+//! writer is. `hekla project` is a separate process and opens a follower: read-only
+//! descriptors, nothing created, a committed prefix pinned at open. A served projection
+//! is inside the writer's own process and passes the coordinator's read handle, which is
+//! what tephra's `Follower` documentation asks for ("In-process, prefer the
+//! coordinator's own `ReadHandle`: it shares the writer's snapshot with no lag and no
+//! second scan").
+//!
+//! **One thing is opened for writing**, and only when the projector seals a column: the
+//! operational database, for the subject keys. [`crate::opdb::OpDb::open`] takes a
+//! read-write connection and would migrate, so the schema version is read separately
+//! first and a mismatch refuses, exactly as `hekla plan` does. It is a connection of its
+//! own rather than the runtime's, because `encrypt_subject_existing` takes that store's
+//! mutex on every sealed write and the runtime's is shared with each effect's hot path.
+//! Nothing in `hekla.db` changes; the mark it can leave is SQLite's own, a `-wal` and
+//! `-shm` pair for the length of the call.
 //!
 //! **The rows go through the real sink.** [`crate::heklang_host::RowWriter`] writes them,
 //! not an in-memory map, and that is a correctness requirement rather than a convenience.
@@ -54,14 +71,34 @@ use crate::progress::thousands;
 use crate::projector::{self, Stopped, Window};
 use crate::read_api;
 use crate::read_model::ReadModel;
-use crate::runtime;
-use crate::schema::{EntityDef, ModuleDef, scalar_to_string};
+use crate::schema::{EntityDef, ModuleDef};
+use crate::store::Store;
 
 /// Rows kept per entity when the caller names no limit.
 ///
 /// `read_api::DEFAULT_LIMIT` deliberately: an operator comparing an ad-hoc projection
 /// against `GET /read/...` should be shown the same amount of it by both.
 pub const DEFAULT_ROWS: usize = read_api::DEFAULT_LIMIT;
+
+/// The events a *served* projection folds when the caller names no budget.
+///
+/// About a second at the measured 11µs an event (`tests/measure.rs`), which is what a
+/// request can spend without a proxy or a person losing patience. The CLI has no such
+/// default and wants none: it holds no request open, runs in its own process, and
+/// folding a whole log is the job it exists for.
+pub const SERVED_DEFAULT_EVENTS: u64 = 100_000;
+
+/// The most a served projection folds however large a budget the caller asks for.
+///
+/// Clamped rather than refused, the way the read API clamps a page size. Past this the
+/// answer belongs to `hekla project`, which is the division that keeps the two surfaces
+/// from being redundant: the endpoint is for an interactive question over a bounded
+/// window, the CLI is for the whole log.
+///
+/// A sealed projection is meaningfully slower per event than an unsealed one, because
+/// every row write is a key load and an unwrap, so treat this as optimistic and let
+/// [`Stopped`] say when it bit.
+pub const SERVED_MAX_EVENTS: u64 = 5_000_000;
 
 /// What to project, and over how much of the log.
 pub struct Request<'a> {
@@ -131,6 +168,12 @@ pub struct Entity {
     /// the report and the JSON say which rows this is out of rather than leaving the two
     /// numbers to read as one.
     pub stale: usize,
+    /// Sealed cells opened on the way out, over the same rows `stale` covers.
+    ///
+    /// Counted so a served projection can audit what it revealed the way
+    /// [`crate::introspect::Renderer::audit`] does. The read API is the one decrypt path
+    /// that does not audit, and its own doc calls that a gap not to copy.
+    pub decrypted: usize,
 }
 
 impl Entity {
@@ -176,13 +219,20 @@ pub struct Projection {
 /// the ad-hoc projector into `project.projectors` beside the deployed ones, built the
 /// same way and special-cased nowhere below this.
 ///
-/// `progress` is called once a batch with the position reached, the position the window
-/// ends at, and the events folded so far. The window end comes from here rather than
-/// from the caller because only this function has opened the follower, and the tip it
-/// pinned is the only honest denominator: a caller guessing one would be reporting
-/// against a number the fold is not working towards.
+/// `store` is what the log is read through, and the caller picks it because only the
+/// caller knows where the writer is. `hekla project` runs in its own process and opens a
+/// follower ([`crate::runtime::follow`]): read-only descriptors, no lock, a prefix pinned
+/// at open. A served projection is in the writer's own process and passes the
+/// coordinator's read handle instead, which tephra's own `Follower` doc asks for: it
+/// shares the writer's snapshot with no lag and no second scan, where a follower per
+/// request would rescan the segment directory and rebuild an index every time.
+///
+/// `progress` is called once a batch with the position reached *within the window*, the
+/// width of that window, and the events folded so far. Window-relative rather than
+/// absolute, so a `from`-bounded scan does not open at ninety percent.
 pub fn run(
     project: &LoadedProject,
+    store: &Store,
     data_dir: &Path,
     request: &Request<'_>,
     progress: &mut dyn FnMut(Position, Position, usize),
@@ -210,22 +260,16 @@ pub fn run(
     }
 
     let keystore = open_keystore(&unit.entities, data_dir, request.master.clone())?;
-    let Some(store) = runtime::follow(data_dir)? else {
-        anyhow::bail!(
-            "no event log at {}, so there is nothing to project over",
-            data_dir.join("events").display()
-        );
-    };
 
-    // The tip the follower pinned when it opened bounds everything: a position above it
-    // is not readable through this handle, so accepting one would report a window that
-    // was never covered.
+    // Whatever the caller reads through bounds everything: a position above its head is
+    // not readable, so accepting one would report a window that was never covered.
     let head = store.head();
     let from = Position::new(request.from.unwrap_or_default());
-    // A window that cannot hold anything is refused rather than folded. Both of these
-    // come back as a clean `ok: 0 row(s)` otherwise, which an operator who typed one
-    // digit too many reads as "the projector matched nothing in the whole log": the
-    // worst answer this command could give, because it is a wrong one that looks right.
+    // A window or a budget that cannot hold anything is refused rather than folded.
+    // Every one of these comes back as a clean `ok: 0 row(s)` otherwise, which an
+    // operator who typed one digit too many reads as "the projector matched nothing in
+    // the whole log": the worst answer this command could give, because it is a wrong
+    // one that looks right.
     if let Some(upto) = request.upto
         && from.get() > upto
     {
@@ -234,10 +278,19 @@ pub fn run(
             from.get()
         );
     }
+    // Positions are 1-based and dense, so a window ending at zero names no position at
+    // all. The clap parser and the served handler each refuse this a layer above, which
+    // is exactly why it belongs here too: a library caller reaches neither.
+    if request.upto == Some(0) {
+        anyhow::bail!("--upto 0 names no position; the log starts at 1");
+    }
+    if request.max_events == Some(0) {
+        anyhow::bail!("a budget of zero folds nothing while reporting a budget");
+    }
     if from.get() > head.get() {
         anyhow::bail!(
-            "--from {} is above position {}, which is the whole log this follower can \
-             see, so the window holds nothing",
+            "--from {} is above position {}, which is the whole log readable here, so \
+             the window holds nothing",
             from.get(),
             head.get()
         );
@@ -257,14 +310,20 @@ pub fn run(
     let model = ReadModel::open(&dir.path().join("projection.db"), &unit.entities)?;
     let mut shredded = Shredded::default();
     let scanned = projector::project_reading(
-        &store,
+        store,
         unit,
         &project.program,
         keystore.as_deref(),
         &model,
         window,
         &mut shredded,
-        &mut |position, matched| progress(position, upto, matched),
+        // Window-relative: a scan bounded by `from` has not covered `from` positions of
+        // anything, and a bar that opens near the end is worse than no bar.
+        &mut |position, matched| {
+            let done = Position::new(position.get().saturating_sub(from.get()));
+            let width = Position::new(upto.get().saturating_sub(from.get()));
+            progress(done, width, matched)
+        },
     )?;
 
     let mut entities = Vec::new();
@@ -430,7 +489,7 @@ fn read_entity(
         .filter_map(|(name, meta)| meta.subject.as_ref().map(|s| (name.clone(), s.clone())))
         .collect();
 
-    let mut stale = 0;
+    let mut revealed = read_api::Revealed::default();
     if decrypt
         && !sealed.is_empty()
         && let Some(keystore) = keystore
@@ -439,40 +498,7 @@ fn read_entity(
         // key once rather than per row.
         let decryptor = keystore.row_decryptor();
         for row in &mut rows {
-            let Some(obj) = row.as_object_mut() else {
-                continue;
-            };
-            for (name, meta) in &entity.fields {
-                let Some(subject) = &meta.subject else {
-                    continue;
-                };
-                let Some(ciphertext) = obj.get(name).and_then(Value::as_str).map(str::to_owned)
-                else {
-                    continue;
-                };
-                let id = obj.get(subject).and_then(scalar_to_string);
-                let plaintext = match &id {
-                    Some(id) => decryptor.decrypt(subject, id, name, &ciphertext)?,
-                    // No subject id to key on, so the value is unreadable.
-                    None => None,
-                };
-                match plaintext {
-                    Some(text) => {
-                        obj.insert(name.clone(), read_api::typed_from_string(&meta.kind, text));
-                    }
-                    None => {
-                        // The key is live and this value still will not open: it was
-                        // written under one that has since been superseded. Worth its own
-                        // count, because unlike an erasure it is not permanent.
-                        if id.is_some_and(|id| decryptor.key_present(subject, &id) == Some(true)) {
-                            stale += 1;
-                        }
-                        // Removed rather than kept, so a cell reads absent exactly as the
-                        // read API would serve it.
-                        obj.remove(name);
-                    }
-                }
-            }
+            read_api::decrypt_row(entity, row, &decryptor, Some(&mut revealed))?;
         }
     }
 
@@ -483,7 +509,8 @@ fn read_entity(
         sealed,
         row_count,
         rows,
-        stale,
+        stale: revealed.stale,
+        decrypted: revealed.decrypted,
     })
 }
 

@@ -352,6 +352,12 @@ folds from the start of its window, so a question asked on every request is a de
 a projection. And nothing appended during the run, because the follower pinned its prefix when it
 opened.
 
+**Over HTTP** the same fold is `POST /admin/projections`, for a caller with no shell on the box. It
+needs `[admin] projections = true` in `hekla.toml`, bounds the event budget itself rather than
+letting the caller do it, and returns exactly what `--json` prints here. See
+`reference/introspection.md`. A whole-log fold stays this command's job: it holds no request open
+while it runs one.
+
 ## `hekla openapi [DIR]`
 
 Prints the generated OpenAPI 3.1 document to stdout and every finding to stderr, so

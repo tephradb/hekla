@@ -10,7 +10,7 @@ mod support;
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use hekla::loader::{LoadedProject, Scratch};
 use hekla::projection::{self, Request};
@@ -69,13 +69,10 @@ fn sealed_request() -> Request<'static> {
 }
 
 fn load(dir: &Path, source: &str) -> LoadedProject {
-    LoadedProject::load_with(
-        dir,
-        Some(Scratch {
-            name: SCRATCH,
-            source,
-        }),
-    )
+    LoadedProject::load(dir).with_scratch(Scratch {
+        name: SCRATCH,
+        source,
+    })
 }
 
 /// Fold `source` over `data_dir` with everything at its default.
@@ -91,7 +88,22 @@ fn project_with(
 ) -> projection::Projection {
     let project = load(dir, source);
     assert!(!project.has_errors(), "{:?}", project.findings);
-    projection::run(&project, data_dir, &request, &mut |_, _, _| {}).expect("the projection ran")
+    projection::run(
+        &project,
+        &follower(data_dir),
+        data_dir,
+        &request,
+        &mut |_, _, _| {},
+    )
+    .expect("the projection ran")
+}
+
+/// The log as `hekla project` reads it: a follower over a directory this process does
+/// not own, which is the seam the CLI passes and the server does not.
+fn follower(data_dir: &Path) -> hekla::store::Store {
+    hekla::runtime::follow(data_dir)
+        .expect("opening a follower")
+        .expect("the fixture wrote a log")
 }
 
 /// One entity's rows, by name.
@@ -254,17 +266,46 @@ fn a_window_that_holds_nothing_is_refused() {
         from: Some(100),
         ..Request::default()
     };
-    let Err(err) = projection::run(&project, data.path(), &above, &mut |_, _, _| {}) else {
+    let Err(err) = projection::run(
+        &project,
+        &follower(data.path()),
+        data.path(),
+        &above,
+        &mut |_, _, _| {},
+    ) else {
         panic!("a window above the log holds nothing")
     };
     assert!(format!("{err:#}").contains("the whole log"), "{err:#}");
+
+    // Positions are 1-based, so a window ending at zero is the same mistake with a
+    // different digit, and it must not come back as a clean empty answer either.
+    let empty = Request {
+        upto: Some(0),
+        ..Request::default()
+    };
+    let Err(err) = projection::run(
+        &project,
+        &follower(data.path()),
+        data.path(),
+        &empty,
+        &mut |_, _, _| {},
+    ) else {
+        panic!("a window ending below the first position holds nothing")
+    };
+    assert!(format!("{err:#}").contains("names no position"), "{err:#}");
 
     let inverted = Request {
         from: Some(5),
         upto: Some(2),
         ..Request::default()
     };
-    let Err(err) = projection::run(&project, data.path(), &inverted, &mut |_, _, _| {}) else {
+    let Err(err) = projection::run(
+        &project,
+        &follower(data.path()),
+        data.path(),
+        &inverted,
+        &mut |_, _, _| {},
+    ) else {
         panic!("a window whose start is above its end holds nothing")
     };
     assert!(format!("{err:#}").contains("is above --upto"), "{err:#}");
@@ -313,7 +354,9 @@ fn a_window_bounds_the_fold() {
         "the first event is below the window"
     );
     assert!(
-        projection.to_string().contains("the window starts at position 2"),
+        projection
+            .to_string()
+            .contains("the window starts at position 2"),
         "{projection}"
     );
 }
@@ -435,8 +478,12 @@ fn a_projector_with_no_handler_is_refused() {
         &dir,
         "projector Silent { entity Thing { id: String @key @max(20) } }",
     );
+    // An empty store, because the refusal lands before anything is read: a projector
+    // that selects no events is caught from its declaration alone.
+    let (_coordinator, store) = support::open_store(data.path());
     let Err(err) = projection::run(
         &project,
+        &store,
         data.path(),
         &Request::default(),
         &mut |_, _, _| {},
@@ -639,6 +686,7 @@ fn a_sealed_projection_is_refused_without_a_master_key() {
     let project = load(orders.path(), BY_CUSTOMER);
     let Err(err) = projection::run(
         &project,
+        &follower(data.path()),
         data.path(),
         &Request::default(),
         &mut |_, _, _| {},
@@ -652,7 +700,7 @@ fn a_sealed_projection_is_refused_without_a_master_key() {
 
 // --- the CLI surface -------------------------------------------------------
 
-fn run_cli(args: &[&str]) -> std::process::Output {
+fn run_cli(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hekla"))
         .args(args)
         .output()
