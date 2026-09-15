@@ -771,14 +771,14 @@ mod tests {
 effect Alpha {
   on @e.one as one { @key id } {
     let reply = http.post("https://example.test/alpha", { "id": one.id })
-    if reply.status >= 400 { fail("alpha rejected") }
+    if reply.status >= 400 { fail "alpha rejected" }
   }
 }
 
 effect Beta {
   on @e.two as two { @key id } {
     let reply = http.post("https://example.test/beta", { "id": two.id })
-    if reply.status >= 400 { fail("beta rejected") }
+    if reply.status >= 400 { fail "beta rejected" }
   }
 }
 "#;
@@ -836,7 +836,7 @@ effect Alpha {
     // Tell the alpha service.
     let response  =  http.post("https://example.test/alpha", { "id": triggering.id })
     if response.status >= 400 {
-      fail("alpha rejected")
+      fail "alpha rejected"
     }
   }
 }
@@ -844,7 +844,7 @@ effect Alpha {
 effect Beta {
   on @e.two as two { @key id } {
     let reply = http.post("https://example.test/beta", { "id": two.id })
-    if reply.status >= 400 { fail("beta rejected") }
+    if reply.status >= 400 { fail "beta rejected" }
   }
 }
 "#;

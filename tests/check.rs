@@ -210,7 +210,7 @@ guard ThingExists(thing_id: Uuid) {
     on @thing.happened(thing_id) => true
 
   if !seen {
-    return reject NoSuchThing
+    reject NoSuchThing
   }
 }
 "#,
@@ -570,7 +570,7 @@ command SignUp(person_id: Uuid) {
     on @person.signed_up(active: true) => true
 
   if seen {
-    return reject Busy
+    reject Busy
   }
 
   emit @person.signed_up { person_id, active: true }
@@ -612,7 +612,7 @@ command SignUp(person_id: Uuid, email: String, plan: String, region: String) {
     on @person.signed_up(person_id, email, plan, region) => true
 
   if seen {
-    return reject Dup
+    reject Dup
   }
 
   emit @person.signed_up { person_id, email, plan, region }
@@ -647,7 +647,7 @@ command DoThing(thing_id: Uuid) {
     on @thing.happened(thing_id) => true
 
   if seen {
-    return reject Dup
+    reject Dup
   }
 
   emit @thing.happened { thing_id, note: "" }
@@ -695,7 +695,7 @@ command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
     on @account.registered(handle) => true
 
   if taken {
-    return reject HandleTaken
+    reject HandleTaken
   }
 
   emit @account.registered { account_id, handle, email }

@@ -816,9 +816,9 @@ dependencies = [
 
 [[package]]
 name = "heklang"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27a0be421f148a99e621bfc9752e7604ca7090e7ebd636c6d727d3a091d30d9b"
+checksum = "4424e6bfef3d113bc0b5c22d927f66aa264401517901a15517342b173dc7a95e"
 dependencies = [
  "sha2",
  "uuid",

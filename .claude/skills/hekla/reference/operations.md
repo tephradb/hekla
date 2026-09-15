@@ -95,7 +95,7 @@ A wedge outranks lag because a wedged effect lags precisely because it is wedged
 - `consecutive_failures` and `last_error` are the wedge. `last_error` carries the arm's own source
   location, which is usually enough to name the call that will not complete.
 - `terminal_skips` and `last_terminal_error` are the opposite: work that was abandoned deliberately
-  and advanced past. An author's `fail(...)` and a `reveal` of an erased subject both land here.
+  and advanced past. An author's `fail` and a `reveal` of an erased subject both land here.
 - `retry_in_ms` is how long until the next attempt.
 
 
@@ -216,7 +216,7 @@ their side effects fire twice. An effect that has never persisted a watermark is
 
 **A wedged lane therefore holds retention down for every lane.** The watermark cannot pass a stuck
 position, so a lane wedged for a month makes a month of journal rows unsweepable across the whole
-effect. The lag figure is not the thing that hurts; this is. `fail(...)` and an operator skip are
+effect. The lag figure is not the thing that hurts; this is. `fail` and an operator skip are
 what resolve it, which is why `/status` names the pinning key.
 
 ### Deploys

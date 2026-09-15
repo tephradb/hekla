@@ -24,7 +24,7 @@ command OpenTicket(
     return
   }
   if in_org >= ORG_CAP {
-    return reject OrgFull
+    reject OrgFull
   }
 
   emit @ticket.opened {

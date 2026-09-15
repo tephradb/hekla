@@ -54,7 +54,7 @@ command PlaceOrder(order_id: Uuid, customer_id: Int, shop_id: Int, email: String
     return
   }
   if sold >= 100 {
-    return reject SoldOut
+    reject SoldOut
   }
 
   emit @order.placed { order_id, customer_id, shop_id, email }

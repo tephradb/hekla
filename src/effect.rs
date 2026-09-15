@@ -2133,7 +2133,7 @@ pub enum Replayed {
     /// can go while this is looking at it. Nothing is left to compare against, and the
     /// empty journal it leaves behind must not be read as a run that called nothing.
     Reclaimed,
-    /// The handler reached `fail(...)`: rule 4's terminal outcome, which advances the
+    /// The handler reached `fail`: rule 4's terminal outcome, which advances the
     /// cursor rather than wedging.
     ///
     /// Only [`Asked::Candidate`] produces this. When the program going in is the one that
@@ -2508,7 +2508,7 @@ pub fn replay(effect: &str, position: u64, runtime: &Arc<Runtime>, asked: Asked)
 
 /// `Ok(Invocation::Failed)` as `asked` reads it, and `None` when it is not news.
 ///
-/// heklang's rule 4 makes `fail(...)` an *outcome* rather than an error: the position is
+/// heklang's rule 4 makes `fail` an *outcome* rather than an error: the position is
 /// recorded failed and the cursor advances, so the row on disk is the same `terminal` row
 /// a success leaves and nothing says which it was. Replaying the program that wrote it
 /// therefore learns nothing by noticing (it fails where it failed), while a candidate that
@@ -2935,7 +2935,7 @@ mod tests {
 
     /// A terminal `fail` is a reproduction to two callers and news to the third.
     ///
-    /// Rule 4 makes `fail(...)` an outcome rather than an error, and the `terminal` row it
+    /// Rule 4 makes `fail` an outcome rather than an error, and the `terminal` row it
     /// leaves is the one a success leaves. So replaying the program that wrote the row
     /// learns nothing by noticing (it fails where it failed), while a candidate that would
     /// newly fail on recorded events is the finding the command exists for.

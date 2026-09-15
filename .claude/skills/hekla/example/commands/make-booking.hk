@@ -24,13 +24,13 @@ command MakeBooking(
   // A rate that is not positive is wrong whoever sends it, so it is `invalid` (400)
   // rather than a refusal (422). A booked room is a fact about the world, so it is.
   if rate <= 0.00 {
-    return invalid("rate must be positive")
+    invalid "rate must be positive"
   }
   if made {
     return
   }
   if booked >= ROOM_NIGHT_CAPACITY {
-    return reject RoomTaken
+    reject RoomTaken
   }
 
   emit @booking.made { booking_id, room_id, guest_id, email, night, rate, notes }

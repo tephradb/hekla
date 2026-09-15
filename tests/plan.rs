@@ -43,7 +43,7 @@ guard ShopIsConnected(shop_id: Int) {
     on @shop.connected(shop_id) => true
 
   if !connected {
-    return reject ShopNotConnected
+    reject ShopNotConnected
   }
 }
 ";
@@ -397,7 +397,7 @@ fn a_const_edit_is_one_shared_edit_and_the_const_has_no_row() {
     on @thing.done(shop_id) => seen + 1
 
   if seen >= BUSY {{
-    return reject ShopNotConnected
+    reject ShopNotConnected
   }}
 
   emit @thing.done {{ shop_id }}
@@ -1829,7 +1829,7 @@ effect Ship {
     assert_eq!(coverage.replayed, 2);
 }
 
-/// `fail(...)` is rule 4's terminal outcome rather than an error, and the `terminal` row
+/// `fail` is rule 4's terminal outcome rather than an error, and the `terminal` row
 /// it leaves is the one a success leaves, so nothing on disk says which happened. That
 /// makes it news exactly when the program being replayed is not the one that wrote the
 /// row: a candidate that would newly give up on recorded events is the finding, and the
@@ -1845,7 +1845,7 @@ fn a_candidate_that_would_now_fail_terminally_is_reported() {
 effect Notify {
   on @order.placed { @key order_id, email } {
     http.post(endpoint(order_id), { \"to\": email })
-    fail(\"the mailer is being retired\")
+    fail \"the mailer is being retired\"
   }
 }
 ";

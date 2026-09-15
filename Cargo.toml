@@ -31,7 +31,7 @@ clap = { version = "4", features = ["derive"] }
 # The `Stream` trait `Body::from_stream` names, for the projection progress stream.
 futures-core = "0.3"
 getrandom = "0.4"
-heklang = "0.6.1"
+heklang = "0.7.0"
 # The recorder and the text-format render, and nothing else: `default-features = false`
 # drops the exporter's own `http-listener` and `push-gateway`, which would pull in hyper
 # and open a second socket. hekla already has an axum router, so `/metrics` is a route

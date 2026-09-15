@@ -7,7 +7,7 @@ command RecordNotified(ticket_id: Uuid) {
     on @ticket.notified(ticket_id) => true
 
   if notified {
-    return reject AlreadyNotified
+    reject AlreadyNotified
   }
 
   emit @ticket.notified { ticket_id }

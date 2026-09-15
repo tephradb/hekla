@@ -145,7 +145,7 @@ event @t.registered { id: Uuid, email: String @max(100) }
 const INVALID_INPUT_COMMAND: &str = r#"
 command Register(id: Uuid, email: String) {
   if !email.contains("@") {
-    return invalid("email must contain @")
+    invalid "email must contain @"
   }
 
   emit @t.registered { id, email }
@@ -346,10 +346,10 @@ command Open(id: Uuid, owner: String) {
     on @t.frozen(owner) => true
 
   if frozen {
-    return reject Frozen
+    reject Frozen
   }
   if opened {
-    return reject AlreadyOpen
+    reject AlreadyOpen
   }
 
   emit @t.opened { id, owner }
@@ -429,13 +429,13 @@ command Open(id: Uuid, owner: String, tier: String) {
     on @t.opened(owner, tier: "gold") => gold + 1
 
   if gold > seen {
-    return reject NarrowOnly
+    reject NarrowOnly
   }
   if seen > gold {
-    return reject WideOnly
+    reject WideOnly
   }
   if seen > 0 {
-    return reject BothRan
+    reject BothRan
   }
 
   emit @t.opened { id, owner, tier }
@@ -526,7 +526,7 @@ command Open(id: Uuid, owner: String) {
     on @t.frozen(owner) => frozen + 1
 
   if frozen > 0 {
-    return reject Frozen { frozen }
+    reject Frozen { frozen }
   }
 
   emit @t.opened { id, owner }
@@ -584,7 +584,7 @@ command Notice(id: Uuid, owner: String) {
     on @t.noticed(owner) => seen + 1
 
   if seen >= 2 {
-    return reject Enough { seen }
+    reject Enough { seen }
   }
 
   emit @t.noticed { id, owner }
@@ -644,7 +644,7 @@ command Read(id: Uuid) {
     on @t.noted(id) { body } => body
 
   if seen.is_none() {
-    return reject Absent
+    reject Absent
   }
 
   emit @t.noted { id, body: seen }
@@ -697,7 +697,7 @@ command Take(id: Uuid, room: String) {
     on @t.taken(room) => seats + 1
 
   if seats >= 2 {
-    return reject Full
+    reject Full
   }
 
   emit @t.taken { id, room }

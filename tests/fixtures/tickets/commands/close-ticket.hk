@@ -12,7 +12,7 @@ command CloseTicket(ticket_id: Uuid, org_id: Int) {
     return
   }
   if !opened {
-    return reject NoSuchTicket
+    reject NoSuchTicket
   }
 
   emit @ticket.closed { ticket_id, org_id }

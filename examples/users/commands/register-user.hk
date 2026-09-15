@@ -9,10 +9,10 @@ command RegisterUser(user_id: Uuid, email: String, name: String) {
     on @user.registered(email) => true
 
   if is_blank(name) {
-    return reject InvalidName
+    reject InvalidName
   }
   if taken {
-    return reject EmailTaken
+    reject EmailTaken
   }
 
   emit @user.registered { user_id, email, name }

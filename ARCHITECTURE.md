@@ -296,7 +296,7 @@ command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?, total: Mone
     on @order.cancelled(customer_id) => open_orders - 1
 
   if open_orders >= 10 {
-    return reject TooManyOpen
+    reject TooManyOpen
   }
 
   emit @order.placed { order_id, customer_id, email, total }
@@ -330,7 +330,7 @@ exists.
   slice per record, then the body runs. Ten folds over a million events read the log once.
 
 **Three outcomes.** `return` with no value, or falling off the end, is `Ok` with whatever was
-emitted; `reject <Refusal>` is a state-dependent refusal (422); `invalid(message)` means the input
+emitted; `reject <Refusal>` is a state-dependent refusal (422); `invalid "<message>"` means the input
 is malformed regardless of state (400). The distinction is the caller's: a blank address is
 `invalid` whoever sends it and whenever, a blocked customer is `reject` because the same request
 would have succeeded yesterday. `reject` carries a code because there is something to branch on;
@@ -566,7 +566,7 @@ effect NotifyCustomer {
     })
 
     if response.status >= 400 {
-      fail("confirmation rejected")
+      fail "confirmation rejected"
     }
 
     invoke RecordNotified {
@@ -696,7 +696,7 @@ immediately; now the language re-sends a few times first, so a limiter that refu
 relents is absorbed inside the invocation and no wait is owed.
 
 **Wedging and the skip hatch**: an exhausted re-send loop and a host error both wedge the
-invocation. An author's own `fail(...)` does not: it is a terminal outcome that completes the
+invocation. An author's own `fail` does not: it is a terminal outcome that completes the
 position and advances, because an author saying "this cannot be processed" is a decision rather than
 a fault.
 The runtime retries the whole invocation with capped exponential backoff, forever, replaying journaled
@@ -734,7 +734,7 @@ what actually stops a position running twice, and a boot with the table empty is
 
 **One wedged lane pins the prefix**, and the consequence that hurts is not the lag figure: journal
 retention is bounded by the mark, so a lane wedged for a month makes a month of journal rows
-unsweepable for *every* lane. `fail()` and an operator skip are what resolve it, which is why
+unsweepable for *every* lane. `fail` and an operator skip are what resolve it, which is why
 `/status` names the pinning key rather than leaving an operator to find one bad shop among thousands.
 
 **The live boundary** is a second number, not a watermark started at head: an effect may mix `on` and

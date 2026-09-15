@@ -370,7 +370,7 @@ command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
     on @account.registered(handle) => true
 
   if taken {
-    return reject HandleTaken
+    reject HandleTaken
   }
 
   emit @account.registered { account_id, handle, email }

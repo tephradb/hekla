@@ -115,5 +115,5 @@ test "a rate that is not positive is invalid" {
     rate: 0.00,
     notes: "",
   }
-  expect invalid("rate must be positive")
+  expect invalid "rate must be positive"
 }

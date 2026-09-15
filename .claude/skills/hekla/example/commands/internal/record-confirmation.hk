@@ -12,7 +12,7 @@ command RecordConfirmation(booking_id: Uuid) {
     on @booking.confirmed(booking_id) => true
 
   if confirmed {
-    return reject AlreadyConfirmed
+    reject AlreadyConfirmed
   }
 
   emit @booking.confirmed { booking_id, channel: "email" }

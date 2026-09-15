@@ -13,7 +13,7 @@ command RecordWelcome(user_id: Uuid) {
     on @user.welcomed(user_id) => true
 
   if welcomed {
-    return reject AlreadyWelcomed
+    reject AlreadyWelcomed
   }
 
   emit @user.welcomed { user_id }

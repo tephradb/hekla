@@ -13,10 +13,10 @@ command RenameUser(user_id: Uuid, name: String) {
     on @user.renamed(user_id) => renames + 1
 
   if is_blank(name) {
-    return reject InvalidName
+    reject InvalidName
   }
   if !exists {
-    return reject UnknownUser
+    reject UnknownUser
   }
 
   emit @user.renamed { user_id, name }

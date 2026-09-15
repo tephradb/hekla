@@ -9,7 +9,7 @@ command RetitleTicket(ticket_id: Uuid, title: String) {
     on @ticket.closed(ticket_id) => true
 
   if !opened || closed {
-    return reject NoSuchTicket
+    reject NoSuchTicket
   }
 
   emit @ticket.retitled { ticket_id, title }

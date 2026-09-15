@@ -554,7 +554,7 @@ command PlaceOrder(
     return
   }
   if sold >= LAUNCH_ALLOCATION {
-    return reject SoldOut
+    reject SoldOut
   }
 
   emit @order.placed {

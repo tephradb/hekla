@@ -64,7 +64,7 @@ Errors are `{correlation_id, causation_id, error: {code, message}}`:
 
 | Status | `code` | When |
 | --- | --- | --- |
-| 400 | `invalid_input` | a parameter that is unknown, missing, or the wrong type, a body that is not a JSON object, **and** the author's own `invalid("...")` (the message is theirs) |
+| 400 | `invalid_input` | a parameter that is unknown, missing, or the wrong type, a body that is not a JSON object, **and** the author's own `invalid "..."` (the message is theirs) |
 | 422 | the refusal's name in snake_case | `reject <Name>`; `refusal RoomTaken` becomes `room_taken`, with the refusal's message |
 | 409 | `concurrency_conflict` | the boundary kept changing for `HEKLA_MAX_ATTEMPTS` attempts (default 5) |
 | 404 | `not_found` | ``no public command `X` ``: unknown, or declared under `commands/internal/` |

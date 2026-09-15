@@ -518,7 +518,7 @@ command ActivateUser(user_id: Uuid) {
     on @user.activated(user_id) => true
 
   if activated {
-    return reject AlreadyActive
+    reject AlreadyActive
   }
 
   emit @user.activated { user_id }

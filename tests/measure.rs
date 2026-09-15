@@ -132,7 +132,7 @@ command CountThing(id: Uuid, shop: Int) {
     on @thing.happened(shop) => seen + 1
 
   if seen >= 0 {
-    return reject Counted { seen }
+    reject Counted { seen }
   }
 
   emit @thing.happened { id, shop, secret: none }
@@ -194,7 +194,7 @@ command CountThing(id: Uuid, shop: Int) {
     on @thing.happened(shop) => seen + 1
 
   if seen >= 0 {
-    return reject Counted { seen }
+    reject Counted { seen }
   }
 
   emit @thing.happened { id, shop, secret: none }
@@ -273,7 +273,7 @@ command PlaceOrder(order_id: Uuid, shop_id: Int) {
     return
   }
   if sold >= 100000 {
-    return reject SoldOut
+    reject SoldOut
   }
   emit @order.placed { order_id, shop_id }
 }

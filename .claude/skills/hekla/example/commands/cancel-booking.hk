@@ -9,7 +9,7 @@ command CancelBooking(booking_id: Uuid, room_id: Int, night: Timestamp) {
     on @booking.cancelled(booking_id) => true
 
   if !made {
-    return reject NoSuchBooking
+    reject NoSuchBooking
   }
   if cancelled {
     return

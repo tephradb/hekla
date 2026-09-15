@@ -64,7 +64,7 @@ command TouchOrder(order_id: Uuid) {
     on @order.placed(order_id) { note } => note
 
   if seen == "" {
-    return reject Unseen
+    reject Unseen
   }
 }
 "#;
