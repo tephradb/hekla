@@ -1629,7 +1629,13 @@ impl heklang::host::Rows for RowWriter<'_> {
                             // subject as erased.
                             None => {
                                 stored.insert(name.clone(), serde_json::Value::Null);
-                                dropped.push((subject.to_string(), id.to_string()));
+                                // Only when somebody is counting. A deployed rebuild
+                                // passes no `Shredded`, and over a log with a bulk
+                                // erasure this is two owned strings per dropped column,
+                                // millions of times, for a tally nothing reads.
+                                if self.shredded.is_some() {
+                                    dropped.push((subject.to_string(), id.to_string()));
+                                }
                                 continue;
                             }
                         },
@@ -1658,7 +1664,9 @@ impl heklang::host::Rows for RowWriter<'_> {
                         // observable through a projection.
                         None => {
                             stored.insert(name.clone(), serde_json::Value::Null);
-                            dropped.push((subject_field.clone(), subject_value.clone()));
+                            if self.shredded.is_some() {
+                                dropped.push((subject_field.clone(), subject_value.clone()));
+                            }
                         }
                     }
                 }

@@ -14,6 +14,7 @@ import { EventsView } from './view-events.js'
 import { TraceView } from './view-trace.js'
 import { EffectsView } from './view-effects.js'
 import { ProjectorsView } from './view-projectors.js'
+import { ProjectionsView } from './view-projections.js'
 import { SchemaView } from './view-schema.js'
 import { SubjectsView } from './view-subjects.js'
 import { SystemView } from './view-system.js'
@@ -25,6 +26,7 @@ const VIEWS = {
   trace: TraceView,
   effects: EffectsView,
   projectors: ProjectorsView,
+  projections: ProjectionsView,
   schema: SchemaView,
   subjects: SubjectsView,
   system: SystemView,

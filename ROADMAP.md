@@ -1203,7 +1203,9 @@ Honest scope:
 
 - **No live tail.** A shared 3s poll of `/status` backs the badges and the views, pausing when the
   tab is hidden. `Subscription` still makes SSE cheap, and the console is what will make it worth
-  wanting, but it is a different transport with its own backpressure and shutdown story.
+  wanting, but it is a different transport with its own backpressure and shutdown story. (Phase 34
+  added one streaming response and did not take that bet: a projection's progress is one request
+  with no reconnection and no fan-out, which is the part of SSE that costs.)
 - **The overview's sparkline is not a metric.** It is bucketed in the browser from the timestamps on
   one page of events, and is labelled as such. Phase 31 gave hekla a metrics endpoint and this still
   does not pretend to be one: a rate belongs in Prometheus, and what this draws is the shape of the
@@ -2175,6 +2177,61 @@ Honest scope:
 - **The probe reads every declared type, every boot.** N indexed `limit`-1 reads, which is small
   beside opening the op-DB, and unconditional on purpose: it catches a directory an earlier deploy
   already broke, not only the deploy that would break one.
+
+## Phase 34: a question the project never anticipated (done)
+
+Every read surface hekla had answered a question somebody declared in advance. A read model exists
+because an author wrote it down, and the page that browses it can only show what was written down.
+The question an operator actually arrives with ("how many of those, grouped by that") had no answer
+short of writing a projector, deploying it, and rebuilding.
+
+An ad-hoc projection is that answer: heklang compiled against what the process booted with, folded
+over the real log through a read-only handle, read back, and thrown away. It shipped on three
+surfaces, and this phase is the third of them plus the transport the third needed.
+
+- **`hekla project`** folds through a follower: read-only descriptors, no lock, a prefix pinned at
+  open. It takes no data-directory lock and writes nothing to the data directory, which is what lets
+  it run against a directory a server is serving from.
+- **`POST /admin/projections`**, behind `[admin] projections = true`. The one route that runs code a
+  caller supplied rather than code the project declared, which is exactly why a deployment has to say
+  yes to it. What bounds it once on is that heklang is total and a projector holds no host: no clock,
+  no network, no general read, no append. The residual cost is CPU and a temporary file, and both are
+  clamped.
+- **The console page**, which is what an operator actually uses: an editor with a gutter and heklang
+  highlighting transcribed from the lexer, `⌘↵` to run, diagnostics whose line and column are a
+  button that moves the caret, and saved projections in `localStorage`.
+
+Decisions worth keeping:
+
+- **Streaming is not the SSE bet phase 20 deferred.** Phase 20 said a live tail was "a different
+  transport with its own backpressure and shutdown story" and that still holds for a subscription.
+  This is not one: it is one request, with no reconnection, no fan-out, no long-lived connection, and
+  a 16-line bounded channel that drops ticks rather than growing. The fold's progress callback
+  already existed for the terminal ticker, so the data was there and only a body was missing.
+- **Compiling is its own hop, before the body opens.** A status code is spent on the first byte, so
+  a source that does not compile or a window that holds nothing has to be refused before that byte.
+  `projection::check` is that refusal, one spelling shared with `run`.
+- **The last line of the stream is the buffered body, byte for byte.** One shape reaches three
+  transports, and a client that wants only the answer reads to the end.
+- **Diagnostics became structured.** They were rendered strings, which a browser can only regex, and
+  the console needs a line and a column to put a caret on. `validate::finding_json` sits beside
+  `validate::render` so the two cannot drift. Fixing this surfaced that `render` had been adding one
+  to a span heklang already counts from one, so every diagnostic hekla had ever printed pointed a
+  line and a column past the problem.
+- **Saved projections are client-side.** Storing them server-side would put a write surface on the
+  one page whose whole claim is that it writes nothing, and a question an operator asked is theirs
+  rather than the deployment's.
+
+Honest scope:
+
+- **`--upto` bounds the answer, not the work.** tephra's forward read has no upper bound, so a
+  window ending early still reads to the tip and discards. `max_events` is what bounds the work.
+- **A disconnected client does not stop a fold.** `spawn_blocking` is not cancellable, so the budget
+  is what bounds an abandoned request, exactly as it is for the buffered shape.
+- **Two at once, per deployment.** The third is refused with `Retry-After` rather than queued.
+- **The console page is checked by opening it**, like the rest of the console: the JavaScript has no
+  test runner, and the two failure modes Rust can see (a URL no route serves, an asset nothing
+  references) are covered by scanning the shipped bytes.
 
 ## Deferred, with triggers
 

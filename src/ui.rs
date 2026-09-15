@@ -139,6 +139,11 @@ pub const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../ui/ui-copy.js"),
     },
     Asset {
+        name: "ui-editor.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/ui-editor.js"),
+    },
+    Asset {
         name: "ui-panel.js",
         content_type: JS,
         bytes: include_bytes!("../ui/ui-panel.js"),
@@ -187,6 +192,11 @@ pub const ASSETS: &[Asset] = &[
         name: "view-overview.js",
         content_type: JS,
         bytes: include_bytes!("../ui/view-overview.js"),
+    },
+    Asset {
+        name: "view-projections.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-projections.js"),
     },
     Asset {
         name: "view-projectors.js",
@@ -459,12 +469,17 @@ pub fn serve(asset: &'static Asset, headers: &HeaderMap) -> Response {
 /// URL as JSON and reports the 404 itself, rather than the browser showing a bare
 /// error document.
 pub async fn negotiate(request: Request, next: Next) -> Response {
-    // A view is something you can open, so only a `GET` can be one. Without this a
+    // A view is something you can open, so only a read can be one. Without this a
     // `POST /admin/projections` from an HTML form, or from any client that lists
     // `text/html` first, would short-circuit into the console shell: 200, a web page,
     // and the projector never compiled or folded. The 405 this used to guard against is
     // unaffected, because a method the route does not serve never reaches this layer.
-    if request.method() == Method::GET && wants_html(request.headers()) {
+    //
+    // `HEAD` alongside `GET` and not by oversight: axum's `get()` answers both, so
+    // excluding it would have `HEAD` and `GET` on one URL disagree about the content
+    // type, which is the one thing HEAD is defined not to do.
+    let readable = matches!(*request.method(), Method::GET | Method::HEAD);
+    if readable && wants_html(request.headers()) {
         // Only a development override touches the disk. With none configured this is a
         // table lookup and a refcount bump, so dispatching to the blocking pool would
         // cost more than the work it moves off the runtime.

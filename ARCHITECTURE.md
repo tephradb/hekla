@@ -871,6 +871,14 @@ consistent copy is not required for them.
   the `GET` on the same path reports the limits and whether the `POST` is served, so a client learns
   the ceiling without spending a fold to find it.
 
+  **It is also the one response under this prefix that arrives in pieces.** `Accept:
+  application/x-ndjson` streams the fold as NDJSON: a `progress` line about ten times a second, then
+  that same body as the last line. It is not the SSE the roadmap defers, and the difference is the
+  part that costs: one request, no reconnection, no fan-out, and a bounded channel that drops ticks
+  rather than growing. The status code survives because compiling the source and checking the window
+  happen in a hop of their own, before a byte of the body is written; a body that has begun has
+  already spent its status.
+
   **It is compiled from the sources the runtime kept, never re-read from disk.** A module edited
   under a live process would typecheck a projection against declarations this process is not
   running, and `record_of` would then read stored payloads against a schema the log has never seen.

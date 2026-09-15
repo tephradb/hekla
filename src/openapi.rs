@@ -292,7 +292,7 @@ impl ComponentNames {
 }
 
 /// The schemas that are always present, whatever the project declares.
-const FIXED_SCHEMAS: [&str; 24] = [
+const FIXED_SCHEMAS: [&str; 28] = [
     "ErrorDetail",
     "Error",
     "CommandError",
@@ -317,6 +317,10 @@ const FIXED_SCHEMAS: [&str; 24] = [
     "SystemInfo",
     "SubjectEntry",
     "Projection",
+    "ProjectionLine",
+    "ProjectionProgress",
+    "ProjectionError",
+    "Finding",
 ];
 
 /// Every kind a `declaration` row can carry: heklang's set minus `test`.
@@ -1131,18 +1135,37 @@ fn projections_path() -> Value {
                 },
             },
             "responses": {
-                "200": response("the rows the projector built", schema_ref("Projection")),
+                "200": {
+                    "description": "The rows the projector built. A caller that sent \
+                        `Accept: application/x-ndjson` is answered as the fold goes \
+                        instead of when it finishes.",
+                    "content": {
+                        "application/json": { "schema": schema_ref("Projection") },
+                        "application/x-ndjson": { "schema": schema_ref("ProjectionLine") },
+                    },
+                },
                 "400": response(
                     "the projector does not compile, or the request asks for something \
                      this projection cannot answer. A compile failure carries a \
-                     `findings` array of the compiler's own diagnostics.",
-                    schema_ref("Error"),
+                     `findings` array of the compiler's own diagnostics, each naming its \
+                     line and column.",
+                    schema_ref("ProjectionError"),
                 ),
                 "403": response(
                     "this deployment does not serve ad-hoc projections",
                     schema_ref("Error"),
                 ),
-                "500": response("internal error", schema_ref("Error")),
+                "429": response(
+                    "every projection slot is already folding. Refused rather than \
+                     queued, with `Retry-After`; the code is `projections_busy`.",
+                    schema_ref("Error"),
+                ),
+                "500": response(
+                    "the projection was valid and could not be completed: a temporary \
+                     directory that could not be made, a log that would not read, or an \
+                     operational database this build does not expect",
+                    schema_ref("Error"),
+                ),
             },
         }
     })
@@ -1858,6 +1881,13 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("SystemInfo".to_owned(), system_info_schema());
     out.insert("SubjectEntry".to_owned(), subject_entry_schema());
     out.insert("Projection".to_owned(), projection_schema());
+    out.insert("ProjectionLine".to_owned(), projection_line_schema());
+    out.insert(
+        "ProjectionProgress".to_owned(),
+        projection_progress_schema(),
+    );
+    out.insert("ProjectionError".to_owned(), projection_error_schema());
+    out.insert("Finding".to_owned(), finding_schema());
     for (event_type, def) in &surface.events {
         out.insert(
             names.event(event_type).to_owned(),
@@ -1993,6 +2023,108 @@ fn projection_schema() -> Value {
             "projector", "source", "digest", "sources", "window", "scanned",
             "shredded", "decrypt", "row_limit", "truncated", "entities"
         ],
+        "additionalProperties": false,
+    })
+}
+
+fn projection_line_schema() -> Value {
+    json!({
+        "oneOf": [
+            schema_ref("ProjectionProgress"),
+            schema_ref("Projection"),
+            schema_ref("Error"),
+        ],
+        "description": "One line of a streamed projection, when the request asked for \
+            `application/x-ndjson`. Every line but the last carries `progress`; the last \
+            is the `Projection` itself, byte for byte what `application/json` returns, or \
+            an `Error` if the fold failed after the body had opened. A stream that ends \
+            without one of those two hit an internal error. Which of the three a line is \
+            can be told from its only top-level key, because all three schemas are \
+            closed: a `Projection` has no `progress` and no `error`.",
+    })
+}
+
+fn projection_progress_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "How far the fold has got. Written about ten times a second while \
+            events are matching, and not at all while none are, so a client showing a \
+            clock should run its own.",
+        "properties": {
+            "progress": {
+                "type": "object",
+                "properties": {
+                    "position": {
+                        "type": "integer",
+                        "description": "The log position reached, absolute, so it can be \
+                            read against the final line's `window` and `scanned`.",
+                    },
+                    "upto": {
+                        "type": "integer",
+                        "description": "The last position this window covers, absolute. \
+                            Fixed for the life of one stream.",
+                    },
+                    "events": {
+                        "type": "integer",
+                        "description": "Matching events folded so far.",
+                    },
+                },
+                "required": ["position", "upto", "events"],
+                "additionalProperties": false,
+            },
+        },
+        "required": ["progress"],
+        "additionalProperties": false,
+    })
+}
+
+fn projection_error_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "The `Error` envelope plus, when the posted source did not \
+            compile, the compiler's own diagnostics. Only this endpoint returns it, \
+            because it is the only one a caller can send code to.",
+        "properties": {
+            "error": schema_ref("ErrorDetail"),
+            "findings": {
+                "type": "array",
+                "items": schema_ref("Finding"),
+                "description": "Present only on a compile failure. Sorted by location \
+                    and then by position, and carrying warnings as well as errors, \
+                    though only an error refuses the request.",
+            },
+        },
+        "required": ["error"],
+        "additionalProperties": false,
+    })
+}
+
+fn finding_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One diagnostic, structured rather than rendered, so a caller can \
+            put a caret on it instead of parsing a sentence.",
+        "properties": {
+            "severity": { "type": "string", "enum": ["error", "warning"] },
+            "location": {
+                "type": "string",
+                "description": "The module it was found in. Source posted to this \
+                    endpoint is compiled under `<projection>`.",
+            },
+            "line": {
+                "type": ["integer", "null"],
+                "description": "Counting from one, the way an editor does. Null together \
+                    with `column` when the finding is about a declaration rather than a \
+                    place in the text.",
+            },
+            "column": { "type": ["integer", "null"] },
+            "message": { "type": "string" },
+            "hint": {
+                "type": ["string", "null"],
+                "description": "What to do about it, when the compiler carried one.",
+            },
+        },
+        "required": ["severity", "location", "line", "column", "message", "hint"],
         "additionalProperties": false,
     })
 }

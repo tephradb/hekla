@@ -735,9 +735,6 @@ fn check(dir: &Path) -> ExitCode {
     }
 }
 
-/// `hekla secrets`: what this machine can supply for the credentials the project
-/// declares.
-///
 /// Everything `hekla project` was asked for beyond its paths. One struct because the
 /// alternative is a free function with twelve positional arguments, half of them `bool`.
 struct Ask<'a> {
@@ -882,6 +879,9 @@ fn project(file: &Path, dir: &Path, data_dir: Option<&Path>, ask: Ask<'_>) -> Ex
     }
 }
 
+/// `hekla secrets`: what this machine can supply for the credentials the project
+/// declares.
+///
 /// Never a value, and not because the printing is careful: it reads a
 /// [`crate::secrets::Resolution`], which does not carry one. What it shows instead is
 /// where each was looked for and a short fingerprint, which is what an operator comparing

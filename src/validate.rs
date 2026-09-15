@@ -13,6 +13,7 @@
 
 use heklang::ir::{Command, Slice, Type};
 use heklang::{Defs, Program};
+use serde_json::{Value, json};
 
 use crate::loader::{Finding, LoadedProject, ProjectorUnit, Severity, Span};
 use crate::schema::{EventDef, FieldKind, event_type};
@@ -53,9 +54,11 @@ pub fn render(finding: &Finding) -> String {
         Severity::Error => "error",
         Severity::Warning => "warning",
     };
-    // Spans are 0-based; editors and humans count from one.
+    // heklang counts from one already (`Pos`: "the line and the column are both 1-based,
+    // and the column counts `char`s"), so there is nothing to adjust. This used to add
+    // one to each and so pointed a line and a column past every diagnostic it printed.
     let at = match finding.span {
-        Some(span) => format!(":{}:{}", span.line + 1, span.column + 1),
+        Some(span) => format!(":{}:{}", span.line, span.column),
         None => String::new(),
     };
     let line = format!("{severity}: {}{at}: {}", finding.location, finding.message);
@@ -65,6 +68,31 @@ pub fn render(finding: &Finding) -> String {
         Some(hint) => format!("{line}\n  = {hint}"),
         None => line,
     }
+}
+
+/// One finding as an object, for a client that has to act on it rather than print it.
+///
+/// The sibling of [`render`], and here beside it so the two cannot drift. A terminal
+/// wants the line; the console wants to put a caret on line 3 column 6 and colour that
+/// row of the gutter, and re-deriving those from the rendered string would couple a
+/// browser to a `format!` in this file.
+///
+/// `line` and `column` count from one, the way an editor does, and the column counts
+/// characters rather than bytes, which is also what an editor does. Both are null
+/// together when the finding is about a declaration rather than a place in the text.
+/// `hint` is null when heklang carried none.
+pub fn finding_json(finding: &Finding) -> Value {
+    json!({
+        "severity": match finding.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        },
+        "location": finding.location,
+        "line": finding.span.map(|span| span.line),
+        "column": finding.span.map(|span| span.column),
+        "message": finding.message,
+        "hint": finding.hint,
+    })
 }
 
 /// How many findings are errors, which is what every load-and-refuse path branches on.

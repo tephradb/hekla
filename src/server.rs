@@ -15,37 +15,45 @@
 //! mapping, so the server only turns an [`crate::runtime::ExecResult`] into a JSON response.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::str;
 use std::sync::Arc;
-use std::time::Duration;
+use std::task;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
+use futures_core::Stream;
 use serde_json::{Value, json};
 use tephra::WriteCoordinator;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use uuid::Uuid;
 
 use crate::context::CommandContext;
+use crate::crypto::MasterKeys;
 use crate::effect::EffectRuntime;
 use crate::introspect;
-use crate::loader;
+use crate::loader::{self, LoadedProject};
 use crate::metrics;
 use crate::projection;
 use crate::projector::{ProjectorSet, ProjectorShared, Readiness};
 use crate::read_api;
 use crate::runtime::{self, Runtime, error_body};
 use crate::schema::{EntityDef, EventDef};
+use crate::store::Store;
 use crate::ui;
 use crate::validate;
 
@@ -139,6 +147,32 @@ const PROJECTION_PARAMS: [&str; 7] = [
     "rows",
     "decrypt",
 ];
+
+/// The media type a caller names to be told how the fold is going rather than only how
+/// it went. One JSON object per line; see [`project_streaming`].
+const NDJSON: &str = "application/x-ndjson";
+
+/// How long between progress lines after the first, matching the terminal ticker's
+/// redraw ([`crate::progress`]) for the same reason: the fold reports once per matching
+/// event, which for a dense projector is tens of thousands of times a second.
+const PROJECTION_TICK: Duration = Duration::from_millis(100);
+
+/// How many lines may be in flight to a reader.
+///
+/// Small deliberately, because it is how stale a tick can be: `try_send` fails when the
+/// buffer is full, so what a fallen-behind reader eventually gets is the *oldest* queued
+/// ticks and not the newest. At four and a tick every hundred milliseconds that bounds
+/// the lag at well under a second, after which the bar catches up in one step. A deeper
+/// buffer would only make the stall it papers over last longer.
+const PROJECTION_TICKS: usize = 4;
+
+/// How long the answer waits for a reader that has stopped reading without closing.
+///
+/// Not a request timeout: the fold is already over by the time this matters, and this
+/// bounds only how long its last line will wait for room. Generous, because a legitimate
+/// client on a slow link should get its answer, and finite, because the alternative is a
+/// projection slot that never comes back.
+const PROJECTION_ABANDONED: Duration = Duration::from_secs(30);
 
 /// The admin console's own files. Flat, because `{file}` captures a single segment: a
 /// nested asset would be unroutable, and worse, undescribable, since the drift test's
@@ -1442,6 +1476,46 @@ async fn admin_projections(State(runtime): State<Shared>) -> Response {
     )
 }
 
+/// The query parameters of one projection, owned, so each blocking hop can borrow a
+/// [`projection::Request`] out of its own copy.
+///
+/// `Request` borrows the two names it carries, and the fold happens in a task that must
+/// own everything it touches, so the alternative is spelling the same eight fields out
+/// once per hop and keeping the two spellings in step by hand.
+#[derive(Clone)]
+struct Knobs {
+    projector: Option<String>,
+    entity: Option<String>,
+    from: Option<u64>,
+    upto: Option<u64>,
+    max_events: u64,
+    decrypt: bool,
+    rows: usize,
+    master: Option<MasterKeys>,
+}
+
+impl Knobs {
+    fn request(&self) -> projection::Request<'_> {
+        projection::Request {
+            projector: self.projector.as_deref(),
+            entity: self.entity.as_deref(),
+            from: self.from,
+            upto: self.upto,
+            max_events: Some(self.max_events),
+            decrypt: self.decrypt,
+            rows: self.rows,
+            master: self.master.clone(),
+        }
+    }
+}
+
+/// Why a projection never started. Both are `400`s about the request; they differ only
+/// in whether the caller gets a sentence or a list of places to fix.
+enum Refused {
+    Findings(Vec<Value>),
+    Invalid(String),
+}
+
 /// `POST /admin/projections`: fold an ad-hoc projector over the log and return its rows.
 ///
 /// The body is the heklang source and the query parameters are the knobs, the way
@@ -1457,6 +1531,7 @@ async fn admin_projections(State(runtime): State<Shared>) -> Response {
 async fn admin_project(
     State(runtime): State<Shared>,
     Query(params): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if !runtime.config().admin.projections {
@@ -1513,13 +1588,10 @@ async fn admin_project(
             .clamp(1, read_api::MAX_LIMIT),
         Err(response) => return *response,
     };
-    let projector = single(&params, "projector").map(str::to_owned);
-    let entity = single(&params, "entity").map(str::to_owned);
-
     // Refused rather than queued: a projection is an interactive act, and holding the
     // request open while two others fold five million events each answers nobody. The
     // permit is held for the whole fold and released by its guard on every path out.
-    let Some(_slot) = runtime.projection_slot() else {
+    let Some(slot) = runtime.projection_slot() else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, "1")],
@@ -1535,61 +1607,229 @@ async fn admin_project(
             .into_response();
     };
 
+    let knobs = Knobs {
+        projector: single(&params, "projector").map(str::to_owned),
+        entity: single(&params, "entity").map(str::to_owned),
+        from,
+        upto,
+        max_events,
+        decrypt,
+        rows,
+        master: runtime.keystore().map(|keys| keys.masters().clone()),
+    };
     let sources = Arc::clone(runtime.sources());
     let data_dir = runtime.data_dir().to_path_buf();
     // The writer's own read handle, not a second follower: this is in the process that
     // owns the log, so a follower would rescan the segment directory and rebuild an
     // index per request for a snapshot it already has.
     let store = runtime.store().clone();
-    let master = runtime.keystore().map(|keys| keys.masters().clone());
-    match tokio::task::spawn_blocking(move || {
-        let project = sources.compile(Some(loader::Scratch {
-            name: PROJECTION_MODULE,
-            source: &source,
-        }));
-        let findings = validate::findings(&project);
-        if validate::errors(&findings) > 0 {
-            // The compiler's own diagnostics, not a summary of them: a caller that sent
-            // source gets back the line and column it has to fix, which is the whole
-            // difference between this and a 500 saying something went wrong.
-            return Err(findings.iter().map(validate::render).collect::<Vec<_>>());
+
+    // Compiling and checking in a hop of their own is what keeps every status code
+    // honest. Nothing here reads an event, and everything a caller can get wrong is
+    // found before a single byte of a response body is written, which matters because a
+    // body that has begun has already spent its status. Ten milliseconds against a fold
+    // measured in seconds.
+    let project = match tokio::task::spawn_blocking({
+        let (sources, store, knobs) = (sources, store.clone(), knobs.clone());
+        move || {
+            let project = sources.compile(Some(loader::Scratch {
+                name: PROJECTION_MODULE,
+                source: &source,
+            }));
+            let findings = validate::findings(&project);
+            if validate::errors(&findings) > 0 {
+                // The compiler's own diagnostics, structured rather than rendered: a
+                // caller that sent source gets back the line and column it has to fix,
+                // which is the whole difference between this and a 500 saying something
+                // went wrong.
+                return Err(Refused::Findings(
+                    findings.iter().map(validate::finding_json).collect(),
+                ));
+            }
+            projection::check(&project, &store, &knobs.request())
+                .map_err(|err| Refused::Invalid(format!("{err:#}")))?;
+            Ok(project)
         }
-        let request = projection::Request {
-            projector: projector.as_deref(),
-            entity: entity.as_deref(),
-            from,
-            upto,
-            max_events: Some(max_events),
-            decrypt,
-            rows,
-            master,
-        };
-        Ok(projection::run(
-            &project,
-            &store,
-            &data_dir,
-            &request,
-            &mut |_, _, _| {},
-        ))
     })
     .await
     {
-        Ok(Ok(Ok(projection))) => {
-            audit_projection(&projection);
-            json_response(200, projection.json())
-        }
+        Ok(Ok(project)) => project,
         // A projection that did not compile, or one refused for a reason the caller
         // chose (no projector in the source, a window that holds nothing, a sealed
         // column with no master key): all of them are about the request.
-        Ok(Ok(Err(err))) => json_response(400, read_error("invalid_input", &format!("{err:#}"))),
-        Ok(Err(findings)) => json_response(
-            400,
-            json!({
-                "error": { "code": "invalid_input", "message": "the projector does not compile" },
-                "findings": findings,
-            }),
-        ),
+        Ok(Err(Refused::Findings(findings))) => {
+            return json_response(
+                400,
+                json!({
+                    "error": {
+                        "code": "invalid_input",
+                        "message": "the projector does not compile",
+                    },
+                    "findings": findings,
+                }),
+            );
+        }
+        Ok(Err(Refused::Invalid(message))) => {
+            return json_response(400, read_error("invalid_input", &message));
+        }
+        Err(err) => return task_panicked(err),
+    };
+
+    if wants_ndjson(&headers) {
+        return project_streaming(project, store, data_dir, knobs, slot);
+    }
+
+    match tokio::task::spawn_blocking(move || {
+        // Moved in, not left in the handler's future. `spawn_blocking` cannot be
+        // cancelled, so a caller that disconnects leaves the fold running; a permit
+        // dropped when the future is dropped would hand the slot back while the work it
+        // stands for is still burning a blocking thread, and a client that POSTs and
+        // aborts in a loop would then run as many folds at once as it liked.
+        let _slot = slot;
+        projection::run(
+            &project,
+            &store,
+            &data_dir,
+            &knobs.request(),
+            &mut |_, _, _| {},
+        )
+    })
+    .await
+    {
+        Ok(Ok(projection)) => {
+            audit_projection(&projection);
+            json_response(200, projection.json())
+        }
+        // Not `invalid_input`: everything the caller can get wrong was refused by
+        // `projection::check` above, so what is left is a temporary directory that
+        // could not be made, a log that would not read, or an operational database
+        // that is not what this build expects. The message is the real one rather than
+        // "internal error", because every one of those names its own fix.
+        Ok(Err(err)) => json_response(500, read_error("internal", &format!("{err:#}"))),
         Err(err) => task_panicked(err),
+    }
+}
+
+/// Whether the caller asked for the fold's progress rather than only its answer.
+///
+/// An opt-in, not a preference, so this is a substring test and not the weighted
+/// negotiation [`ui::wants_html`] does. There, two representations of the same resource
+/// compete and a `q` value picks between them. Here the two bodies say different things:
+/// a caller that has not heard of the streaming one must never be handed it, and a
+/// caller that names it wants it whatever else it also accepts.
+fn wants_ndjson(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.contains(NDJSON))
+}
+
+/// Fold with the progress written out as it goes, one JSON object per line.
+///
+/// The last line is byte for byte the body the buffered path returns, so a client that
+/// wants only the answer reads to the end and parses that. Progress lines are told apart
+/// by their `progress` key, and a failure mid-fold by its `error` key, neither of which
+/// a `Projection` can carry: its schema is closed (`openapi::projection_schema`).
+///
+/// Everything a caller can get wrong was refused before this, because the status is sent
+/// with the first byte and cannot be taken back. What remains is a fold that has already
+/// been checked, so the only failure left is one the log or the disk caused.
+///
+/// A stream that ends without a final line is a panic in the fold, and a client should
+/// read that as the `500` the buffered path would have sent.
+fn project_streaming(
+    project: LoadedProject,
+    store: Store,
+    data_dir: PathBuf,
+    knobs: Knobs,
+    slot: OwnedSemaphorePermit,
+) -> Response {
+    let (lines, reader) = mpsc::channel::<Bytes>(PROJECTION_TICKS);
+    // The closure is handed window-relative positions, because that is what a bar should
+    // fill against. The wire carries absolute ones, so a tick and the `window` and
+    // `scanned` of the final line are read in the same units.
+    let base = knobs.from.unwrap_or_default();
+    tokio::task::spawn_blocking(move || {
+        // Held until the last line is written, not until the handler returned: the fold
+        // is the thing that occupies the deployment, and it outlives its handler here.
+        let _slot = slot;
+        // The first match reports at once and the rest are throttled. The terminal
+        // ticker waits before its first paint because a bar that flashes up and goes is
+        // worse than none; a stream pays nothing for the line and the line says two
+        // useful things early, that the fold is underway rather than still compiling,
+        // and what the window it is filling against is.
+        let mut painted: Option<Instant> = None;
+        let folded = projection::run(
+            &project,
+            &store,
+            &data_dir,
+            &knobs.request(),
+            &mut |reached, width, events| {
+                if painted.is_some_and(|at| at.elapsed() < PROJECTION_TICK) {
+                    return;
+                }
+                painted = Some(Instant::now());
+                // Dropped rather than queued when the reader is behind or gone: a fold
+                // that blocks on a slow client is a slot this deployment cannot get
+                // back, and a tick is worth nothing once the next one exists.
+                let _ = lines.try_send(line(&json!({
+                    "progress": {
+                        "position": base + reached.get(),
+                        "upto": base + width.get(),
+                        "events": events,
+                    },
+                })));
+            },
+        );
+        let last = match folded {
+            Ok(projection) => {
+                audit_projection(&projection);
+                line(&projection.json())
+            }
+            // `internal` for the same reason the buffered path says it: the request was
+            // checked before this body opened, so a failure here is not the caller's.
+            Err(err) => line(&read_error("internal", &format!("{err:#}"))),
+        };
+        // Waits for room, unlike a tick: a tick nobody reads is noise and the answer is
+        // the whole point of the request. Bounded, though, because "waits" against a
+        // peer that has stopped reading without closing means forever, and forever here
+        // holds a projection slot and a blocking thread that no restart-free thing gets
+        // back. A reader that has not taken a line in this long is not coming back.
+        let handle = tokio::runtime::Handle::current();
+        let _ = handle
+            .block_on(async { tokio::time::timeout(PROJECTION_ABANDONED, lines.send(last)).await });
+    });
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, NDJSON)],
+        Body::from_stream(Ticks(reader)),
+    )
+        .into_response()
+}
+
+/// One JSON value as one line of the stream.
+fn line(value: &Value) -> Bytes {
+    let mut rendered = value.to_string();
+    rendered.push('\n');
+    Bytes::from(rendered)
+}
+
+/// The fold's lines as a response body.
+///
+/// Hand-written because `Receiver::poll_recv` is the whole of it, and reaching for
+/// `tokio-stream` would be taking a crate to spell these four lines.
+struct Ticks(mpsc::Receiver<Bytes>);
+
+impl Stream for Ticks {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut task::Context<'_>,
+    ) -> task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(context).map(|line| line.map(Ok))
     }
 }
 

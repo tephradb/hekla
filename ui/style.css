@@ -1291,6 +1291,207 @@ textarea:focus {
   align-items: start;
 }
 
+/* --- the source editor --------------------------------------------------- */
+
+/* A painted layer under a transparent textarea. Every metric below that either one
+ * uses is set on both, because a single pixel of disagreement puts the caret beside
+ * the character instead of on it. `resize` lives on the wrapper rather than the
+ * textarea, which is absolutely positioned and so cannot carry a handle. */
+.hk-editor {
+  display: flex;
+  height: clamp(11rem, 30vh, 28rem);
+  overflow: hidden;
+  resize: vertical;
+  border-top: 1px solid var(--border);
+  background: var(--bg-inset);
+  --hk-pad: 10px;
+  --hk-size: 12.5px;
+  --hk-leading: 1.6;
+}
+
+.hk-gutter {
+  flex: none;
+  overflow: hidden;
+  padding: var(--hk-pad) var(--s2) var(--hk-pad) var(--s3);
+  border-right: 1px solid var(--border);
+  background: var(--bg-raised);
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: var(--hk-size);
+  line-height: var(--hk-leading);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.hk-gutter .bad {
+  color: var(--err);
+  font-weight: 600;
+}
+
+.hk-scroll {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.hk-paint,
+.hk-input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: var(--hk-pad);
+  border: 0;
+  font-family: var(--mono);
+  font-size: var(--hk-size);
+  line-height: var(--hk-leading);
+  /* No wrapping, in both: it is what makes one source line one painted line, which is
+   * what lets the gutter be a list of numbers rather than a measurement. */
+  white-space: pre;
+  tab-size: 2;
+}
+
+.hk-paint {
+  overflow: hidden;
+  pointer-events: none;
+  background: none;
+  color: var(--text);
+}
+
+.hk-input {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  resize: none;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--text);
+  border-radius: 0;
+}
+
+.hk-input:focus {
+  outline: none;
+}
+
+/* The text is transparent, so the selection cannot tint it and has to be visible on
+ * its own. */
+.hk-input::selection {
+  background: var(--accent-dim);
+}
+
+.hk-input::placeholder {
+  color: var(--text-faint);
+}
+
+/* Five colours, all of them tokens already carrying this meaning elsewhere: `.json`
+ * paints a string with `--ok` and a comment is as quiet as a `.faint`. A type name is
+ * left alone on purpose, because a declaration is mostly type names and colouring them
+ * colours the whole file. */
+.hk-comment {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.hk-string {
+  color: var(--ok);
+}
+
+.hk-number {
+  color: var(--warn);
+}
+
+.hk-keyword {
+  color: var(--accent);
+}
+
+.hk-path {
+  color: var(--info);
+}
+
+/* --- projections --------------------------------------------------------- */
+
+/* A saved projection is two buttons in one chip: the name loads it and the ✕ deletes
+ * it, so the destructive one is never the bigger target. */
+.chip-open {
+  font: inherit;
+  color: var(--text);
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip-open:hover {
+  color: var(--accent);
+}
+
+.chip.on {
+  border-color: var(--accent);
+}
+
+.hk-insert {
+  max-width: 14rem;
+}
+
+/* A label above its field rather than beside it: four of them sit in one row, and a
+ * leading label doubles the width each one costs. */
+.hk-knob {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.hk-knob.row {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--s1);
+  align-self: flex-end;
+  padding-bottom: 5px;
+}
+
+.hk-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.hk-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--motion);
+}
+
+/* Before the first tick there is no denominator to fill against, and a bar sitting at
+ * zero reads as stalled. This one says "working" without claiming to know how far. */
+.hk-bar.waiting .hk-bar-fill {
+  width: 30% !important;
+  animation: hk-sweep 1.1s ease-in-out infinite;
+}
+
+@keyframes hk-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(333%);
+  }
+}
+
+.hk-finding {
+  display: grid;
+  grid-template-columns: max-content max-content minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--s2);
+  padding: var(--s2) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.hk-finding:last-child {
+  border-bottom: 0;
+}
+
 /* --- responsive ---------------------------------------------------------- */
 
 /* Two controls exist only on one side of the narrow breakpoint: the drawer's own
@@ -1473,13 +1674,17 @@ textarea:focus {
   }
 
   /* Safari zooms the whole page when a field under 16px takes focus, so every tap
-   * into a filter or a command parameter rescaled the layout under it. The two
-   * fields that set their own size are named again here, or they keep it. */
+   * into a filter or a command parameter rescaled the layout under it. Anything that
+   * sets its own size is named again here, or it keeps it. The editor's three layers
+   * have to move together, or the paint stops sitting under the caret. */
   input,
   select,
   textarea,
   .palette input,
-  .cmd-json {
+  .cmd-json,
+  .hk-input,
+  .hk-paint,
+  .hk-gutter {
     font-size: 16px;
   }
 }

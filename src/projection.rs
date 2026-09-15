@@ -213,31 +213,36 @@ pub struct Projection {
     pub row_limit: usize,
 }
 
-/// Fold the project's scratch projector over the log and read its rows back.
+/// What a checked request resolves to: the projector to fold and the window it covers.
+struct Checked<'a> {
+    unit: &'a ProjectorUnit,
+    /// Its declared name, taken here so [`run`] need not re-prove it is a projector.
+    name: &'a str,
+    window: Window,
+    head: Position,
+}
+
+/// Everything a request can be refused for before a single event is read.
 ///
-/// `project` must have been loaded with a [`crate::loader::Scratch`], which is what puts
-/// the ad-hoc projector into `project.projectors` beside the deployed ones, built the
-/// same way and special-cased nowhere below this.
+/// [`run`] does this itself, so a library caller need not. The served path calls it one
+/// step earlier, before it commits to a response shape: a status code is spent on the
+/// first byte of a body, so a window nobody can satisfy has to be refused before that
+/// byte or it arrives as an error line inside a `200`.
 ///
-/// `store` is what the log is read through, and the caller picks it because only the
-/// caller knows where the writer is. `hekla project` runs in its own process and opens a
-/// follower ([`crate::runtime::follow`]): read-only descriptors, no lock, a prefix pinned
-/// at open. A served projection is in the writer's own process and passes the
-/// coordinator's read handle instead, which tephra's own `Follower` doc asks for: it
-/// shares the writer's snapshot with no lag and no second scan, where a follower per
-/// request would rescan the segment directory and rebuild an index every time.
-///
-/// `progress` is called once a batch with the position reached *within the window*, the
-/// width of that window, and the events folded so far. Window-relative rather than
-/// absolute, so a `from`-bounded scan does not open at ninety percent.
-pub fn run(
-    project: &LoadedProject,
+/// Reads nothing and opens nothing, which is what makes asking twice cheap: the second
+/// ask costs a walk of the units, not another operational database. Opening that is
+/// [`run`]'s, once.
+pub fn check(project: &LoadedProject, store: &Store, request: &Request<'_>) -> anyhow::Result<()> {
+    checked(project, store, request).map(|_| ())
+}
+
+/// One spelling of the rules, reached twice: by [`check`] for whether they pass, and by
+/// [`run`], which needs what they resolve to.
+fn checked<'a>(
+    project: &'a LoadedProject,
     store: &Store,
-    data_dir: &Path,
     request: &Request<'_>,
-    progress: &mut dyn FnMut(Position, Position, usize),
-) -> anyhow::Result<Projection> {
-    let started = Instant::now();
+) -> anyhow::Result<Checked<'a>> {
     let unit = select(project, request.projector)?;
     let ModuleDef::Projector { name, .. } = &unit.def else {
         anyhow::bail!("the scratch module is not a projector");
@@ -259,7 +264,10 @@ pub fn run(
         );
     }
 
-    let keystore = open_keystore(&unit.entities, data_dir, request.master.clone())?;
+    // The declaration half of what a sealed projector needs, which is the half that can
+    // be settled without touching a disk. [`open_keystore`] does the other half, and
+    // repeats this one because a library caller can reach it without coming through here.
+    needs_master(&unit.entities, request.master.as_ref())?;
 
     // Whatever the caller reads through bounds everything: a position above its head is
     // not readable, so accepting one would report a window that was never covered.
@@ -300,12 +308,53 @@ pub fn run(
     let upto = request
         .upto
         .map_or(head, |upto| Position::new(upto).min(head));
-    let window = Window {
-        from,
-        upto,
-        max_events: request.max_events,
-    };
 
+    Ok(Checked {
+        unit,
+        name,
+        window: Window {
+            from,
+            upto,
+            max_events: request.max_events,
+        },
+        head,
+    })
+}
+
+/// Fold the project's scratch projector over the log and read its rows back.
+///
+/// `project` must have been loaded with a [`crate::loader::Scratch`], which is what puts
+/// the ad-hoc projector into `project.projectors` beside the deployed ones, built the
+/// same way and special-cased nowhere below this.
+///
+/// `store` is what the log is read through, and the caller picks it because only the
+/// caller knows where the writer is. `hekla project` runs in its own process and opens a
+/// follower ([`crate::runtime::follow`]): read-only descriptors, no lock, a prefix pinned
+/// at open. A served projection is in the writer's own process and passes the
+/// coordinator's read handle instead, which tephra's own `Follower` doc asks for: it
+/// shares the writer's snapshot with no lag and no second scan, where a follower per
+/// request would rescan the segment directory and rebuild an index every time.
+///
+/// `progress` is called once per matching event with the position reached *within the
+/// window*, the width of that window, and the events folded so far. Window-relative
+/// rather than absolute, so a `from`-bounded scan does not open at ninety percent.
+pub fn run(
+    project: &LoadedProject,
+    store: &Store,
+    data_dir: &Path,
+    request: &Request<'_>,
+    progress: &mut dyn FnMut(Position, Position, usize),
+) -> anyhow::Result<Projection> {
+    let started = Instant::now();
+    let Checked {
+        unit,
+        name,
+        window,
+        head,
+    } = checked(project, store, request)?;
+    let Window { from, upto, .. } = window;
+
+    let keystore = open_keystore(&unit.entities, data_dir, request.master.clone())?;
     let dir = TempDir::new()?;
     let model = ReadModel::open(&dir.path().join("projection.db"), &unit.entities)?;
     let mut shredded = Shredded::default();
@@ -341,7 +390,7 @@ pub fn run(
     }
 
     Ok(Projection {
-        projector: name.clone(),
+        projector: name.to_owned(),
         source: unit.rel_path.clone(),
         digest: unit.digest_hash.clone(),
         sources: unit.sources.clone(),
@@ -405,36 +454,55 @@ pub fn select<'a>(
     }
 }
 
-/// The key store, if this projection needs one.
-///
-/// It needs one exactly when the projector seals a column, and then it is not optional:
-/// [`crate::heklang_host::RowWriter`] refuses a sealed column with no key rather than
-/// storing plaintext, so without it the *fold* fails and not just the rendering. Saying
-/// so before the scan beats discovering it a million events in.
-///
-/// A projection over plaintext columns opens no operational database at all, so it needs
-/// nothing but the event log.
-fn open_keystore(
-    entities: &[EntityDef],
-    data_dir: &Path,
-    master: Option<MasterKeys>,
-) -> anyhow::Result<Option<Arc<KeyStore>>> {
-    let sealed = entities.iter().find_map(|entity| {
+/// The first sealed column this projector declares, and the sibling naming its key.
+fn sealed_column(entities: &[EntityDef]) -> Option<(&String, &String)> {
+    entities.iter().find_map(|entity| {
         entity
             .fields
             .iter()
             .find_map(|(name, meta)| meta.subject.as_ref().map(|subject| (name, subject)))
-    });
-    let Some((column, subject)) = sealed else {
-        return Ok(None);
+    })
+}
+
+/// Refuse a projector that seals a column with no master key to seal it under.
+///
+/// Split out of [`open_keystore`] so it can be asked without opening anything: this is
+/// the half of "can this fold run" that is a fact about the declaration, and [`check`]
+/// wants exactly that half. [`crate::heklang_host::RowWriter`] refuses a sealed column
+/// with no key rather than storing plaintext, so without one the *fold* fails and not
+/// just the rendering, and saying so before the scan beats discovering it a million
+/// events in.
+fn needs_master(entities: &[EntityDef], master: Option<&MasterKeys>) -> anyhow::Result<()> {
+    let Some((column, subject)) = sealed_column(entities) else {
+        return Ok(());
     };
-    let Some(master) = master else {
+    if master.is_none() {
         anyhow::bail!(
             "this projection seals column `{column}` under `{subject}`, so folding it \
              needs HEKLA_MASTER_KEY\n       a projector re-seals a column under the \
              column's own field name, so the fold cannot carry the log's ciphertext \
              through untouched"
         );
+    }
+    Ok(())
+}
+
+/// The key store, if this projection needs one.
+///
+/// A projection over plaintext columns opens no operational database at all, so it needs
+/// nothing but the event log. One over a sealed column opens one, here and once: [`run`]
+/// calls this after [`checked`], which deliberately touches no disk.
+fn open_keystore(
+    entities: &[EntityDef],
+    data_dir: &Path,
+    master: Option<MasterKeys>,
+) -> anyhow::Result<Option<Arc<KeyStore>>> {
+    if sealed_column(entities).is_none() {
+        return Ok(None);
+    }
+    needs_master(entities, master.as_ref())?;
+    let Some(master) = master else {
+        return Ok(None);
     };
 
     let db_path = data_dir.join("hekla.db");

@@ -28,6 +28,8 @@ anyhow = "1"
 axum = "0.8"
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
+# The `Stream` trait `Body::from_stream` names, for the projection progress stream.
+futures-core = "0.3"
 getrandom = "0.4"
 heklang = "0.6.1"
 # The recorder and the text-format render, and nothing else: `default-features = false`

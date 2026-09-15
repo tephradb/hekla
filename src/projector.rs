@@ -837,8 +837,10 @@ pub struct Scanned {
 ///
 /// [`Reads::is_exhausted`]: tephra::read::Reads::is_exhausted
 ///
-/// `progress` is called once a batch and never per event, so a caller drawing a terminal
-/// line pays nothing per record.
+/// `progress` is called once per *matching* event, not once per flushed batch: a
+/// selective projector can scan millions of positions for a few hundred matches, which is
+/// exactly the run worth reporting on and exactly the one that would never fill a batch.
+/// The cost is one call per match, so a caller that reports on a clock rate-limits itself.
 #[allow(clippy::too_many_arguments)]
 pub fn project_reading(
     store: &Store,

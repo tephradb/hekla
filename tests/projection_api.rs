@@ -109,6 +109,30 @@ async fn post(app: &Router, query: &str, body: &str) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+/// The same POST, asking to be told how the fold is going. Returns the status and one
+/// `Value` per line, in order.
+async fn stream(app: &Router, query: &str, body: &str) -> (StatusCode, Vec<Value>) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/admin/projections{query}"))
+        .header(header::CONTENT_TYPE, "text/plain")
+        .header(header::ACCEPT, "application/x-ndjson")
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let lines = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("every line is one JSON value"))
+        .collect();
+    (status, lines)
+}
+
 // --- the happy path --------------------------------------------------------
 
 #[tokio::test]
@@ -165,6 +189,175 @@ async fn the_response_is_what_the_cli_prints_with_json() {
     over_http["source"] = Value::Null;
     from_cli["source"] = Value::Null;
     assert_eq!(over_http, from_cli);
+}
+
+// --- watching it fold ------------------------------------------------------
+
+/// The point of the stream: the answer is unchanged, and it is preceded by news.
+#[tokio::test]
+async fn a_stream_ends_with_the_projection_a_plain_post_returns() {
+    let (_project, _data, harness) = booted(ADMIN_ON);
+    let (buffered_status, buffered) = post(&harness.app(), "", BY_NAME).await;
+    let (streamed_status, lines) = stream(&harness.app(), "", BY_NAME).await;
+
+    assert_eq!(buffered_status, StatusCode::OK);
+    assert_eq!(streamed_status, StatusCode::OK, "{lines:?}");
+    // `elapsed` is not on the wire and the digest is of the source, so two folds of the
+    // same projector over the same log are the same value. A client that learned the
+    // buffered body has learned this one.
+    assert_eq!(
+        lines.last().expect("a final line"),
+        &buffered,
+        "the last line is the body the other shape returns"
+    );
+
+    harness.shutdown();
+}
+
+/// Progress arrives before the answer, in the same units the answer reports.
+#[tokio::test]
+async fn a_stream_says_where_it_got_to_before_it_says_what_it_found() {
+    let (_project, _data, harness) = booted(ADMIN_ON);
+    let (status, lines) = stream(&harness.app(), "", BY_NAME).await;
+    assert_eq!(status, StatusCode::OK, "{lines:?}");
+
+    let ticks: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line.get("progress").is_some())
+        .collect();
+    // At least the unthrottled first one. Not *exactly* one: the throttle is real
+    // elapsed time, so a loaded machine can put more than it between two of the three
+    // matching events, and a count is the one thing here that is not a property of the
+    // protocol.
+    assert!(!ticks.is_empty(), "{lines:?}");
+    let first = &ticks[0]["progress"];
+    let answer = lines.last().unwrap();
+
+    // Absolute, not window-relative: a tick is read against the final line's own
+    // numbers, which is the whole reason the handler adds `from` back.
+    assert_eq!(first["position"], 1, "the first match is at position 1");
+    assert_eq!(first["upto"], answer["window"]["upto"]);
+    assert_eq!(first["events"], 1);
+    assert!(
+        lines[lines.len() - 1].get("progress").is_none(),
+        "the answer is not a tick: {lines:?}"
+    );
+
+    harness.shutdown();
+}
+
+/// A window that starts part way through still reports where it really is.
+#[tokio::test]
+async fn a_tick_inside_a_bounded_window_is_still_an_absolute_position() {
+    let (_project, _data, harness) = booted(ADMIN_ON);
+    let (status, lines) = stream(&harness.app(), "?from=2", BY_NAME).await;
+    assert_eq!(status, StatusCode::OK, "{lines:?}");
+
+    let first = lines
+        .iter()
+        .find_map(|line| line.get("progress"))
+        .expect("a tick");
+    assert_eq!(
+        first["position"], 2,
+        "not 1, which is where the window opens"
+    );
+    assert_eq!(lines.last().unwrap()["scanned"]["events"], 2);
+
+    harness.shutdown();
+}
+
+/// Compiling happens before a byte of the body is written, which is what keeps the
+/// status code worth reading. A stream that carried this as a line would be a 200.
+#[tokio::test]
+async fn a_source_that_does_not_compile_is_a_400_even_when_a_stream_was_asked_for() {
+    let (_project, _data, harness) = booted(ADMIN_ON);
+    let (status, lines) = stream(
+        &harness.app(),
+        "",
+        "projector Bad {\n  entity T { id: String @key @max(9) }\n  on @user.nope { id } { put T { id } }\n}\n",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{lines:?}");
+    assert_eq!(lines.len(), 1, "a refusal is one body, not a stream");
+    assert_eq!(lines[0]["error"]["code"], "invalid_input");
+    assert!(lines[0]["findings"].is_array(), "{lines:?}");
+
+    harness.shutdown();
+}
+
+/// The window is checked in the same hop as the compile, for the same reason.
+#[tokio::test]
+async fn a_window_that_holds_nothing_is_a_400_even_when_a_stream_was_asked_for() {
+    let (_project, _data, harness) = booted(ADMIN_ON);
+    let (status, lines) = stream(&harness.app(), "?from=9&upto=2", BY_NAME).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{lines:?}");
+    assert_eq!(lines[0]["error"]["code"], "invalid_input");
+
+    harness.shutdown();
+}
+
+/// A request that passed the check and then failed is ours, not the caller's. Every
+/// refusal the caller could have avoided is a 400 from the hop before this one, so a
+/// 400 here would tell somebody with a full disk to go and fix their heklang.
+#[tokio::test]
+async fn a_fold_that_fails_after_the_check_is_not_the_callers_fault() {
+    let project = write_project(&[
+        ("hekla.toml", ADMIN_ON),
+        ("events/user.hk", EVENTS),
+        ("commands/register.hk", REGISTER),
+    ]);
+    let data = tempfile::tempdir().unwrap();
+    let harness = Boot::new(project.path()).data_dir(data.path()).start();
+
+    // A projector that seals a column, with no master key anywhere. The declaration half
+    // of that is a 400 from `check`; what is left for `run` to hit is the operational
+    // database, and this proves the two are told apart rather than both being 400.
+    let sealed = "\
+projector Sealed {
+  entity S {
+    name: String @key @max(120) @subject(name),
+    seen: Int,
+  }
+
+  on @user.registered { name } {
+    patch S[name] { seen: .seen + 1 }
+  }
+}
+";
+    let (status, body) = post(&harness.app(), "", sealed).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "no master key is a fact about the declaration, settled before anything opens: {body:?}"
+    );
+    assert_eq!(body["error"]["code"], "invalid_input");
+
+    harness.shutdown();
+}
+
+/// A caller that has not heard of the streaming body is never handed one, whatever else
+/// it accepts.
+#[tokio::test]
+async fn a_caller_that_did_not_ask_for_a_stream_gets_the_whole_body() {
+    let (_project, _data, harness) = booted(ADMIN_ON);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/admin/projections")
+        .header(header::ACCEPT, "application/json, text/html, */*")
+        .body(Body::from(BY_NAME))
+        .unwrap();
+    let response = harness.app().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/json",
+        "`*/*` is not an ask for a representation nothing else offers"
+    );
+
+    harness.shutdown();
 }
 
 // --- the gate --------------------------------------------------------------
@@ -314,9 +507,22 @@ async fn a_source_that_does_not_compile_is_a_400_carrying_the_findings() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "invalid_input");
     let findings = body["findings"].as_array().expect("the diagnostics");
-    let first = findings[0].as_str().unwrap();
-    assert!(first.contains("user.nope"), "{first}");
-    assert!(first.contains(':'), "it names a line and column: {first}");
+    let first = &findings[0];
+    assert_eq!(first["severity"], "error", "{first:?}");
+    assert_eq!(first["location"], "<projection>", "{first:?}");
+    assert!(
+        first["message"].as_str().unwrap().contains("user.nope"),
+        "{first:?}"
+    );
+    // Structured, not rendered: the console puts a caret here, and a browser regexing a
+    // `format!` in `validate.rs` is the coupling this shape exists to avoid.
+    //
+    // The numbers are checked and not merely present, because they were wrong: heklang
+    // counts from one and hekla added one more, so every diagnostic it had ever printed
+    // pointed a line past the problem. `on @user.nope` is the third line of the body
+    // above and `@` is its sixth character.
+    assert_eq!(first["line"], 3, "{first:?}");
+    assert_eq!(first["column"], 6, "{first:?}");
 
     harness.shutdown();
 }
@@ -387,7 +593,10 @@ async fn a_projection_compiles_against_what_booted_not_what_is_on_disk() {
     );
     let findings = body["findings"].as_array().unwrap();
     assert!(
-        findings[0].as_str().unwrap().contains("user.invented"),
+        findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("user.invented"),
         "{findings:?}"
     );
 

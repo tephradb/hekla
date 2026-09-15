@@ -227,12 +227,43 @@ Folding a whole log is `hekla project`'s job, which holds no request open while 
 running server is not visible to a projection, which is deliberate: it would otherwise typecheck
 against declarations the process is not running and then misread stored payloads.
 
-A compile failure is a 400 carrying the compiler's own diagnostics:
+A compile failure is a 400 carrying the compiler's own diagnostics, structured so a caller can put a
+caret on one rather than parse a sentence. `line` and `column` count from one and are null together
+when the finding is about a declaration rather than a place in the text:
 
 ```json
 { "error": { "code": "invalid_input", "message": "the projector does not compile" },
-  "findings": ["error: <projection>:3:5: event @user.nope is not declared"] }
+  "findings": [{ "severity": "error", "location": "<projection>", "line": 3, "column": 5,
+                 "message": "event @user.nope is not declared", "hint": null }] }
 ```
+
+**Watching it fold.** `Accept: application/x-ndjson` answers as the fold goes rather than when it
+finishes: one JSON object per line, a `progress` tick about ten times a second, then the projection
+itself as the last line, byte for byte what the buffered body would have been.
+
+```sh
+curl -N -H 'accept: application/x-ndjson' --data-binary @question.hk \
+  localhost:8080/admin/projections
+```
+```
+{"progress":{"position":412903,"upto":1000000,"events":1284}}
+{"projector":"ByStatus","window":{…},"entities":[…]}
+```
+
+Positions are absolute, so a tick reads against the final line's own `window` and `scanned`. Tell
+the three line shapes apart by their only top-level key: a `Projection` carries neither `progress`
+nor `error`, and all three schemas are closed. Ticks arrive once per *matching* event, so a
+selective projector reports rarely while working perfectly; run your own clock rather than treating
+silence as a stall. A stream that ends without a final line hit an internal error, which is the
+`500` the buffered shape would have sent.
+
+Everything a request can get wrong is still a status code: the source is compiled and the window
+checked before a byte of the body is written, because a body that has begun has spent its status.
+A fold that fails after that arrives as a final `{"error":{…}}` line.
+
+Two projections fold at once per deployment. A third is `429 projections_busy` with `Retry-After`,
+refused rather than queued, because holding a request open while two others fold five million events
+answers nobody.
 
 ## The console
 
@@ -296,10 +327,34 @@ subject columns decrypted. The selection lives in the query string, so a row is 
 - A projector that is rebuilding, stale or quarantined cannot serve rows at its current definition.
   The section reports the server's own message, which names the fix, rather than an error.
 
+### Writing a projection
+
+`/admin/projections` is the editor for the endpoint above: heklang with a line gutter and
+highlighting, `⌘↵` / `Ctrl-↵` to run, and the rows underneath. The page opens with a projector that
+already works, generated from an event the project declares, and `insert on @…` splices a handler
+with that event's real field names in at the closing brace.
+
+- It always streams, so the bar fills against real positions and the count is events actually
+  folded. Silence is not a stall: a selective projector reports only when something matches, which
+  is why the elapsed clock is the page's own.
+- A diagnostic's `line:column` is a button. It puts the caret on that line and the gutter lights it
+  up.
+- **Saved projections live in this browser**, under `hekla.projections`, along with an autosaved
+  draft of whatever is in the editor. A question you asked is yours, not the deployment's, and
+  storing them server-side would put a write surface on the one page whose whole claim is that it
+  writes nothing.
+- With `[admin] projections = true` unset the page still opens and says what to add to
+  `hekla.toml`. A refusal nobody can ask about is worse than one they can.
+- A blank cell in a **sealed** column may be an erasure; a blank cell anywhere else cannot be. The
+  response carries no field kinds, only which columns are sealed, so that is the only line the page
+  draws and it draws exactly that one.
+
 | Key | Does |
 | --- | --- |
 | `⌘K` / `Ctrl-K` | jump to a position, a correlation id, an effect, a projector, or a view |
 | `j` / `k` | move the row cursor |
 | `Enter` | open the row |
-| `Esc` | close the drawer or dialog |
+| `⌘↵` / `Ctrl-↵` | run the projection, from inside the editor |
+| `Esc` | close the drawer or dialog, or leave the editor |
+| `Tab` | indent in the editor, rather than leaving it |
 | `/` | focus the filter |

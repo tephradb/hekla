@@ -31,7 +31,7 @@ use tephra::{
 use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use heklang::Program;
 
@@ -255,7 +255,7 @@ pub struct Runtime {
     /// more module against exactly what booted. See [`crate::loader::Sources`].
     sources: Arc<loader::Sources>,
     /// How many ad-hoc projections may fold at once. See [`PROJECTION_SLOTS`].
-    projections: Semaphore,
+    projections: Arc<Semaphore>,
 }
 
 /// The log as a reader that must not disturb it sees it, or `None` when the directory
@@ -438,7 +438,7 @@ impl Runtime {
             config,
             data_dir: data_dir.to_path_buf(),
             sources,
-            projections: Semaphore::new(PROJECTION_SLOTS),
+            projections: Arc::new(Semaphore::new(PROJECTION_SLOTS)),
         });
 
         // Effects need `Arc<Runtime>` (for `invoke_command` and the boundary fold), so they
@@ -541,7 +541,7 @@ impl Runtime {
             openapi_json: String::new(),
             config: project.config.clone(),
             sources: Arc::clone(project.sources()),
-            projections: Semaphore::new(PROJECTION_SLOTS),
+            projections: Arc::new(Semaphore::new(PROJECTION_SLOTS)),
             data_dir: data_dir.to_path_buf(),
             _lock: Some(lock),
             // The sweep calls the checks directly. Leaving this off keeps a replay it
@@ -614,7 +614,7 @@ impl Runtime {
             openapi_json: String::new(),
             config: project.config.clone(),
             sources: Arc::clone(project.sources()),
-            projections: Semaphore::new(PROJECTION_SLOTS),
+            projections: Arc::new(Semaphore::new(PROJECTION_SLOTS)),
             data_dir: data_dir.to_path_buf(),
             _lock: None,
             // Nothing here schedules work, so there is nothing for a continuous check to
@@ -1052,8 +1052,12 @@ impl Runtime {
     /// Public because holding the slots is the only honest way to watch the endpoint
     /// refuse: racing two real folds to overlap would be a test that passes for timing
     /// reasons.
-    pub fn projection_slot(&self) -> Option<SemaphorePermit<'_>> {
-        self.projections.try_acquire().ok()
+    ///
+    /// Owned rather than borrowed because a streaming projection outlives its handler:
+    /// the fold runs on until its last line is written, and the slot has to be held for
+    /// all of it rather than released when the response head goes out.
+    pub fn projection_slot(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.projections).try_acquire_owned().ok()
     }
 
     /// The resolved data directory.

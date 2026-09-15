@@ -223,4 +223,78 @@ export const api = {
 
   skip: (name, position) =>
     request(`/effects/${encodeURIComponent(name)}/skip/${position}`, { method: 'POST' }),
+
+  /* Whether this deployment folds ad-hoc projections, and the ceilings it folds them
+   * within. It answers with the feature off too, so the page can say what to turn on
+   * rather than guessing from a 403 nobody can ask about. */
+  projections: (signal) => request('/admin/projections', { signal }),
+
+  /**
+   * Fold one, watching it go.
+   *
+   * The console's only hand-rolled fetch, because it is the only response that arrives
+   * in pieces and `request` above ends at `response.json()`. `Accept:
+   * application/x-ndjson` opts into that; every other caller of this endpoint gets one
+   * buffered body and never has to know.
+   *
+   * `onProgress` is called with `{ position, upto, events }` as the server reports it,
+   * about ten times a second while events are matching and not at all while none are.
+   * The resolved value is the projection itself: the last line of the stream, and the
+   * same value the buffered shape returns.
+   */
+  project: async (source, params, { onProgress, signal } = {}) => {
+    let response
+    try {
+      response = await fetch('/admin/projections' + query(params), {
+        method: 'POST',
+        headers: { accept: 'application/x-ndjson', 'content-type': 'text/plain' },
+        body: source,
+        signal,
+      })
+    } catch (err) {
+      if (err.name === 'AbortError') throw err
+      throw new ApiError(0, 'unreachable', 'hekla is not answering on this address')
+    }
+    /* Everything the request can get wrong is refused before the body opens, so a
+     * failure here is still a status and an envelope, exactly like every other call. */
+    if (!response.ok) throw await toError(response)
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let pending = ''
+    let last = null
+    const take = (line) => {
+      if (!line.trim()) return
+      const message = JSON.parse(line)
+      if (message.progress) onProgress?.(message.progress)
+      else last = message
+    }
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      pending += decoder.decode(value, { stream: true })
+      let breaks
+      while ((breaks = pending.indexOf('\n')) >= 0) {
+        take(pending.slice(0, breaks))
+        pending = pending.slice(breaks + 1)
+      }
+    }
+    /* The flush completes a multi-byte character split across the last two chunks, and
+     * what is left over is a final line that arrived without its newline. hekla writes
+     * one, but throwing away an answer that is sitting right there because a proxy
+     * trimmed a byte would report a fold that worked as a fold that vanished. */
+    pending += decoder.decode()
+    take(pending)
+    /* Told apart by their only top-level key, which works because all three schemas
+     * are closed: a projection carries neither `progress` nor `error`. */
+    if (last?.error) {
+      throw new ApiError(200, last.error.code ?? 'internal', last.error.message ?? '', last)
+    }
+    if (!last) {
+      /* The fold panicked: the sender dropped without writing an answer. The buffered
+       * shape would have said 500, and a stream that stops has said the same thing. */
+      throw new ApiError(500, 'internal', 'the projection stopped without answering')
+    }
+    return last
+  },
 }

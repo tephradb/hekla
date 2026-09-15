@@ -214,3 +214,10 @@ All of it is a `GET` but one. `POST /admin/projections` folds an ad-hoc heklang 
 log and returns its rows, deploying nothing and writing nothing; it needs `[admin] projections =
 true` in `hekla.toml` and answers 403 otherwise. The body is the source as `text/plain`, the knobs
 are query parameters, and the response is what `hekla project --json` prints.
+
+It is also the one response that can arrive in pieces. `Accept: application/x-ndjson` streams the
+fold: one JSON object per line, a `{"progress":{…}}` tick while it works, and the projection itself
+as the last line, identical to the buffered body. Any other `Accept` gets that buffered body and
+nothing changes for it. Not SSE and not a subscription: one request, no reconnection, no fan-out,
+and a bounded channel that drops ticks rather than growing. The status code still means what it
+says, because the source is compiled and the window checked before the body opens.

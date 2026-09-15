@@ -357,6 +357,40 @@ async fn a_method_the_route_does_not_serve_is_405_even_for_a_browser() {
     harness.shutdown();
 }
 
+/// HEAD says what GET would say. axum's `get()` answers both, so negotiating one and not
+/// the other would have a browser's HEAD announce `application/json` for a URL whose GET
+/// is a web page, which is the one thing HEAD is defined not to do.
+#[tokio::test]
+async fn a_head_announces_what_the_get_would_have_sent() {
+    let harness = boot();
+    let app = harness.app();
+
+    for uri in ["/admin", "/admin/events", "/admin/projections"] {
+        let head = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(uri)
+                    .header(header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, content_type, _) = await_html(&app, uri).await;
+
+        assert_eq!(head.status(), status, "HEAD {uri}");
+        assert_eq!(
+            head.headers()[header::CONTENT_TYPE],
+            content_type.as_str(),
+            "HEAD {uri} announced a type its GET does not serve"
+        );
+    }
+
+    harness.shutdown();
+}
+
 #[tokio::test]
 async fn a_path_outside_admin_is_never_negotiated() {
     let harness = boot();

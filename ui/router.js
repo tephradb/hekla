@@ -29,6 +29,10 @@ export const ROUTES = [
   },
   { id: 'projectors', path: '/admin/projectors', title: 'Projectors' },
   { id: 'projectors', path: '/admin/projectors/{name}', title: 'Projectors' },
+  /* Directly under the deployed folds, because the two read as a contrast rather than
+   * a near-duplicate when they are side by side: those are the projectors this
+   * deployment runs, this is one it does not. */
+  { id: 'projections', path: '/admin/projections', title: 'Projections' },
   { id: 'schema', path: '/admin/schema', title: 'Schema' },
   { id: 'subjects', path: '/admin/subjects', title: 'Subjects' },
   { id: 'subjects', path: '/admin/subjects/{field}/{value}', title: 'Subjects' },
