@@ -12,6 +12,7 @@
 //! `lib/` and `tests/` are what the examples do, and nothing here checks them.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -252,6 +253,25 @@ pub struct LoadedProject {
     pub projectors: Vec<ProjectorUnit>,
     pub effects: Vec<EffectUnit>,
     pub findings: Vec<Finding>,
+    /// The module name of the [`Scratch`] this project was loaded with, if any. What
+    /// `hekla project` finds its own projector by, since everything else about that
+    /// projector is built exactly like a deployed one.
+    pub scratch: Option<String>,
+}
+
+/// One module that is not on disk under the project root.
+///
+/// `hekla project` compiles an ad-hoc projector against the deployed schema, and the
+/// only way to typecheck it is to parse it with the declarations it names. So it joins
+/// the project's own sources rather than being checked apart from them, which is also
+/// what lets it call the project's `fn` helpers and use its `const`s, records and enums.
+///
+/// `name` is the path the operator typed, so a diagnostic names the file they are
+/// looking at. heklang treats a module as a label for a diagnostic and nothing else, so
+/// nothing but the message depends on it.
+pub struct Scratch<'a> {
+    pub name: &'a str,
+    pub source: &'a str,
 }
 
 /// Every declaration's entry hash, keyed by kind and the name heklang knows it by.
@@ -303,6 +323,12 @@ fn digest_hashes(digest: &Digest) -> HashMap<(Kind, &str), String> {
 
 impl LoadedProject {
     pub fn load(root: &Path) -> LoadedProject {
+        LoadedProject::load_with(root, None)
+    }
+
+    /// [`LoadedProject::load`], plus one module that is not on disk. See [`Scratch`].
+    pub fn load_with(root: &Path, scratch: Option<Scratch<'_>>) -> LoadedProject {
+        let scratch_name = scratch.as_ref().map(|one| one.name.to_owned());
         let mut findings = Vec::new();
         let config = match Config::load(root) {
             Ok(config) => config,
@@ -317,12 +343,30 @@ impl LoadedProject {
         let mut sources: Vec<(String, String)> = Vec::new();
         for path in hek_files(root, &mut findings) {
             let rel = rel_to_string(root, &path);
-            match std::fs::read_to_string(&path) {
+            match fs::read_to_string(&path) {
                 Ok(text) => sources.push((rel, text)),
                 Err(err) => findings.push(Finding::error(rel, format!("reading: {err}"))),
             }
         }
+        // A scratch file written inside the project is the most natural invocation there
+        // is (`hekla project question.hk` from the root), and the walk above has already
+        // read it. Handing heklang the same source twice is `projector X is declared
+        // twice` for a file the operator did nothing wrong with.
+        if let Some(one) = &scratch {
+            let same = fs::canonicalize(one.name).ok();
+            sources.retain(|(rel, _)| {
+                same.as_ref()
+                    .zip(fs::canonicalize(root.join(rel)).ok())
+                    .is_none_or(|(scratch, walked)| scratch != &walked)
+            });
+        }
         sources.sort_by(|left, right| left.0.cmp(&right.0));
+        // After the sort, not in it. heklang reports a duplicate declaration against the
+        // *second* file it sees, so a scratch module that sorts early would make a name
+        // collision read as the project's fault rather than as this file's.
+        if let Some(one) = &scratch {
+            sources.push((one.name.to_owned(), one.source.to_owned()));
+        }
 
         let borrowed: Vec<(&str, &str)> = sources
             .iter()
@@ -348,6 +392,7 @@ impl LoadedProject {
                     projectors: Vec::new(),
                     effects: Vec::new(),
                     findings,
+                    scratch: scratch_name,
                 };
             }
         };
@@ -400,7 +445,13 @@ impl LoadedProject {
         let mut projectors = Vec::new();
         for projector in &program.projectors {
             let rel = projector.module.clone().unwrap_or_default();
-            if role_for(&rel) != Some(Role::Projector) {
+            // The scratch module is exempt, and only for a projector: it is the one
+            // thing `hekla project` submits, it is never deployed, and requiring an
+            // operator to put a one-off question under projectors/ would be requiring
+            // them to edit the project to ask it. A command or an effect written there
+            // still lands on the rule below, which is the right answer.
+            let scratch = scratch_name.as_deref() == Some(rel.as_str());
+            if !scratch && role_for(&rel) != Some(Role::Projector) {
                 findings.push(Finding::error(
                     rel.clone(),
                     format!(
@@ -464,6 +515,7 @@ impl LoadedProject {
             projectors,
             effects,
             findings,
+            scratch: scratch_name,
         }
     }
 

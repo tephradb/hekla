@@ -689,3 +689,38 @@ pub async fn post_command(
         .unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
+
+/// Every file under `dir`, by relative path and content, sorted.
+///
+/// Recursive on purpose: `events/` holds the log segments *and* an `index/` beside them,
+/// and a follower rebuilds an index in memory rather than rewriting the `.idx` on disk.
+/// A listing that stopped at the top level would miss exactly that.
+///
+/// A missing directory is an empty listing rather than a panic, because "no read model
+/// appeared" is a thing a caller asserts and a directory that was never created is how
+/// that reads on disk.
+pub fn tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, prefix: &str, into: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), &rel, into);
+            } else {
+                into.push((rel, fs::read(entry.path()).unwrap()));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, "", &mut found);
+    found.sort_by(|(left, _), (right, _)| left.cmp(right));
+    found
+}

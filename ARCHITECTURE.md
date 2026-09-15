@@ -944,6 +944,48 @@ consistent copy is not required for them.
   it, so that closure is what keeps an edited helper, or an event field that just became `@subject`,
   from hiding behind an unchanged effect hash.
 
+- `hekla project <file> <dir>`: fold an undeployed projector over the log once and print its rows.
+  The read API serves what a deployed projector chose to materialise and `/admin` serves raw events
+  filtered by type and tag; neither answers "count these, grouped by that", and the only route to
+  that was writing a projector, deploying it and waiting for a rebuild. This is that question
+  without the deploy: a standalone `.hk` file declaring one `projector`, folded into a read model in
+  a temporary directory that is deleted when it returns. Nothing is recorded, no declaration row, no
+  database under `data/projectors/`, no route.
+
+  **The scratch file is compiled with the project**, in the same `check_files` call, because it names
+  events it does not declare and heklang has no import. What falls out is the point: it typechecks
+  against the deployed event declarations, calls the project's `fn` helpers and reads its `const`s,
+  and a name it shares with a deployed declaration is heklang's own duplicate diagnostic rather than
+  a rule this had to invent. The one rule relaxed for it is placement: a projector there need not sit
+  under `projectors/`, because requiring an operator to edit the project to ask a question of it
+  would defeat the command. A `command` or an `effect` written there still lands on the rule, which
+  is the right answer: neither can be folded over anything.
+
+  **The rows go through the real sink**, `RowWriter` into a real `ReadModel`, the way `hekla test`
+  and the rebuild check already build a throwaway one. That is a correctness requirement rather than
+  a convenience, and three properties say why. A projector re-seals a moved seal under the column's
+  own field name, because the key store binds the field name into the ciphertext and a column stores
+  a `Timestamp` in a shape an event does not; it writes through `encrypt_subject_existing`, so
+  re-projecting an erased subject cannot mint the key the erasure destroyed; and it decrypts on read,
+  so a `patch` over a sealed column sees plaintext. A sink carrying the log's bytes through verbatim
+  would split one subject into two rows wherever two event types name its field differently.
+
+  It reads through the same read-only follower `plan --replay` uses: no lock, nothing created,
+  nothing deleted, so it runs against a deployment serving traffic, and the answer is a snapshot at
+  the tip the follower pinned when it opened. A projection that seals a column needs
+  `HEKLA_MASTER_KEY` and is refused before the scan rather than a million events into one; a
+  projection over plaintext opens no operational database at all. Exit is 0 whenever the projection
+  ran: the rows are the answer, not a fault.
+
+  **What it cannot see** is stated rather than assumed away, the way `plan --replay`'s limits are.
+  Only the event log, so effect invocations, journals and checkpoints stay `/admin`'s to answer; no
+  `reveal`, since a projector holds no host, though it can key and group on a sealed column because
+  the encryption is deterministic; no checkpoint, so every run folds from the start of its window
+  and a question asked on every request is a deployment rather than a projection; and nothing
+  appended during the run. A `--max-events` budget, a `--from`/`--upto` window and a `--rows` cap
+  each name what they left out, because a bounded answer that read like a complete one would be the
+  worst thing this could print.
+
 **`hekla fmt` and `hekla lsp` are gone.** Both were Starlark tooling: starlark-rust ships a formatter
 and a language server, and hekla wrapped them with its own project knowledge (which builtins are in
 scope depends on the directory, and `load()` resolves against the project root). heklang has a

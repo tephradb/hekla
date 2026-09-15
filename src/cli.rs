@@ -7,6 +7,7 @@
 //! irreversibly deleting one subject's key.
 
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,11 @@ use tracing_subscriber::EnvFilter;
 use crate::http::{HttpClient, UreqClient};
 use heklang::ir::Delivery;
 
-use crate::loader::{ArmRef, EffectUnit, Finding, LoadedProject, Severity};
+use crate::loader::{ArmRef, EffectUnit, Finding, LoadedProject, Scratch, Severity};
 use crate::opdb::{self, OpDb};
 use crate::plan::Replay;
-use crate::{crypto, lock, metrics, runtime, server, testing, validate};
+use crate::progress::Progress;
+use crate::{crypto, lock, metrics, projection, runtime, server, testing, validate};
 
 /// The default HTTP bind address when `--addr` is not given.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
@@ -156,6 +158,82 @@ enum Command {
               value_parser = clap::value_parser!(u32).range(1..))]
         replay_limit: u32,
     },
+    /// Fold an ad-hoc projector over the event log and print its rows, deploying nothing.
+    ///
+    /// FILE is a standalone `.hk` file declaring one `projector`. It is compiled together
+    /// with the project, so it typechecks against the deployed events and can call the
+    /// project's own `fn`, `const`, `record` and `enum` declarations, but it is folded
+    /// into a read model in a temporary directory and nothing is kept: no declaration
+    /// row, no database under `data/projectors/`, no checkpoint and no route.
+    ///
+    /// This is for the question a deploy should not have to answer: count these, grouped
+    /// by that, without waiting for a rebuild to find out. It reads the log through a
+    /// read-only follower and takes no data-directory lock, so like `plan` it runs
+    /// against a deployment that is serving traffic, and the rows are a snapshot at the
+    /// tip pinned when it opened. Exits zero whenever the projection ran; the rows are
+    /// the answer, not a fault.
+    Project {
+        /// The `.hk` file declaring the projector to fold. Never part of the project,
+        /// and never written to.
+        file: PathBuf,
+        /// The project directory, whose events the projector is compiled against.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// The data directory (event store and operational DB). Defaults to
+        /// `<dir>/data`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Which projector to fold, when FILE declares more than one. A file declaring
+        /// exactly one needs no flag; one declaring none is an error, because there is
+        /// nothing to fold.
+        #[arg(long)]
+        projector: Option<String>,
+        /// Report only this entity. The default reports every one the projector
+        /// declares, in declaration order.
+        #[arg(long)]
+        entity: Option<String>,
+        /// Fold only from this position. The default folds the whole log.
+        ///
+        /// A narrowed window narrows the answer rather than speeding it up: a row whose
+        /// creating event is below it is missing, and an accumulated one is partial. The
+        /// summary names the window whenever it is not the whole log, so a partial answer
+        /// cannot be read as a total.
+        #[arg(long)]
+        from: Option<u64>,
+        /// Stop at this position instead of the log's tip, for reproducing what a
+        /// projector would have shown at a moment whose position you already know.
+        #[arg(long)]
+        upto: Option<u64>,
+        /// Stop after folding this many matching events, whatever the window says.
+        ///
+        /// For a first look at a log too large to fold whole. At least one: a budget of
+        /// zero would fold nothing while reporting a budget, which describes no work at
+        /// all. A run that spends its budget says so on its own line and never reads like
+        /// a complete one.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_events: Option<u64>,
+        /// How many rows of each entity to print. The rest are counted, never dropped
+        /// quietly, and `--json` is bounded the same way for the same reason: a
+        /// projection over a large log can build more rows than either form can carry.
+        #[arg(long, default_value_t = crate::projection::DEFAULT_ROWS as u32,
+              value_parser = clap::value_parser!(u32).range(1..))]
+        rows: u32,
+        /// Print sealed columns as the ciphertext that is stored rather than opening
+        /// them.
+        ///
+        /// The fold still holds the master key, because a projector re-seals a column
+        /// under the column's own field name and reads its own stored loads back as
+        /// plaintext. This withholds only the last step, the way
+        /// `/admin/events?decrypt=false` does, so what prints is what is on disk.
+        #[arg(long)]
+        no_decrypt: bool,
+        /// Suppress the progress line even when stderr is a terminal.
+        #[arg(long)]
+        no_progress: bool,
+        /// Print the projection as JSON on stdout, for a script to read.
+        #[arg(long)]
+        json: bool,
+    },
     /// Report every deployment credential the project declares and whether this machine
     /// can supply it, without printing any of them.
     ///
@@ -250,6 +328,35 @@ pub fn run() -> ExitCode {
             replay,
             replay_limit,
         } => plan(&dir, data_dir.as_deref(), json, replay, replay_limit),
+        Command::Project {
+            file,
+            dir,
+            data_dir,
+            projector,
+            entity,
+            from,
+            upto,
+            max_events,
+            rows,
+            no_decrypt,
+            no_progress,
+            json,
+        } => project(
+            &file,
+            &dir,
+            data_dir.as_deref(),
+            Ask {
+                projector: projector.as_deref(),
+                entity: entity.as_deref(),
+                from,
+                upto,
+                max_events,
+                rows: rows as usize,
+                decrypt: !no_decrypt,
+                progress: !no_progress,
+                json,
+            },
+        ),
         Command::Secrets { dir } => secrets(&dir),
         Command::Erase {
             subject_field,
@@ -631,6 +738,126 @@ fn check(dir: &Path) -> ExitCode {
 /// `hekla secrets`: what this machine can supply for the credentials the project
 /// declares.
 ///
+/// Everything `hekla project` was asked for beyond its paths. One struct because the
+/// alternative is a free function with twelve positional arguments, half of them `bool`.
+struct Ask<'a> {
+    projector: Option<&'a str>,
+    entity: Option<&'a str>,
+    from: Option<u64>,
+    upto: Option<u64>,
+    max_events: Option<u64>,
+    rows: usize,
+    decrypt: bool,
+    progress: bool,
+    json: bool,
+}
+
+/// Fold an ad-hoc projector over the log and print its rows.
+///
+/// Exits zero whenever the projection ran, whatever it found: zero rows, a spent budget
+/// and a bounded row list are all answers. `plan` states the same rule for a change, and
+/// it holds harder here, where the rows *are* the result. Everything that can go wrong is
+/// an error rather than a finding, so the report ends on `ok:` or `partial:` and never on
+/// `failed:`.
+fn project(file: &Path, dir: &Path, data_dir: Option<&Path>, ask: Ask<'_>) -> ExitCode {
+    // Checked before the directory, because `[DIR]` defaulting to `.` makes the
+    // transposed `hekla project . question.hk` easy to type, and a complaint about `.`
+    // not being a `.hk` file is the one that names the real mistake.
+    if !file.is_file() {
+        eprintln!("error: `{}` is not a file", file.display());
+        return ExitCode::FAILURE;
+    }
+    if file.extension().is_none_or(|ext| ext != "hk") {
+        eprintln!(
+            "error: `{}` is not a `.hk` file; the projector to fold goes in one",
+            file.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    // Same reason as `openapi` and `plan`: `load` succeeds vacuously on a path that is
+    // not a project, and folding against a typo'd directory would report an empty answer
+    // rather than a mistake.
+    if !dir.is_dir() {
+        eprintln!("error: `{}` is not a directory", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let source = match fs::read_to_string(file) {
+        Ok(source) => source,
+        Err(err) => {
+            eprintln!("error: reading `{}`: {err}", file.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let name = file.display().to_string();
+    let project = LoadedProject::load_with(
+        dir,
+        Some(Scratch {
+            name: &name,
+            source: &source,
+        }),
+    );
+    let findings = collect_findings(&project);
+    for finding in &findings {
+        eprintln!("{}", render_finding(finding));
+    }
+    let errors = count_errors(&findings);
+    if errors > 0 {
+        eprintln!("refusing to project: the project has {errors} error(s)");
+        return ExitCode::FAILURE;
+    }
+
+    // Resolved here rather than inside the projection, the way `plan` resolves its own:
+    // a malformed master must fail the run that asked for it, and a projection that
+    // seals no column never needs one at all.
+    let master = match crypto::master_keys_from_env() {
+        Ok(master) => master,
+        Err(err) => {
+            eprintln!("error: reading the master key: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let data = runtime::resolve_data_dir(dir, data_dir);
+    let request = projection::Request {
+        projector: ask.projector,
+        entity: ask.entity,
+        from: ask.from,
+        upto: ask.upto,
+        max_events: ask.max_events,
+        decrypt: ask.decrypt,
+        rows: ask.rows,
+        master,
+    };
+    let ticker = Progress::stderr(ask.progress);
+    let result = projection::run(&project, &data, &request, &mut |position, upto, matched| {
+        ticker.tick(position.get(), upto.get(), matched);
+    });
+    // Before either arm writes, so half a progress line can never sit under a result or
+    // under a diagnostic.
+    ticker.clear();
+
+    match result {
+        Ok(projection) => {
+            if ask.json {
+                match serde_json::to_string_pretty(&projection.json()) {
+                    Ok(text) => println!("{text}"),
+                    Err(err) => {
+                        eprintln!("error: serializing the projection: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                println!("{projection}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Never a value, and not because the printing is careful: it reads a
 /// [`crate::secrets::Resolution`], which does not carry one. What it shows instead is
 /// where each was looked for and a short fingerprint, which is what an operator comparing

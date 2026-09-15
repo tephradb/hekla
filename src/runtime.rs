@@ -279,6 +279,7 @@ impl Runtime {
         http: Arc<dyn HttpClient>,
         master: Option<MasterKeys>,
     ) -> anyhow::Result<(Arc<Runtime>, WriteCoordinator, ProjectorSet, EffectRuntime)> {
+        refuse_scratch(&project)?;
         // Taken before anything opens the log. tephra does not lock its segment
         // directory, so a second process here would corrupt it rather than fail.
         fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
@@ -441,6 +442,7 @@ impl Runtime {
         data_dir: &Path,
         master: Option<MasterKeys>,
     ) -> anyhow::Result<(Arc<Runtime>, WriteCoordinator)> {
+        refuse_scratch(project)?;
         let lock = DataDirLock::acquire(data_dir)?;
         let events_dir = data_dir.join("events");
         let set = SegmentSet::open(&events_dir, SegmentConfig::new(SEGMENT_SIZE))
@@ -553,6 +555,7 @@ impl Runtime {
         data_dir: &Path,
         master: Option<MasterKeys>,
     ) -> anyhow::Result<Option<Arc<Runtime>>> {
+        refuse_scratch(project)?;
         let Some(store) = follow(data_dir)? else {
             return Ok(None);
         };
@@ -1353,6 +1356,23 @@ fn tag_strings(tags: &[(String, Option<String>)]) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// Refuse a project that was loaded with a scratch module.
+///
+/// A [`crate::loader::Scratch`] is a question, not a deployment: the projector in it was
+/// never written to the project, and opening a runtime over one would record its
+/// declaration, build it a read model under `data/projectors/` and route its entities.
+/// Only `hekla project` builds one today, so this guards against a second caller rather
+/// than against a current bug, which is the point of putting it where every opener passes.
+fn refuse_scratch(project: &LoadedProject) -> anyhow::Result<()> {
+    match &project.scratch {
+        Some(name) => anyhow::bail!(
+            "this project was loaded with the scratch module `{name}`, which is a \
+             question rather than a deployment; load it without one to run it"
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Resolve the data directory: the flag if given, else `<project>/data`.

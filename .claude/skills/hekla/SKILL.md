@@ -37,6 +37,7 @@ hekla openapi <dir>   # the generated OpenAPI 3.1 document on stdout, findings o
 hekla verify <dir>    # the offline invariant sweep over a data directory
 hekla plan   <dir>    # what deploying this project over a data directory would change
                       #   --replay also re-runs recorded effect invocations against it
+hekla project <file> <dir>  # fold an undeployed projector over the log once and print its rows
 hekla secrets <dir>   # every declared credential, where it is read from, and whether it is set
 hekla rewind <Effect> <position> <dir>  # take an effect back so it reprocesses. Irreversible
 hekla erase <field> <value> <dir>    # delete one subject's key. Irreversible
@@ -107,6 +108,7 @@ one under `tests/` does.
 | prove a deployment did not diverge | stop it (or copy the data directory) and `hekla verify` |
 | pin the API in CI | `hekla openapi . > openapi.json` and diff it |
 | see what the log actually holds | `GET /admin/events`, or open `/admin` in a browser |
+| count or group the log once, without deploying | write a `projector` in a scratch `.hk` and `hekla project <file> <dir>` |
 | back up | copy the data directory of a stopped process |
 
 ## What each subcommand needs
@@ -117,6 +119,8 @@ one under `tests/` does.
 | `test` | yes | no (throwaway) | no | no (pinned) | an error finding, or a failing test |
 | `serve` | yes | yes, creates | **yes** | if any `@subject` | errors, a bad addr, a held lock |
 | `verify` | yes | yes, must exist | **yes** | if any `@subject` | any violation |
+| `plan` | yes | yes, must exist | no | only for `--replay` of an effect that reveals | not a directory, errors, an unreadable log |
+| `project` | yes | yes, must hold a log | no | if the projector seals a column | not a `.hk` file, not a directory, errors, no projector, no log |
 | `openapi` | yes | no | no | no | not a directory, errors, nothing declared |
 | `secrets` | yes | no | no | no | not a directory, errors, a required credential unset |
 | `rewind` | yes, to name the arms | must hold `hekla.db` | **yes** | no | a held lock, an unknown effect |

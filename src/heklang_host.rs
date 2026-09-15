@@ -18,7 +18,9 @@
 //! Carrying the ciphertext deletes both.
 
 use anyhow::anyhow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::hash::{Hash, Hasher};
 use std::slice;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1441,6 +1443,43 @@ fn build_tags(pairs: &[(String, Option<String>)], extra: &[&str]) -> Result<Tags
 // Read models
 // ---------------------------------------------------------------------------
 
+/// Sealed column writes a fold dropped because the subject's key was gone.
+///
+/// Counted where the decision is taken, because this is the only place that can tell.
+/// [`Rows::put`] writes NULL for a shredded key, and the read model omits a NULL column,
+/// so by the time a row is read back an erased column and an optional the handler never
+/// wrote are the same absent key. Anything downstream would have to guess, and the guess
+/// that says "this row's subject is erased, so its blank column was erased too" is wrong
+/// exactly when the column was never written.
+///
+/// Only the two counts are reported, so only the two counts are kept. A fold over a log
+/// whose bulk erasure took a million subjects would otherwise hold a million owned
+/// `(String, String)` pairs for the whole scan to answer one `len()`; hashing them keeps
+/// distinctness at eight bytes each. A 64-bit collision would undercount one subject in
+/// a report, which is not a number anything branches on.
+#[derive(Debug, Default)]
+pub struct Shredded {
+    /// One per dropped column write. A row written three times counts three.
+    pub writes: u64,
+    /// One hash per distinct `(subject_field, subject_value)` behind those writes.
+    seen: HashSet<u64>,
+}
+
+impl Shredded {
+    /// How many distinct subjects the dropped writes were scoped to.
+    pub fn subjects(&self) -> usize {
+        self.seen.len()
+    }
+
+    fn record(&mut self, subject_field: &str, subject_value: &str) {
+        let mut hasher = DefaultHasher::new();
+        subject_field.hash(&mut hasher);
+        subject_value.hash(&mut hasher);
+        self.writes += 1;
+        self.seen.insert(hasher.finish());
+    }
+}
+
 /// One projector's read models, as heklang writes them.
 ///
 /// The crypto is symmetric with the log's: a subject-scoped column is stored as
@@ -1455,6 +1494,10 @@ pub struct RowWriter<'a> {
     /// The tables, by entity name.
     pub entities: &'a std::collections::HashMap<String, crate::schema::EntityDef>,
     pub keystore: Option<&'a KeyStore>,
+    /// Where to record a sealed column this write had to drop. `None` on every deployed
+    /// path: a live projector has nobody to report to, and its rebuild is not a question
+    /// anyone asked.
+    pub shredded: Option<&'a mut Shredded>,
 }
 
 impl RowWriter<'_> {
@@ -1529,6 +1572,9 @@ impl heklang::host::Rows for RowWriter<'_> {
     ) -> Result<(), Error> {
         let table = self.table(entity)?;
         let _ = key;
+        // Collected rather than recorded as they are found, so the whole column loop can
+        // keep the borrow of `self` that reaching the tables needs.
+        let mut dropped: Vec<(String, String)> = Vec::new();
 
         // The subject ids first, for the same reason the append path needs them: a
         // scoped column is keyed on a sibling's plaintext.
@@ -1574,8 +1620,16 @@ impl heklang::host::Rows for RowWriter<'_> {
                             Some(plaintext) => unsealed_json(&meta.kind, plaintext),
                             // The key is gone, so the column is too. Same answer as the
                             // `_existing` miss below, reached one step earlier.
+                            //
+                            // Recorded against the *seal's* own subject rather than the
+                            // column's. They are usually the same, because a column's
+                            // scope is propagated from what is written into it, but the
+                            // key that was actually missing is the one this decrypt
+                            // asked for, and naming another would report the wrong
+                            // subject as erased.
                             None => {
                                 stored.insert(name.clone(), serde_json::Value::Null);
+                                dropped.push((subject.to_string(), id.to_string()));
                                 continue;
                             }
                         },
@@ -1604,6 +1658,7 @@ impl heklang::host::Rows for RowWriter<'_> {
                         // observable through a projection.
                         None => {
                             stored.insert(name.clone(), serde_json::Value::Null);
+                            dropped.push((subject_field.clone(), subject_value.clone()));
                         }
                     }
                 }
@@ -1618,7 +1673,15 @@ impl heklang::host::Rows for RowWriter<'_> {
                 table,
                 crate::schema::EntityOpKind::Put(serde_json::Value::Object(stored).to_string()),
             )
-            .map_err(|err| host_error(format!("applying a write to entity `{entity}`: {err}")))
+            .map_err(|err| host_error(format!("applying a write to entity `{entity}`: {err}")))?;
+        // After the write, so a row that failed to store is never reported as one whose
+        // column was shredded.
+        if let Some(shredded) = self.shredded.as_deref_mut() {
+            for (field, value) in &dropped {
+                shredded.record(field, value);
+            }
+        }
+        Ok(())
     }
 
     fn delete(&mut self, entity: &heklang::ir::Ident, key: &heklang::Key) -> Result<(), Error> {

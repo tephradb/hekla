@@ -1,6 +1,6 @@
 # The CLI
 
-One binary, nine subcommands, `<dir>` defaulting to `.` everywhere. `hekla --version` and
+One binary, eleven subcommands, `<dir>` defaulting to `.` everywhere. `hekla --version` and
 `hekla <subcommand> --help` work.
 
 Logging is `tracing` behind `RUST_LOG`, default `info`. `serve` and `verify` initialise it; the other
@@ -276,6 +276,81 @@ A divergence does not change the exit code. `plan` reports; a gate reads `--json
 `divergences` list would be a clean replay result, and a gate must not read one off a run that never
 opened the log. `--replay-limit` requires `--replay`, for the same reason a cap nobody can see is
 not acceptable: a limit on a replay that is not happening would be accepted and dropped.
+
+## `hekla project <FILE> [DIR] [--data-dir PATH] [--projector NAME] [--entity NAME] [--from N] [--upto N] [--max-events N] [--rows N] [--no-decrypt] [--no-progress] [--json]`
+
+Folds an undeployed projector over the event log once and prints its rows. `FILE` is a standalone
+`.hk` file declaring one `projector`; it is compiled together with the project, folded into a read
+model in a temporary directory, and that directory is deleted when the command returns.
+
+```
+$ hekla project ~/by-customer.hk . --data-dir /srv/hekla/data
+folded 38214 event(s) of @order.placed into `projector ByCustomer` in 1.70s
+  entity PerCustomer, key customer_id, 3 row(s)
+    sealed: last_email under customer_id
+    customer_id  orders  last_email
+    1            21044   ada@example.test
+    2            14903   -
+    7            2267    grace@example.test
+14,903 sealed column write(s) dropped across 1 erased subject(s), so those cells read absent
+a snapshot at position 412903, the tip pinned when this opened; anything appended since is not in it
+ok: 3 row(s) from 38214 event(s)
+```
+
+**Nothing is deployed and nothing is recorded**: no declaration row, no database under
+`data/projectors/`, no checkpoint, no route, no metric. A later `hekla plan` cannot tell it ran.
+It reads the log through the same read-only follower `hekla plan --replay` uses, so it takes **no
+data-directory lock** and runs against a directory a server has open.
+
+**The scratch file is compiled with the project.** That is what lets it name events it does not
+declare, call the project's `fn` helpers and read its `const`s. Two consequences worth knowing:
+
+- A projector in it need not sit under `projectors/`; that placement rule is relaxed for the scratch
+  module alone. A `command` or an `effect` written there is still an error, because neither can be
+  folded over anything.
+- A name it shares with a deployed declaration is heklang's own duplicate-declaration diagnostic,
+  reported against the scratch file rather than against the project's.
+
+A file that lives inside the project directory is compiled once, not twice, so
+`hekla project question.hk` from the project root works.
+
+**Sealed columns.** A projection that seals a column needs `HEKLA_MASTER_KEY`, because a projector
+re-seals under the column's own field name and reads its own stored loads back as plaintext. It is
+refused up front rather than part-way through a scan:
+
+```
+error: this projection seals column `last_email` under `customer_id`, so folding it needs HEKLA_MASTER_KEY
+       a projector re-seals a column under the column's own field name, so the fold cannot carry the log's ciphertext through untouched
+```
+
+`--no-decrypt` withholds only the *rendering*, like `/admin/events?decrypt=false`; the fold still
+holds the key. An erased subject's column reads absent, and the count under the table comes from the
+sink, which knows it dropped the write, rather than from an inference over the rows: an optional the
+handler never wrote is never reported as an erasure. It counts **writes**, not rows, so a projector
+that patches the same row on every event reports one drop per event.
+
+**`--upto` bounds the answer, not the work.** tephra's forward read has no upper bound, so the read
+is planned over the whole log and the window is applied as the fold walks it. A narrow `--upto` over
+a large log costs what the whole log costs. `--max-events` is the bound that reaches the planner.
+
+**Bounds always name what they left out**, because a bounded answer must not read like a complete
+one. `--max-events` ends the report on `partial:` instead of `ok:` and JSON's `scanned.stopped` is
+`"max-events"` instead of `null`; `--from`/`--upto` add a line saying which positions were not
+folded; `--rows` prints `... and N more row(s)` and sets `truncated`.
+
+Exit is 0 whenever the projection ran, whatever it found, for the same reason `plan` exits 0 on a
+change: the rows are the answer, not a fault. It is 1 when `FILE` is not a `.hk` file, `DIR` is not a
+directory, the project has error findings, the file declares no projector or more than one with no
+`--projector`, the projector declares no handler, a sealed column has no master key, the data
+directory holds no log or a schema version this build does not expect, or `--json` fails to
+serialise. Findings go to stderr, so `hekla project q.hk . --json > out.json` writes only JSON.
+
+**What it cannot see.** Only the event log, so effect invocations, journals, retry counts and
+checkpoints stay `/admin`'s to answer. No `reveal`, since a projector holds no host, though it can
+key and group on a sealed column because the encryption is deterministic. No checkpoint: every run
+folds from the start of its window, so a question asked on every request is a deployment rather than
+a projection. And nothing appended during the run, because the follower pinned its prefix when it
+opened.
 
 ## `hekla openapi [DIR]`
 

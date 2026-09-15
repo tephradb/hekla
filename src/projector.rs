@@ -22,10 +22,10 @@ use std::time::Instant;
 
 use anyhow::Context;
 use heklang::{Program, Projection};
-use tephra::{Event, Position, WaitOutcome};
+use tephra::{DEFAULT_MAX_BATCH_EVENTS, Event, Position, WaitOutcome};
 
 use crate::crypto::KeyStore;
-use crate::heklang_host::{self, RowWriter};
+use crate::heklang_host::{self, RowWriter, Shredded};
 use crate::invariant::Violation;
 use crate::loader::ProjectorUnit;
 use crate::metrics;
@@ -601,6 +601,7 @@ fn run_inner(
                 keystore,
                 &batch,
                 sub.position(),
+                None,
             )?;
             // After the apply and its commit, so the count and the progress timestamp
             // only ever describe work that actually landed in the read model.
@@ -755,6 +756,7 @@ pub fn project_to(
             keystore,
             &batch,
             checkpoint,
+            None,
         )?;
         if upto.is_some_and(|limit| checkpoint >= limit) {
             return Ok(seen);
@@ -784,6 +786,160 @@ pub fn project_to_head(
     project_to(store, unit, program, keystore, model, None)
 }
 
+/// The stretch of log one scan covers, and the budget it may spend on it.
+///
+/// `from` and `upto` are **inclusive** positions, the ones `/admin/events` reports and an
+/// operator types. `max_events` counts *matching* events rather than positions, because
+/// that is what the work is proportional to and what a caller can reason about.
+#[derive(Debug, Clone, Copy)]
+pub struct Window {
+    pub from: Position,
+    pub upto: Position,
+    pub max_events: Option<u64>,
+}
+
+/// Why a scan stopped before the end of its window.
+///
+/// A scan that stopped early answered a different question than one that finished, and
+/// the caller has to be able to say so: rows from a prefix of the log are not the rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// The event budget ran out.
+    MaxEvents,
+}
+
+/// What one scan did.
+#[derive(Debug, Clone, Copy)]
+pub struct Scanned {
+    /// Matching events applied to the model.
+    pub events: usize,
+    /// The position the model stands at: the end of the window for a scan that finished
+    /// it, and the last event applied for one that stopped early.
+    pub position: Position,
+    pub stopped: Option<Stopped>,
+}
+
+/// Project `window` into `model`, reading through a handle that may be a follower.
+///
+/// The sibling of [`project_to`], and the seam it reads through is the whole difference.
+/// `project_to` subscribes, because both of its callers advance a *checkpointed* model
+/// and need a watermark that moves past events the query does not select. A follower has
+/// no advancing watermark by design: it pins one committed prefix when it opens and never
+/// refreshes, so [`Store::subscribe`] refuses one outright rather than parking forever on
+/// a tip that cannot move. Reading that fixed prefix instead is what lets a projection run
+/// against a directory a server holds open, with no lock and nothing created.
+///
+/// **The budget is tephra's `limit`, and so is the answer to whether it was spent.** A
+/// limit is pushed into planning, so a bounded scan does work proportional to the bound
+/// rather than to the query's full result, and [`Reads::is_exhausted`] then reports
+/// whether the read drained its range or stopped at the cap. Counting matches by hand
+/// would be re-deriving what the reader already knows.
+///
+/// [`Reads::is_exhausted`]: tephra::read::Reads::is_exhausted
+///
+/// `progress` is called once a batch and never per event, so a caller drawing a terminal
+/// line pays nothing per record.
+#[allow(clippy::too_many_arguments)]
+pub fn project_reading(
+    store: &Store,
+    unit: &ProjectorUnit,
+    program: &Program,
+    keystore: Option<&KeyStore>,
+    model: &ReadModel,
+    window: Window,
+    shredded: &mut Shredded,
+    progress: &mut dyn FnMut(Position, usize),
+) -> anyhow::Result<Scanned> {
+    let ModuleDef::Projector {
+        entities, sources, ..
+    } = &unit.def
+    else {
+        anyhow::bail!("project_reading called on a non-projector module");
+    };
+    let query = heklang_host::query_of_types(sources).map_err(|err| anyhow::anyhow!("{err}"))?;
+    let entities_by_name = by_name(entities);
+    let name = unit.def.name().to_owned();
+
+    // tephra's `after` is an exclusive lower bound and `from` is inclusive, so the read
+    // starts one below it; `from` at the first position reads the whole log.
+    let after = Position::new(window.from.get().saturating_sub(1));
+    // One past the budget, and the budget itself enforced below. `Reads::is_exhausted`
+    // looks like the answer and is not: tephra sets `hit_limit` when the cap runs out
+    // even where the range ran out with it, so a budget that exactly equals the number
+    // of matching events would report a complete answer as a truncated one. Reading one
+    // more than will be applied makes "there was more" a fact, which is the same reason
+    // the read API over-fetches a row per page.
+    let limit = window.max_events.map(|max| max.saturating_add(1));
+    let mut reads = store.read(&query, after, limit);
+
+    let mut batch: Vec<(Position, Event)> = Vec::with_capacity(DEFAULT_MAX_BATCH_EVENTS);
+    let mut matched = 0usize;
+    let mut reached = after;
+    let mut stopped = None;
+    while let Some(item) = reads.next() {
+        let seq = item.map_err(|err| anyhow::anyhow!("reading the event log: {err}"))?;
+        // The window first: an event past it means everything the window held was
+        // folded, whatever the budget still had left.
+        if seq.position > window.upto {
+            break;
+        }
+        if window.max_events.is_some_and(|max| matched as u64 >= max) {
+            stopped = Some(Stopped::MaxEvents);
+            break;
+        }
+        matched += 1;
+        reached = seq.position;
+        batch.push((seq.position, seq.event.to_owned()));
+        // Reported every event rather than every flushed batch. A selective projector
+        // can scan millions of positions for a few hundred matches, which is exactly the
+        // run worth reporting on and exactly the one that would never fill a batch.
+        // `Progress::tick` rate-limits itself, so this costs a clock read at most.
+        progress(reached, matched);
+        if batch.len() >= DEFAULT_MAX_BATCH_EVENTS {
+            apply_batch(
+                model,
+                program,
+                &name,
+                &entities_by_name,
+                keystore,
+                &batch,
+                reached,
+                Some(&mut *shredded),
+            )?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        apply_batch(
+            model,
+            program,
+            &name,
+            &entities_by_name,
+            keystore,
+            &batch,
+            reached,
+            Some(&mut *shredded),
+        )?;
+    }
+
+    // A scan that covered its whole window leaves the model standing at the end of that
+    // window, not at its last matching event. The two differ whenever the log ends in
+    // events the query does not select, including when it selects none at all, and a
+    // reader has to be told which position these rows are the answer as of.
+    let position = match stopped {
+        Some(_) => reached,
+        None => window.upto,
+    };
+    if position > model.read_checkpoint()? {
+        model.advance_checkpoint(position)?;
+    }
+    Ok(Scanned {
+        events: matched,
+        position,
+        stopped,
+    })
+}
+
 /// Apply one batch of events and advance the checkpoint, in one transaction.
 ///
 /// Every read and write runs on `model`'s single connection, so a `patch`'s stored load
@@ -799,6 +955,7 @@ fn apply_batch(
     keystore: Option<&KeyStore>,
     batch: &[(Position, Event)],
     checkpoint: Position,
+    shredded: Option<&mut Shredded>,
 ) -> anyhow::Result<()> {
     let declared = program
         .projector(projector_name)
@@ -814,6 +971,7 @@ fn apply_batch(
             projector: declared,
             entities,
             keystore,
+            shredded,
         };
         for (position, event) in batch {
             let record = heklang_host::record_of(program, *position, event.as_ref())

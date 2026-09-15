@@ -1108,7 +1108,7 @@ fn replay_changes_no_event_segment() {
     deploy_with_invocations(project.path(), data.path(), 2);
 
     let events = data.path().join("events");
-    let before = segments(&events);
+    let before = support::tree(&events);
     assert!(!before.is_empty(), "the fixture wrote a segment");
 
     add_an_audit_call(project.path());
@@ -1116,38 +1116,10 @@ fn replay_changes_no_event_segment() {
     assert!(!plan.divergences.is_empty(), "the replay actually ran");
 
     assert_eq!(
-        segments(&events),
+        support::tree(&events),
         before,
         "a follower creates, deletes and rewrites nothing"
     );
-}
-
-/// Every file under `dir`, recursively, by relative path and content.
-///
-/// Recursive on purpose: `events/` holds the log segments *and* an `index/` beside them,
-/// and a follower rebuilds an index in memory rather than rewriting the `.idx` on disk.
-/// A listing that stopped at the top level would miss exactly that.
-fn segments(dir: &Path) -> Vec<(String, Vec<u8>)> {
-    fn walk(dir: &Path, prefix: &str, into: &mut Vec<(String, Vec<u8>)>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let rel = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if entry.file_type().unwrap().is_dir() {
-                walk(&entry.path(), &rel, into);
-            } else {
-                into.push((rel, fs::read(entry.path()).unwrap()));
-            }
-        }
-    }
-    let mut found = Vec::new();
-    walk(dir, "", &mut found);
-    found.sort_by(|(left, _), (right, _)| left.cmp(right));
-    found
 }
 
 /// A data directory whose log has never been written is not an error. Nothing could

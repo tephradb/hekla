@@ -26,6 +26,8 @@ pub mod loader;
 pub mod metrics;
 pub mod openapi;
 pub mod plan;
+pub mod progress;
+pub mod projection;
 pub mod projector;
 pub mod runtime;
 pub mod server;

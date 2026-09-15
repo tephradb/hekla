@@ -308,6 +308,7 @@ impl TestRows {
             projector: declared,
             entities: &self.tables,
             keystore: self.keystore.as_deref(),
+            shredded: None,
         })
     }
 }

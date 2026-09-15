@@ -96,8 +96,9 @@ HEKLA_MASTER_KEY=$(head -c 32 /dev/urandom | base64) \
 the directory its kind requires, that a read model can be keyed and indexed the way the read API
 needs, and two warnings about a boundary too broad or too narrow to do its job. Also `hekla erase`
 and `hekla rotate` for key management, `hekla plan` for what a deploy would change (and, with
-`--replay`, would do), `hekla rewind` for taking an effect back over history it has already
-processed, and `hekla verify` for the invariant sweep below.
+`--replay`, would do), `hekla project` for folding an undeployed projector over the log to answer a
+question once, `hekla rewind` for taking an effect back over history it has already processed, and
+`hekla verify` for the invariant sweep below.
 
 From a checkout the same three are `cargo run -- check examples/orders` and so on. The repository
 is also a flake: `nix build` for the binary, `nix flake check` for the suite.
@@ -193,6 +194,29 @@ A gate reads `--json`, where `divergences` and `coverage` are both `null` when n
 empty divergence list would be a clean replay result, and nothing should read one off a run that
 never opened the log. `secrets` is never null, because it is always computable, and a deploy whose
 credentials this machine cannot supply is not an empty plan.
+
+## Asking the log a question
+
+The read API serves what a deployed projector chose to materialise. For the question you want to ask
+once, `hekla project` folds an undeployed projector over the log and prints its rows, without
+deploying anything or waiting for a rebuild.
+
+```sh
+cat > /tmp/by-customer.hk <<'EOF'
+projector ByCustomer {
+  entity PerCustomer { customer_id: Int @key, orders: Int }
+  on @order.placed { customer_id } { patch PerCustomer[customer_id] { orders: .orders + 1 } }
+}
+EOF
+
+# Against whichever data directory already holds a log; a fresh checkout has none.
+hekla project /tmp/by-customer.hk examples/orders --data-dir /srv/hekla/data
+```
+
+The scratch file is compiled with the project, so it typechecks against the deployed events and can
+call the project's own helpers. It reads the log through a read-only follower, so like `plan` it
+takes no lock and runs against a server that is serving traffic, and the rows are a snapshot at the
+position it reports. Nothing is recorded: no declaration, no read model on disk, no route.
 
 ## Deployment credentials
 
