@@ -1446,11 +1446,11 @@ fn build_tags(pairs: &[(String, Option<String>)], extra: &[&str]) -> Result<Tags
 /// Sealed column writes a fold dropped because the subject's key was gone.
 ///
 /// Counted where the decision is taken, because this is the only place that can tell.
-/// [`Rows::put`] writes NULL for a shredded key, and the read model omits a NULL column,
-/// so by the time a row is read back an erased column and an optional the handler never
-/// wrote are the same absent key. Anything downstream would have to guess, and the guess
-/// that says "this row's subject is erased, so its blank column was erased too" is wrong
-/// exactly when the column was never written.
+/// [`heklang::Rows::put`] writes NULL for a shredded key, and the read model omits a NULL
+/// column, so by the time a row is read back an erased column and an optional the handler
+/// never wrote are the same absent key. Anything downstream would have to guess, and the
+/// guess that says "this row's subject is erased, so its blank column was erased too" is
+/// wrong exactly when the column was never written.
 ///
 /// Only the two counts are reported, so only the two counts are kept. A fold over a log
 /// whose bulk erasure took a million subjects would otherwise hold a million owned

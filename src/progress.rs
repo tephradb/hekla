@@ -2,7 +2,7 @@
 //!
 //! A projection over a small log finishes before a human could read anything, and one
 //! over a large log can run for minutes with nothing to show for it. Both are the same
-//! command, so this draws nothing at all until [`FIRST_PAINT`] has passed and then
+//! command, so this draws nothing at all until `FIRST_PAINT` has passed and then
 //! redraws one line in place, which costs a fast run nothing and gives a slow one the
 //! only two facts an operator wants: how far along it is, and whether it is finding
 //! anything.
