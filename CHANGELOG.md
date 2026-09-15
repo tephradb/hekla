@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://git.tqwewe.com/tephra/hekla/compare/v0.5.1...v0.6.0) - 2026-09-15
+
+### Added
+
+- the console writes an ad-hoc projection and watches it fold
+- an ad-hoc projection answers over HTTP, behind a setting a deployment turns on
+- an undeployed projector folds over the live log and prints its rows
+
+### Fixed
+
+- rustls 0.23.45 rejects a handshake message that spans a key change (RUSTSEC-2026-0285)
+
+### Other
+
+- heklang 0.8.0
+- a private const is named rather than linked, and a trait link takes its crate path
+- heklang 0.7.0, where an answer takes no return and no parens
+
 ## [0.5.1](https://git.tqwewe.com/tephra/hekla/compare/v0.5.0...v0.5.1) - 2026-09-12
 
 ### Other
