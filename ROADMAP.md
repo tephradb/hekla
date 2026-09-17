@@ -2632,6 +2632,50 @@ Honest scope:
   true of what it asks for. An order control is the obvious next console change and nothing here
   blocks it.
 
+What review changed, after both phases were written:
+
+- **A cursor's ordering token and its width move independently.** An index already containing the key
+  is not widened by it, so moving `@key` onto another column turns `index (a, k)` from a two-column
+  ordering into a three-column one while `by_a_k` still spells both. The token check passed, the
+  model dropped the tuple, and every page came back as page one with the same `next_cursor`: a client
+  following cursors in a circle with nothing reporting a problem. The handler now compares the width
+  too. The same class is why `EntityDef::validate` refuses an index whose generated name is also the
+  key column, rather than leaving `parse_order`'s index-before-key preference to adjudicate it.
+- **A range over an optional column was refused, and should not have been.** `is_comparable` was
+  read off the un-`base()`d kind, so `Optional(_)` matched none of its arms and every optional
+  indexed column lost its `.gte`/`.lt` bounds, in the runtime and in the generated document alike.
+  A range over a nullable column is well defined: `>=` does not match NULL, which is the answer
+  someone asking for one wants. Only the *ordering* breaks, and `ordering_problem` refuses that
+  separately, which is what made the bug invisible.
+- **Two query-plan tests exercised no cursor**, despite comments insisting the cursor was the point:
+  they passed a tuple as wide as the index against a key ordering, and `usable_cursor` silently
+  dropped it. The tests still caught what they were written for, so nothing was wrong in the code
+  they guarded; what they did not guard was the cursor's interaction with `INDEXED BY`. Their helper
+  now asserts the width, and they assert the emitted statement as well as the plan. Same lesson as
+  Phase 36: a test that would pass against the reverted fix is not the test it claims to be.
+- **The index reconcile ran in two autocommits**, and pinning made that expensive. `ReadModel::open`
+  runs at runtime, not only at boot, so a read landing between the `DROP INDEX` and the `CREATE`
+  would fail on `INDEXED BY` with "no such index" rather than merely running slowly. It is one
+  transaction now.
+- **`cursor_at` returning `None` was reported as `next_cursor: null`**, which tells a caller the scan
+  is complete. It is only reached once an over-fetched row has proved another page exists, so that
+  was a silent truncation, and the one failure a paginating reader cannot detect. It errors.
+
+Two findings from the same review are deliberately not acted on:
+
+- **A sealed `Json` column whose plaintext does not parse wedges the projector while the read API
+  serves the raw text.** The asymmetry is real, and the wedge is Phase 36's documented rule: a seal
+  whose text is not the document its declaration promises wedges and retries, because the plaintext
+  is intact behind a live key and one edit to one `.hk` line fixes it. Making the projector tolerant
+  here would contradict that, so the right fix if it ever bites is to reconsider the rule, not this
+  call site.
+- **Two entities can generate the same index name.** `X_by_a` with `index (b)` and `X` with
+  `index (a, by, b)` both produce `X_by_a_by_b`, and the reconcile would then drop and recreate one
+  entity's index on the other's table on every open. It needs a column literally named `by`, and
+  closing it needs a cross-entity validation pass that does not exist (`validate` is per-entity). The
+  failure got louder with `INDEXED BY` (a 500 rather than an unindexed scan), which is the argument
+  for a name check whenever something else needs that pass.
+
 ## Phase 39: a subject can be deleted with its tenant (planned, decision first)
 
 `shop/redact` is one erase of `shop_id` plus one erase per `customer_ref` that shop ever produced.

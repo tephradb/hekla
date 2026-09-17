@@ -12,6 +12,8 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hekla::runtime::Runtime;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1069,9 +1071,84 @@ projector Stock {
     let filtered = scanned_ids(&app, "/read/Stock/Item?shelf=top").await;
     assert_eq!(filtered, vec!["00000000-0000-0000-0000-000000000001"]);
 
+    // And it ranges. A range over a nullable column is well defined: `>=` does not match
+    // NULL, which is the answer someone asking for one wants. Only the *ordering* breaks,
+    // because a row-value comparison against NULL loses rows at a page boundary instead
+    // of excluding them from an answer.
+    let ranged = scanned_ids(&app, "/read/Stock/Item?shelf.gte=a").await;
+    assert_eq!(ranged, vec!["00000000-0000-0000-0000-000000000001"]);
+    let above = scanned_ids(&app, "/read/Stock/Item?shelf.gt=top").await;
+    assert!(above.is_empty(), "{above:?}");
+
+    // The document agrees with the runtime: the bounds are declared, the ordering is not.
+    let (status, doc) = get(&app, "/openapi.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let params: Vec<&str> = doc["paths"]["/read/Stock/Item"]["get"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|param| param["name"].as_str().unwrap())
+        .collect();
+    assert!(params.contains(&"shelf.gte"), "{params:?}");
+    let orderings = doc["paths"]["/read/Stock/Item"]["get"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|param| param["name"] == "order_by")
+        .map(|param| param["schema"]["enum"].clone())
+        .unwrap();
+    assert_eq!(
+        orderings,
+        json!(["id", "-id"]),
+        "an index that cannot sort is left out of the orderings rather than listed and refused"
+    );
+
     let message = refused(&app, "/read/Stock/Item?order_by=by_shelf", "invalid_input").await;
     assert!(
         message.contains("`shelf` is optional") && message.contains("stays filterable"),
+        "{message}"
+    );
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn a_cursor_whose_ordering_changed_width_is_refused_rather_than_looping() {
+    // The ordering *token* and its *width* move independently: an index already
+    // containing the key is not widened by it, so moving `@key` turns `index (a, k)` from
+    // a two-column ordering into a three-column one while `by_a_k` still spells it. The
+    // token check would pass. Left to the model, the tuple is dropped and every request
+    // returns page one with the same `next_cursor`, which is a client following cursors
+    // in a circle with nothing reporting a problem.
+    //
+    // Hand-built rather than reached by editing a project mid-flight, because it is the
+    // handler's arithmetic under test and a deploy in the middle of a scan is not.
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    seeded_catalog(&harness).await;
+    let app = harness.app();
+
+    let wide = URL_SAFE_NO_PAD.encode(br#"{"o":"id","v":["a","b"]}"#);
+    let message = refused(
+        &app,
+        &format!("/read/Catalog/Item?limit=2&cursor={wide}"),
+        "invalid_input",
+    )
+    .await;
+    assert!(
+        message.contains("carries 2 value(s)") && message.contains("orders on 1"),
+        "{message}"
+    );
+
+    let narrow = URL_SAFE_NO_PAD.encode(br#"{"o":"by_bucket_shelf_rank","v":["a"]}"#);
+    let message = refused(
+        &app,
+        &format!("/read/Catalog/Item?order_by=by_bucket_shelf_rank&limit=2&cursor={narrow}"),
+        "invalid_input",
+    )
+    .await;
+    assert!(
+        message.contains("carries 1 value(s)") && message.contains("orders on 4"),
         "{message}"
     );
 

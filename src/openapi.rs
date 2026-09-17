@@ -773,9 +773,14 @@ fn filter_param(entity: &EntityDef, field: &str) -> Value {
 /// holds its decimal string and a `OneOf` its variant's spelling, so a `.gte` over either
 /// would answer by an order nobody declared. [`FieldKind::is_comparable`] is the same
 /// question `read_api::check_filter` refuses on, so the document and the runtime agree.
+///
+/// Through `base()`, so an optional column keeps the bounds of the kind underneath it. A
+/// range over a nullable column excludes NULL, which is the answer a reader asking for one
+/// wants; it is an *ordering* over one that loses rows at a page boundary, and `order_by`
+/// leaves those out separately.
 fn range_params(entity: &EntityDef, field: &str) -> Vec<Value> {
     let meta = filterable_meta(entity, field);
-    if !meta.kind.is_comparable() {
+    if !meta.kind.base().is_comparable() {
         return Vec::new();
     }
     read_api::RANGE_OPERATORS

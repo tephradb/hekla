@@ -418,7 +418,8 @@ function Rows({ projector, entity, field, value, cursor, openRow }) {
    * index's leading column. Derived from `indexes` rather than taken from `filterable`,
    * which is the wider "may be named in a filter" set and would enable a column that
    * 400s without the one before it. */
-  const alone = new Set([entity.key, ...entity.indexes.map((index) => index.columns[0])])
+  const leading = (entity.indexes ?? []).map((index) => index.columns?.[0]).filter(Boolean)
+  const alone = new Set([entity.key, ...leading])
   const [draftField, setDraftField] = useState(field || entity.key)
   const [draftValue, setDraftValue] = useState(value)
 

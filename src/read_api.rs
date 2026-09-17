@@ -290,7 +290,13 @@ pub fn check_filter(entity: &EntityDef, filter: &Filter) -> anyhow::Result<()> {
         let Some(kind) = kind(field) else {
             return Ok(());
         };
-        if !kind.is_comparable() {
+        // `base()`, so an optional column ranges like the one underneath it. A range over
+        // a nullable column is well defined and useful: `>=` simply does not match NULL,
+        // which is what a reader asking for one wants. It is an *ordering* over one that
+        // breaks, because a row-value comparison against NULL loses rows at a page
+        // boundary rather than excluding them from an answer, and `ordering_problem`
+        // refuses that separately.
+        if !kind.base().is_comparable() {
             anyhow::bail!(
                 "filter `{field}` is {}, which has no order a range could use; filter it for equality instead",
                 kind.describe()
@@ -328,7 +334,12 @@ impl Order {
     /// The columns this ordering sorts by, outermost first. Always ends in the key, which
     /// is what makes it unique: an index tuple is not, and without the tiebreak two rows
     /// sharing one would be skipped or repeated at a page boundary.
-    fn columns(&self, entity: &EntityDef) -> Vec<String> {
+    ///
+    /// **The one definition of what an ordering sorts by.** The cursor's values come from
+    /// here and so do the `ORDER BY`, the row-value comparison and its binds; two copies
+    /// drifting apart is exactly the "a tuple compared against the wrong columns" failure
+    /// that [`Cursor::ordering`] exists to prevent, so there is only ever one.
+    pub(crate) fn columns(&self, entity: &EntityDef) -> Vec<String> {
         match &self.index {
             None => vec![entity.key.clone()],
             Some(name) => entity
@@ -345,8 +356,10 @@ impl Order {
 ///
 /// A leading `-` reverses. The rest names a declared index, or the key column, which is
 /// the default ordering and is nameable so that it can be reversed. An index is matched
-/// first: index names are generated as `by_<columns>`, so the two can only collide on an
-/// entity whose key is literally named that.
+/// first: index names are generated as `by_<columns>` and never authored, so the only way
+/// the two could name the same thing is a key column spelled `by_<something>`, which
+/// `EntityDef::validate` refuses at load precisely so this order does not have to be a
+/// judgement call.
 pub fn parse_order(entity: &EntityDef, raw: &str) -> Result<Order, String> {
     let (descending, name) = match raw.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -389,7 +402,17 @@ pub fn parse_order(entity: &EntityDef, raw: &str) -> Result<Order, String> {
 /// and present to be a key at all.
 pub fn ordering_problem(entity: &EntityDef, index: &IndexDef) -> Option<String> {
     for column in &index.columns {
-        let (_, meta) = entity.fields.iter().find(|(name, _)| name == column)?;
+        // Fails closed. `EntityDef::validate` refuses an index naming an undeclared
+        // column, so a miss here is a broken invariant, and returning `None` would read
+        // as "this index can order rows" and let the SQL name a column that is not there:
+        // a 500 from the database rather than a 400 from the handler.
+        let Some((_, meta)) = entity.fields.iter().find(|(name, _)| name == column) else {
+            return Some(format!(
+                "index `{}` cannot order rows: it names `{column}`, which entity `{}` does \
+                 not declare",
+                index.name, entity.name
+            ));
+        };
         // Before the comparability check, which also refuses an optional but for a
         // reason the author cannot act on: here the fix is the `?`, not the type.
         if meta.is_nullable() {
@@ -400,7 +423,7 @@ pub fn ordering_problem(entity: &EntityDef, index: &IndexDef) -> Option<String> 
                 index.name
             ));
         }
-        if !meta.kind.is_comparable() {
+        if !meta.kind.base().is_comparable() {
             return Some(format!(
                 "index `{}` cannot order rows: `{column}` is {}, which has no order an \
                  ordering could use. It stays filterable.",
@@ -594,13 +617,20 @@ pub fn scan(
     let model = open_with_retry(db_path)?;
     let snapshot = model.begin()?;
     let position = model.read_checkpoint()?.get();
+    let probe = Query {
+        limit: query.limit + 1,
+        ..query.clone()
+    };
     // Over-fetch one row to learn whether another page follows.
-    let mut items = model.scan(entity, query, query.limit + 1)?;
+    let mut items = model.scan(entity, &probe)?;
     drop(snapshot);
 
     let next_cursor = if items.len() > query.limit {
         items.truncate(query.limit);
-        items.last().and_then(|row| cursor_at(entity, query, row))
+        match items.last() {
+            Some(row) => Some(cursor_at(entity, query, row)?),
+            None => None,
+        }
     } else {
         None
     };
@@ -624,27 +654,41 @@ pub fn scan(
 
 /// The cursor that resumes after `row`, or `None` if any ordering column is missing from
 /// it, which would make a row-value comparison compare the wrong things.
-fn cursor_at(entity: &EntityDef, query: &Query, row: &Value) -> Option<String> {
-    let values: Option<Vec<String>> = query
+fn cursor_at(entity: &EntityDef, query: &Query, row: &Value) -> anyhow::Result<String> {
+    let values = query
         .order
         .columns(entity)
         .iter()
-        .map(|column| row.get(column).and_then(scalar_string))
-        .collect();
-    Some(encode_cursor(&Cursor {
+        .map(|column| {
+            // An error rather than "no more pages". This is only reached once an
+            // over-fetched row has *proved* another page exists, so answering
+            // `next_cursor: null` would tell the caller the scan was complete while rows
+            // remained: a silent truncation, and the one failure a paginating reader
+            // cannot detect. An ordering column is declared non-optional and non-blob, so
+            // reaching this means the stored row disagrees with the declaration.
+            row.get(column)
+                .and_then(scalar_string)
+                .with_context(|| format!("ordering column `{column}` is not a scalar in this row"))
+        })
+        .collect::<anyhow::Result<Vec<String>>>()
+        .context("cannot describe where this page ended")?;
+    Ok(encode_cursor(&Cursor {
         ordering: query.order.token(entity),
-        values: values?,
+        values,
     }))
 }
 
 /// The string form of an ordering column for cursor encoding: strings as-is, numbers by
-/// their canonical decimal form (so integer-keyed entities paginate too), booleans by the
-/// spelling `coerce_value` reads back.
+/// their canonical decimal form, so integer-keyed entities paginate too.
+///
+/// No `Bool` arm, deliberately: `is_keyable` refuses a boolean key and `ordering_problem`
+/// refuses a boolean index column, so one cannot reach an ordering. If that ever changes,
+/// [`cursor_at`] says so loudly rather than an arm here quietly deciding what `true`
+/// sorts as.
 fn scalar_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
-        Value::Bool(flag) => Some(flag.to_string()),
         _ => None,
     }
 }

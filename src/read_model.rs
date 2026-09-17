@@ -56,16 +56,25 @@ impl ReadModel {
             .context("enabling WAL")?;
         conn.execute_batch(INTERNAL_DDL)
             .context("creating the projector's internal tables")?;
+        // One transaction for the whole schema, because a reshaped index is a drop and a
+        // create and a reader must never see the gap between them. `ReadModel::open` runs
+        // at runtime as well as at boot (a projector reopens after a rebuild or a swap,
+        // while the HTTP surface is serving), read connections are separate under WAL, and
+        // a scan pins its index with `INDEXED BY`: a read landing between the two
+        // statements would fail with "no such index" rather than merely running slowly.
+        // SQLite's DDL is transactional, so this costs nothing to hold.
+        let tx = conn.unchecked_transaction()?;
         for entity in entities {
-            conn.execute_batch(&entity.create_table_sql())
+            tx.execute_batch(&entity.create_table_sql())
                 .with_context(|| format!("creating table `{}`", entity.name))?;
-            drop_reshaped_indexes(&conn, entity)
+            drop_reshaped_indexes(&tx, entity)
                 .with_context(|| format!("reconciling indexes on table `{}`", entity.name))?;
             for stmt in entity.create_index_sql() {
-                conn.execute_batch(&stmt)
+                tx.execute_batch(&stmt)
                     .with_context(|| format!("indexing table `{}`", entity.name))?;
             }
         }
+        tx.commit().context("committing the read-model schema")?;
         Ok(ReadModel { conn })
     }
 
@@ -250,7 +259,7 @@ impl ReadModel {
     /// Read every row of an entity back as a JSON object (NULL columns omitted),
     /// ordered by key. For inspection and display.
     pub fn rows(&self, entity: &EntityDef) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.scan(entity, &Query::default(), i64::MAX as usize)
+        self.scan(entity, &Query::all(i64::MAX as usize))
     }
 
     /// Read one row by key, as a JSON object (NULL columns omitted), or `None`.
@@ -274,9 +283,8 @@ impl ReadModel {
         &self,
         entity: &EntityDef,
         query: &Query,
-        limit: usize,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
-        let (sql, binds) = self.scan_statement(entity, query, limit)?;
+        let (sql, binds) = self.scan_statement(entity, query)?;
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(binds))?;
         let mut out = Vec::new();
@@ -292,14 +300,13 @@ impl ReadModel {
         &self,
         entity: &EntityDef,
         query: &Query,
-        limit: usize,
     ) -> anyhow::Result<(String, Vec<SqlValue>)> {
         let access = choose_index(entity, &query.filter, &query.order).with_context(|| {
             format!("no declared index on `{}` serves this filter", entity.name)
         })?;
         let mut binds = filter_binds(entity, &query.filter);
         binds.extend(cursor_binds(entity, query));
-        binds.push(SqlValue::Integer(limit as i64));
+        binds.push(SqlValue::Integer(query.limit as i64));
         Ok((scan_sql(entity, query, access), binds))
     }
 
@@ -309,7 +316,7 @@ impl ReadModel {
     fn explain_scan(&self, entity: &EntityDef, query: &Query) -> anyhow::Result<String> {
         // The planner sees bound values, so they have to be present and in the order the
         // statement declares them for the plan to be the one the real call gets.
-        let (sql, binds) = self.scan_statement(entity, query, 1)?;
+        let (sql, binds) = self.scan_statement(entity, query)?;
         let mut stmt = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
         let rows = stmt.query_map(params_from_iter(binds), |row| row.get::<_, String>(3))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?.join("\n"))
@@ -386,24 +393,20 @@ fn scan_sql(entity: &EntityDef, query: &Query, access: Access<'_>) -> String {
 
 /// The columns an ordering sorts by, outermost first, always ending in the key.
 fn order_columns(entity: &EntityDef, order: &Order) -> Vec<String> {
-    match &order.index {
-        None => vec![entity.key.clone()],
-        Some(name) => entity
-            .indexes
-            .iter()
-            .find(|index| &index.name == name)
-            .map(|index| entity.index_columns(index))
-            .unwrap_or_else(|| vec![entity.key.clone()]),
-    }
+    order.columns(entity)
 }
 
 /// The cursor's tuple, if it can be used at all: present, and exactly as wide as the
 /// ordering it will be compared against.
 ///
-/// A tuple of the wrong width would compare the wrong columns, so it is dropped and the
-/// scan starts from the beginning rather than resuming wrongly. The handler refuses such
-/// a cursor before it gets here, with a message; this is what keeps the statement and its
-/// binds agreeing whether or not anyone remembered to.
+/// A tuple of the wrong width would compare the wrong columns, so it is dropped rather
+/// than resumed from. The handler refuses such a cursor first, with a message; this is
+/// what keeps the statement and its binds agreeing whether or not anyone remembered to,
+/// since a row-value clause emitted with the wrong number of placeholders is a SQL error.
+///
+/// Dropping it restarts the scan, which on its own would be a client following cursors in
+/// a circle forever with nothing reporting a problem. That is why the handler's check is
+/// the real one and this is only the backstop that cannot be forgotten.
 fn usable_cursor<'a>(entity: &EntityDef, query: &'a Query) -> Option<&'a [String]> {
     let cursor = query.cursor.as_ref()?;
     let width = order_columns(entity, &query.order).len();
@@ -735,10 +738,22 @@ mod tests {
 
     /// The same query resumed after `values`, which must be the ordering's columns
     /// outermost first, ending in the key.
-    fn at_cursor(mut query: Query, values: &[&str]) -> Query {
+    ///
+    /// **Asserts the width**, because `usable_cursor` drops a mismatched tuple silently
+    /// and a test that passed the wrong one would run a query with no cursor clause at
+    /// all while its name and comments said otherwise. That is not hypothetical: two
+    /// query-plan tests here did exactly that.
+    fn at_cursor(entity: &EntityDef, mut query: Query, values: &[&str]) -> Query {
+        let width = order_columns(entity, &query.order).len();
+        assert_eq!(
+            values.len(),
+            width,
+            "a cursor over {:?} needs {width} value(s), not {}",
+            order_columns(entity, &query.order),
+            values.len()
+        );
         query.cursor = Some(Cursor {
-            // Not the real token, which needs the entity. Nothing downstream of the
-            // handler reads it: the width is what `usable_cursor` checks.
+            // Not the real token, which the handler checks and nothing below it reads.
             ordering: String::new(),
             values: values.iter().map(|value| (*value).to_owned()).collect(),
         });
@@ -788,7 +803,7 @@ mod tests {
             ..Query::default()
         };
         loop {
-            let page = model.scan(&entity, &query, 2).unwrap();
+            let page = model.scan(&entity, &query).unwrap();
             if page.is_empty() {
                 break;
             }
@@ -818,7 +833,7 @@ mod tests {
         put(&model, &entity, "u1", "match@x");
         put(&model, &entity, "u2", "other@x");
         let rows = model
-            .scan(&entity, &equals(&[("email", "match@x")]), 50)
+            .scan(&entity, &equals(&[("email", "match@x")]))
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["user_id"], "u1");
@@ -849,12 +864,10 @@ mod tests {
                 )
                 .unwrap();
         }
-        let active = model
-            .scan(&entity, &equals(&[("active", "true")]), 50)
-            .unwrap();
+        let active = model.scan(&entity, &equals(&[("active", "true")])).unwrap();
         assert_eq!(active.len(), 2);
         let inactive = model
-            .scan(&entity, &equals(&[("active", "false")]), 50)
+            .scan(&entity, &equals(&[("active", "false")]))
             .unwrap();
         assert_eq!(inactive.len(), 1);
         assert_eq!(inactive[0]["user_id"], "u2");
@@ -891,9 +904,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(model.get(&entity, "g1").unwrap().unwrap()["select"], "a");
-        let filtered = model
-            .scan(&entity, &equals(&[("select", "b")]), 50)
-            .unwrap();
+        let filtered = model.scan(&entity, &equals(&[("select", "b")])).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["group"], "g2");
         // The cursor branch adds `key > ?` and the ORDER BY on the keyword key.
@@ -901,13 +912,13 @@ mod tests {
             .scan(
                 &entity,
                 &at_cursor(
+                    &entity,
                     Query {
                         limit: 50,
                         ..Query::default()
                     },
                     &["g1"],
                 ),
-                50,
             )
             .unwrap();
         assert_eq!(after.len(), 1);
@@ -966,7 +977,7 @@ mod tests {
         assert_eq!(model.rows(&entity).unwrap().len(), 2);
         assert_eq!(
             model
-                .scan(&entity, &equals(&[("email", "old@x")]), 50)
+                .scan(&entity, &equals(&[("email", "old@x")]))
                 .unwrap()
                 .len(),
             1
@@ -1079,18 +1090,16 @@ mod tests {
     #[test]
     fn scan_filters_on_a_whole_index_and_on_its_prefix() {
         let (model, entity, _dir) = catalog_model();
-        let prefix = model
-            .scan(&entity, &equals(&[("bucket", "a")]), 50)
-            .unwrap();
+        let prefix = model.scan(&entity, &equals(&[("bucket", "a")])).unwrap();
         assert_eq!(ids(&prefix), vec!["i1", "i2", "i3"]);
         let whole = model
-            .scan(&entity, &equals(&[("bucket", "a"), ("rank", "5")]), 50)
+            .scan(&entity, &equals(&[("bucket", "a"), ("rank", "5")]))
             .unwrap();
         assert_eq!(ids(&whole), vec!["i2"]);
         // The same two columns the other way round is the same question: a query string
         // carries no order, so the match against the index is a set comparison.
         let reversed = model
-            .scan(&entity, &equals(&[("rank", "5"), ("bucket", "a")]), 50)
+            .scan(&entity, &equals(&[("rank", "5"), ("bucket", "a")]))
             .unwrap();
         assert_eq!(ids(&reversed), vec!["i2"]);
     }
@@ -1107,7 +1116,7 @@ mod tests {
             },
         );
         assert_eq!(
-            ids(&model.scan(&entity, &half_open, 50).unwrap()),
+            ids(&model.scan(&entity, &half_open).unwrap()),
             vec!["i2", "i3"]
         );
         // Both ends together, and the exclusive upper is what keeps `i3` out: a bounded
@@ -1120,7 +1129,7 @@ mod tests {
                 upper: Some((Bound::Exclusive, "9".to_owned())),
             },
         );
-        assert_eq!(ids(&model.scan(&entity, &bounded, 50).unwrap()), vec!["i2"]);
+        assert_eq!(ids(&model.scan(&entity, &bounded).unwrap()), vec!["i2"]);
     }
 
     #[test]
@@ -1129,9 +1138,7 @@ mod tests {
         // `rank` is the index's *second* column, so reaching these rows means visiting
         // every bucket. The handler refuses this first; the model refuses it too, so
         // the promise does not rest on one caller remembering to ask.
-        let err = model
-            .scan(&entity, &equals(&[("rank", "5")]), 50)
-            .unwrap_err();
+        let err = model.scan(&entity, &equals(&[("rank", "5")])).unwrap_err();
         assert!(
             err.to_string().contains("no declared index"),
             "unexpected error: {err}"
@@ -1147,15 +1154,19 @@ mod tests {
         // difference is visible: the rows are identical either way, so no behavioural
         // test can see it.
         //
-        // Paginated deliberately (`Some("i1")`), because a first page could hide the
-        // cost: it is the cursor that makes the sort recur.
+        // Paginated deliberately, because a first page could hide the cost: it is the
+        // cursor that makes the sort recur. The statement is asserted alongside the plan
+        // because a cursor whose width did not match the ordering would be dropped by
+        // `usable_cursor` and this would quietly be an unpaginated query with a comment
+        // claiming otherwise.
         let (model, entity, _dir) = catalog_model();
-        let plan = model
-            .explain_scan(
-                &entity,
-                &at_cursor(equals(&[("bucket", "a"), ("rank", "5")]), &["a", "5", "i1"]),
-            )
-            .unwrap();
+        let query = at_cursor(&entity, equals(&[("bucket", "a"), ("rank", "5")]), &["i1"]);
+        let (sql, _) = model.scan_statement(&entity, &query).unwrap();
+        assert!(
+            sql.contains(r#"("item_id") > (?)"#),
+            "this test is about a paginated scan: {sql}"
+        );
+        let plan = model.explain_scan(&entity, &query).unwrap();
         assert!(
             plan.contains("USING INDEX item_by_bucket_rank"),
             "the filter must be served by the declared index: {plan}"
@@ -1184,12 +1195,13 @@ mod tests {
         });
         let (model, _dir) = open_temp(slice::from_ref(&entity));
         put_item(&model, &entity, "i1", "a", 1);
-        let plan = model
-            .explain_scan(
-                &entity,
-                &at_cursor(equals(&[("bucket", "a")]), &["a", "i1"]),
-            )
-            .unwrap();
+        let query = at_cursor(&entity, equals(&[("bucket", "a")]), &["i1"]);
+        let (sql, _) = model.scan_statement(&entity, &query).unwrap();
+        assert!(
+            sql.contains(r#"("item_id") > (?)"#),
+            "this test is about a paginated scan: {sql}"
+        );
+        let plan = model.explain_scan(&entity, &query).unwrap();
         assert!(
             plan.contains("USING INDEX item_by_bucket "),
             "the narrower index is the one that serves this without a sort: {plan}"
@@ -1205,14 +1217,14 @@ mod tests {
         let (model, entity, _dir) = catalog_model();
         let by_rank = ordered(equals(&[]), "by_bucket_rank", false);
         assert_eq!(
-            ids(&model.scan(&entity, &by_rank, 50).unwrap()),
+            ids(&model.scan(&entity, &by_rank).unwrap()),
             // `(bucket, rank, item_id)`, which is a different order from the key's: i4
             // sorts last here and third by key.
             vec!["i1", "i2", "i3", "i4"]
         );
         let reversed = ordered(equals(&[]), "by_bucket_rank", true);
         assert_eq!(
-            ids(&model.scan(&entity, &reversed, 50).unwrap()),
+            ids(&model.scan(&entity, &reversed).unwrap()),
             vec!["i4", "i3", "i2", "i1"],
             "reversing turns the whole tuple around, not just its first column"
         );
@@ -1224,7 +1236,7 @@ mod tests {
             ..equals(&[])
         };
         assert_eq!(
-            ids(&model.scan(&entity, &by_key_desc, 50).unwrap()),
+            ids(&model.scan(&entity, &by_key_desc).unwrap()),
             vec!["i4", "i3", "i2", "i1"]
         );
     }
@@ -1255,7 +1267,7 @@ mod tests {
         query.limit = 1;
         let mut seen = Vec::new();
         for _ in 0..6 {
-            let page = model.scan(&entity, &query, 1).unwrap();
+            let page = model.scan(&entity, &query).unwrap();
             let Some(row) = page.first() else { break };
             seen.push(row["item_id"].as_str().unwrap().to_owned());
             // Read off the ordering rather than written out, so shortening the ordering
@@ -1282,6 +1294,7 @@ mod tests {
         // refuses, and the plan is where it shows.
         let (model, entity, _dir) = catalog_model();
         let query = at_cursor(
+            &entity,
             ordered(equals(&[("bucket", "a")]), "by_bucket_rank", true),
             &["a", "5", "i2"],
         );

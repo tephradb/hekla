@@ -473,15 +473,12 @@ fn parse_filter(
             }));
         }
         let Some(operator) = operator else {
-            if filter
-                .equals
-                .iter()
-                .any(|(existing, _)| *existing == column)
-            {
-                return Err(FilterProblem::invalid(format!(
-                    "filter `{column}` is given more than once"
-                )));
-            }
+            // No check for a repeated column here, because there cannot be one to catch:
+            // `read_scan` extracts a `HashMap`, which keeps one value per key, so
+            // `?a=1&a=2` arrives as a single pair. The two-bound check further down *can*
+            // fire, since `.gte` and `.gt` are distinct keys. One column appearing twice
+            // is also what `choose_index`'s prefix match assumes cannot happen, and this
+            // is why that assumption holds.
             filter.equals.push((column, value));
             continue;
         };
@@ -696,6 +693,26 @@ async fn read_scan(
                     "this cursor was taken over `order_by={}` and this request asks for \
                      `order_by={taken}`; start the new ordering from its first page",
                     cursor.ordering
+                ),
+            );
+        }
+        // The token matching is not enough. An ordering's name and its *width* move
+        // independently: an index containing the key is not widened by it, so moving
+        // `@key` onto another column turns `index (a, k)` from a two-column ordering into
+        // a three-column one while `by_a_k` still spells it. Without this the tuple is
+        // dropped downstream and every page comes back as page one with the same cursor,
+        // which is a client looping forever and no error anywhere.
+        let width = order.columns(&entity_def).len();
+        if cursor.values.len() != width {
+            return read_invalid(
+                &projector,
+                &entity,
+                "invalid_input",
+                &format!(
+                    "this cursor carries {} value(s) and `order_by={taken}` now orders on \
+                     {width}; the entity's declaration changed under it, so start from its \
+                     first page",
+                    cursor.values.len()
                 ),
             );
         }

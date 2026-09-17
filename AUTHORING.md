@@ -329,7 +329,8 @@ Every `{Name}` below is a *declared* name, not a file stem: `command PlaceOrder`
   means visiting every shop, which is the table scan the read API exists to refuse. Anything it
   cannot serve is a 400 naming what is declared. A range needs a column whose order means something,
   so `Money` (stored as its decimal string), an enum (stored as its variant's spelling), `Bool` and
-  `Json` take equality only. Pagination is cursor-based, never offset.
+  `Json` take equality only. An optional column ranges like the type under its `?`: `>=` simply does
+  not match the absent ones. Pagination is cursor-based, never offset.
 - **Declare the narrow index too if you filter on it alone.** A scan is ordered by the key, and the
   key is appended to every generated index, so a filter using *all* of an index's columns is a pure
   seek. A shorter prefix leaves a declared column between the filter and the key, and SQLite sorts

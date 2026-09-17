@@ -452,6 +452,34 @@ projector Things {
     assert_error(&files, "reserved read query param");
 }
 
+/// `?order_by=` accepts a declared index or the key column and resolves the index first.
+/// Index names are generated as `by_<columns>`, so the two collide only on a key spelled
+/// that way, and then one ordering becomes unnameable while both spell the same cursor
+/// token: a cursor from one would be accepted under the other and compare the wrong
+/// columns. Refusing the declaration is cheaper than adjudicating it per request.
+#[test]
+fn a_key_named_like_a_generated_index_is_an_error() {
+    let files = vec![
+        ("events/thing.hk", EVENTS),
+        (
+            "projectors/things.hk",
+            r#"
+projector Things {
+  entity Thing {
+    by_note: Uuid @key,
+    note: String @max(200) @index,
+  }
+
+  on @thing.happened { thing_id, note } {
+    put Thing { by_note: thing_id, note }
+  }
+}
+"#,
+        ),
+    ];
+    assert_error(&files, "which is also the key column");
+}
+
 /// `order_by` joined the reserved set when orderings did, so a column named after it is
 /// the newest way to trip this gate and the one an existing project is likeliest to hit.
 #[test]

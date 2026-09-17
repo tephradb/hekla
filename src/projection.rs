@@ -550,7 +550,7 @@ fn read_entity(
     limit: usize,
 ) -> anyhow::Result<Entity> {
     let row_count = model.count(entity)?;
-    let mut rows = model.scan(entity, &read_api::Query::default(), limit)?;
+    let mut rows = model.scan(entity, &read_api::Query::all(limit))?;
     let sealed: Vec<(String, String)> = entity
         .fields
         .iter()

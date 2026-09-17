@@ -523,6 +523,7 @@ below, which report against the file and not a position.
 | ``projector `X` must be declared under projectors/`` | a `projector` elsewhere | move it |
 | ``effect `X` must be declared under effects/`` | an `effect` elsewhere | move it |
 | ``entity `E`: filterable field `f` collides with a reserved read query param (one of: limit, cursor, after, timeout_ms, order_by)`` | a key or a column of any declared index named like a read parameter | rename the column |
+| ``entity `E`: the index over (c) is named `i`, which is also the key column`` | a key column spelled `by_<something>` that a generated index name matches | rename the key |
 | ``entity `E`: index `i` covers subject-encrypted column `c`; filter by the plaintext subject id instead`` | an index over a column that receives sealed content | index the subject id instead |
 | ``column `c` of entity `E` is sealed under `s`, so erasing that subject leaves it absent, but its declared type cannot be absent: make it optional`` | a sealed column typed `T` rather than `T?` | make it optional |
 | ``event `t` field `_hekla_x` uses the reserved `_hekla_` prefix, which is hekla's own tag namespace`` | an event field in the runtime's tag namespace (located at `events`, with no file) | rename the field |

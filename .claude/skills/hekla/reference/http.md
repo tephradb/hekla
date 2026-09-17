@@ -114,7 +114,9 @@ reads it newest-first; `?order_by=-<key column>` reverses the default.
 - **The key is the last term of every ordering.** An index tuple is not unique, and without the
   tiebreak two rows sharing one are silently dropped or repeated at a page boundary.
 - **A cursor records the ordering it was taken over**, and reading it back under another is a 400.
-  Dropping `?order_by=` counts as another: the default key order is an ordering too.
+  Dropping `?order_by=` counts as another: the default key order is an ordering too. A cursor whose
+  tuple no longer matches the ordering's width is refused the same way, which is what a deploy that
+  moved `@key` onto another column looks like from a paging client.
 - **An index with an optional column cannot sort** (a row-value comparison against NULL matches
   nothing, so a page boundary would lose every row whose column is absent), nor can one with a `Money`
   or enum column, for the same reason a range cannot. Each stays filterable, and `order_by`'s
@@ -129,8 +131,10 @@ Two things follow that are worth knowing before declaring:
 
 - **A range needs a column whose order means something.** `Money` is stored as its decimal string
   (so `>=` would sort `"2"` above `"10"`) and an enum as its variant's spelling (so a range would
-  walk the alphabet, not the severity). Those, plus `Bool`, `Json` and optional columns, take
-  equality only, and asking for a range on one is a 400 naming the declared type.
+  walk the alphabet, not the severity). Those, plus `Bool` and `Json`, take equality only, and
+  asking for a range on one is a 400 naming the declared type. An **optional** column ranges like
+  the type under its `?`: `>=` just does not match the absent ones, which is what a reader asking
+  for a range wants. It is an *ordering* over one that is refused, for a different reason.
 - **Declare the narrow index too if you filter on it alone.** The key is appended to every generated
   index, so a filter using all of an index's columns is a pure seek; a shorter prefix leaves a
   declared column between the filter and the key and SQLite sorts the match set on every page. The
@@ -142,7 +146,7 @@ Errors are `{error: {code, message}}` (no correlation ids outside `/commands`):
 | Status | `code` | When |
 | --- | --- | --- |
 | 400 | `unindexed_filter` | ``filter on (a, b) is not a prefix of any declared index``, ``filter field `f` is not indexed; declare an index on it``, ``filter field `f` is not a column of entity `E` ``, or `a scan ranges over one column` |
-| 400 | `invalid_input` | `limit must be a positive integer`, `cursor is not valid`, ``filter `f`: expected an integer``, ``unknown filter operator `.between` ``, ``filter `f` is Money(2), which has no order a range could use``, ``` `x` is not an ordering of entity `E` ```, ``index `i` cannot order rows``, or `this cursor was taken over `order_by=...`` |
+| 400 | `invalid_input` | `limit must be a positive integer`, `cursor is not valid`, ``filter `f`: expected an integer``, ``unknown filter operator `.between` ``, ``filter `f` is Money(2), which has no order a range could use``, ``` `x` is not an ordering of entity `E` ```, ``index `i` cannot order rows``, ``this cursor was taken over `order_by=...` ``, or ``this cursor carries N value(s) and `order_by=x` now orders on M`` |
 | 404 | `not_found` | no such projector, entity or row |
 | 503 | `not_caught_up` | the `after` wait timed out, with `Retry-After: 1` |
 | 503 | `rebuilding` | a rebuild is in flight; carries `Retry-After: 1` because it resolves on its own |

@@ -350,6 +350,22 @@ impl EntityDef {
                     ix.name
                 );
             }
+            // `?order_by=` names either a declared index or the key column, and resolves
+            // an index first. Index names are generated as `by_<columns>` and never
+            // authored, so the two can only ever collide on a key literally spelled that
+            // way, and then the key's own ordering becomes unnameable while both spell
+            // the same cursor token: a cursor from one ordering would be accepted under
+            // the other. Refusing the name is cheaper than making the request path
+            // adjudicate it.
+            if ix.name == self.key {
+                anyhow::bail!(
+                    "entity `{}`: the index over ({}) is named `{}`, which is also the key column, so `order_by={}` could mean either; rename the key",
+                    self.name,
+                    ix.columns.join(", "),
+                    ix.name,
+                    ix.name
+                );
+            }
         }
         let Some((_, key_meta)) = self.fields.iter().find(|(n, _)| *n == self.key) else {
             anyhow::bail!(
