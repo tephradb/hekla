@@ -180,6 +180,18 @@ pub fn tickets() -> Scenario {
                         "fee": "12.50",
                         "budget": "900.00",
                         "contact": contact,
+                        "contacted_at": due_at,
+                        // Sealed composites, varying per thing for the same reason
+                        // `due_at` does: a column that stopped varying would show up
+                        // as a row difference rather than as nothing.
+                        "reporter": {
+                            "name": format!("owner {owner}"),
+                            "team": format!("group {group}"),
+                            "badge": format!("{thing:04}"),
+                            "filed_at": due_at,
+                        },
+                        "watchers": [format!("ops{group}@example.com")],
+                        "labels": { "area": format!("area {group}") },
                         "meta": { "thing": thing, "note": "generated" },
                     }),
                 }

@@ -43,6 +43,46 @@ hekla's half.
   equality over two ciphertexts. Keep a plaintext handle beside the sealed address and fold on that;
   erasing the subject does not reopen the handle it claimed.
 
+## Sealing a record, a list or a map
+
+`@subject(...)` takes any declared type, not just a scalar. The seal's text for a composite is the
+JSON document rule 8 already writes, and `reveal` parses it back, so an effect gets an `Address` and
+reads `.city` off it.
+
+```hek
+record Address { line1: String @max(200), city: String @max(100), postcode: String @max(10) }
+
+event @order.placed {
+  order_id: Uuid,
+  customer_id: Int,
+  ship_to: Address @subject(customer_id),
+}
+```
+
+This is the shape to reach for. The alternative is one sealed `String` per part, where adding a tenth
+part is a schema-evolution event on every event that carries one, and a `@subject` field takes `?` and
+never `@absent`.
+
+- **The annotation goes on the event field, never inside the record.** `@subject(x)` names a sibling
+  holding the id, and a field reached through a container has no sibling to name. A record *type* on
+  a subject-bound event field is fine; `@subject` on a field of a `record` declaration is refused.
+- **A leaf that looks like a number stays text.** The document quotes its own leaves, so a badge of
+  `"0042"` reveals as `"0042"` rather than as `42`.
+- **A nested `Timestamp` is epoch microseconds, in the payload seal and the column seal alike.** Only
+  a *top-level* `Timestamp` column is rewritten to RFC 3339, and nothing rewrites inside a document.
+- **It goes whole or not at all.** An erased subject's record column reads back absent, the same as a
+  scalar's; there is no half-parsed object.
+- **A field added to the record since a seal was written reads as its `@absent` literal**, in an
+  effect's `reveal` and in a read-model column alike. That is what makes growing a subject-bound
+  record safe: the plaintext is behind a key, so no migration is available even in principle.
+- **A seal whose text is not the document its declaration promises wedges the lane and retries.** That
+  is a field whose type changed under the log, and it is deliberately *not* terminal: an erased
+  subject is unrecoverable, while a mismatch has its plaintext intact behind a live key and one edit
+  to one `.hk` line fixes it. `GET /admin/events/{position}` still shows the raw text, because the
+  operator diagnosing the wedge is the one who needs to read it.
+
+Needs heklang 0.9 or newer. Against 0.8 a composite seal reveals as a mismatch and the lane wedges.
+
 ## Erasure
 
 `hekla erase <field> <value> <dir>` from the CLI, or `erase(...)` from an effect arm. It deletes the

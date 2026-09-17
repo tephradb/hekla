@@ -13,6 +13,10 @@ test "an erased owner loses their contact and keeps everything else" {
     fee: 12.50,
     budget: 900.00,
     contact: "ada@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: { "source": "email" },
   }
   erased owner_id "10"
@@ -38,6 +42,10 @@ test "an erased organisation loses its budget and keeps the owner's contact" {
     fee: 1.00,
     budget: 900.00,
     contact: "ada@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   erased org_id "1"
@@ -59,6 +67,10 @@ test "erasing one owner leaves another's contact alone" {
     fee: 1.00,
     budget: 1.00,
     contact: "ada@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   given @ticket.opened {
@@ -71,6 +83,10 @@ test "erasing one owner leaves another's contact alone" {
     fee: 1.00,
     budget: 1.00,
     contact: "bob@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   erased owner_id "10"

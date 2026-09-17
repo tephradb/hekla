@@ -13,6 +13,10 @@ test "notifies the owner then records it" {
     fee: 12.50,
     budget: 900.00,
     contact: "ada@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   // The setup lever, for when the shape of the value matters: this one has to read as
@@ -38,6 +42,10 @@ test "a ticket with no contact is logged rather than sent" {
     fee: 1.00,
     budget: 1.00,
     contact: none,
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   deliver NotifyOwner
@@ -55,6 +63,10 @@ test "a rejected notification stops before the internal command" {
     fee: 1.00,
     budget: 1.00,
     contact: "ada@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   // No setup lever here: an unmentioned credential answers `secret:NAME`, so a test of
@@ -78,6 +90,10 @@ test "an erased owner skips rather than sending plaintext" {
     fee: 1.00,
     budget: 1.00,
     contact: "ada@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   erased owner_id "10"

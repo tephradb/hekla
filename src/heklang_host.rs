@@ -42,7 +42,6 @@ use crate::hash::sha256_hex;
 use crate::http::{HttpClient, HttpRequest};
 use crate::metrics;
 use crate::opdb::OpDb;
-use crate::read_api;
 use crate::read_model::ReadModel;
 use crate::schema::{self, EmittedEvent, EventDef, EventDefs, FieldKind};
 use crate::secrets::SecretStore;
@@ -1415,7 +1414,7 @@ fn stored_seal(
 /// number or a boolean. A `Json` field is written whole, quotes and all, because it is
 /// the one kind whose value can itself be a string that looks like another type:
 /// flattening `"42"` to `42` would read back as a number. Its inverse is
-/// [`unsealed_json`] for a payload and [`read_api::typed_from_string`] for a column, and
+/// [`unsealed_json`] for a payload and [`crate::read_api::typed_from_string`] for a column, and
 /// both parse a `Json` field for exactly this reason.
 fn seal_text(kind: &FieldKind, json: &serde_json::Value) -> String {
     if matches!(kind.base(), FieldKind::Json) {
@@ -1535,30 +1534,38 @@ impl heklang::host::Rows for RowWriter<'_> {
         let mut row = heklang::Row::default();
         for field in &declared.fields {
             let raw = stored.get(&field.name);
-            let subject = table
+            // One lookup, and borrowed: the loop is over every declared column and this
+            // searches every stored one, so a second pass makes a row read quadratic in
+            // the width of the entity for nothing.
+            let meta = table
                 .fields
                 .iter()
                 .find(|(name, _)| name == &field.name)
-                .and_then(|(_, meta)| meta.subject.clone());
-            let kind = table
-                .fields
-                .iter()
-                .find(|(name, _)| name == &field.name)
-                .map(|(_, meta)| meta.kind.clone());
-            let json = match (subject, raw) {
+                .map(|(_, meta)| meta);
+            let kind = meta.map(|meta| &meta.kind);
+            let value = match (meta.and_then(|meta| meta.subject.as_deref()), raw) {
                 (Some(subject_field), Some(raw)) => {
-                    self.decrypt_field(&stored, &subject_field, &field.name, raw, kind.as_ref())?
+                    match self.decrypt_field(&stored, subject_field, &field.name, raw)? {
+                        Some(plaintext) => sealed_column(&field.ty, kind, plaintext, defs)?,
+                        // The key is gone, so the column is: the same answer `read_api`
+                        // gives a reader, and what makes an erasure observable here.
+                        None => Value::from_json(&Json::Null, &field.ty, defs)
+                            .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?,
+                    }
                 }
-                (_, Some(raw)) => match kind.as_ref() {
-                    Some(kind) => to_heklang_json(&wire_form(kind, raw.clone())),
-                    None => to_heklang_json(raw),
-                },
+                (_, Some(raw)) => {
+                    let json = match kind {
+                        Some(kind) => to_heklang_json(&wire_form(kind, raw.clone())),
+                        None => to_heklang_json(raw),
+                    };
+                    Value::from_json(&json, &field.ty, defs)
+                        .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?
+                }
                 // A column the read model omitted is a NULL, which is an absent
                 // optional or a row written before the column existed.
-                (_, None) => Json::Null,
+                (_, None) => Value::from_json(&Json::Null, &field.ty, defs)
+                    .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?,
             };
-            let value = Value::from_json(&json, &field.ty, defs)
-                .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?;
             row.0.insert(field.name.clone(), value);
         }
         Ok(Some(row))
@@ -1700,27 +1707,82 @@ impl heklang::host::Rows for RowWriter<'_> {
     }
 }
 
+/// A decrypted column back as the value its declaration says it is.
+///
+/// **[`Value::from_sealed`] rather than [`Value::from_json`], and the difference is the
+/// one `@absent` turns on.** `from_json` reads a body, which has to satisfy the
+/// declaration as it stands; this is stored history, written under whatever the
+/// declaration was that day. heklang states that the distinction holds through a seal
+/// (`docs/declarations.md`), and `reveal` already keeps the promise for the payload copy
+/// of this same content. The read-model copy has to keep it too, or a field added to a
+/// record with an `@absent` reads fine in every effect and fails every row written before
+/// it, which is precisely the migration the annotation exists to make unnecessary.
+///
+/// It is also the reading half of what sealed the text, so the two cannot drift: the
+/// column's own table is [`crate::read_api::typed_from_string`], which answers a reader
+/// over a socket rather than the interpreter.
+///
+/// `Opt` is peeled here rather than passed down. It sits outside a seal, never inside
+/// one, and `from_sealed` reads an `Opt` as text on the way to a host that handed it one
+/// by mistake, which for a record would be a parse of the wrong thing.
+fn sealed_column(
+    declared: &Type,
+    kind: Option<&FieldKind>,
+    plaintext: String,
+    defs: Defs<'_>,
+) -> Result<Value, Error> {
+    let (content, optional) = match declared {
+        Type::Opt(inner) => (inner.as_ref(), true),
+        other => (other, false),
+    };
+    let content = match content {
+        Type::Sealed(inner, _) => inner.as_ref(),
+        other => other,
+    };
+    // A column holds a `Timestamp` as RFC 3339 and a payload holds it as micros, and the
+    // payload form is the one `from_sealed` reads. It is the only kind the two differ
+    // on, which is what [`column_form`] and [`wire_form`] say in JSON and this says in
+    // the text a seal actually holds.
+    let text = match kind.map(FieldKind::base) {
+        Some(FieldKind::Timestamp) => {
+            heklang::value::timestamp(&plaintext).map_or(plaintext, |micros| micros.to_string())
+        }
+        _ => plaintext,
+    };
+    let read = Value::from_sealed(&text, content, defs)
+        .map_err(|why| Error::new(ErrorKind::Mismatch(why)))?;
+    Ok(if optional {
+        Value::Opt {
+            inner: content.clone(),
+            value: Some(Box::new(read)),
+        }
+    } else {
+        read
+    })
+}
+
 impl RowWriter<'_> {
     /// The same decrypt the log path does, against a row's own subject column.
     ///
-    /// A ciphertext is text whatever the column holds, so the declared kind is what
-    /// says how to read it back. It goes through the same [`wire_form`] the plain
-    /// branch does, because `put` sealed the column form.
+    /// The plaintext, or `None` for a key that is gone. Re-typing it is
+    /// [`sealed_column`]'s business, because a column is read as stored history and this
+    /// only opens it.
     fn decrypt_field(
         &self,
         row: &serde_json::Value,
         subject_field: &str,
         field: &str,
         stored: &serde_json::Value,
-        kind: Option<&FieldKind>,
-    ) -> Result<Json, Error> {
+    ) -> Result<Option<String>, Error> {
         let Some(keystore) = self.keystore else {
             return Err(host_error(format!(
                 "column `{field}` is scoped to `{subject_field}` but no master key is configured"
             )));
         };
+        // Not text at all, so there is no seal here to open: a column written before the
+        // field was scoped. `scalar_to_string` is what a seal would have held.
         let Some(ciphertext) = stored.as_str() else {
-            return Ok(to_heklang_json(stored));
+            return Ok(schema::scalar_to_string(stored).or_else(|| Some(stored.to_string())));
         };
         let subject_value = row
             .get(subject_field)
@@ -1730,16 +1792,10 @@ impl RowWriter<'_> {
             .decrypt_subject(subject_field, &subject_value, field, ciphertext)
             .map_err(host_error)?
         {
-            Some(plaintext) => Ok(match kind {
-                Some(kind) => to_heklang_json(&wire_form(
-                    kind,
-                    read_api::typed_from_string(kind, plaintext),
-                )),
-                None => Json::Str(plaintext),
-            }),
+            Some(plaintext) => Ok(Some(plaintext)),
             // The key is gone. Absent is the same answer `read_api` gives a reader,
             // and it is what makes an erased subject observable in a projection.
-            None => Ok(Json::Null),
+            None => Ok(None),
         }
     }
 }
@@ -1807,7 +1863,7 @@ pub fn append_one(host: &mut HeklaHost, event: &Event) -> Result<(), Error> {
 /// `Type` where this is keyed on a `FieldKind`.
 ///
 /// **Which producer a seal came from decides which table reads it**, and that is the
-/// whole difference between this and [`read_api::typed_from_string`]. A payload seal is
+/// whole difference between this and [`crate::read_api::typed_from_string`]. A payload seal is
 /// made by [`stored_seal`] out of the wire form, so a `Timestamp` in it is micros; a
 /// read-model column seal runs through [`column_form`] first, so a `Timestamp` in that
 /// one is RFC 3339. Reading one with the other's table types a timestamp as a string.
@@ -1892,6 +1948,7 @@ mod tests {
 
     use super::*;
     use crate::propgen;
+    use crate::read_api;
 
     fn undecodable(expected: Type, found: &str) -> Unreadable {
         Unreadable {
@@ -2014,7 +2071,59 @@ mod tests {
         );
     }
 
+    /// The declaration a `@subject(...)` makes of a type. `Opt` stays outermost, so the
+    /// seal goes under it and never over it, which is the shape `Type::unsealed` reads
+    /// back through.
+    fn scoped(ty: &Type) -> Type {
+        match ty {
+            Type::Opt(inner) => Type::opt(Type::sealed((**inner).clone(), "owner_id")),
+            other => Type::sealed(other.clone(), "owner_id"),
+        }
+    }
+
     proptest! {
+        /// A sealed column and a plain one of the same declaration read back as the same
+        /// value.
+        ///
+        /// The seal is invisible by the time `RowWriter::row` is done with it: the column
+        /// holds ciphertext, `decrypt_field` opens it, and what a projector then sees is
+        /// what it would have seen had the field never been personal. Two tables have to
+        /// agree for that, `decrypt_field`'s and the plain branch's, and this is what
+        /// stops one growing an arm the other did not.
+        ///
+        /// **It is not the regression test for reading one back at the wrong
+        /// declaration.** That fault was in which type `row` passes to `from_json`, and
+        /// no property over these functions can see it: `scoped(ty).unsealed()` is `ty`
+        /// by construction. `tests/tickets.rs` holds that one, on an `update` that reads
+        /// a row back and puts it whole.
+        #[test]
+        fn a_sealed_column_reads_back_as_the_plain_one_beside_it(
+            (ty, value) in propgen::typed_value()
+        ) {
+            let kind = propgen::kind_of(&ty);
+            let column = column_form(&kind, wire(&value));
+            prop_assume!(!column.is_null());
+            let defs = propgen::defs();
+
+            // The plain branch of `row`.
+            let plain = Value::from_json(
+                &to_heklang_json(&wire_form(&kind, column.clone())),
+                &ty,
+                defs,
+            ).expect("a plain column reads back");
+
+            // The scoped branch: what `decrypt_field` hands back, read against the
+            // declaration with the seal taken off.
+            let decrypted = to_heklang_json(&wire_form(
+                &kind,
+                read_api::typed_from_string(&kind, seal_text(&kind, &column)),
+            ));
+            let sealed = Value::from_json(&decrypted, &scoped(&ty).unsealed(), defs)
+                .expect("a sealed column reads back too");
+
+            prop_assert!(sealed.same(&plain), "sealed {sealed:?}, plain {plain:?}");
+        }
+
         /// A column stores what a socket would send, in one of two shapes, and the pair
         /// has to be a bijection or a `Timestamp` reads back as whatever it was stored
         /// as. Only `Timestamp` differs between the two forms today; the property is

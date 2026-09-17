@@ -2312,7 +2312,7 @@ Honest scope:
   tables do and what `.table-wrap` is for, and the alternative was worse: clipping that column instead
   makes every column collapse on a phone rather than scroll, which was checked at both widths.
 
-## Phase 36: a sealed record round-trips (planned)
+## Phase 36: a sealed record round-trips (written, gated on the heklang release)
 
 heklang 0.8.0's `Value::from_sealed` has no arm for a record, a list, a map or a `Json`, and `reveal`
 has no other decode path. So `ship_to: Address @subject(customer_ref)` does not merely fail in
@@ -2339,7 +2339,12 @@ because it is the one `heklang/docs/declarations.md` now recommends: one address
 parallel optional sealed fields, where adding a tenth is a schema-evolution event on every event that
 carries it.
 
-- The heklang version bump, which is the gate. Nothing here can land against 0.8.0.
+- The heklang version bump, which is the gate. Nothing here can land against 0.8.0, and
+  that is still true of the tree this is written in: the work is done and validated
+  against a `[patch.crates-io]` path override, and it is not committed until heklang 0.9
+  is published and the requirement moves with it. Removing the override without bumping
+  the requirement resolves the released 0.8.0, which compiles and wedges, so the two
+  edits are one edit.
 - A fixture sealing a record, a list and a map, in `tests/fixtures/tickets`, which already seals a
   `Money(2)` and a `String?`.
 - Coverage through the whole path: seal on append, store, read back, `reveal` in an effect, and a
@@ -2349,6 +2354,24 @@ carries it.
   into.
 - A shredded key: a sealed record must come back absent from a row and terminal in an effect, never
   a partially parsed object.
+
+**It turned out not to be coverage only.** Writing the fixture found a fault in `RowWriter::row`, and
+it was hekla's rather than heklang's. A scoped column is a sealed one, so `Value::from_json` was
+reading the decrypted plaintext back against a declaration with the seal still on it, and a sealed
+position takes text and nothing else. Every kind whose stored form is not text failed there: an
+`Int`, a `Bool`, a `Timestamp` and all three composites. Nothing caught it because the only sealed
+columns anything projected were a `String` and a `Money`, and both of those read back as text anyway.
+`row` now reads a decrypted column against `field.ty.unsealed()`, which is the declaration the column
+would have had were the field not personal. The fixture grew a sealed `Timestamp` beside the three
+composites to cover the rest of that class, and it earns a second keep of its own: it is the one
+sealed kind whose column form differs from its payload form.
+
+**Flattening it to text is the other way to satisfy that position, and it loses.** `put` cannot then
+tell a document read back out of a column from a string a handler wrote, so an `update` touching one
+column of a row carrying a sealed record re-seals that record quoted as a string: still readable,
+still decryptable, and a different value. Reading it back at its declared shape has no such ambiguity,
+and it is also what makes `expect Ticket[k] { reporter: filed_by() }` compare a record against a
+record rather than against a document's text.
 
 Decisions worth keeping:
 
@@ -2370,6 +2393,35 @@ Decisions worth keeping:
 - **A nested timestamp stays micros in both seals.** `column_form` rewrites a top-level `Timestamp`
   only, so a timestamp inside a record is epoch microseconds in a payload seal and in a column seal
   alike. Consistent, and consistent for a reason nothing tested.
+- **The byte-stability test is stated as one seal against the other**, not against a literal. A
+  subject key is deterministic, so identical ciphertext is identical plaintext, and the payload seal
+  and the column seal of one field are made by two different routes: one renders the request body,
+  the other parses that rendering and renders it again. Comparing the two ciphertexts is the whole
+  property in one assertion, and it is the only assertion that would fail: both halves still decrypt
+  to a readable document, so everything about what a reader sees would go on passing. `due_at` is
+  why it is stated per column rather than over every sealed one, since a sealed `Timestamp` column
+  would hold RFC 3339 against the payload's micros on purpose.
+- **A decrypted column is read as stored history, not as a body.** The first fix reached for
+  `Value::from_json`, which is `Origin::Body` and so ignores `@absent` by design: a caller who
+  omits a field must be told, not handed a default. A row is the other case. heklang states that
+  the distinction holds through a seal, and `reveal` already keeps the promise on the payload copy
+  of the same content through `Value::from_sealed`; keeping it on one copy and not the other is
+  worse than not keeping it at all, because an author adding a field to a record would see every
+  effect go on working and every row written before today fail. So the column goes through
+  `from_sealed` too, which is the reading half of what `seal_text` wrote and cannot drift from it.
+  Nothing triggers a rebuild to paper over it either: a projector's digest names a referenced
+  record by name, so growing that record does not move the hash.
+- **The regression test is an `update`, not a `put`.** `row` is only read by `update`, `patch` and a
+  `.hk` `expect`, so a fixture that only `put`s never takes the path at all. The assertion sits on the
+  retitle in `every_write_statement_reaches_the_read_model`, which reads the row back and puts it
+  whole, so every sealed column on it makes the round trip whether or not the statement names it.
+  A property test cannot stand in: the fault was in which type `row` hands `from_json`, and
+  `scoped(ty).unsealed()` is `ty` by construction, so no property over those functions can see it.
+- **The shadow world reads a seal back too.** `tests/support/shadow.rs` rendered a sealed column as
+  the text it stores, which agreed with hekla only because every sealed column in the fixtures was
+  text-shaped. It now reads the content back against the declaration through `Value::from_sealed`,
+  which is heklang's half of the table `read_api::typed_from_string` is hekla's, so the model test
+  keeps comparing two implementations rather than a copy.
 
 Honest scope:
 
@@ -2380,7 +2432,21 @@ Honest scope:
 - **`Int.pad` and `Timestamp.add_seconds/minutes/hours/days` ride along in the same bump and cost
   nothing.** heklang's IR does not move, so no digest moves, no `signature_hash` moves, no
   `script_hash` is invalidated and no projector rebuilds. The console's editor highlights keywords
-  only and its list still matches `lex.rs` exactly, so there is nothing to sync there either.
+  only and its list still matches `lex.rs` exactly, so there is nothing to sync there either. The new
+  `ErrorKind::PadWidth` is additive and hekla never matches `ErrorKind` exhaustively, so the whole
+  bump is source-compatible.
+- **`support::seed_event` cannot seed a sealed composite, and that is not a fault to fix here.** It
+  reads an event from JSON, and a sealed field is read at its stored shape, which is text; a document
+  passed as text is then sealed re-quoted. Seeding is a test facility and no production path builds
+  an event this way, so the tests that need a hand-made seal go through `seed_event_value`
+  instead, which takes the `Event` already built. It is also the only way to have a seal written
+  under a declaration that has since moved, since the plaintext is behind a key and no rewrite is
+  available: that is what the `@absent` test needs, and what the corrupt seal is.
+- **An `expect` on a sealed column compares against what `row` read back**, which is now the declared
+  value, so a record, a list and a map can each be named in one. A sealed `Timestamp` still cannot:
+  a written moment is a string, and heklang's literal reader looks through a plain `Timestamp` column
+  and not through a sealed one. That column is asserted in `tests/tickets.rs` instead, and the
+  omission is written down where it sits.
 
 ## Phase 37: a scan filters on what was declared, not on its first column (planned)
 

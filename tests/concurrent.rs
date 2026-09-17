@@ -47,6 +47,10 @@ fn open_body(ticket: &str, org: i64, owner: i64, contact: Option<&str>) -> Value
         "fee": "12.50",
         "budget": "900.00",
         "contact": contact,
+        "contacted_at": 1_700_040_000_000_000i64,
+        "reporter": { "name": "Ada Lovelace", "badge": "0042", "filed_at": 1_700_000_000_000_000i64, "team": "printers" },
+        "watchers": ["ops@example.com"],
+        "labels": { "area": "printers" },
         "meta": {},
     })
 }

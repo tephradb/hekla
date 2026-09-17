@@ -329,15 +329,17 @@ impl<'a> Renderer<'a> {
 /// on a poll. It is a page of one effect's detail, so it is served where a page belongs:
 /// behind the route that names one effect.
 ///
-/// Derived by removing the key rather than by building a second object, so the two cannot
-/// drift into disagreeing about the fields they share. `EffectSummary` in the generated
-/// document is derived from `EffectDetail` the same way, for the same reason.
+/// One body with a flag rather than two, so the fields the pair share cannot drift into
+/// disagreeing. `EffectSummary` in the generated document is derived from `EffectDetail`
+/// by removing the key, which is the same guarantee where a static object allows it.
+///
+/// The flag is also the saving. Building the array here and dropping it afterwards would
+/// take the `stuck` mutex (the one every dispatch attempt takes), sort up to
+/// `MAX_INFLIGHT` entries and clone a hundred heklang error messages, per effect per
+/// poll: the whole cost this split exists to avoid, paid in full during the outage it was
+/// written for.
 pub fn effect_summary(shared: &EffectShared, head: u64, state: Option<&EffectState>) -> Value {
-    let mut summary = effect_detail(shared, head, state);
-    if let Some(object) = summary.as_object_mut() {
-        object.remove(STUCK_LANES);
-    }
-    summary
+    one_effect(shared, head, state, false)
 }
 
 /// The one key [`effect_detail`] carries and [`effect_summary`] does not. Named because
@@ -348,17 +350,27 @@ pub const STUCK_LANES: &str = "stuck_lanes";
 /// One effect, with everything the operational database knows about it on top of what
 /// `/status` already reports, and every wedged lane.
 pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectState>) -> Value {
+    one_effect(shared, head, state, true)
+}
+
+/// Both of the above. `lanes` is whether the caller is serving a page of them.
+fn one_effect(shared: &EffectShared, head: u64, state: Option<&EffectState>, lanes: bool) -> Value {
     let position = shared.position();
     let watermark = state.and_then(|state| state.watermark);
     let quarantine = state.and_then(|state| state.quarantine.as_ref());
     // Read once: the key and the position are a pair, and two loads could straddle a
     // republish and report one lane's key beside another's position.
     let pinning = shared.pinning();
-    // One read for the page and the count both. Two would let the count come from before
-    // a lane cleared and the page from after it, which a reader comparing them (the only
-    // way to see that the page was capped) reads as a truncation that never happened.
-    let stuck = shared.stuck_lanes();
-    json!({
+    // One read for the page and the count both, where there is a page. Two would let the
+    // count come from before a lane cleared and the page from after it, which a reader
+    // comparing them (the only way to see that the page was capped) reads as a truncation
+    // that never happened. With no page nothing compares them, so the counter alone is
+    // enough, and it is what `/status` already reports.
+    let stuck = lanes.then(|| shared.stuck_lanes());
+    let wedged = stuck
+        .as_ref()
+        .map_or_else(|| shared.wedged_lanes(), |stuck| stuck.total);
+    let mut out = json!({
         "name": shared.name,
         // One word for what the counters below add up to, derived in the runtime so
         // `/status`, this endpoint and the console cannot disagree about it.
@@ -377,7 +389,7 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
         "watermark": watermark,
         "consecutive_failures": shared.consecutive_failures(),
         "last_error": shared.last_error(),
-        "wedged_lanes": stuck.total,
+        "wedged_lanes": wedged,
         // Rule 15: the position `on live` arms decline at or below, resolved once at
         // this effect's first activation against this data directory and kept since.
         "live_boundary": shared.live_boundary(),
@@ -392,20 +404,6 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
         // describes and the one an operator skips.
         "pinning_key": pinning.as_ref().map(|(lane, _)| lane),
         "pinning_position": pinning.as_ref().map(|(_, at)| at),
-        // Every stuck lane, worst first, which `pinning_key` alone cannot say. A wedge
-        // appends nothing, so an application listing failures out of the log sees every
-        // `fail` and not one wedge; this is where it reads them instead. Capped, with
-        // `wedged_lanes` above as the untruncated count.
-        STUCK_LANES: stuck.listed.iter().map(|lane| json!({
-            "lane": lane.lane,
-            "position": lane.position,
-            "attempt": lane.attempt,
-            "error": lane.error,
-            // Milliseconds from now rather than an instant, for the reason `retry_in_ms`
-            // above is one. Zero is a retry that is due or running, where the null up
-            // there means no lane is stuck at all.
-            "retry_in_ms": lane.retry_in_ms,
-        })).collect::<Vec<_>>(),
         // Process-local and reset by a restart. The durable trace of a skipped
         // position is a terminal invocation row, indistinguishable from a completed one.
         "terminal_skips": shared.terminal_skips(),
@@ -416,7 +414,31 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
             "reason": row.reason,
             "at": row.at,
         })),
-    })
+    });
+    // Every stuck lane, worst first, which `pinning_key` alone cannot say. A wedge
+    // appends nothing, so an application listing failures out of the log sees every
+    // `fail` and not one wedge; this is where it reads them instead. Capped, with
+    // `wedged_lanes` above as the untruncated count.
+    if let Some(stuck) = stuck {
+        out[STUCK_LANES] = stuck
+            .listed
+            .iter()
+            .map(|lane| {
+                json!({
+                    "lane": lane.lane,
+                    "position": lane.position,
+                    "attempt": lane.attempt,
+                    "error": lane.error,
+                    // Milliseconds from now rather than an instant, for the reason
+                    // `retry_in_ms` above is one. Zero is a retry that is due or running,
+                    // where the null up there means no lane is stuck at all.
+                    "retry_in_ms": lane.retry_in_ms,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    out
 }
 
 /// One effect invocation found by position, for a trace to attribute an event to the

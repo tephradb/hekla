@@ -12,6 +12,10 @@ test "opens a ticket" {
     fee: 12.50,
     budget: 900.00,
     contact: "ada@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: { "source": "email" },
   }
   expect @ticket.opened {
@@ -24,6 +28,10 @@ test "opens a ticket" {
     fee: 12.50,
     budget: 900.00,
     contact: "ada@example.com",
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: { "source": "email" },
   }
 }
@@ -39,6 +47,10 @@ test "a repeat of the same ticket writes nothing" {
     fee: 1.00,
     budget: 2.00,
     contact: none,
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   run OpenTicket {
@@ -51,6 +63,10 @@ test "a repeat of the same ticket writes nothing" {
     fee: 1.00,
     budget: 2.00,
     contact: none,
+    contacted_at: "2023-11-15T09:20:00Z",
+    reporter: filed_by(),
+    watchers: ["ops@example.com"],
+    labels: ticket_labels(),
     meta: {},
   }
   expect nothing

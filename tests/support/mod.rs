@@ -20,7 +20,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use hekla::context::CommandContext;
-use hekla::crypto::MasterKeys;
+use hekla::crypto::{KeyStore, MasterKeys};
 use hekla::effect::{EffectRuntime, StubHttpClient};
 use hekla::heklang_host::{HeklaHost, Stamp, event_from_json};
 use hekla::http::HttpClient;
@@ -31,6 +31,7 @@ use hekla::runtime::Runtime;
 use hekla::server;
 use hekla::store::Store;
 use hekla::validate;
+use heklang::Event;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tephra::{SegmentConfig, SegmentSet, WriteCoordinator, WriterConfig};
@@ -580,11 +581,39 @@ pub fn seed_event(
     data: Value,
 ) {
     let event = event_from_json(&project.program, event_type, &data).expect("a declared event");
+    append_as_host(store, project, ctx, None, &event);
+}
+
+/// The same, for an event the caller has already built and a store whose subject keys
+/// are real.
+///
+/// The one thing [`seed_event`] cannot reach. It goes through JSON, and JSON is exactly
+/// what a hand-made seal is not: `Value::Sealed` carries a host's own ciphertext, and
+/// `stored_seal` passes that through verbatim rather than sealing it again. So this is
+/// the only way to put content in a log that a later declaration cannot read, which is
+/// what a field whose type changed leaves behind.
+pub fn seed_event_value(
+    store: &Store,
+    project: &LoadedProject,
+    ctx: &CommandContext,
+    keystore: Arc<KeyStore>,
+    event: &Event,
+) {
+    append_as_host(store, project, ctx, Some(keystore), event);
+}
+
+fn append_as_host(
+    store: &Store,
+    project: &LoadedProject,
+    ctx: &CommandContext,
+    keystore: Option<Arc<KeyStore>>,
+    event: &Event,
+) {
     let mut host = HeklaHost {
         program: Arc::clone(&project.program),
         events: Arc::clone(&project.events),
         store: store.clone(),
-        keystore: None,
+        keystore,
         ctx: *ctx,
         stamp: Stamp::Wall(TEST_NOW.to_owned()),
         idem_tag: None,
@@ -602,7 +631,7 @@ pub fn seed_event(
         last_transport: None,
         sealed: false,
     };
-    hekla::heklang_host::append_one(&mut host, &event).expect("seeded");
+    hekla::heklang_host::append_one(&mut host, event).expect("seeded");
 }
 
 // --- the loader and validation pass ---------------------------------------

@@ -8,15 +8,25 @@
 secret NOTIFY_URL
 
 effect NotifyOwner {
-  on @ticket.opened { @key ticket_id, contact } {
+  on @ticket.opened { @key ticket_id, contact, reporter, watchers } {
     if contact.is_none() {
       log("ticket {ticket_id} has no contact to notify")
       return
     }
 
+    // A composite reveals as what it was sealed from, so this is a `Reporter` and
+    // `.badge` reads a field of it. Before that it was the text of a JSON document, and
+    // reaching a field of one was an error no handler could recover from.
+    let filed_by = reveal(reporter)
     let response = http.post(
       NOTIFY_URL,
-      { "to": reveal(contact), "ticket": ticket_id },
+      {
+        "to": reveal(contact),
+        "ticket": ticket_id,
+        "reporter": filed_by.name,
+        "badge": filed_by.badge,
+        "watchers": reveal(watchers),
+      },
     )
     if response.status >= 400 {
       log("notification rejected with status {response.status}")

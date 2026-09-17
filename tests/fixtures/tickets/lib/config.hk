@@ -7,3 +7,40 @@ enum Priority { @default Low, Normal, Urgent }
 refusal OrgFull "this organisation has opened its allocation of tickets"
 refusal NoSuchTicket "no such ticket"
 refusal AlreadyNotified "that ticket's notification is already recorded"
+
+// Who filed the ticket, as one field rather than three parallel sealed ones. `@subject`
+// goes on the event field whose type this is: a record reached through a container has
+// no sibling to name as the key's id, so the annotation cannot live inside here.
+record Reporter {
+  name: String @max(80),
+  // A string that looks like a number. A composite's seal holds a JSON document, so
+  // this leaf stays quoted; flattened it would read back as 42 and be a different badge.
+  badge: String @max(16),
+  // Epoch microseconds in the payload seal and in the column seal alike, because
+  // `column_form` rewrites a top-level `Timestamp` only and never one inside a document.
+  filed_at: Timestamp,
+  // A field younger than some of the log. `@absent` is what says so, and a seal is read
+  // as stored history rather than as a body, so it applies inside one: a document sealed
+  // before this field existed reads it as "" rather than failing. That has to hold on
+  // both copies of the content, the payload an effect reveals and the read-model column
+  // a projector reads back, or adding a field breaks one and not the other.
+  team: String @max(40) @absent(""),
+}
+
+// The reporter every test names, written once. A `fn` is callable from a `given` and an
+// `expect` as well as from a `run`, so the record is not spelled out at each of the
+// eighteen positions a test mentions one.
+fn filed_by() -> Reporter {
+  return Reporter {
+    name: "Ada Lovelace",
+    badge: "0042",
+    filed_at: "2023-11-14T22:13:20Z",
+    team: "printers",
+  }
+}
+
+// The same, for the map. There is no map literal in the language (`Map.empty` and `.set`
+// are the constructors), so a test naming one names this instead.
+fn ticket_labels() -> Map(String, String) {
+  return Map.empty.set("area", "printers")
+}

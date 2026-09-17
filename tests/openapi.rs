@@ -406,13 +406,30 @@ fn matches_schema(body: &Value, schema_name: &str, what: &str) {
     check(body, schema, &format!("{what} ({schema_name})"));
 }
 
-/// The same two promises, against a schema rather than a name, and through arrays as
-/// well as objects.
+/// The same two promises, against a schema rather than a name, and through arrays,
+/// objects and `$ref`s alike.
 ///
 /// Descending is the whole point: `stuck_lanes` declares an item shape with its own
 /// `required` list and its own `additionalProperties: false`, and a check that stopped
 /// at the top level would pass while the server sent items the document forbids.
+///
+/// **A `$ref` is followed rather than treated as a leaf**, and that is not a nicety.
+/// `/status` declares its `effects` and `projectors` entries by reference, so stopping
+/// at one made this descend into each element and then assert nothing about it: exactly
+/// the bodies the admin console reads, and the class of drift the doc comment above
+/// names. It is also a trapdoor the other way, since turning `stuck_lanes`' inline items
+/// into a named component is the obvious next refactor and would have taken the coverage
+/// with it.
 fn check(body: &Value, schema: &Value, at: &str) {
+    if let Some(name) = schema.get("$ref").and_then(Value::as_str) {
+        let name = name
+            .strip_prefix("#/components/schemas/")
+            .unwrap_or_else(|| panic!("{at} refers to {name}, which is not a local schema"));
+        let target = &served_document()["components"]["schemas"][name];
+        assert!(target.is_object(), "{at} refers to {name}, which is absent");
+        check(body, target, &format!("{at} -> {name}"));
+        return;
+    }
     if let Some(items) = schema.get("items") {
         let elements = body
             .as_array()

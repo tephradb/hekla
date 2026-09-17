@@ -12,6 +12,10 @@ command OpenTicket(
   fee: Money(2),
   budget: Money(2),
   contact: String?,
+  contacted_at: Timestamp,
+  reporter: Reporter,
+  watchers: List(String),
+  labels: Map(String, String),
   meta: Json,
 ) {
   fold opened: Bool = false
@@ -37,6 +41,10 @@ command OpenTicket(
     fee,
     budget,
     contact,
+    contacted_at,
+    reporter,
+    watchers,
+    labels,
     meta,
   }
 }

@@ -33,7 +33,7 @@ use heklang::host::{
     AppendCondition, Attempt, Clock, Http, Keys, Log, Query, Request, Rows, Secrets,
 };
 use heklang::interp::{Error, Interpreter, Invocation, Projection, Store, key_as_value};
-use heklang::ir::Ident;
+use heklang::ir::{Ident, Type};
 use heklang::value::{Defs, Event, Json, Key, Record, Value};
 use heklang::{Effectful, Harness, Journal, Outcome, Program};
 
@@ -373,11 +373,33 @@ impl<'a> Shadow<'a> {
         })
         .map_err(|err| format!("projecting {projector}: {err}"))?;
 
+        // The declared column types, which is what a seal's content has to be read back
+        // against: a seal holds text and only the declaration says what that text was.
+        let owner = self
+            .program
+            .projector(projector)
+            .ok_or_else(|| format!("projector `{projector}` is not declared"))?;
+        let declared = owner
+            .entities
+            .iter()
+            .find(|def| def.name == entity)
+            .ok_or_else(|| format!("entity `{entity}` is not declared by {projector}"))?;
+        // `in_projector`, not `of`: a projector's own enums shadow the module's, and
+        // `RowWriter::defs` resolves a column the same way. The module-only set reads a
+        // projector-local enum as undeclared, which would make the oracle disagree for a
+        // reason that is the harness's rather than the runtime's.
+        let defs = Defs::in_projector(self.program, owner);
+
         let mut out = BTreeMap::new();
         for (key, row) in store.rows(entity) {
             let mut fields = Fields::new();
             for (name, value) in &row.0 {
-                if let Some(rendered) = self.render(value) {
+                let ty = declared
+                    .fields
+                    .iter()
+                    .find(|field| &field.name == name)
+                    .map(|field| &field.ty);
+                if let Some(rendered) = self.render(defs, ty, value) {
                     fields.insert(name.clone(), rendered);
                 }
             }
@@ -393,22 +415,61 @@ impl<'a> Shadow<'a> {
     /// "a column whose key generation has moved on reads back absent" is stated here,
     /// once. It is the invariant the whole erasure half of the model test turns on,
     /// which is why it is not spelled anywhere else.
-    fn render(&self, value: &Value) -> Option<serde_json::Value> {
+    /// `ty` is the column's declaration, carried through the `Opt` because a seal sits
+    /// under one rather than over it.
+    fn render(
+        &self,
+        defs: Defs<'_>,
+        ty: Option<&Type>,
+        value: &Value,
+    ) -> Option<serde_json::Value> {
         match value {
             Value::Opt { value: None, .. } => None,
             Value::Opt {
                 value: Some(inner), ..
-            } => self.render(inner),
-            Value::Sealed { subject, id, .. } => {
+            } => self.render(defs, ty, inner),
+            Value::Sealed {
+                subject,
+                id,
+                content,
+                ..
+            } => {
                 let (id, sealed_under) = unstamp(id);
-                (sealed_under == self.interp.host().generation(subject, id))
-                    .then(|| from_heklang_json(&Json::from_value(value)))
+                if sealed_under != self.interp.host().generation(subject, id) {
+                    return None;
+                }
+                // What a reader of the read model is served, which is the seal's content
+                // read back against its declaration rather than the text it is stored
+                // as. For a scalar the two are the same and this changes nothing; a
+                // record, a list and a map each seal as a JSON document, and a reader
+                // gets the document's value. hekla's half of that table is
+                // `read_api::typed_from_string`, so using heklang's own half here keeps
+                // the shadow a second implementation rather than a copy of the first.
+                // `and_then` on the option rather than `?` on it: `None` out of this
+                // function means the column is absent, which is the erasure signal the
+                // model test turns on, and a declaration this could not find is not that.
+                // It falls to the text below, the same as content that will not read.
+                let read = ty
+                    .and_then(sealed_inner)
+                    .and_then(|inner| Value::from_sealed(content, inner, defs).ok())
+                    .unwrap_or_else(|| Value::str(content.as_ref()));
+                Some(from_heklang_json(&Json::from_value(&read)))
             }
             other => match Json::from_value(other) {
                 Json::Null => None,
                 json => Some(from_heklang_json(&json)),
             },
         }
+    }
+}
+
+/// What a sealed declaration says its content was, looking through the `Opt` that a
+/// declared optional wraps it in. `None` for a column that is not sealed at all.
+fn sealed_inner(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Sealed(inner, _) => Some(inner),
+        Type::Opt(inner) => sealed_inner(inner),
+        _ => None,
     }
 }
 

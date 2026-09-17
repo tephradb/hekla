@@ -1,7 +1,10 @@
-// One event carrying two subjects, so each can be erased without touching the other:
-// `budget` is the organisation's commercial figure and `contact` is the owner's personal
-// address. Everything else is plaintext, including both subject ids, which is how the
-// runtime finds the keys.
+// One event carrying two subjects, so each can be erased without touching the other: the
+// organisation's commercial figures and the owner's personal ones. Between them the
+// sealed fields reach every shape a seal has, because a seal holds text and what that
+// text was is the only thing that differs: a scalar, a scalar whose column is a different
+// shape from its payload, and the three composites that seal as a JSON document.
+//
+// Both subject ids stay plaintext, which is how the runtime finds the keys.
 
 event @ticket.opened {
   ticket_id: Uuid,
@@ -15,6 +18,19 @@ event @ticket.opened {
   // Optional because an erased subject's column reads back absent, and a type that
   // cannot be absent could not say so.
   contact: String? @subject(owner_id) @max(120),
+  // The one sealed kind whose column is a different shape from its payload: a
+  // `Timestamp` is epoch micros on the wire and RFC 3339 in a column, so this field's
+  // two seals hold different text on purpose. Everything else seals once and reads the
+  // same both ways.
+  contacted_at: Timestamp @subject(owner_id),
+  // A record, a list and a map, each sealed whole. A composite's seal holds the JSON
+  // document rule 8 already writes rather than a bare rendering, so all three take one
+  // path and the shapes are the only thing that can differ between them. The reporter is
+  // the owner's and the other two are the organisation's, so shredding one owner takes a
+  // composite and leaves two.
+  reporter: Reporter @subject(owner_id),
+  watchers: List(String) @subject(org_id),
+  labels: Map(String, String) @subject(org_id),
   meta: Json @no_index,
 }
 

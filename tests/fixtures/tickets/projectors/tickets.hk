@@ -18,6 +18,13 @@ projector Tickets {
     fee: Money(2),
     budget: Money(2)?,
     contact: String? @max(120),
+    contacted_at: Timestamp?,
+    // Sealed composite columns. Rule 9 propagates a seal onto whichever column
+    // receives sealed content, so each of these holds ciphertext of the same JSON
+    // document the payload holds. Optional for the reason the two above are.
+    reporter: Reporter?,
+    watchers: List(String)?,
+    labels: Map(String, String)?,
     meta: Json,
   }
 
@@ -41,6 +48,10 @@ projector Tickets {
     fee,
     budget,
     contact,
+    contacted_at,
+    reporter,
+    watchers,
+    labels,
     meta,
   } {
     put Ticket {
@@ -53,6 +64,10 @@ projector Tickets {
       fee,
       budget,
       contact,
+      contacted_at,
+      reporter,
+      watchers,
+      labels,
       meta,
     }
     // `patch`, so the first ticket in an organisation materialises the row from zeros
