@@ -34,8 +34,15 @@ projector Tickets {
     //
     // `due_at` last, because it is the only one of the three a range can run over. An
     // enum sorts by the spelling of its variant rather than by severity, so `priority`
-    // takes equality and nothing else.
-    index (org_id, priority, due_at)
+    // takes equality and nothing else. That also makes this index filter-only: an
+    // `order_by` over it would sort by that spelling, so the runtime refuses it and
+    // leaves it out of the orderings `/openapi.json` enumerates.
+    index (org_id, priority, due_at),
+
+    // Which is why this one exists beside it: both columns order, so it can back
+    // `?order_by=-by_org_id_due_at` (an organisation's tickets, latest deadline first)
+    // as well as filter. The pair is the difference between the two rules in one entity.
+    index (org_id, due_at)
   }
 
   // An `Int @key`, which orders numerically in SQL and lexicographically as text. The

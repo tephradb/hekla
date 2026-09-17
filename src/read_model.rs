@@ -18,7 +18,7 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, Row, Transaction, params_from_iter};
 use tephra::Position;
 
-use crate::read_api::{Access, Filter, choose_index};
+use crate::read_api::{Access, Filter, Order, Query, choose_index};
 use crate::schema::{EntityDef, EntityOpKind, FieldKind, FieldMeta};
 
 /// The projector's internal tables: the checkpoint, co-located with the read-model
@@ -250,7 +250,7 @@ impl ReadModel {
     /// Read every row of an entity back as a JSON object (NULL columns omitted),
     /// ordered by key. For inspection and display.
     pub fn rows(&self, entity: &EntityDef) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.scan(entity, &Filter::default(), None, i64::MAX as usize)
+        self.scan(entity, &Query::default(), i64::MAX as usize)
     }
 
     /// Read one row by key, as a JSON object (NULL columns omitted), or `None`.
@@ -266,26 +266,17 @@ impl ReadModel {
         rows.next()?.map(|row| row_to_json(entity, row)).transpose()
     }
 
-    /// Scan an entity ordered by key, filtered over a declared index and resumed after
-    /// a key (cursor pagination). The caller has already put `filter` through
-    /// `read_api::choose_index`, so the index this pins is the one it was validated
-    /// against. Values bind as typed parameters, never interpolated.
+    /// Scan an entity, filtered and ordered over a declared index and resumed after a
+    /// cursor. The caller has already put `query` through `read_api::choose_index`, so the
+    /// index this pins is the one it was validated against. Values bind as typed
+    /// parameters, never interpolated.
     pub fn scan(
         &self,
         entity: &EntityDef,
-        filter: &Filter,
-        after_key: Option<&str>,
+        query: &Query,
         limit: usize,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
-        let access = choose_index(entity, filter).with_context(|| {
-            format!("no declared index on `{}` serves this filter", entity.name)
-        })?;
-        let sql = scan_sql(entity, filter, access, after_key.is_some());
-        let mut binds = filter_binds(entity, filter);
-        if let Some(after) = after_key {
-            binds.push(bind_or_text(key_kind(entity), after));
-        }
-        binds.push(SqlValue::Integer(limit as i64));
+        let (sql, binds) = self.scan_statement(entity, query, limit)?;
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(binds))?;
         let mut out = Vec::new();
@@ -295,32 +286,37 @@ impl ReadModel {
         Ok(out)
     }
 
-    /// The query plan [`ReadModel::scan`] actually gets, for the test that pins it to an
-    /// index seek rather than a scan and a sort.
-    #[cfg(test)]
-    fn explain_scan(
+    /// The statement and binds one scan runs, built once so the test that explains the
+    /// plan and the code that executes it cannot describe different queries.
+    fn scan_statement(
         &self,
         entity: &EntityDef,
-        filter: &Filter,
-        after_key: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let access = choose_index(entity, filter).context("no index serves this filter")?;
-        let sql = scan_sql(entity, filter, access, after_key.is_some());
-        let mut stmt = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        query: &Query,
+        limit: usize,
+    ) -> anyhow::Result<(String, Vec<SqlValue>)> {
+        let access = choose_index(entity, &query.filter, &query.order).with_context(|| {
+            format!("no declared index on `{}` serves this filter", entity.name)
+        })?;
+        let mut binds = filter_binds(entity, &query.filter);
+        binds.extend(cursor_binds(entity, query));
+        binds.push(SqlValue::Integer(limit as i64));
+        Ok((scan_sql(entity, query, access), binds))
+    }
+
+    /// The query plan [`ReadModel::scan`] actually gets, for the tests that pin it to an
+    /// index seek rather than a scan and a sort.
+    #[cfg(test)]
+    fn explain_scan(&self, entity: &EntityDef, query: &Query) -> anyhow::Result<String> {
         // The planner sees bound values, so they have to be present and in the order the
         // statement declares them for the plan to be the one the real call gets.
-        let mut binds = filter_binds(entity, filter);
-        if let Some(after) = after_key {
-            binds.push(bind_or_text(key_kind(entity), after));
-        }
-        binds.push(SqlValue::Integer(1));
+        let (sql, binds) = self.scan_statement(entity, query, 1)?;
+        let mut stmt = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
         let rows = stmt.query_map(params_from_iter(binds), |row| row.get::<_, String>(3))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?.join("\n"))
     }
 }
 
-/// The statement [`ReadModel::scan`] runs, built once so the test that explains the plan
-/// and the code that executes it cannot describe different queries.
+/// The statement [`ReadModel::scan`] runs.
 ///
 /// `INDEXED BY` is what turns "you may only ask what you declared" from a rule the
 /// handler enforces into one the database enforces: without it the planner is free to
@@ -329,10 +325,19 @@ impl ReadModel {
 /// index: an `INTEGER` key is the rowid and a text key's index is SQLite's own
 /// `sqlite_autoindex_*`, and there is no scan for the planner to prefer either way.
 ///
-/// Binds are positional, so their order here is the order [`filter_binds`] produces:
-/// equality in filter order, then the range's lower and upper bounds, then the cursor,
-/// then the limit.
-fn scan_sql(entity: &EntityDef, filter: &Filter, access: Access<'_>, after_key: bool) -> String {
+/// The cursor resumes with a **row-value comparison**, `(a, b, key) > (?, ?, ?)`, which
+/// SQLite serves from the same index the `ORDER BY` reads: one seek to the tuple the last
+/// page ended on, then forward. Comparing the columns one at a time (`a > ? OR (a = ? AND
+/// ...)`) describes the same rows and is not an index seek, which is the whole reason the
+/// row-value form exists. A one-column ordering degenerates to `("key") > (?)`, which is
+/// exactly the `key > ?` that came before, because SQLite reads a parenthesised single
+/// expression as itself.
+///
+/// Binds are positional, so their order here is the order [`filter_binds`] and
+/// [`cursor_binds`] produce: equality in filter order, then the range's lower and upper
+/// bounds, then the cursor tuple outermost-first, then the limit.
+fn scan_sql(entity: &EntityDef, query: &Query, access: Access<'_>) -> String {
+    let filter = &query.filter;
     let mut clauses = Vec::new();
     for (column, _) in &filter.equals {
         clauses.push(format!("{} = ?", quote_ident(column)));
@@ -346,8 +351,16 @@ fn scan_sql(entity: &EntityDef, filter: &Filter, access: Access<'_>, after_key: 
             clauses.push(format!("{column} {} ?", bound.operator(false)));
         }
     }
-    if after_key {
-        clauses.push(format!("{} > ?", quote_ident(&entity.key)));
+    let ordering = order_columns(entity, &query.order);
+    if usable_cursor(entity, query).is_some() {
+        let tuple = ordering
+            .iter()
+            .map(|column| quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = vec!["?"; ordering.len()].join(", ");
+        let after = if query.order.descending { "<" } else { ">" };
+        clauses.push(format!("({tuple}) {after} ({placeholders})"));
     }
     let where_clause = if clauses.is_empty() {
         String::new()
@@ -358,12 +371,66 @@ fn scan_sql(entity: &EntityDef, filter: &Filter, access: Access<'_>, after_key: 
         Access::Key => String::new(),
         Access::Index(name) => format!(" INDEXED BY {}", quote_ident(&entity.index_name(name))),
     };
+    let direction = if query.order.descending { " DESC" } else { "" };
+    let order_by = ordering
+        .iter()
+        .map(|column| format!("{}{direction}", quote_ident(column)))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "SELECT {} FROM {}{pin}{where_clause} ORDER BY {} LIMIT ?",
+        "SELECT {} FROM {}{pin}{where_clause} ORDER BY {order_by} LIMIT ?",
         column_list(entity),
         quote_ident(&entity.name),
-        quote_ident(&entity.key),
     )
+}
+
+/// The columns an ordering sorts by, outermost first, always ending in the key.
+fn order_columns(entity: &EntityDef, order: &Order) -> Vec<String> {
+    match &order.index {
+        None => vec![entity.key.clone()],
+        Some(name) => entity
+            .indexes
+            .iter()
+            .find(|index| &index.name == name)
+            .map(|index| entity.index_columns(index))
+            .unwrap_or_else(|| vec![entity.key.clone()]),
+    }
+}
+
+/// The cursor's tuple, if it can be used at all: present, and exactly as wide as the
+/// ordering it will be compared against.
+///
+/// A tuple of the wrong width would compare the wrong columns, so it is dropped and the
+/// scan starts from the beginning rather than resuming wrongly. The handler refuses such
+/// a cursor before it gets here, with a message; this is what keeps the statement and its
+/// binds agreeing whether or not anyone remembered to.
+fn usable_cursor<'a>(entity: &EntityDef, query: &'a Query) -> Option<&'a [String]> {
+    let cursor = query.cursor.as_ref()?;
+    let width = order_columns(entity, &query.order).len();
+    (cursor.values.len() == width).then_some(cursor.values.as_slice())
+}
+
+/// A cursor's tuple as typed binds, in the order [`scan_sql`] names them. Empty when the
+/// scan starts from the beginning.
+fn cursor_binds(entity: &EntityDef, query: &Query) -> Vec<SqlValue> {
+    let Some(values) = usable_cursor(entity, query) else {
+        return Vec::new();
+    };
+    order_columns(entity, &query.order)
+        .iter()
+        .zip(values)
+        .map(|(column, value)| {
+            let kind = entity
+                .fields
+                .iter()
+                .find(|(name, _)| name == column)
+                .map(|(_, meta)| &meta.kind);
+            match kind {
+                Some(kind) => bind_or_text(kind, value),
+                None => text(value),
+            }
+        })
+        .collect()
 }
 
 /// A filter's values as typed binds, in the order [`scan_sql`] names them.
@@ -609,7 +676,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::read_api::{Bound, Range};
+    use crate::read_api::{Bound, Cursor, Range};
     use crate::schema::IndexDef;
 
     fn users_entity() -> EntityDef {
@@ -633,23 +700,49 @@ mod tests {
         (model, dir)
     }
 
-    /// A filter of equality on each column, which is what most of these want.
-    fn equals(pairs: &[(&str, &str)]) -> Filter {
-        Filter {
-            equals: pairs
-                .iter()
-                .map(|(column, value)| ((*column).to_owned(), (*value).to_owned()))
-                .collect(),
-            range: None,
+    /// A page in key order matching each column for equality, which is what most of
+    /// these want. The page size is deliberately large: a test that wants to see the
+    /// boundary sets it.
+    fn equals(pairs: &[(&str, &str)]) -> Query {
+        Query {
+            filter: Filter {
+                equals: pairs
+                    .iter()
+                    .map(|(column, value)| ((*column).to_owned(), (*value).to_owned()))
+                    .collect(),
+                range: None,
+            },
+            limit: 50,
+            ..Query::default()
         }
     }
 
-    /// A filter of equality on `pairs`, then a range over `column`.
-    fn ranged(pairs: &[(&str, &str)], column: &str, range: Range) -> Filter {
-        Filter {
-            range: Some((column.to_owned(), range)),
-            ..equals(pairs)
-        }
+    /// The same, with a range over `column` after the equality columns.
+    fn ranged(pairs: &[(&str, &str)], column: &str, range: Range) -> Query {
+        let mut query = equals(pairs);
+        query.filter.range = Some((column.to_owned(), range));
+        query
+    }
+
+    /// The same query read in a declared index's order instead of the key's.
+    fn ordered(mut query: Query, index: &str, descending: bool) -> Query {
+        query.order = Order {
+            index: Some(index.to_owned()),
+            descending,
+        };
+        query
+    }
+
+    /// The same query resumed after `values`, which must be the ordering's columns
+    /// outermost first, ending in the key.
+    fn at_cursor(mut query: Query, values: &[&str]) -> Query {
+        query.cursor = Some(Cursor {
+            // Not the real token, which needs the entity. Nothing downstream of the
+            // handler reads it: the width is what `usable_cursor` checks.
+            ordering: String::new(),
+            values: values.iter().map(|value| (*value).to_owned()).collect(),
+        });
+        query
     }
 
     fn put(model: &ReadModel, entity: &EntityDef, id: &str, email: &str) {
@@ -690,18 +783,23 @@ mod tests {
             put(&model, &entity, &format!("u{i}"), &format!("{i}@x"));
         }
         let mut seen = Vec::new();
-        let mut after: Option<String> = None;
+        let mut query = Query {
+            limit: 2,
+            ..Query::default()
+        };
         loop {
-            let page = model
-                .scan(&entity, &Filter::default(), after.as_deref(), 2)
-                .unwrap();
+            let page = model.scan(&entity, &query, 2).unwrap();
             if page.is_empty() {
                 break;
             }
             for row in &page {
                 seen.push(row["user_id"].as_str().unwrap().to_owned());
             }
-            after = Some(page.last().unwrap()["user_id"].as_str().unwrap().to_owned());
+            let last = page.last().unwrap()["user_id"].as_str().unwrap();
+            query.cursor = Some(Cursor {
+                ordering: entity.key.clone(),
+                values: vec![last.to_owned()],
+            });
             if page.len() < 2 {
                 break;
             }
@@ -720,7 +818,7 @@ mod tests {
         put(&model, &entity, "u1", "match@x");
         put(&model, &entity, "u2", "other@x");
         let rows = model
-            .scan(&entity, &equals(&[("email", "match@x")]), None, 50)
+            .scan(&entity, &equals(&[("email", "match@x")]), 50)
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["user_id"], "u1");
@@ -752,11 +850,11 @@ mod tests {
                 .unwrap();
         }
         let active = model
-            .scan(&entity, &equals(&[("active", "true")]), None, 50)
+            .scan(&entity, &equals(&[("active", "true")]), 50)
             .unwrap();
         assert_eq!(active.len(), 2);
         let inactive = model
-            .scan(&entity, &equals(&[("active", "false")]), None, 50)
+            .scan(&entity, &equals(&[("active", "false")]), 50)
             .unwrap();
         assert_eq!(inactive.len(), 1);
         assert_eq!(inactive[0]["user_id"], "u2");
@@ -794,13 +892,23 @@ mod tests {
         }
         assert_eq!(model.get(&entity, "g1").unwrap().unwrap()["select"], "a");
         let filtered = model
-            .scan(&entity, &equals(&[("select", "b")]), None, 50)
+            .scan(&entity, &equals(&[("select", "b")]), 50)
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["group"], "g2");
         // The cursor branch adds `key > ?` and the ORDER BY on the keyword key.
         let after = model
-            .scan(&entity, &Filter::default(), Some("g1"), 50)
+            .scan(
+                &entity,
+                &at_cursor(
+                    Query {
+                        limit: 50,
+                        ..Query::default()
+                    },
+                    &["g1"],
+                ),
+                50,
+            )
             .unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0]["group"], "g2");
@@ -858,7 +966,7 @@ mod tests {
         assert_eq!(model.rows(&entity).unwrap().len(), 2);
         assert_eq!(
             model
-                .scan(&entity, &equals(&[("email", "old@x")]), None, 50)
+                .scan(&entity, &equals(&[("email", "old@x")]), 50)
                 .unwrap()
                 .len(),
             1
@@ -972,27 +1080,17 @@ mod tests {
     fn scan_filters_on_a_whole_index_and_on_its_prefix() {
         let (model, entity, _dir) = catalog_model();
         let prefix = model
-            .scan(&entity, &equals(&[("bucket", "a")]), None, 50)
+            .scan(&entity, &equals(&[("bucket", "a")]), 50)
             .unwrap();
         assert_eq!(ids(&prefix), vec!["i1", "i2", "i3"]);
         let whole = model
-            .scan(
-                &entity,
-                &equals(&[("bucket", "a"), ("rank", "5")]),
-                None,
-                50,
-            )
+            .scan(&entity, &equals(&[("bucket", "a"), ("rank", "5")]), 50)
             .unwrap();
         assert_eq!(ids(&whole), vec!["i2"]);
         // The same two columns the other way round is the same question: a query string
         // carries no order, so the match against the index is a set comparison.
         let reversed = model
-            .scan(
-                &entity,
-                &equals(&[("rank", "5"), ("bucket", "a")]),
-                None,
-                50,
-            )
+            .scan(&entity, &equals(&[("rank", "5"), ("bucket", "a")]), 50)
             .unwrap();
         assert_eq!(ids(&reversed), vec!["i2"]);
     }
@@ -1009,7 +1107,7 @@ mod tests {
             },
         );
         assert_eq!(
-            ids(&model.scan(&entity, &half_open, None, 50).unwrap()),
+            ids(&model.scan(&entity, &half_open, 50).unwrap()),
             vec!["i2", "i3"]
         );
         // Both ends together, and the exclusive upper is what keeps `i3` out: a bounded
@@ -1022,10 +1120,7 @@ mod tests {
                 upper: Some((Bound::Exclusive, "9".to_owned())),
             },
         );
-        assert_eq!(
-            ids(&model.scan(&entity, &bounded, None, 50).unwrap()),
-            vec!["i2"]
-        );
+        assert_eq!(ids(&model.scan(&entity, &bounded, 50).unwrap()), vec!["i2"]);
     }
 
     #[test]
@@ -1035,7 +1130,7 @@ mod tests {
         // every bucket. The handler refuses this first; the model refuses it too, so
         // the promise does not rest on one caller remembering to ask.
         let err = model
-            .scan(&entity, &equals(&[("rank", "5")]), None, 50)
+            .scan(&entity, &equals(&[("rank", "5")]), 50)
             .unwrap_err();
         assert!(
             err.to_string().contains("no declared index"),
@@ -1058,8 +1153,7 @@ mod tests {
         let plan = model
             .explain_scan(
                 &entity,
-                &equals(&[("bucket", "a"), ("rank", "5")]),
-                Some("i1"),
+                &at_cursor(equals(&[("bucket", "a"), ("rank", "5")]), &["a", "5", "i1"]),
             )
             .unwrap();
         assert!(
@@ -1091,7 +1185,10 @@ mod tests {
         let (model, _dir) = open_temp(slice::from_ref(&entity));
         put_item(&model, &entity, "i1", "a", 1);
         let plan = model
-            .explain_scan(&entity, &equals(&[("bucket", "a")]), Some("i1"))
+            .explain_scan(
+                &entity,
+                &at_cursor(equals(&[("bucket", "a")]), &["a", "i1"]),
+            )
             .unwrap();
         assert!(
             plan.contains("USING INDEX item_by_bucket "),
@@ -1100,6 +1197,138 @@ mod tests {
         assert!(
             !plan.contains("TEMP B-TREE"),
             "which is the whole reason to prefer it: {plan}"
+        );
+    }
+
+    #[test]
+    fn an_ordering_reads_a_declared_index_forwards_or_backwards() {
+        let (model, entity, _dir) = catalog_model();
+        let by_rank = ordered(equals(&[]), "by_bucket_rank", false);
+        assert_eq!(
+            ids(&model.scan(&entity, &by_rank, 50).unwrap()),
+            // `(bucket, rank, item_id)`, which is a different order from the key's: i4
+            // sorts last here and third by key.
+            vec!["i1", "i2", "i3", "i4"]
+        );
+        let reversed = ordered(equals(&[]), "by_bucket_rank", true);
+        assert_eq!(
+            ids(&model.scan(&entity, &reversed, 50).unwrap()),
+            vec!["i4", "i3", "i2", "i1"],
+            "reversing turns the whole tuple around, not just its first column"
+        );
+        let by_key_desc = Query {
+            order: Order {
+                index: None,
+                descending: true,
+            },
+            ..equals(&[])
+        };
+        assert_eq!(
+            ids(&model.scan(&entity, &by_key_desc, 50).unwrap()),
+            vec!["i4", "i3", "i2", "i1"]
+        );
+    }
+
+    #[test]
+    fn an_ordered_scan_pages_over_the_tuple_without_dropping_a_shared_value() {
+        // Every row here shares `(bucket, rank)` with another, so the index tuple is not
+        // unique and every page boundary falls inside a tie. The key is the last term of
+        // every ordering for exactly this: a comparison stopping at `(bucket, rank)`
+        // would resume strictly *after* the shared value and lose the rest of the tie.
+        //
+        // The ties are deliberate rather than incidental. With distinct tuples the
+        // tiebreak is unobservable, and a test over distinct tuples passes whether the
+        // key is in the ordering or not.
+        let entity = catalog_entity();
+        let (model, _dir) = open_temp(slice::from_ref(&entity));
+        for (id, bucket, rank) in [
+            ("i1", "a", 1),
+            ("i2", "a", 1),
+            ("i3", "a", 5),
+            ("i4", "a", 5),
+            ("i5", "b", 5),
+        ] {
+            put_item(&model, &entity, id, bucket, rank);
+        }
+
+        let mut query = ordered(equals(&[]), "by_bucket_rank", false);
+        query.limit = 1;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let page = model.scan(&entity, &query, 1).unwrap();
+            let Some(row) = page.first() else { break };
+            seen.push(row["item_id"].as_str().unwrap().to_owned());
+            // Read off the ordering rather than written out, so shortening the ordering
+            // shortens the cursor with it. A hardcoded tuple would make dropping the key
+            // fail as a width mismatch, which is loud but is not this bug.
+            query.cursor = Some(Cursor {
+                ordering: String::new(),
+                values: order_columns(&entity, &query.order)
+                    .iter()
+                    .map(|column| match &row[column] {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect(),
+            });
+        }
+        assert_eq!(seen, vec!["i1", "i2", "i3", "i4", "i5"]);
+    }
+
+    #[test]
+    fn an_ordered_scan_reaches_its_rows_through_the_index_it_orders_by() {
+        // The filter and the `ORDER BY` have to agree on one index, or the rows come out
+        // of one and are sorted for the other. That is the in-memory sort this API
+        // refuses, and the plan is where it shows.
+        let (model, entity, _dir) = catalog_model();
+        let query = at_cursor(
+            ordered(equals(&[("bucket", "a")]), "by_bucket_rank", true),
+            &["a", "5", "i2"],
+        );
+        let plan = model.explain_scan(&entity, &query).unwrap();
+        assert!(
+            plan.contains("USING INDEX item_by_bucket_rank"),
+            "the ordering picks the index outright: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "a reversed read of an index is a backwards scan, not a sort: {plan}"
+        );
+    }
+
+    #[test]
+    fn an_index_that_cannot_order_rows_can_still_filter_them() {
+        // Optional and Money columns both fail, and for different reasons: NULL compares
+        // as neither side of a row-value comparison, and a decimal string sorts "2" above
+        // "10". Both stay filterable, which is why this is a request-time refusal.
+        let mut entity = catalog_entity();
+        entity.fields.push((
+            "sku".to_owned(),
+            FieldMeta::plain(FieldKind::Optional(Box::new(FieldKind::Text {
+                max_length: None,
+            }))),
+        ));
+        entity.fields.push((
+            "price".to_owned(),
+            FieldMeta::plain(FieldKind::Money { scale: 2 }),
+        ));
+        entity.indexes.push(IndexDef {
+            name: "by_sku".to_owned(),
+            columns: vec!["sku".to_owned()],
+        });
+        entity.indexes.push(IndexDef {
+            name: "by_price".to_owned(),
+            columns: vec!["price".to_owned()],
+        });
+
+        let optional = crate::read_api::ordering_problem(&entity, &entity.indexes[1]).unwrap();
+        assert!(optional.contains("`sku` is optional"), "{optional}");
+        assert!(optional.contains("stays filterable"), "{optional}");
+        let money = crate::read_api::ordering_problem(&entity, &entity.indexes[2]).unwrap();
+        assert!(money.contains("Money(2)"), "{money}");
+        assert!(
+            crate::read_api::ordering_problem(&entity, &entity.indexes[0]).is_none(),
+            "a Text and an Int index orders fine"
         );
     }
 

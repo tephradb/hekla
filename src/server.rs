@@ -546,8 +546,25 @@ fn range_operator_list() -> String {
 /// It names the indexes the entity has, because the author's next move is either to
 /// filter on a prefix of one of them or to declare the one they meant, and neither is
 /// obvious from a refusal that only names what was asked.
-fn no_index_for(entity: &EntityDef, filter: &read_api::Filter) -> String {
+fn no_index_for(entity: &EntityDef, filter: &read_api::Filter, order: &read_api::Order) -> String {
     let asked = filter.columns().join(", ");
+    // An ordering pins the index, so this is not "nothing serves it" but "the one you
+    // asked to sort by does not". Saying so names the fix, which is to drop the ordering
+    // or to filter on a prefix of the index it names.
+    if let Some(name) = &order.index {
+        let columns = entity
+            .indexes
+            .iter()
+            .find(|index| &index.name == name)
+            .map(|index| index.columns.join(", "))
+            .unwrap_or_default();
+        return format!(
+            "filter on ({asked}) is not a prefix of `{name}` ({columns}), and `order_by={}` \
+             asks for the rows in that index's order, so no other index can serve it. \
+             Filter on a prefix of `{name}`, or drop the ordering.",
+            order.token(entity)
+        );
+    }
     let declared = entity
         .indexes
         .iter()
@@ -597,6 +614,7 @@ async fn read_scan(
     let mut raw: Vec<(String, String)> = Vec::new();
     let mut limit = read_api::DEFAULT_LIMIT;
     let mut cursor: Option<String> = None;
+    let mut order_by: Option<String> = None;
     for (name, value) in params {
         match name.as_str() {
             "limit" => match value.parse::<usize>() {
@@ -611,6 +629,7 @@ async fn read_scan(
                 }
             },
             "cursor" => cursor = Some(value),
+            "order_by" => order_by = Some(value),
             // `after`/`timeout_ms` are consumed by parse_wait, so never a filter.
             _ if read_api::RESERVED_QUERY_PARAMS.contains(&name.as_str()) => {}
             _ => raw.push((name, value)),
@@ -624,41 +643,77 @@ async fn read_scan(
         Ok(filter) => filter,
         Err(problem) => return read_invalid(&projector, &entity, problem.code, &problem.message),
     };
-    if read_api::choose_index(&entity_def, &filter).is_none() {
+    let order = match order_by {
+        Some(raw) => match read_api::parse_order(&entity_def, &raw) {
+            Ok(order) => order,
+            Err(why) => return read_invalid(&projector, &entity, "invalid_input", &why),
+        },
+        None => read_api::Order::default(),
+    };
+    // Whether an index can *sort* depends on the index asked for, not on the entity, so
+    // it is a request-time refusal rather than a load-time one: an index that cannot
+    // order rows still filters perfectly well and stays worth declaring.
+    if let Some(index) = entity_def
+        .indexes
+        .iter()
+        .find(|index| Some(&index.name) == order.index.as_ref())
+        && let Some(why) = read_api::ordering_problem(&entity_def, index)
+    {
+        return read_invalid(&projector, &entity, "invalid_input", &why);
+    }
+    if read_api::choose_index(&entity_def, &filter, &order).is_none() {
         return read_invalid(
             &projector,
             &entity,
             "unindexed_filter",
-            &no_index_for(&entity_def, &filter),
+            &no_index_for(&entity_def, &filter, &order),
         );
     }
     if let Err(err) = read_api::check_filter(&entity_def, &filter) {
         return read_invalid(&projector, &entity, "invalid_input", &format!("{err:#}"));
     }
-    let after_key = match &cursor {
+    let cursor = match &cursor {
         Some(raw) => match read_api::decode_cursor(raw) {
-            Ok(key) => Some(key),
+            Ok(cursor) => Some(cursor),
             Err(_) => {
                 return read_invalid(&projector, &entity, "invalid_input", "cursor is not valid");
             }
         },
         None => None,
     };
+    // A cursor is a position *in an ordering*, so reading one back under a different one
+    // compares the wrong columns. When the cursor was a bare key this could not arise,
+    // because every scan was in key order; now it is the difference between a refusal and
+    // a page of the wrong rows.
+    if let Some(cursor) = &cursor {
+        let taken = order.token(&entity_def);
+        if cursor.ordering != taken {
+            return read_invalid(
+                &projector,
+                &entity,
+                "invalid_input",
+                &format!(
+                    "this cursor was taken over `order_by={}` and this request asks for \
+                     `order_by={taken}`; start the new ordering from its first page",
+                    cursor.ordering
+                ),
+            );
+        }
+    }
 
     if let Some(response) = honor_wait(&shared, &projector, wait).await {
         return response;
     }
     let db_path = shared.db_path.clone();
     let keystore = runtime.keystore().cloned();
+    let query = read_api::Query {
+        filter,
+        order,
+        cursor,
+        limit,
+    };
     let task = tokio::task::spawn_blocking(move || {
-        read_api::scan(
-            &db_path,
-            &entity_def,
-            &filter,
-            after_key.as_deref(),
-            limit,
-            keystore.as_ref(),
-        )
+        read_api::scan(&db_path, &entity_def, &query, keystore.as_ref())
     });
     match task.await {
         Ok(Ok(page)) => {

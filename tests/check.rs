@@ -452,6 +452,31 @@ projector Things {
     assert_error(&files, "reserved read query param");
 }
 
+/// `order_by` joined the reserved set when orderings did, so a column named after it is
+/// the newest way to trip this gate and the one an existing project is likeliest to hit.
+#[test]
+fn a_column_named_order_by_is_an_error() {
+    let files = vec![
+        ("events/thing.hk", EVENTS),
+        (
+            "projectors/things.hk",
+            r#"
+projector Things {
+  entity Thing {
+    thing_id: Uuid @key,
+    order_by: String @max(200) @index,
+  }
+
+  on @thing.happened { thing_id, note } {
+    put Thing { thing_id, order_by: note }
+  }
+}
+"#,
+        ),
+    ];
+    assert_error(&files, "reserved read query param");
+}
+
 // --- the reserved tag namespace --------------------------------------------
 
 /// `_hekla_` is where the idempotency and correlation tags live. An event field there

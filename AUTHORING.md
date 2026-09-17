@@ -150,7 +150,7 @@ constraints come from the reader rather than from the language. `hekla check` re
 - **An index over a sealed column is refused.** A filter arrives as plaintext and, without the
   subject, cannot derive the key to compare against the ciphertext, so the index could never match.
   Filter by the plaintext subject id instead.
-- **A filterable column may not be named `limit`, `cursor`, `after` or `timeout_ms`.** Those are the
+- **A filterable column may not be named `limit`, `cursor`, `after`, `timeout_ms` or `order_by`.** Those are the
   read API's own query parameters, so such a column could never be filtered.
 
 **A column's subject is propagated, not declared.** You never write `@subject` on an entity column: a
@@ -335,6 +335,12 @@ Every `{Name}` below is a *declared* name, not a file stem: `command PlaceOrder`
   seek. A shorter prefix leaves a declared column between the filter and the key, and SQLite sorts
   the match set on every page. `index (shop_id)` beside `index (shop_id, status)` is what makes both
   questions cheap; the runtime picks the narrowest index that serves a given filter.
+- `?order_by=<index>` orders by a declared index instead of the key, with a leading `-` to reverse
+  the whole tuple; `?order_by=-<key column>` reverses the default. Index names are generated from
+  their columns (`by_shop_id_status_month`) and `/admin/projectors/{Name}` lists them. The ordering
+  fixes which index serves the request, so the filter must be a prefix of that same index, and a
+  cursor is only valid under the `order_by` it was taken with. An index containing an optional,
+  `Money` or enum column can filter but cannot sort.
 - **Read-your-writes** is opt-in per read: pass `?after=<pos>` (the `positions.last` a command
   returned) and the read blocks until that projector reaches the position, then serves the normal
   snapshot. Bounded by `timeout_ms` (default 5s, capped at 30s); on timeout it fails closed with 503

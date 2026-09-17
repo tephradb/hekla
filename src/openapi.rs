@@ -685,6 +685,7 @@ fn scan_params(entity: &EntityDef) -> Vec<Value> {
             json!({ "type": "string" }),
         ),
     ];
+    params.push(order_by_param(entity));
     params.extend(wait_params());
     // Deduplicated here rather than in `filterable_fields`, which stays lazy for the
     // read path's membership check. Under a prefix rule this is load-bearing rather than
@@ -702,6 +703,39 @@ fn scan_params(entity: &EntityDef) -> Vec<Value> {
         params.extend(range_params(entity, field));
     }
     params
+}
+
+/// The `order_by` query param, enumerating every ordering this entity can actually
+/// serve: the key and each declared index that can sort, each with its reversed form.
+///
+/// An `enum` rather than a bare string, because the set is small, closed and knowable
+/// from the declaration, and because an index that cannot order rows is left out of it
+/// rather than documented and then refused. `read_api::ordering_problem` is the same
+/// question the runtime answers at request time, so the document and the 400 agree.
+fn order_by_param(entity: &EntityDef) -> Value {
+    let mut orderings = vec![entity.key.clone()];
+    orderings.extend(
+        entity
+            .indexes
+            .iter()
+            .filter(|index| read_api::ordering_problem(entity, index).is_none())
+            .map(|index| index.name.clone()),
+    );
+    let reversed: Vec<String> = orderings.iter().map(|name| format!("-{name}")).collect();
+    let described = orderings.join("`, `");
+    orderings.extend(reversed);
+    query_param(
+        "order_by",
+        &format!(
+            "How to order the page. Defaults to the `{}` key ascending. One of `{described}`, \
+             each optionally prefixed with `-` to reverse it. Reversing turns the whole tuple \
+             around, never one column of it. An ordering fixes which index serves the request, \
+             so the filter has to be a prefix of that same index. A cursor records the ordering \
+             it was taken over and is a 400 when read back under another.",
+            entity.key,
+        ),
+        json!({ "type": "string", "enum": orderings }),
+    )
 }
 
 /// One equality-filter query param. Only the key and the columns of declared indexes

@@ -3,8 +3,9 @@
 //! Reads open a fresh read-only connection to the projector's database per
 //! request (WAL lets them run concurrently with the projector's single writer)
 //! and read the projector's log position in the same snapshot as the rows, so a
-//! response's `position` is consistent with its data. Filters are restricted to
-//! declared indexes, and pagination is by an opaque key cursor, never an offset.
+//! response's `position` is consistent with its data. Filters and orderings are both
+//! restricted to declared indexes, and pagination is by an opaque cursor over the
+//! ordering's own tuple, never an offset.
 
 use std::iter;
 use std::path::Path;
@@ -14,11 +15,12 @@ use std::time::Duration;
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::crypto::{KeyStore, RowDecryptor};
 use crate::read_model::{ReadModel, coerce_value};
-use crate::schema::{EntityDef, FieldKind, scalar_to_string};
+use crate::schema::{EntityDef, FieldKind, IndexDef, scalar_to_string};
 
 /// Default page size for a scan when the request does not set `limit`.
 pub const DEFAULT_LIMIT: usize = 50;
@@ -30,7 +32,7 @@ pub const MAX_LIMIT: usize = 500;
 /// for both the scan handler (which must not treat one as a filter) and `hekla
 /// check` (which rejects an entity field that would collide with one). Keep in sync
 /// with the keys the read handlers read off the query string.
-pub const RESERVED_QUERY_PARAMS: [&str; 4] = ["limit", "cursor", "after", "timeout_ms"];
+pub const RESERVED_QUERY_PARAMS: [&str; 5] = ["limit", "cursor", "after", "timeout_ms", "order_by"];
 
 /// One page of a scan: the rows, the cursor to resume after them (absent at the
 /// end), and the projector's log position at read time.
@@ -186,53 +188,77 @@ pub enum Access<'a> {
 /// Equality is matched as a **set**: a query string carries no order, so
 /// `?status=x&shop_id=1` and `?shop_id=1&status=x` are the same question.
 ///
-/// **Where several indexes qualify, the narrowest wins**, and that is a performance
-/// decision rather than a cosmetic one. The scan orders by the key, and the key sits at
-/// the end of every generated index (`EntityDef::index_columns`), so the rows only arrive
-/// already in key order when the filter uses up *all* of an index's declared columns.
-/// Filtering `shop_id` through `index (shop_id, status)` leaves `status` ahead of the key
-/// and costs a sort of the whole match set on every page; through `index (shop_id)` it
-/// costs nothing. Taking the shortest qualifying index is how an entity that declares
+/// **An explicit ordering decides the index outright.** `ORDER BY` and the filter have to
+/// agree on one index or the rows come out of one and get sorted for the other, which is
+/// the in-memory sort this API exists to refuse. So when `order` names an index, that
+/// index must be the one that serves the filter, and nothing else is considered.
+///
+/// **Otherwise, where several indexes qualify, the narrowest wins**, and that is a
+/// performance decision rather than a cosmetic one. The scan orders by the key, and the
+/// key sits at the end of every generated index (`EntityDef::index_columns`), so the rows
+/// only arrive already in key order when the filter uses up *all* of an index's declared
+/// columns. Filtering `shop_id` through `index (shop_id, status)` leaves `status` ahead of
+/// the key and costs a sort of the whole match set on every page; through `index (shop_id)`
+/// it costs nothing. Taking the shortest qualifying index is how an entity that declares
 /// both gets the better plan. Ties go to declaration order, so the choice is stable: it
 /// is pinned into the SQL and asserted by a query-plan test.
 ///
 /// A prefix shorter than every index that serves it still sorts. That is a real cost and
 /// there is no way around it short of generating an index per prefix; declaring the
 /// narrower index is the author's lever, and `EXPLAIN QUERY PLAN` is where it shows.
-pub fn choose_index<'a>(entity: &'a EntityDef, filter: &Filter) -> Option<Access<'a>> {
+pub fn choose_index<'a>(
+    entity: &'a EntityDef,
+    filter: &Filter,
+    order: &Order,
+) -> Option<Access<'a>> {
+    if let Some(name) = &order.index {
+        let index = entity.indexes.iter().find(|index| &index.name == name)?;
+        return serves(index, filter).then_some(Access::Index(index.name.as_str()));
+    }
+    choose_for_key_order(entity, filter)
+}
+
+/// Whether one index can serve a filter: the equality columns are exactly its leading
+/// ones, and the range column (if any) is the one directly after them.
+fn serves(index: &IndexDef, filter: &Filter) -> bool {
     let equals: Vec<&str> = filter
         .equals
         .iter()
         .map(|(column, _)| column.as_str())
         .collect();
-    let range = filter.range_column();
+    let Some(prefix) = index.columns.get(..equals.len()) else {
+        return false;
+    };
+    // `prefix` holds exactly `equals.len()` columns and the caller has already refused a
+    // repeated one, so every equality column being in it makes the two equal as sets.
+    let covered = equals
+        .iter()
+        .all(|column| prefix.iter().any(|declared| declared == column));
+    covered
+        && match filter.range_column() {
+            Some(column) => index
+                .columns
+                .get(equals.len())
+                .is_some_and(|next| next == column),
+            None => true,
+        }
+}
+
+/// The access path for a filter under the default key ordering.
+fn choose_for_key_order<'a>(entity: &'a EntityDef, filter: &Filter) -> Option<Access<'a>> {
     // The key is its own index, and the only one that can serve a bare scan. It is
     // tried first so an entity that also declares an index leading with its key does
     // not change which plan a key filter gets.
-    let key_only = equals.iter().all(|column| *column == entity.key)
-        && range.is_none_or(|column| column == entity.key);
+    let on_key = |column: &str| column == entity.key;
+    let key_only = filter.equals.iter().all(|(column, _)| on_key(column))
+        && filter.range_column().is_none_or(on_key);
     if key_only {
         return Some(Access::Key);
     }
     entity
         .indexes
         .iter()
-        .filter(|index| {
-            let Some(prefix) = index.columns.get(..equals.len()) else {
-                return false;
-            };
-            let covered = equals
-                .iter()
-                .all(|column| prefix.iter().any(|declared| declared == column));
-            covered
-                && match range {
-                    Some(column) => index
-                        .columns
-                        .get(equals.len())
-                        .is_some_and(|next| next == column),
-                    None => true,
-                }
-        })
+        .filter(|index| serves(index, filter))
         // `min_by_key` keeps the first of equal keys, so declaration order breaks ties.
         .min_by_key(|index| index.columns.len())
         .map(|index| Access::Index(index.name.as_str()))
@@ -277,17 +303,166 @@ pub fn check_filter(entity: &EntityDef, filter: &Filter) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Encode a row key as an opaque forward cursor.
-fn encode_cursor(key: &str) -> String {
-    URL_SAFE_NO_PAD.encode(key.as_bytes())
+/// How a scan is ordered: by the primary key, or by a declared index, either direction.
+///
+/// One direction for the whole tuple, because the cursor resumes with a row-value
+/// comparison and a row-value comparison has one. `(a, b, key) > (?, ?, ?)` is the shape
+/// an index serves; per-column directions are not expressible in it, so an index is read
+/// as declared or reversed as a whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Order {
+    /// The declared name of the index to order by, or `None` for the primary key.
+    pub index: Option<String>,
+    pub descending: bool,
 }
 
-/// Decode an opaque cursor back to a row key.
-pub fn decode_cursor(cursor: &str) -> anyhow::Result<String> {
+impl Order {
+    /// The `order_by` spelling of this ordering, which is also what a cursor records so
+    /// that resuming under a different one can be refused.
+    pub fn token(&self, entity: &EntityDef) -> String {
+        let name = self.index.as_deref().unwrap_or(&entity.key);
+        let sign = if self.descending { "-" } else { "" };
+        format!("{sign}{name}")
+    }
+
+    /// The columns this ordering sorts by, outermost first. Always ends in the key, which
+    /// is what makes it unique: an index tuple is not, and without the tiebreak two rows
+    /// sharing one would be skipped or repeated at a page boundary.
+    fn columns(&self, entity: &EntityDef) -> Vec<String> {
+        match &self.index {
+            None => vec![entity.key.clone()],
+            Some(name) => entity
+                .indexes
+                .iter()
+                .find(|index| &index.name == name)
+                .map(|index| entity.index_columns(index))
+                .unwrap_or_else(|| vec![entity.key.clone()]),
+        }
+    }
+}
+
+/// Read an `order_by` value against what the entity declares.
+///
+/// A leading `-` reverses. The rest names a declared index, or the key column, which is
+/// the default ordering and is nameable so that it can be reversed. An index is matched
+/// first: index names are generated as `by_<columns>`, so the two can only collide on an
+/// entity whose key is literally named that.
+pub fn parse_order(entity: &EntityDef, raw: &str) -> Result<Order, String> {
+    let (descending, name) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    if entity.indexes.iter().any(|index| index.name == name) {
+        return Ok(Order {
+            index: Some(name.to_owned()),
+            descending,
+        });
+    }
+    if name == entity.key {
+        return Ok(Order {
+            index: None,
+            descending,
+        });
+    }
+    let mut known: Vec<&str> = entity
+        .indexes
+        .iter()
+        .map(|index| index.name.as_str())
+        .collect();
+    known.push(&entity.key);
+    Err(format!(
+        "`{name}` is not an ordering of entity `{}`; order by one of {}, each optionally \
+         prefixed with `-` to reverse it",
+        entity.name,
+        known.join(", ")
+    ))
+}
+
+/// Why a declared index cannot back an ordering, if it cannot.
+///
+/// Refused at request time rather than at load, because it depends on which index was
+/// asked for: an index that cannot sort can still filter perfectly well, and rejecting it
+/// at load would make a useful declaration unloadable over a question nobody asked.
+///
+/// The appended key is not checked. The ordering an author asked for is the declared
+/// columns; the key is the tiebreak underneath them, and it already had to be orderable
+/// and present to be a key at all.
+pub fn ordering_problem(entity: &EntityDef, index: &IndexDef) -> Option<String> {
+    for column in &index.columns {
+        let (_, meta) = entity.fields.iter().find(|(name, _)| name == column)?;
+        // Before the comparability check, which also refuses an optional but for a
+        // reason the author cannot act on: here the fix is the `?`, not the type.
+        if meta.is_nullable() {
+            return Some(format!(
+                "index `{}` cannot order rows: `{column}` is optional, and a row-value \
+                 comparison against NULL matches nothing, so a page boundary would drop \
+                 every row whose `{column}` is absent. It stays filterable.",
+                index.name
+            ));
+        }
+        if !meta.kind.is_comparable() {
+            return Some(format!(
+                "index `{}` cannot order rows: `{column}` is {}, which has no order an \
+                 ordering could use. It stays filterable.",
+                index.name,
+                meta.kind.describe()
+            ));
+        }
+    }
+    None
+}
+
+/// An opaque forward cursor: which ordering the page was taken under, and where in that
+/// ordering it ended.
+///
+/// Carrying the ordering is what makes reading one back under a different `order_by` a
+/// 400 instead of a wrong page. When the cursor was a bare key that hardly mattered,
+/// because every scan was in key order; a tuple read against the wrong ordering compares
+/// the wrong columns and silently returns the wrong rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    /// [`Order::token`] for the page this came from.
+    #[serde(rename = "o")]
+    pub ordering: String,
+    /// The ordering's columns for the last row of that page, outermost first, ending in
+    /// the key. Strings, because that is what a filter value is and what `bind_or_text`
+    /// re-types against the column.
+    #[serde(rename = "v")]
+    pub values: Vec<String>,
+}
+
+/// Encode a cursor opaquely. Base64url of its JSON, so it stays one URL-safe token.
+fn encode_cursor(cursor: &Cursor) -> String {
+    URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor).expect("a cursor serialises"))
+}
+
+/// Decode an opaque cursor. A cursor issued before orderings existed was the bare key,
+/// which is not JSON, so it fails here rather than being read as a tuple of one.
+pub fn decode_cursor(cursor: &str) -> anyhow::Result<Cursor> {
     let bytes = URL_SAFE_NO_PAD
         .decode(cursor.as_bytes())
         .context("cursor is not valid base64url")?;
-    String::from_utf8(bytes).context("cursor is not valid UTF-8")
+    serde_json::from_slice(&bytes).context("cursor is not a cursor this server issued")
+}
+
+/// Everything a scan was asked for beyond the entity: what to match, in what order, where
+/// to resume, and how much.
+#[derive(Debug, Clone, Default)]
+pub struct Query {
+    pub filter: Filter,
+    pub order: Order,
+    pub cursor: Option<Cursor>,
+    pub limit: usize,
+}
+
+impl Query {
+    /// Every row, in key order. What a caller reading a whole entity wants.
+    pub fn all(limit: usize) -> Query {
+        Query {
+            limit,
+            ..Query::default()
+        }
+    }
 }
 
 /// Read one row by key, plus the projector position, in one read snapshot.
@@ -405,39 +580,35 @@ pub(crate) fn typed_from_string(kind: &FieldKind, text: String) -> Value {
     }
 }
 
-/// Scan an entity, filtered over a declared index and resumed after a cursor, plus the
-/// projector position, in one read snapshot. `filter` must already have been through
-/// [`choose_index`] and [`check_filter`]; this re-chooses the index rather than taking
-/// one, so the statement cannot be built against a different index than the handler
+/// Scan an entity, filtered and ordered over a declared index and resumed after a cursor,
+/// plus the projector position, in one read snapshot. `query` must already have been
+/// through [`choose_index`] and [`check_filter`]; this re-chooses the index rather than
+/// taking one, so the statement cannot be built against a different index than the handler
 /// validated against.
 pub fn scan(
     db_path: &Path,
     entity: &EntityDef,
-    filter: &Filter,
-    after_key: Option<&str>,
-    limit: usize,
+    query: &Query,
     keystore: Option<&KeyStore>,
 ) -> anyhow::Result<Page> {
     let model = open_with_retry(db_path)?;
     let snapshot = model.begin()?;
     let position = model.read_checkpoint()?.get();
     // Over-fetch one row to learn whether another page follows.
-    let mut items = model.scan(entity, filter, after_key, limit + 1)?;
+    let mut items = model.scan(entity, query, query.limit + 1)?;
     drop(snapshot);
 
-    let next_cursor = if items.len() > limit {
-        items.truncate(limit);
-        items
-            .last()
-            .and_then(|row| row.get(&entity.key))
-            .and_then(key_string)
-            .map(|key| encode_cursor(&key))
+    let next_cursor = if items.len() > query.limit {
+        items.truncate(query.limit);
+        items.last().and_then(|row| cursor_at(entity, query, row))
     } else {
         None
     };
-    // The cursor is computed from the plaintext key (a key is never encrypted), so
-    // decrypting the rows afterward does not affect pagination. One decryptor for the
-    // whole page unwraps each subject's key once, not per row.
+    // The cursor is computed before this loop, and out of plaintext columns only: a key
+    // is never encrypted, and `EntityDef::validate` refuses an index over a sealed
+    // column. So decrypting a page cannot affect where the next one starts, and a page
+    // whose subject keys were erased paginates exactly like one whose were not. One
+    // decryptor for the whole page unwraps each subject's key once, not per row.
     if let Some(ks) = keystore {
         let decryptor = ks.row_decryptor();
         for row in &mut items {
@@ -451,12 +622,29 @@ pub fn scan(
     })
 }
 
-/// The string form of a key value for cursor encoding: strings as-is, numbers by
-/// their canonical decimal form (so integer-keyed entities paginate too).
-fn key_string(value: &Value) -> Option<String> {
+/// The cursor that resumes after `row`, or `None` if any ordering column is missing from
+/// it, which would make a row-value comparison compare the wrong things.
+fn cursor_at(entity: &EntityDef, query: &Query, row: &Value) -> Option<String> {
+    let values: Option<Vec<String>> = query
+        .order
+        .columns(entity)
+        .iter()
+        .map(|column| row.get(column).and_then(scalar_string))
+        .collect();
+    Some(encode_cursor(&Cursor {
+        ordering: query.order.token(entity),
+        values: values?,
+    }))
+}
+
+/// The string form of an ordering column for cursor encoding: strings as-is, numbers by
+/// their canonical decimal form (so integer-keyed entities paginate too), booleans by the
+/// spelling `coerce_value` reads back.
+fn scalar_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
         _ => None,
     }
 }
@@ -512,9 +700,19 @@ mod tests {
 
     #[test]
     fn cursor_round_trips() {
-        let cursor = encode_cursor("u1");
-        assert_ne!(cursor, "u1");
-        assert_eq!(decode_cursor(&cursor).unwrap(), "u1");
+        let taken = Cursor {
+            ordering: "-by_bucket_rank".to_owned(),
+            values: vec!["a".to_owned(), "5".to_owned(), "u1".to_owned()],
+        };
+        let encoded = encode_cursor(&taken);
+        assert!(!encoded.contains("by_bucket_rank"), "cursors stay opaque");
+        assert_eq!(decode_cursor(&encoded).unwrap(), taken);
         assert!(decode_cursor("not valid base64!!").is_err());
+        // A cursor issued before orderings existed was the bare key, base64. It is
+        // still valid base64, so the refusal has to come from the shape rather than the
+        // encoding, and it has to come at all: read as a tuple of one it would compare
+        // the key against whatever the ordering's first column is.
+        let legacy = URL_SAFE_NO_PAD.encode(b"u1");
+        assert!(decode_cursor(&legacy).is_err());
     }
 }

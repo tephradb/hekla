@@ -729,17 +729,10 @@ impl Run<'_> {
             .ok_or_else(|| Disagreement::Oracle(format!("no entity `{entity}`")))?;
 
         let mut out = BTreeMap::new();
-        let mut cursor: Option<String> = None;
+        let mut query = read_api::Query::all(64);
         loop {
-            let page = read_api::scan(
-                &shared.db_path,
-                def,
-                &read_api::Filter::default(),
-                cursor.as_deref(),
-                64,
-                rt.keystore(),
-            )
-            .map_err(|err| Disagreement::Oracle(format!("scanning {entity}: {err}")))?;
+            let page = read_api::scan(&shared.db_path, def, &query, rt.keystore())
+                .map_err(|err| Disagreement::Oracle(format!("scanning {entity}: {err}")))?;
             for row in &page.items {
                 let key = row
                     .get(&def.key)
@@ -748,7 +741,7 @@ impl Run<'_> {
             }
             match page.next_cursor {
                 Some(next) => {
-                    cursor = Some(
+                    query.cursor = Some(
                         read_api::decode_cursor(&next)
                             .map_err(|err| Disagreement::Oracle(format!("{err}")))?,
                     );

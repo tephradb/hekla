@@ -839,6 +839,246 @@ async fn a_range_is_refused_where_it_could_not_mean_what_it_says() {
 }
 
 #[tokio::test]
+async fn a_scan_orders_by_a_declared_index_in_either_direction() {
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    seeded_catalog(&harness).await;
+    let app = harness.app();
+
+    // `(bucket, shelf, rank)` is a different order from the key's, so this is not the
+    // default dressed up: rows 3 and 4 swap places against key order.
+    let ordered = scanned_ids(&app, "/read/Catalog/Item?order_by=by_bucket_shelf_rank").await;
+    assert_eq!(
+        ordered,
+        vec![
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000005",
+            "00000000-0000-0000-0000-000000000004",
+        ]
+    );
+
+    let reversed = scanned_ids(&app, "/read/Catalog/Item?order_by=-by_bucket_shelf_rank").await;
+    let mut backwards = ordered.clone();
+    backwards.reverse();
+    assert_eq!(
+        reversed, backwards,
+        "reversing turns the whole tuple around, not its first column"
+    );
+
+    // The key is nameable so that it can be reversed, which is the common "newest
+    // first" request and has no other spelling.
+    let newest = scanned_ids(&app, "/read/Catalog/Item?order_by=-id").await;
+    assert_eq!(newest[0], "00000000-0000-0000-0000-000000000005");
+
+    // An ordering composes with a filter, as long as the filter is a prefix of the same
+    // index the ordering names.
+    let filtered = scanned_ids(
+        &app,
+        "/read/Catalog/Item?bucket=a&order_by=-by_bucket_shelf_rank",
+    )
+    .await;
+    assert_eq!(filtered.len(), 4, "{filtered:?}");
+    assert_eq!(filtered[0], "00000000-0000-0000-0000-000000000005");
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn an_ordered_scan_pages_without_dropping_or_repeating_a_row() {
+    // Every seeded row shares `(bucket, shelf)` with another and two share `rank`, so
+    // the index tuple is not unique and page boundaries fall inside ties. The key is the
+    // last term of every ordering for exactly that reason.
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    let mut last = 0;
+    for (n, bucket, shelf, rank) in [
+        (1, "a", "top", 5),
+        (2, "a", "top", 5),
+        (3, "a", "top", 5),
+        (4, "a", "low", 1),
+        (5, "b", "top", 1),
+        (6, "b", "top", 1),
+    ] {
+        let id = format!("00000000-0000-0000-0000-00000000000{n}");
+        last = add_item(&harness, &id, bucket, shelf, rank);
+    }
+    wait_position_async(&harness.rt, "Catalog", last).await;
+    let app = harness.app();
+
+    for order in ["by_bucket_shelf_rank", "-by_bucket_shelf_rank"] {
+        let (seen, _) = page_through(
+            &app,
+            &format!("/read/Catalog/Item?order_by={order}&limit=2"),
+            "id",
+        )
+        .await;
+        assert_eq!(seen.len(), 6, "{order}: {seen:?}");
+        let mut deduped = seen.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            6,
+            "{order}: every row exactly once: {seen:?}"
+        );
+    }
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn an_ordering_that_cannot_be_served_is_refused_rather_than_sorted() {
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    seeded_catalog(&harness).await;
+    let app = harness.app();
+
+    let message = refused(
+        &app,
+        "/read/Catalog/Item?order_by=by_nothing",
+        "invalid_input",
+    )
+    .await;
+    assert!(
+        message.contains("is not an ordering of entity `Item`")
+            && message.contains("by_bucket_shelf_rank"),
+        "the refusal lists what can be ordered by: {message}"
+    );
+
+    // The filter is a prefix of `by_bucket`, but the ordering names the wider index, and
+    // `shelf` is not a prefix of it. One index has to serve both or the rows come out of
+    // one and get sorted for the other.
+    let message = refused(
+        &app,
+        "/read/Catalog/Item?shelf=top&order_by=by_bucket_shelf_rank",
+        "unindexed_filter",
+    )
+    .await;
+    assert!(
+        message.contains("asks for the rows in that index's order"),
+        "{message}"
+    );
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn a_cursor_taken_over_one_ordering_is_refused_under_another() {
+    // When a cursor was a bare key this could not arise: every scan was in key order, so
+    // carrying one across queries was nearly harmless. A tuple read under a different
+    // ordering compares the wrong columns, which is a page of the wrong rows rather than
+    // an error, so it has to be caught here.
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    seeded_catalog(&harness).await;
+    let app = harness.app();
+
+    let (status, body) = get(
+        &app,
+        "/read/Catalog/Item?order_by=by_bucket_shelf_rank&limit=2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let cursor = body["next_cursor"].as_str().expect("a second page follows");
+    assert!(
+        !cursor.contains("by_bucket"),
+        "a cursor stays opaque: {cursor}"
+    );
+
+    // The same cursor under the same ordering resumes.
+    let (status, body) = get(
+        &app,
+        &format!("/read/Catalog/Item?order_by=by_bucket_shelf_rank&limit=2&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+
+    for other in ["-by_bucket_shelf_rank", "id"] {
+        let message = refused(
+            &app,
+            &format!("/read/Catalog/Item?order_by={other}&limit=2&cursor={cursor}"),
+            "invalid_input",
+        )
+        .await;
+        assert!(
+            message.contains("was taken over `order_by=by_bucket_shelf_rank`"),
+            "{other}: {message}"
+        );
+    }
+
+    // Dropping `order_by` entirely is the default key ordering, which is another
+    // ordering: a cursor is not portable just because the parameter is absent.
+    let message = refused(
+        &app,
+        &format!("/read/Catalog/Item?limit=2&cursor={cursor}"),
+        "invalid_input",
+    )
+    .await;
+    assert!(message.contains("`order_by=id`"), "{message}");
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn an_index_that_cannot_order_rows_still_filters_them() {
+    // `shelf` is optional here, so `by_shelf` cannot back an ordering: a row-value
+    // comparison against NULL matches nothing, and pagination would drop every row whose
+    // `shelf` is absent at a page boundary. It stays a perfectly good filter.
+    let dir = write_project(&[
+        (
+            "events/stocked.hk",
+            "event @stocked { id: Uuid, shelf: String? @max(20) }\n",
+        ),
+        (
+            "commands/stock.hk",
+            "command Stock(id: Uuid, shelf: String?) {\n  emit @stocked { id, shelf }\n}\n",
+        ),
+        (
+            "projectors/stock.hk",
+            r#"
+projector Stock {
+  entity Item {
+    id: Uuid @key,
+    shelf: String? @max(20) @index,
+  }
+
+  on @stocked { id, shelf } {
+    put Item { id, shelf }
+  }
+}
+"#,
+        ),
+    ]);
+    let harness = boot_project(dir.path());
+    let mut last = 0;
+    for (n, shelf) in [(1, json!("top")), (2, Value::Null)] {
+        let id = format!("00000000-0000-0000-0000-00000000000{n}");
+        let result = harness
+            .rt
+            .execute("Stock", json!({ "id": id, "shelf": shelf }), &ctx(), None)
+            .unwrap();
+        assert_eq!(result.status, 200, "Stock failed: {:?}", result.body);
+        last = result.body["positions"]["last"].as_u64().unwrap();
+    }
+    wait_position_async(&harness.rt, "Stock", last).await;
+    let app = harness.app();
+
+    let filtered = scanned_ids(&app, "/read/Stock/Item?shelf=top").await;
+    assert_eq!(filtered, vec!["00000000-0000-0000-0000-000000000001"]);
+
+    let message = refused(&app, "/read/Stock/Item?order_by=by_shelf", "invalid_input").await;
+    assert!(
+        message.contains("`shelf` is optional") && message.contains("stays filterable"),
+        "{message}"
+    );
+
+    harness.shutdown();
+}
+
+#[tokio::test]
 async fn a_money_column_ranges_only_where_an_index_would_have_admitted_it() {
     // The refusal above is the *unindexed* one, because `price` is in no index, so it
     // never reaches the comparability check. A column that is indexed and still cannot

@@ -92,12 +92,33 @@ not_found` with the message `no such row`. Unknown entity or projector: `404 not
 | --- | --- |
 | `<field>=<value>` | equality filter; the columns given must be a **prefix** of one declared index (or the key) |
 | `<field>.gte=`, `.gt=`, `.lte=`, `.lt=` | range on the column **after** that prefix; one column only, both ends may be given |
+| `order_by` | a declared index name, or the key column; a leading `-` reverses. Defaults to the key ascending |
 | `limit` | page size, default 50, clamped to 1..500 (so `limit=0` is one row, not an error) |
-| `cursor` | the previous page's `next_cursor`; opaque (it is the key, base64) |
+| `cursor` | the previous page's `next_cursor`; opaque, and only valid under the `order_by` it was taken with |
 | `after` | wait until the projector reaches this log position before reading |
 | `timeout_ms` | how long `after` waits, default 5000, capped at 30000 |
 
-`next_cursor` is `null` on the last page. Pagination is cursor-based over the key, never offset.
+`next_cursor` is `null` on the last page. Pagination is cursor-based over the ordering, never offset.
+
+## Ordering a scan
+
+Index names are generated from their columns, so `index (shop_id, status, month)` is
+`by_shop_id_status_month` and `/admin/projectors/{Name}` lists them. `?order_by=-by_shop_id_status_month`
+reads it newest-first; `?order_by=-<key column>` reverses the default.
+
+- **One direction for the whole tuple.** The cursor resumes with a row-value comparison
+  (`(a, b, key) > (?, ?, ?)`), which has one direction; per-column directions are not expressible in
+  it. An index is read as declared or reversed as a whole.
+- **The ordering fixes the index**, so the filter has to be a prefix of that same index. `ORDER BY`
+  and the filter reading different indexes is the in-memory sort this API exists to refuse.
+- **The key is the last term of every ordering.** An index tuple is not unique, and without the
+  tiebreak two rows sharing one are silently dropped or repeated at a page boundary.
+- **A cursor records the ordering it was taken over**, and reading it back under another is a 400.
+  Dropping `?order_by=` counts as another: the default key order is an ordering too.
+- **An index with an optional column cannot sort** (a row-value comparison against NULL matches
+  nothing, so a page boundary would lose every row whose column is absent), nor can one with a `Money`
+  or enum column, for the same reason a range cannot. Each stays filterable, and `order_by`'s
+  enumerated values in `/openapi.json` leave them out rather than listing them and then refusing.
 
 `index (shop_id, status, month)` answers `?shop_id=`, `?shop_id=&status=` and all three, plus
 `?shop_id=&status.gte=` and `?shop_id=&status=&month.lt=`. It refuses `?status=&month=`: reaching
@@ -121,7 +142,7 @@ Errors are `{error: {code, message}}` (no correlation ids outside `/commands`):
 | Status | `code` | When |
 | --- | --- | --- |
 | 400 | `unindexed_filter` | ``filter on (a, b) is not a prefix of any declared index``, ``filter field `f` is not indexed; declare an index on it``, ``filter field `f` is not a column of entity `E` ``, or `a scan ranges over one column` |
-| 400 | `invalid_input` | `limit must be a positive integer`, `cursor is not valid`, ``filter `f`: expected an integer``, ``unknown filter operator `.between` ``, or ``filter `f` is Money(2), which has no order a range could use`` |
+| 400 | `invalid_input` | `limit must be a positive integer`, `cursor is not valid`, ``filter `f`: expected an integer``, ``unknown filter operator `.between` ``, ``filter `f` is Money(2), which has no order a range could use``, ``` `x` is not an ordering of entity `E` ```, ``index `i` cannot order rows``, or `this cursor was taken over `order_by=...`` |
 | 404 | `not_found` | no such projector, entity or row |
 | 503 | `not_caught_up` | the `after` wait timed out, with `Retry-After: 1` |
 | 503 | `rebuilding` | a rebuild is in flight; carries `Retry-After: 1` because it resolves on its own |

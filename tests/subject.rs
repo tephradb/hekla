@@ -633,9 +633,7 @@ fn scan_rows(harness: &Harness, projector: &str, entity: &str, after: u64) -> Ve
     read_api::scan(
         &shared.db_path,
         entity_def,
-        &read_api::Filter::default(),
-        None,
-        50,
+        &read_api::Query::all(50),
         harness.rt.keystore(),
     )
     .unwrap()

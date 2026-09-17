@@ -2532,8 +2532,8 @@ Honest scope:
   belongs in the release note.
 - **A partial prefix still sorts.** Covered above; there is no way around it short of generating an
   index per prefix, and the cost is bounded by the match set rather than the table.
-- **Ordering by anything but the key is Phase 38**, which is now purely `order_by` and the tuple
-  cursor: the DDL it needed came forward to here.
+- **Ordering by anything but the key was Phase 38**, which landed straight after as purely `order_by`
+  and the tuple cursor, the DDL it needed having come forward to here.
 - **The console's filter UI still takes one field**, so it offers the key and each index's leading
   column, derived client-side from the `indexes` introspection already reports rather than from the
   widened `filterable`. Using the wider list would have enabled options that 400 on their own and lost
@@ -2544,7 +2544,7 @@ Honest scope:
   coverage is in `tests/fixtures/tickets`, which declares `index (org_id, priority, due_at)` and
   reaches every case including both refused ranges.
 
-## Phase 38: an ordering is a declared index, and the cursor is its tuple (planned)
+## Phase 38: an ordering is a declared index, and the cursor is its tuple (done)
 
 After Phase 37 an entity can be filtered on what it declared and is still ordered only by its key. An
 edit log that wants order plus status plus month, newest first, is three filters and a sort, and the
@@ -2567,10 +2567,23 @@ Decisions worth keeping:
 - **One direction for the whole tuple, because a row-value comparison has one.**
   `(a, b, key) > (?, ?, ?)` is the shape the index serves, and mixed per-column directions are not
   expressible in it. An index is read as declared or reversed as a whole.
-- **An index containing an optional column cannot back an ordering.** A row-value comparison against
-  NULL yields NULL, so the row is excluded and pagination loses it at a page boundary. The index
-  stays filterable and simply cannot sort. It is a request-time refusal rather than a load-time one,
-  because it depends on which index was asked for.
+- **An index containing an optional column cannot back an ordering**, and nor can one containing a
+  `Money` or enum column, which is `FieldKind::is_comparable` again: the predicate Phase 37 extracted
+  for ranges turned out to be the same one an ordering needs, for the same reason. A row-value
+  comparison against NULL yields NULL, so the row is excluded and pagination loses it at a page
+  boundary; a decimal string sorts `"2"` above `"10"`; an enum sorts by its variant's spelling. Each
+  index stays filterable and simply cannot sort. Request-time rather than load-time, because it
+  depends on which index was asked for, and an index that cannot sort is still worth declaring.
+- **The key is nameable as an ordering, so the default can be reversed.** `order_by` was specified as
+  naming a declared index, and "newest first by key" then had no spelling at all while being the
+  commonest thing to ask for. The key column's own name is accepted (`?order_by=-order_id`), which
+  costs nothing: the primary key is an index, and the tuple cursor over it is the bare key the cursor
+  used to be. An index is matched before the key, and they can only collide on an entity whose key is
+  literally named `by_<something>`.
+- **`order_by`'s OpenAPI parameter is an enumeration, and it leaves out what cannot sort.** The set is
+  small, closed and knowable from the declaration, and it is generated from `ordering_problem`, which
+  is what the runtime refuses on. Documenting an index and then rejecting it would be worse than not
+  documenting it.
 - **A cursor carries which ordering it was taken over, and a mismatch is a 400.** Today a cursor is a
   bare key and carrying one across queries is nearly harmless. A tuple cursor read under a different
   ordering is a correctness hazard, so it refuses rather than paginating wrongly.
@@ -2594,10 +2607,30 @@ Honest scope:
   `heklang/docs/projectors.md`, which said the runtime could filter only on an index's leftmost
   column; a doc correction in the sibling repo, not a language change.
 - **`?order_by=` names the generated index name**, which is derived (`by_org_id_priority_due_at`)
-  rather than authored, because heklang holds that index naming is a storage concern. So this phase
-  is where a derived name becomes part of hekla's public request surface. Worth deciding
-  deliberately rather than inheriting: the alternative is letting an author name an index, which is a
-  heklang change and reopens a question it already answered.
+  rather than authored, because heklang holds that index naming is a storage concern. So this is where
+  a derived name became part of hekla's public request surface, which means renaming a column renames
+  an ordering. Decided deliberately rather than inherited: the alternative is letting an author name
+  an index, which is a heklang change and reopens a question it already answered. Both
+  `/admin/projectors/{Name}` and the `order_by` enum in `/openapi.json` list the names, so nobody has
+  to derive one by hand.
+- **Every cursor issued before this is refused**, because the old one was the bare key base64'd and
+  that is not the JSON a cursor now is. It fails as "not a cursor this server issued" rather than
+  being read as a one-element tuple and compared against the wrong column, which is the failure worth
+  paying a refusal for. Cursors are ephemeral, so the blast radius is a client holding one across the
+  deploy, and its next page is a 400 rather than wrong rows.
+- **A cursor's width is checked twice**, once in the handler with a message and once in
+  `read_model::usable_cursor` without one, which drops a mismatched tuple and starts the page over.
+  The second exists so that the statement and its binds cannot disagree: a row-value clause emitted
+  with the wrong number of placeholders is a SQL error rather than a wrong answer, but it is one only
+  the second check makes impossible to reach.
+- **A partial prefix under an explicit ordering still sorts nothing extra**, but it does give up the
+  narrowest-index rule from Phase 37: the ordering pins the index outright, so a filter on `a` under
+  `?order_by=by_a_b` reads `(a, b, key)` rather than the narrower `(a, key)`. That is correct rather
+  than unfortunate, since the caller asked for the rows in `b` order, and it is worth knowing when
+  reading a plan.
+- **The console still neither sends nor offers `order_by`.** It says "in `<key>` order" and that stays
+  true of what it asks for. An order control is the obvious next console change and nothing here
+  blocks it.
 
 ## Phase 39: a subject can be deleted with its tenant (planned, decision first)
 
@@ -2700,8 +2733,8 @@ forward. Collected here so they are not lost in the prose of the phase that intr
   derived read models, so it can ask things no read model materialised; and it needs none of the
   private table layout, which stays behind the generated read API as section 10 says it must.
 - **Multi-field (composite-prefix) scan filters** (Phase 3): **closed.** Phase 37 widened a scan to
-  equality across any prefix of a declared index plus a range on the column after it. Phase 38 adds
-  an ordering over one, which is the remaining half.
+  equality across any prefix of a declared index plus a range on the column after it, and Phase 38
+  added an ordering over one with a tuple cursor. Nothing of the original gap is left open.
 - **Automatic dead-lettering** (Phase 4): the manual `POST /effects/{name}/skip/{position}` is the only
   escape hatch; a wedged effect is never advanced automatically.
 - **`hekla fmt` and `hekla lsp`** (Phase 21): both were Starlark tooling wrapped in hekla's project
