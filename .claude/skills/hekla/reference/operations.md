@@ -92,6 +92,10 @@ A wedge outranks lag because a wedged effect lags precisely because it is wedged
   by thousands while every lane but one is healthy.
 - **`wedged_lanes`** is how many lanes are stuck. `consecutive_failures` counts the pinning lane's
   attempts and cannot say how many lanes are in that state.
+- **`stuck_lanes` names every one of them**, worst first, each with its own position, attempt, error
+  and countdown. On `/admin/effects/{name}` only, never the listing. This is the only surface a wedge
+  appears on at all, because a wedge appends no event: a failure list built from the log shows every
+  `fail` and no wedge.
 - `consecutive_failures` and `last_error` are the wedge. `last_error` carries the arm's own source
   location, which is usually enough to name the call that will not complete.
 - `terminal_skips` and `last_terminal_error` are the opposite: work that was abandoned deliberately
@@ -181,14 +185,18 @@ One HTTP attempt is capped at 10s to connect and 30s overall. Neither is configu
 
 ### Getting past a wedge
 
-1. `pinning_key` names the lane and `pinning_position` is where it is stuck. Read `last_error` and
-   that invocation's journaled calls (`/admin/effects/{Name}/invocations/{position}`).
+1. `pinning_key` names the lane holding the watermark down and `pinning_position` is where it is
+   stuck. Read `last_error` and that invocation's journaled calls
+   (`/admin/effects/{Name}/invocations/{position}`). `stuck_lanes` in the same body is every other
+   lane that is stuck, each with its own error, which is how you tell one bad customer from a dead
+   endpoint: one entry is the former and every entry failing alike is the latter.
 2. Fix the cause. A code fix plus a restart replays the running invocation, and every completed call
    comes back from the journal instead of firing again.
-3. If the event is genuinely unprocessable, `POST /effects/{Name}/skip/{position}`, naming
-   `pinning_position`. The driver honours it only for a position that has already failed. Several
-   requests can be pending at once, one per wedged lane, and a request the watermark passes is
-   forgotten. Nothing is ever skipped automatically.
+3. If the event is genuinely unprocessable, `POST /effects/{Name}/skip/{position}`. Several requests
+   can be pending at once, one per wedged lane, so a position out of `stuck_lanes` can be skipped
+   without clearing the pinning lane first; only `pinning_position` releases the watermark, and the
+   others release their own lanes. The driver honours a skip only for a position that has already
+   failed, and a request the watermark passes is forgotten. Nothing is ever skipped automatically.
 4. Erasing the subject a `reveal` needs also clears it, by turning the failure terminal.
 
 Worth doing promptly for a reason beyond the lag figure: see the retention note below.

@@ -2233,6 +2233,317 @@ Honest scope:
   test runner, and the two failure modes Rust can see (a URL no route serves, an asset nothing
   references) are covered by scanning the shipped bytes.
 
+## Phase 35: every wedged lane is nameable, not just the worst one (done)
+
+An effect publishes exactly one stuck lane. `EffectShared.pinning` is `Mutex<Option<(String, u64)>>`,
+surfaced as `pinning_key` and `pinning_position`, and `wedged_lanes` beside it is a bare count. So a
+failure list built on hekla is structurally incomplete: it can show every `fail`, because those append
+events, and not a single wedge, because those append nothing. Under lanes a wedge is the commonest
+production failure, so the customer whose refund is stuck behind one sees an empty list.
+
+**The fix is not the runtime appending events.** "Only commands append" stands, and
+`heklang/docs/effects.md` rule 4 keeps a wedge invisible to the script on purpose: an author must not
+be able to branch on a retry count. What this adds is an operator-facing surface that can enumerate
+what is stuck, so a caller can join a lane back to an order.
+
+Most of it is already in memory. `EffectShared.stuck` is `Mutex<BTreeMap<LaneId, StuckLane>>` and
+`StuckLane` already holds the position, the attempt, the error and the retry deadline, because
+`republish` derives every single-valued field from that map. Nothing new is recorded; what is missing
+is a reader.
+
+- An accessor beside `pinning()` returning one public view per lane, filtering out `DRIVER_LANE` the
+  way the counters already do. `!driver` is not a key and must never be reported as one.
+- `stuck_lanes` on `effect_detail`: the lane key, the position, the attempt count, the error and the
+  time to the next retry. `pinning_key` stays, because it is the one `last_error` describes and the
+  one an operator skips.
+- The console lists them with a skip control per lane, which is the payoff: today the only skippable
+  position is the pinning one, so clearing the second-worst lane means clearing the worst first.
+- The OpenAPI `EffectDetail` schema grows the array and its `required` entry.
+
+Decisions worth keeping:
+
+- **The published deadline is a remaining duration, never an instant.** `StuckLane.retry_at_ms` is
+  millis since `EffectShared::started`: monotonic, per-process, and meaningless on a reader's clock.
+  It publishes through the same `retry_in_ms` shape the single-lane field already uses, for the
+  reason written on that field.
+- **Ordered by position ascending, so the pinning lane is first.** The same ordering `republish`
+  picks the pinning lane by, so the head of the array and `pinning_key` cannot disagree.
+- **Neither `/status` nor the `/admin/effects` listing grows an array.** `/status` is the summary a
+  scrape reads and `wedged_lanes` is the number it wants; the listing is polled every few seconds
+  across every effect at once, and during the outage where each one is wedged (the only time a person
+  is watching) the arrays would be the whole body, mostly repeated error text. Per-lane detail belongs
+  behind the route that names one effect. The listing's shape is `EffectSummary`, derived from
+  `EffectDetail` by removing the one key rather than written out beside it, in the generated document
+  and in `introspect` alike, so the twenty fields they share cannot drift.
+- **The page and the count are read under one lock.** They are the only way to see that the page was
+  capped, so a count from before a lane cleared beside a page from after it would read as a
+  truncation that never happened.
+- **Capped rather than assumed bounded.** `MAX_INFLIGHT` is 1024 positions, so the map is bounded in
+  practice, but the array is capped and `wedged_lanes` carries the true count, so a reader can tell
+  it was truncated.
+- **The schema drift test grows two more bodies and learns to descend.**
+  `a_described_body_carries_exactly_the_keys_its_schema_declares` (which guarded `/status` alone, as
+  `the_status_body_matches_the_schema_that_describes_it`) now covers the effect detail and the
+  listing, and walks into array items rather than stopping at the top level. Both halves matter: a
+  `required` key the body stopped sending, and a key the body grew that
+  `additionalProperties: false` forbids. It boots against a 503 stub so the effect actually wedges,
+  because a body whose array is always empty leaves the item shape describing nothing the test looks
+  at.
+
+Honest scope:
+
+- **`stuck` is process-local and a restart clears it.** The durable record is `effect_invocation`,
+  which has no lane column. The map self-heals: the driver resubscribes from the watermark and every
+  lane that was wedged re-wedges within a poll cycle, so the empty window is short. Enumerating
+  stuck lanes durably is deferred rather than designed, and if it comes back it is resolve-on-read
+  through `lane_of` (already `pub(crate)`) rather than a stored column, so there is no migration and
+  the lane cannot drift from the code that computes it.
+- **A blocked effect still reports nothing here**, and correctly: nothing is retrying and nothing is
+  stuck. `state()` already reports `blocked` and `last_error` already outranks a wedge with the
+  reason.
+- **The page is capped and there is no cursor**, so past a hundred wedged lanes the rest cannot be
+  named until the ones ahead of them clear. Deliberate rather than deferred: the cap keeps the worst
+  lanes, and the worst are the ones holding the watermark and therefore the ones an operator clears
+  first, so clearing forward is the order the work happens in anyway. `wedged_lanes` says how many
+  are hidden. A cursor is what this grows if an effect ever routinely wedges in the hundreds.
+- **The lane column can be wider than the screen.** A lane is an encoded `@key`, and a string key
+  reaches 512 characters before `crate::lane::encode` elides it to a hash, so one long key pushes the
+  error and the skip control off to the right. The table scrolls sideways, which is what the console's
+  tables do and what `.table-wrap` is for, and the alternative was worse: clipping that column instead
+  makes every column collapse on a phone rather than scroll, which was checked at both widths.
+
+## Phase 36: a sealed record round-trips (planned)
+
+heklang 0.8.0's `Value::from_sealed` has no arm for a record, a list, a map or a `Json`, and `reveal`
+has no other decode path. So `ship_to: Address @subject(customer_ref)` does not merely fail in
+heklang's test harness: it raises a `Mismatch` inside a deployed effect, which hekla classifies as
+non-terminal and retries forever. heklang fixes the arm and moves the writing half to
+`value::sealed_text` beside its inverse; this phase is hekla taking the fix and covering the path it
+opens.
+
+**hekla's own halves were already right**, which is why this is coverage rather than a fix.
+`FieldKind::of` maps `Record`, `List`, `Map` and `Json` all to `FieldKind::Json`, `seal_text` writes
+`json.to_string()` for that kind, and `unsealed_json` parses it back, falling back to the raw text
+for a scalar that was flattened instead. That is the inverse pair heklang grew, and the two writers
+agree case for case: a composite renders as its JSON document on both sides, a `Json` is written
+whole on both sides, and a scalar renders bare on both. Object keys sort on both sides (heklang's
+`Json::Obj` is a `BTreeMap`, and serde_json's `Map` is one with no `preserve_order` feature here),
+and number text is exact on both (`Json::Num(String)` there, `arbitrary_precision` here). heklang's
+reader is deliberately lenient about exactly what serde_json emits: `\u00XX`, surrogate pairs, and
+the `\/`, `\b` and `\f` it never writes itself.
+
+**None of that was tested.** No fixture seals a composite and no example uses one:
+`examples/orders/events/order.hk` seals a `String?`, a `String?` and a `Money(2)`, all scalars. The
+path is written correctly and unexercised, and authors will reach for the shape as soon as it works,
+because it is the one `heklang/docs/declarations.md` now recommends: one address rather than nine
+parallel optional sealed fields, where adding a tenth is a schema-evolution event on every event that
+carries it.
+
+- The heklang version bump, which is the gate. Nothing here can land against 0.8.0.
+- A fixture sealing a record, a list and a map, in `tests/fixtures/tickets`, which already seals a
+  `Money(2)` and a `String?`.
+- Coverage through the whole path: seal on append, store, read back, `reveal` in an effect, and a
+  projector column that receives the sealed value and is decrypted by `read_api::decrypt_row`.
+- The `Json`-that-is-a-string case, through a record containing a string field that looks like a
+  number, which is the trap `seal_text`'s comment names and the one heklang's writer was falling
+  into.
+- A shredded key: a sealed record must come back absent from a row and terminal in an effect, never
+  a partially parsed object.
+
+Decisions worth keeping:
+
+- **The byte-stability test belongs on the projector column path**, not the append path. A moved seal
+  in `stored_seal` is decrypted to text and re-encrypted as that same text, so a re-seal under a
+  different field name is byte-stable by construction with no JSON round trip at all. The path that
+  does parse and restringify a composite is the read-model column write, where a moved seal is
+  opened, `unsealed_json` parses, `column_form` runs and `seal_text` restringifies.
+- **A corrupt seal is a wedge, and that is the right answer.** `Json::parse` returning `None` raises
+  a `Mismatch`, and any `Err` from `interpreter.deliver` is `terminal: false`, so the lane retries
+  rather than skipping. A declaration that no longer matches stored data needs a person, unlike an
+  erased subject, which is terminal by design. It is a new error path the arm creates, so it is
+  asserted rather than left to be discovered in production.
+- **The admin surface still shows the bad bytes.** `unsealed_json` falls back to the raw text where
+  `from_sealed` hard-errors, so a corrupt composite renders as a string on `/admin/events/{id}` while
+  the effect wedges. The asymmetry is deliberate and matches
+  `a_json_column_that_does_not_parse_reads_back_as_its_raw_text`: the operator diagnosing the wedge
+  is the one who needs to see them.
+- **A nested timestamp stays micros in both seals.** `column_form` rewrites a top-level `Timestamp`
+  only, so a timestamp inside a record is epoch microseconds in a payload seal and in a column seal
+  alike. Consistent, and consistent for a reason nothing tested.
+
+Honest scope:
+
+- **`@subject` on a field inside a `record` declaration stays refused in heklang**, and the refusal
+  is correct: the annotation names a sibling field holding the id, and a record reached through a
+  container has no sibling the parser can name. What is allowed is `@subject` on an event field whose
+  type happens to be a record. Both arrive here as `FieldKind::Json` and hekla distinguishes nothing.
+- **`Int.pad` and `Timestamp.add_seconds/minutes/hours/days` ride along in the same bump and cost
+  nothing.** heklang's IR does not move, so no digest moves, no `signature_hash` moves, no
+  `script_hash` is invalidated and no projector rebuilds. The console's editor highlights keywords
+  only and its list still matches `lex.rs` exactly, so there is nothing to sync there either.
+
+## Phase 37: a scan filters on what was declared, not on its first column (planned)
+
+heklang has declared compound indexes for a while and hekla already creates them: `create_index_sql`
+emits `CREATE INDEX ... ON t (a, b)` with every column in declared order. The index is in SQLite. It
+is simply not reachable from the query surface: `read_api::is_filterable` admits the primary key and
+the leftmost column of each declared index and nothing else, `read_model::scan` takes one
+`(column, value)` pair, and the scan handler refuses a second filter outright.
+
+What that costs an application is workaround columns. Six entities in one port grew a composite
+string column whose only job was to be filterable (`shop_state`, `shop_open`, `shop_period` and
+three more), each a stringly-typed key that has to be built byte-identically at every write site, and
+each part of the projector's definition hash, so one mistake is a rebuild.
+
+The safety property survives unchanged: **you may only ask what you declared, never a table scan.**
+
+- ANDed equality across any prefix of a declared index's columns. `index (shop_id, status, month)`
+  admits `shop_id`, `(shop_id, status)` and `(shop_id, status, month)`, and refuses
+  `(status, month)`.
+- A range on the column after the equality prefix, which is the standard index-prefix shape:
+  equality on columns 1 to n-1, a range on column n.
+- The index chosen explicitly in Rust from the declared set and pinned with `INDEXED BY`, so the
+  planner cannot quietly choose a scan, with a query-plan test in the mould of
+  `the_invocation_join_reads_the_primary_key_rather_than_scanning`.
+
+Decisions worth keeping:
+
+- **A range operator is a dotted suffix, so it adds no reserved query param.** `?month.gte=` and
+  `?month.lt=` cannot collide with a declared field, because `is_sql_identifier` restricts a name to
+  ascii letters, digits and underscores. That is what keeps `EntityDef::validate`'s reserved-param
+  gate exactly as strict as it is, and it is why the range half of this phase carries no
+  compatibility risk at all.
+- **`filterable_fields` stays the one source.** The comment on that gate is explicit that it is the
+  only thing stopping the OpenAPI generator from emitting a duplicate query parameter, and it names
+  widening to an index prefix as the change that would expose it. The gate keeps deriving from the
+  same function, and `RESERVED_QUERY_PARAMS` is re-checked against the wider set.
+- **Deduplication stops being a nicety.** `filterable_fields` may repeat a name, and a prefix-based
+  version repeats far more, because every index contributes every prefix. `scan_params` dedups and
+  `introspect::self_entity` sorts and dedups today as a convenience; both now depend on it.
+- **The cursor does not move.** Ordering stays the primary key, so the cursor stays the plaintext key
+  computed before decryption, and the property that decrypting a page cannot affect pagination is
+  untouched.
+
+Honest scope:
+
+- **Widening filterability widens what `validate()` rejects at load.** An entity carrying a column
+  named `limit`, `cursor`, `after` or `timeout_ms` anywhere in an index stops loading where it used
+  to load if that column was not previously leftmost. That is the gate doing its job, and it is a
+  clear error at boot rather than a silent shadowing at request time, but it is a real break and
+  belongs in the release note.
+- **Ordering by anything but the key is Phase 38.** It is the half that moves the cursor and the
+  generated DDL, and it is split out so the payoff lands before the migration does.
+- **The console's filter UI still takes one field.** The prose beside it ("only the key and each
+  index's leftmost column can be filtered") stops being true, so it changes with this phase even
+  though the input does not.
+
+## Phase 38: an ordering is a declared index, and the cursor is its tuple (planned)
+
+After Phase 37 an entity can be filtered on what it declared and is still ordered only by its key. An
+edit log that wants order plus status plus month, newest first, is three filters and a sort, and the
+sort is the half still missing, so an application punts to paging and sorting in its own process.
+
+- `order_by` naming a declared index, with the whole tuple reversed or none of it.
+- The cursor over the index tuple plus the primary key as a final tiebreak, resumed with a row-value
+  comparison the index serves.
+- The primary key appended to every generated index, and an index reconcile so an existing read model
+  gets the new shape.
+
+Decisions worth keeping:
+
+- **The direction rides in the value, so this costs one reserved name rather than two.**
+  `?order_by=-by_shop_month` reverses, and `order_by` joins `RESERVED_QUERY_PARAMS` under the same
+  load-time gate as the rest.
+- **A tuple cursor needs the key as its last term.** The key is unique, so today's cursor can neither
+  skip nor repeat a row. An index tuple is not unique, and without the tiebreak pagination silently
+  drops rows at a page boundary where two rows share an index value.
+- **One direction for the whole tuple, because a row-value comparison has one.**
+  `(a, b, key) > (?, ?, ?)` is the shape the index serves, and mixed per-column directions are not
+  expressible in it. An index is read as declared or reversed as a whole.
+- **An index containing an optional column cannot back an ordering.** A row-value comparison against
+  NULL yields NULL, so the row is excluded and pagination loses it at a page boundary. The index
+  stays filterable and simply cannot sort. It is a request-time refusal rather than a load-time one,
+  because it depends on which index was asked for.
+- **A cursor carries which ordering it was taken over, and a mismatch is a 400.** Today a cursor is a
+  bare key and carrying one across queries is nearly harmless. A tuple cursor read under a different
+  ordering is a correctness hazard, so it refuses rather than paginating wrongly.
+- **An index over a subject-encrypted column still cannot back an ordering**, and nothing relaxes to
+  allow it. `EntityDef::validate` already refuses such an index, which is what keeps every ordering
+  column plaintext and keeps the cursor computable before decryption.
+- **`ORDER BY` and the filter agree on one index by construction**, because the index is chosen in
+  Rust and pinned. Letting the planner choose would reintroduce in memory the sort this API exists to
+  refuse.
+
+Honest scope:
+
+- **Appending the key to a generated index needs a reconcile, not a rebuild.** A projector's
+  definition hash is heklang's digest and does not cover hekla's DDL choices, so
+  `CREATE INDEX IF NOT EXISTS` is a no-op against an existing model and the old shape would survive
+  forever. The reconcile compares against `sqlite_master` and recreates on mismatch, which is cheap,
+  and it removes the sorter from the existing single-column filter case as well.
+- **Nothing is asked of heklang, by either this phase or Phase 37.** `EntityDef.indexes` already
+  carries every column in declared order and the digest already hashes them, so there is no language
+  change and no version bump for the pair.
+
+## Phase 39: a subject can be deleted with its tenant (planned, decision first)
+
+`shop/redact` is one erase of `shop_id` plus one erase per `customer_ref` that shop ever produced.
+`erase` is journaled per call by design, so the row count is not something heklang can batch away: a
+50,000-customer shop writes 50,000 journal rows in one invocation, and the application has to carry a
+projector whose only purpose is to enumerate subjects for deletion. That is the mandatory-compliance
+path, with a legal deadline on it.
+
+Letting a subject declare a parent is what removes it. `customer_ref` keys are wrapped under
+`shop_id`'s key, so deleting the `shop_id` row makes every customer key beneath it unwrappable in one
+delete. It is ordinary key-hierarchy cryptography, and "delete this tenant" is the shape of the
+multi-tenant deployments hekla is most likely to land in.
+
+**This is a decision before it is a task, and the sequence is hekla commits, then heklang declares,
+then hekla implements.** A declaration the runtime does not act on is worse than no declaration,
+because it reads as a guarantee.
+
+heklang's share is small and is only the declaration: somewhere to say a subject has a parent, and
+the one check hekla cannot make, which is that every event carrying a `@subject(child)` field also
+carries the parent id field, non-optional and of the right type. Without it hekla meets an event it
+cannot file a key under, at write time, in production. Everything else is hekla's, and it is the bulk
+of the work: parent columns on `subject_key`, a recursive unwrap, presence checks that walk the
+chain, a rotation that walks roots, and a sweeper.
+
+Decisions worth keeping:
+
+- **The write path already has what it needs.** `lower` builds an `ids` map of every scalar field's
+  plaintext before sealing anything, so the parent id is in hand at the one moment a child key is
+  minted. Everywhere else the parent pointer lives on the child's own `subject_key` row, so
+  `load_secret` walks it without a caller knowing. The parent is a creation-time fact and nothing
+  else, which is what keeps the projector write path unchanged.
+- **An unwrappable child row reads as absent, and is replaced.** A child row survives its parent's
+  deletion, so a re-created parent mints a fresh secret and leaves the old child row unwrappable.
+  `get_or_create_secret` would find that row and hard-fail on `unwrap_key` rather than minting a new
+  key. Such a row has to read as absent and be replaced, which is safe because its ciphertext is
+  already unrecoverable. This is designed in rather than discovered.
+- **`erase_subject` needs no master key today, deliberately, and that survives.** Deleting a parent
+  stays a plain row delete, and reachability is structural rather than cryptographic: `erased` and
+  `key_present` walk parent pointers checking row existence, with no master involved. So the
+  `hekla erase` CLI keeps working without one.
+- **`rotate()` becomes a walk rather than a scan.** Only root rows are wrapped under a master, so a
+  rotation touches fewer rows, and child rows are reachable only by unwrapping their parent first.
+- **`hekla erase` grows the summary and the prompt `rewind` has.** Its no-prompt rationale is written
+  down as "an erase carries its blast radius in its own arguments, because you named the subject". A
+  cascading erase makes that false, and the asymmetry that justified the inconsistency goes with it.
+
+Honest scope:
+
+- **O(1) deletes and O(1) journal rows, not O(1) storage.** The child rows are still there and still
+  need a sweeper, which fits the hourly retention sweep. Worth being precise about, because the
+  50,000-row figure is the number this feature is justified against.
+- **Orphans accumulate until swept.** Shredding a parent leaves unreadable child rows behind. Not a
+  correctness problem, a growth one.
+- **`key_present` and `erased` get more expensive**, because both become a chain walk, and heklang's
+  `Keys::decrypt` returning `None` for an erased subject has to keep meaning exactly what it means
+  now.
+- **Rule 9's erase-then-reveal analysis in heklang is subject-blind**, so the wider blast radius
+  costs nothing there.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is
@@ -2255,6 +2566,12 @@ warranted.
   actually hurt.
 - **Vendoring Scalar for `/docs`**: when hekla has to run somewhere with no outbound network. The
   page loads the reference UI from a CDN today; `/openapi.json` itself needs nothing.
+- **A timer that wakes a command**: when something a deployment cannot solve outside the runtime
+  needs one. A window cap elapsing runs no handler today, and the shape proposed for it is an
+  effect-arm verb (`schedule Cmd { .. } at <timestamp>`), so it is heklang's decision before it is
+  hekla's and nothing here is designed around it in the meantime. What makes it deferrable rather
+  than missing is that a caller with a clock can invoke the command itself, and hekla's guarantees
+  (idempotency by tag, at-least-once effects) already cover one that fires twice.
 
 ### Carried-forward gaps from earlier phases
 
@@ -2268,8 +2585,9 @@ forward. Collected here so they are not lost in the prose of the phase that intr
   it is total and typechecked against the deployed declarations; it folds the *log* rather than the
   derived read models, so it can ask things no read model materialised; and it needs none of the
   private table layout, which stays behind the generated read API as section 10 says it must.
-- **Multi-field (composite-prefix) scan filters** (Phase 3): a scan supports a single indexed filter
-  field only.
+- **Multi-field (composite-prefix) scan filters** (Phase 3): **scheduled.** A scan supports a single
+  indexed filter field only. Phase 37 widens it to any prefix of a declared index plus a range on the
+  column after it, and Phase 38 adds an ordering over one.
 - **Automatic dead-lettering** (Phase 4): the manual `POST /effects/{name}/skip/{position}` is the only
   escape hatch; a wedged effect is never advanced automatically.
 - **`hekla fmt` and `hekla lsp`** (Phase 21): both were Starlark tooling wrapped in hekla's project

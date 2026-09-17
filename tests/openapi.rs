@@ -11,7 +11,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use serde_json::Value;
@@ -20,7 +22,7 @@ use tower::ServiceExt;
 mod support;
 
 use hekla::server::routes;
-use support::{boot_example, example_dir, load_ok};
+use support::{ALICE, Boot, boot_example, example_dir, load_ok, register_user};
 
 /// The document a booted runtime holds, parsed once for the whole binary.
 ///
@@ -335,45 +337,107 @@ fn generating_the_document_touches_no_data_directory() {
 /// promised a key the server had stopped sending and the admin console crashed reading
 /// it.
 #[tokio::test]
-async fn the_status_body_matches_the_schema_that_describes_it() {
-    let harness = boot_example();
-    let response = harness
-        .app()
+async fn a_described_body_carries_exactly_the_keys_its_schema_declares() {
+    // A 503 is retryable, so the runtime absorbs it before the arm sees it and the
+    // invocation wedges. That is what puts entries in `stuck_lanes`: a body where the
+    // array is empty would leave the item schema, and its `additionalProperties: false`,
+    // describing nothing this test ever looks at.
+    let harness = Boot::example().http_status(503).start();
+    register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
+    let app = harness.app();
+    let effect = wait_for_a_wedged_lane(&app).await;
+    let status = fetch(&app, "/status").await;
+    // The listing and the single effect are two shapes now, and the listing's is derived
+    // from the other by removing one key. A reader of either has to be able to trust it.
+    let listing = fetch(&app, "/admin/effects").await;
+    harness.shutdown();
+
+    matches_schema(&status, "Status", "/status");
+    matches_schema(&effect, "EffectDetail", "/admin/effects/SendWelcome");
+    for entry in listing["effects"].as_array().expect("effects is an array") {
+        matches_schema(entry, "EffectSummary", "/admin/effects[]");
+    }
+}
+
+/// Poll `/admin/effects/SendWelcome` until a lane is wedged, and answer with that body.
+async fn wait_for_a_wedged_lane(app: &Router) -> Value {
+    let started = Instant::now();
+    loop {
+        let body = fetch(app, "/admin/effects/SendWelcome").await;
+        if !body["stuck_lanes"].as_array().is_none_or(Vec::is_empty) {
+            return body;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the effect never wedged, so the item schema would go unchecked: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn fetch(app: &Router, uri: &str) -> Value {
+    let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/status")
+                .uri(uri)
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    harness.shutdown();
+    serde_json::from_slice(&bytes).unwrap()
+}
 
-    let schema = &served_document()["components"]["schemas"]["Status"];
-    let declared: Vec<&str> = schema["properties"]
-        .as_object()
-        .expect("Status declares properties")
-        .keys()
-        .map(String::as_str)
-        .collect();
+/// Both halves of what a named schema promises about a body: every `required` key is
+/// there, and `additionalProperties: false` means no key is there that the schema does
+/// not describe.
+fn matches_schema(body: &Value, schema_name: &str, what: &str) {
+    let schema = &served_document()["components"]["schemas"][schema_name];
+    assert!(
+        schema.is_object(),
+        "{schema_name} is not in the served document"
+    );
+    check(body, schema, &format!("{what} ({schema_name})"));
+}
+
+/// The same two promises, against a schema rather than a name, and through arrays as
+/// well as objects.
+///
+/// Descending is the whole point: `stuck_lanes` declares an item shape with its own
+/// `required` list and its own `additionalProperties: false`, and a check that stopped
+/// at the top level would pass while the server sent items the document forbids.
+fn check(body: &Value, schema: &Value, at: &str) {
+    if let Some(items) = schema.get("items") {
+        let elements = body
+            .as_array()
+            .unwrap_or_else(|| panic!("{at} is an array"));
+        for (index, element) in elements.iter().enumerate() {
+            check(element, items, &format!("{at}[{index}]"));
+        }
+        return;
+    }
+    let Some(properties) = schema["properties"].as_object() else {
+        return; // a leaf, whose type this test does not police
+    };
+    let declared: Vec<&str> = properties.keys().map(String::as_str).collect();
     let returned: Vec<&str> = body
         .as_object()
-        .expect("the status body is an object")
+        .unwrap_or_else(|| panic!("{at} is an object"))
         .keys()
         .map(String::as_str)
         .collect();
 
-    for name in schema["required"].as_array().unwrap() {
+    for name in schema["required"].as_array().into_iter().flatten() {
         let name = name.as_str().unwrap();
         assert!(
             returned.contains(&name),
-            "the schema requires `{name}` and the body does not carry it: {returned:?}"
+            "{at} requires `{name}` and the body does not carry it: {returned:?}"
         );
     }
     // `additionalProperties: false` is the other half of the promise, so a key the
@@ -381,7 +445,15 @@ async fn the_status_body_matches_the_schema_that_describes_it() {
     for name in &returned {
         assert!(
             declared.contains(name),
-            "the body carries `{name}` and the schema does not describe it: {declared:?}"
+            "{at} carries `{name}` and the schema does not describe it: {declared:?}"
         );
+    }
+    // And on down, so a nested array's item shape is held to the same two promises.
+    for (name, sub) in properties {
+        if let Some(value) = body.get(name)
+            && !value.is_null()
+        {
+            check(value, sub, &format!("{at}.{name}"));
+        }
     }
 }

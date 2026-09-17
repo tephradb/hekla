@@ -319,8 +319,34 @@ impl<'a> Renderer<'a> {
     }
 }
 
+/// One effect as the listing reports it: everything the operational database knows about
+/// it on top of what `/status` already reports, and no per-lane detail.
+///
+/// [`effect_detail`] is this plus `stuck_lanes`, and the split is only about size. The
+/// console polls the listing every few seconds for every effect at once, and a wedged
+/// lane carries a heklang error message; during the outage where every effect is wedged
+/// (the one time a person is watching) that array is the whole body, repeated per effect,
+/// on a poll. It is a page of one effect's detail, so it is served where a page belongs:
+/// behind the route that names one effect.
+///
+/// Derived by removing the key rather than by building a second object, so the two cannot
+/// drift into disagreeing about the fields they share. `EffectSummary` in the generated
+/// document is derived from `EffectDetail` the same way, for the same reason.
+pub fn effect_summary(shared: &EffectShared, head: u64, state: Option<&EffectState>) -> Value {
+    let mut summary = effect_detail(shared, head, state);
+    if let Some(object) = summary.as_object_mut() {
+        object.remove(STUCK_LANES);
+    }
+    summary
+}
+
+/// The one key [`effect_detail`] carries and [`effect_summary`] does not. Named because
+/// three places have to agree on it: the two functions here and the schema pair that
+/// describes them.
+pub const STUCK_LANES: &str = "stuck_lanes";
+
 /// One effect, with everything the operational database knows about it on top of what
-/// `/status` already reports.
+/// `/status` already reports, and every wedged lane.
 pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectState>) -> Value {
     let position = shared.position();
     let watermark = state.and_then(|state| state.watermark);
@@ -328,6 +354,10 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
     // Read once: the key and the position are a pair, and two loads could straddle a
     // republish and report one lane's key beside another's position.
     let pinning = shared.pinning();
+    // One read for the page and the count both. Two would let the count come from before
+    // a lane cleared and the page from after it, which a reader comparing them (the only
+    // way to see that the page was capped) reads as a truncation that never happened.
+    let stuck = shared.stuck_lanes();
     json!({
         "name": shared.name,
         // One word for what the counters below add up to, derived in the runtime so
@@ -347,7 +377,7 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
         "watermark": watermark,
         "consecutive_failures": shared.consecutive_failures(),
         "last_error": shared.last_error(),
-        "wedged_lanes": shared.wedged_lanes(),
+        "wedged_lanes": stuck.total,
         // Rule 15: the position `on live` arms decline at or below, resolved once at
         // this effect's first activation against this data directory and kept since.
         "live_boundary": shared.live_boundary(),
@@ -362,6 +392,20 @@ pub fn effect_detail(shared: &EffectShared, head: u64, state: Option<&EffectStat
         // describes and the one an operator skips.
         "pinning_key": pinning.as_ref().map(|(lane, _)| lane),
         "pinning_position": pinning.as_ref().map(|(_, at)| at),
+        // Every stuck lane, worst first, which `pinning_key` alone cannot say. A wedge
+        // appends nothing, so an application listing failures out of the log sees every
+        // `fail` and not one wedge; this is where it reads them instead. Capped, with
+        // `wedged_lanes` above as the untruncated count.
+        STUCK_LANES: stuck.listed.iter().map(|lane| json!({
+            "lane": lane.lane,
+            "position": lane.position,
+            "attempt": lane.attempt,
+            "error": lane.error,
+            // Milliseconds from now rather than an instant, for the reason `retry_in_ms`
+            // above is one. Zero is a retry that is due or running, where the null up
+            // there means no lane is stuck at all.
+            "retry_in_ms": lane.retry_in_ms,
+        })).collect::<Vec<_>>(),
         // Process-local and reset by a restart. The durable trace of a skipped
         // position is a terminal invocation row, indistinguishable from a completed one.
         "terminal_skips": shared.terminal_skips(),

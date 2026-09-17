@@ -1166,7 +1166,7 @@ async fn admin_effects(State(runtime): State<Shared>) -> Response {
         let effects: Vec<Value> = runtime
             .effect_handles()
             .into_iter()
-            .map(|shared| introspect::effect_detail(shared, head, states.get(&shared.name)))
+            .map(|shared| introspect::effect_summary(shared, head, states.get(&shared.name)))
             .collect();
         Ok(json!({ "effects": effects, "log_head": head }))
     })

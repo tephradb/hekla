@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
+use crate::effect::MAX_STUCK_LISTED;
 use crate::introspect;
 use crate::loader::LoadedProject;
 use crate::projection;
@@ -292,7 +293,7 @@ impl ComponentNames {
 }
 
 /// The schemas that are always present, whatever the project declares.
-const FIXED_SCHEMAS: [&str; 28] = [
+const FIXED_SCHEMAS: [&str; 29] = [
     "ErrorDetail",
     "Error",
     "CommandError",
@@ -305,6 +306,7 @@ const FIXED_SCHEMAS: [&str; 28] = [
     "LogEvent",
     "SubjectState",
     "EffectDetail",
+    "EffectSummary",
     "EffectInvocation",
     "EffectInvocationDetail",
     "TraceInvocation",
@@ -1429,7 +1431,7 @@ fn effects_path() -> Value {
     let body = json!({
         "type": "object",
         "properties": {
-            "effects": { "type": "array", "items": schema_ref("EffectDetail") },
+            "effects": { "type": "array", "items": schema_ref("EffectSummary") },
             "log_head": position_schema("The log's head position."),
         },
         "required": ["effects", "log_head"],
@@ -1863,6 +1865,7 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("LogEvent".to_owned(), log_event_schema());
     out.insert("SubjectState".to_owned(), subject_state_schema());
     out.insert("EffectDetail".to_owned(), effect_detail_schema());
+    out.insert("EffectSummary".to_owned(), effect_summary_schema());
     out.insert("EffectInvocation".to_owned(), effect_invocation_schema());
     out.insert(
         "EffectInvocationDetail".to_owned(),
@@ -2856,6 +2859,7 @@ fn effect_detail_schema() -> Value {
                 "description": "Where that lane is stuck: the position an operator skip \
                     names. Null when no lane is failing.",
             },
+            "stuck_lanes": stuck_lanes_schema(),
             "live_boundary": {
                 "type": "integer",
                 "minimum": 0,
@@ -2911,11 +2915,100 @@ fn effect_detail_schema() -> Value {
         "required": [
             "name", "state", "position", "lag", "retry_in_ms", "sources", "watermark",
             "consecutive_failures", "last_error", "wedged_lanes", "pinning_key",
-            "pinning_position", "live_boundary", "live_suppressed", "latest_collapsed",
-            "terminal_skips", "last_terminal_error",
+            "pinning_position", "stuck_lanes", "live_boundary", "live_suppressed",
+            "latest_collapsed", "terminal_skips", "last_terminal_error",
             "quarantined", "quarantine"
         ],
         "additionalProperties": false,
+    })
+}
+
+/// The listing's shape: [`effect_detail_schema`] without the one key a listing does not
+/// carry.
+///
+/// Derived by removing it rather than written out, so the twenty fields the two share
+/// cannot drift into disagreeing. `introspect::effect_summary` builds the body the same
+/// way, off the same constant.
+fn effect_summary_schema() -> Value {
+    let mut schema = effect_detail_schema();
+    // Not an `if let`: a rename that misses one of these would silently leave the key in
+    // the listing's schema, and the pair of removals is the whole of what this function
+    // does. `expect` here is a broken invariant in this file, not a runtime input.
+    let object = schema
+        .as_object_mut()
+        .expect("the detail schema is an object");
+    object["properties"]
+        .as_object_mut()
+        .expect("properties is an object")
+        .remove(introspect::STUCK_LANES)
+        .expect("the detail schema declares the key this removes");
+    let required = object["required"]
+        .as_array_mut()
+        .expect("required is an array");
+    let before = required.len();
+    required.retain(|name| name != introspect::STUCK_LANES);
+    assert_eq!(
+        required.len() + 1,
+        before,
+        "the detail schema requires the key this removes"
+    );
+    schema
+}
+
+/// Every lane that is wedged, which is what `pinning_key` beside it cannot say.
+///
+/// Rule 4 makes a `fail` append an event and leaves a wedge appending nothing, so a
+/// caller building a failure list out of the log sees every terminal failure and not one
+/// wedge. This is where it reads them instead, and the lane key is what it joins back to
+/// whatever the key names.
+fn stuck_lanes_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": MAX_STUCK_LISTED,
+        "description": "Every wedged lane, ordered worst first. Empty when nothing is \
+            stuck. Capped at this many, so a `wedged_lanes` larger than this array is \
+            the rest being left out rather than a lane clearing: the two are read under \
+            one lock. The first element is the lane `pinning_key` names whenever that is \
+            non-null; it can be null beside a populated array, which is a driver-level \
+            failure outranking every lane, since that one belongs to no partition key.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "lane": {
+                    "type": "string",
+                    "description": "The arm's `@key` values, encoded. Opaque, and compared \
+                        rather than parsed: the encoding keeps a key's type so two keys \
+                        that spell alike stay distinct, and an over-long one is replaced \
+                        by its hash.",
+                },
+                "position": position_schema(
+                    "The position this lane is stuck on, which is the one a skip names.",
+                ),
+                "attempt": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "How many times in a row this lane has failed here. \
+                        Never zero: a lane is listed because an attempt failed, and the \
+                        first failure is attempt one.",
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Why the last attempt failed.",
+                },
+                "retry_in_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "format": "int64",
+                    "description": "Milliseconds until the next attempt, so a client can \
+                        count down without its clock agreeing with the server's. Zero is \
+                        an attempt that is due or running. Never null, unlike the \
+                        effect-wide `retry_in_ms`: an entry exists here only because a \
+                        lane is waiting.",
+                },
+            },
+            "required": ["lane", "position", "attempt", "error", "retry_in_ms"],
+            "additionalProperties": false,
+        },
     })
 }
 

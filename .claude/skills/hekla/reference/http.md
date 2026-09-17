@@ -147,8 +147,10 @@ The operational snapshot. Not a liveness probe: it opens the log head and every 
 ```
 
 An effect's `position` is its **durable low-water mark**, the highest position every lane has passed,
-not the invocation it is working on. `pinning_key` names the lane holding it down. See
-`operations.md` for what each state and counter means.
+not the invocation it is working on. `pinning_key` names the lane holding it down, and
+`wedged_lanes` counts the rest without naming them: this is the summary, and
+`GET /admin/effects/{name}` carries a `stuck_lanes` entry per lane. See `operations.md` for what each
+state and counter means.
 
 **There is no rewind endpoint, and that is deliberate.** Taking an effect back over history is
 `hekla rewind`, CLI only, against a stopped process: an effect declaring `on live` is one whose author

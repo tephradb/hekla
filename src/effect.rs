@@ -104,6 +104,56 @@ struct StuckLane {
     retry_at_ms: u64,
 }
 
+/// The most lanes [`EffectShared::stuck_lanes`] lists at once.
+///
+/// Not what keeps the response finite: `MAX_INFLIGHT` already bounds how many positions
+/// one effect holds, and therefore how many lanes can be stuck at once. This keeps the
+/// bound a decision taken for the reader rather than a consequence of a constant chosen
+/// for the dispatcher, and keeps the list one a person can read. `wedged_lanes` carries
+/// the untruncated count beside it, so truncation is never silent.
+pub const MAX_STUCK_LISTED: usize = 100;
+
+/// One wedged lane, as a reader outside this module sees it.
+///
+/// A separate type from `StuckLane` for one reason, and it is the deadline. That one is
+/// milliseconds since this process started: monotonic, so a clock step cannot move it,
+/// and meaningless to anything that did not start with it. What leaves here is the
+/// remaining duration instead, for exactly the reason written on `retry_at_ms`.
+#[derive(Debug, Clone)]
+pub struct StuckLaneView {
+    /// The partition key, as [`crate::lane::encode`] wrote it.
+    pub lane: String,
+    /// The position this lane is stuck on, which is the one an operator skip names.
+    pub position: u64,
+    /// How many times in a row this lane has failed on that position. Never zero: a lane
+    /// is listed because an attempt failed, and the first failure is attempt one.
+    pub attempt: u32,
+    /// Why the last attempt failed.
+    pub error: String,
+    /// How long until the next attempt, and zero for one that is due or running.
+    ///
+    /// Not an `Option`, where [`EffectShared::retry_in_ms`] is one. That answers for the
+    /// whole effect, where "nothing is waiting" is a state it has to be able to report.
+    /// A row here exists because a lane is wedged, and `record_stuck` never publishes a
+    /// deadline of zero, so there is no such state left to report.
+    pub retry_in_ms: u64,
+}
+
+/// A page of wedged lanes, and how many there are in total.
+///
+/// The two travel together because a reader compares them: the page is capped, so a
+/// `total` above `listed.len()` is the only way to learn that lanes were left out. Taken
+/// under one lock for the same reason, since two reads could report a count from before
+/// a lane cleared beside a page from after it, which reads as a truncation that never
+/// happened.
+#[derive(Debug, Clone)]
+pub struct StuckLanes {
+    /// At most `MAX_STUCK_LISTED` lanes, worst first.
+    pub listed: Vec<StuckLaneView>,
+    /// Every wedged lane, counted before the cap was applied.
+    pub total: u64,
+}
+
 /// The lane a driver-level failure is recorded under.
 ///
 /// A store or op-DB error belongs to no lane, but it has to reach the same `/status`
@@ -329,6 +379,55 @@ impl EffectShared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Every wedged lane, worst first, and how many there are.
+    ///
+    /// [`EffectShared::pinning`] answers "which one do I clear first", and names the lane
+    /// `last_error` and `consecutive_failures` describe. This answers "what is stuck",
+    /// which is a different question and the one a failure list asks. Rule 4 makes a
+    /// `fail` append an event and leaves a wedge appending nothing, so an application
+    /// building that list out of the log sees every terminal failure and not one wedge;
+    /// this is the only place a wedge can be seen at all.
+    ///
+    /// Ordered by position ascending, which is the order `republish` picks the pinning
+    /// lane by, so the head is the lane `pinning()` names **whenever it names one**. It
+    /// does not always: a driver failure sits at position 0 and outranks every lane, and
+    /// `republish` reports it through `last_error` while leaving `pinning` empty, because
+    /// `!driver` is not a key. So a null `pinning_key` beside a populated list is the
+    /// driver being the worst failure, not a disagreement. The driver is filtered out
+    /// here for that same reason, and never counted in `total`.
+    ///
+    /// The page is capped at `MAX_STUCK_LISTED` and `total` is taken before the cap, both
+    /// under one lock, so a reader can tell truncation from a lane clearing underneath it.
+    pub fn stuck_lanes(&self) -> StuckLanes {
+        // Read once, outside the lock, so every row in one response counts down from the
+        // same instant. Taking it per row would measure the last lane's deadline against
+        // a later "now" than the first's, for no reason a reader could see.
+        let now = self.elapsed_ms();
+        let driver = driver_lane();
+        let stuck = self.stuck.lock().unwrap_or_else(PoisonError::into_inner);
+        // Sorted and cut as references first, so the strings are cloned for the lanes
+        // that survive rather than for all of them. The map holds up to `MAX_INFLIGHT`
+        // entries and this runs on a poll, behind the mutex every dispatch attempt takes.
+        let mut worst: Vec<(&LaneId, &StuckLane)> =
+            stuck.iter().filter(|(lane, _)| *lane != driver).collect();
+        let total = worst.len() as u64;
+        // A position is admitted to exactly one lane, so this is a total order and the
+        // unstable sort has no tie to resolve arbitrarily.
+        worst.sort_unstable_by_key(|(_, stuck)| stuck.position);
+        worst.truncate(MAX_STUCK_LISTED);
+        let listed = worst
+            .into_iter()
+            .map(|(lane, stuck)| StuckLaneView {
+                lane: lane.as_str().to_owned(),
+                position: stuck.position,
+                attempt: stuck.attempt,
+                error: stuck.error.clone(),
+                retry_in_ms: stuck.retry_at_ms.saturating_sub(now),
+            })
+            .collect();
+        StuckLanes { listed, total }
     }
 
     pub fn terminal_skips(&self) -> u64 {
@@ -2780,6 +2879,114 @@ mod tests {
             Some("driver: reading events")
         );
         assert_eq!(shared.pinning(), None, "and it is not a partition key");
+        assert_eq!(
+            shared
+                .stuck_lanes()
+                .listed
+                .iter()
+                .map(|lane| lane.lane.as_str())
+                .collect::<Vec<_>>(),
+            ["i:1"],
+            "and it is not listed as one either"
+        );
+    }
+
+    /// The list and the single pinning slot answer two different questions, and the one
+    /// thing they may never do is disagree about which lane is worst. `pinning()` takes
+    /// the lowest position and so does this, so the head of the list is that same lane.
+    #[test]
+    fn every_wedged_lane_is_listed_worst_first() {
+        let shared = test_shared();
+        for (lane, position) in [("i:3", 900), ("i:1", 500), ("i:2", 700)] {
+            shared.record_lane_failure(
+                &LaneId::from(lane),
+                position,
+                &format!("boom at {position}"),
+                Duration::from_millis(200),
+            );
+        }
+
+        let listed = shared.stuck_lanes().listed;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|lane| (lane.lane.as_str(), lane.position))
+                .collect::<Vec<_>>(),
+            [("i:1", 500), ("i:2", 700), ("i:3", 900)],
+        );
+        assert_eq!(
+            shared.pinning(),
+            Some((listed[0].lane.clone(), listed[0].position)),
+            "the head of the list is the lane `last_error` describes"
+        );
+        assert_eq!(shared.wedged_lanes() as usize, listed.len());
+    }
+
+    /// Each entry carries what a skip needs and what a countdown needs: the attempt count
+    /// the lane is on, its own error rather than the pinning lane's, and a duration
+    /// measured from now rather than an instant on this process's clock.
+    #[test]
+    fn a_listed_lane_carries_its_own_attempt_error_and_countdown() {
+        let shared = test_shared();
+        let lane = LaneId::from("i:9");
+        shared.record_lane_failure(&lane, 42, "first", Duration::from_secs(30));
+        shared.record_lane_failure(&lane, 42, "second", Duration::from_secs(30));
+
+        let listed = shared.stuck_lanes().listed;
+        assert_eq!(listed.len(), 1, "one entry per lane, not per attempt");
+        assert_eq!(listed[0].attempt, 2);
+        assert_eq!(listed[0].error, "second");
+        assert_eq!(listed[0].position, 42);
+        // A remaining duration, so it is under the delay just asked for and not the
+        // monotonic offset the map stores, which would be that plus this process's age.
+        assert!(
+            listed[0].retry_in_ms > 0 && listed[0].retry_in_ms <= 30_000,
+            "expected a countdown, got {}",
+            listed[0].retry_in_ms
+        );
+    }
+
+    /// `wedged_lanes` is a count and this is a page of a list, so past the cap the two
+    /// stop agreeing. That is the only signal a reader has that it was truncated, which
+    /// is why the count is not quietly capped to match.
+    #[test]
+    fn the_list_is_capped_and_the_count_still_says_how_many() {
+        let shared = test_shared();
+        let over = MAX_STUCK_LISTED + 10;
+        for position in 0..over {
+            shared.record_lane_failure(
+                &LaneId::from(format!("i:{position}").as_str()),
+                position as u64,
+                "boom",
+                Duration::from_millis(200),
+            );
+        }
+
+        let stuck = shared.stuck_lanes();
+        assert_eq!(stuck.listed.len(), MAX_STUCK_LISTED);
+        // The count is taken before the cap and under the same lock, so it is what tells a
+        // reader the page was cut rather than the lanes having cleared.
+        assert_eq!(stuck.total as usize, over);
+        assert_eq!(shared.wedged_lanes() as usize, over);
+        assert_eq!(
+            stuck.listed.last().map(|lane| lane.position),
+            Some(MAX_STUCK_LISTED as u64 - 1),
+            "the cap keeps the worst lanes, which are the ones an operator clears first"
+        );
+    }
+
+    /// Nothing wedged is an empty list rather than an absent one: a caller rendering a
+    /// failure list has to be able to tell "nothing is stuck" from "this effect cannot
+    /// say", and the two are different answers.
+    #[test]
+    fn a_healthy_effect_lists_no_lanes() {
+        let shared = test_shared();
+        assert!(shared.stuck_lanes().listed.is_empty());
+        assert_eq!(shared.stuck_lanes().total, 0);
+        shared.record_lane_failure(&test_lane(), 4, "boom", Duration::from_millis(200));
+        assert_eq!(shared.stuck_lanes().listed.len(), 1);
+        shared.clear_lane(&test_lane());
+        assert!(shared.stuck_lanes().listed.is_empty());
     }
 
     /// The regression this guards spun a pool worker at full CPU. `run_lane` learned to

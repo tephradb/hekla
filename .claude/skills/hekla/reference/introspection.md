@@ -69,7 +69,13 @@ failing the request:
 ```json
 { "name": "SendWelcome", "state": "wedged", "position": 1, "watermark": 1, "lag": 3,
   "consecutive_failures": 8, "last_error": "effects/send-welcome.hk:11:20: ...",
-  "wedged_lanes": 1, "pinning_key": "i:4471", "pinning_position": 2,
+  "wedged_lanes": 2, "pinning_key": "i:4471", "pinning_position": 2,
+  "stuck_lanes": [
+    { "lane": "i:4471", "position": 2, "attempt": 8,
+      "error": "effects/send-welcome.hk:11:20: ...", "retry_in_ms": 39719 },
+    { "lane": "i:5120", "position": 9, "attempt": 3,
+      "error": "effects/send-welcome.hk:11:20: ...", "retry_in_ms": 1200 }
+  ],
   "live_boundary": 0, "live_suppressed": 0, "latest_collapsed": 0,
   "last_terminal_error": null, "terminal_skips": 0, "quarantined": false, "quarantine": null,
   "retry_in_ms": 39719, "sources": ["user.registered"] }
@@ -81,7 +87,19 @@ the highest position every lane has passed, not the newest thing finished.
 
 `pinning_key` is the partition key of the lane holding that mark down and `pinning_position` is where
 it is stuck: the position an operator skip takes. `wedged_lanes` says how many lanes are stuck at
-all, which `consecutive_failures` (the pinning lane's attempts) cannot. `live_boundary` is the log
+all, which `consecutive_failures` (the pinning lane's attempts) cannot.
+
+**`stuck_lanes` is every one of them**, worst first, each with the position a skip names, the attempt
+it is on, its own error and its own countdown. It is the only place a wedge can be read at all: a
+`fail` appends an event, so anything reading the log can list one, and a wedge appends nothing. Use it
+to clear a lane that is not the pinning one, which `pinning_position` alone cannot name. Two edges to
+know: it is capped, so a `wedged_lanes` larger than the array is the rest being left out (the two are
+read together, so a gap is never a lane that merely cleared), and `pinning_key` can be `null` beside a
+populated array, which is a driver-level failure outranking every lane, since that one belongs to no
+partition key. **`GET /admin/effects` does not carry it**, because a listing polled every few seconds
+across every effect would be mostly error text; ask for the one effect.
+
+`live_boundary` is the log
 head at this effect's first activation here, which `on live` arms decline at or below;
 `live_suppressed` counts what they have declined since this process started, and
 `latest_collapsed` counts the positions an `on latest` arm has folded into another invocation, so lag

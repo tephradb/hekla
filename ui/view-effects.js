@@ -253,6 +253,12 @@ function EffectDetail({ name, position }) {
           </div>
         </section>
 
+        <${StuckLanes}
+          lanes=${detail.stuck_lanes}
+          total=${detail.wedged_lanes}
+          onSkip=${setConfirming}
+        />
+
         <div class="split">
           <section class="card">
             <header>Invocations</header>
@@ -358,6 +364,95 @@ function EffectDetail({ name, position }) {
         `}
       `}
     <//>
+  `
+}
+
+/* Every lane that is stuck, which is the half of "my effect is wedged" the log cannot
+ * answer. A `fail` appends an event, so anything reading the log can list one; a wedge
+ * appends nothing, so without this panel a person sees lag in the thousands and one
+ * pinning key, and no way to learn that forty other shops are stuck behind their own
+ * failures rather than behind that one.
+ *
+ * Skipping is per row, because the header's button can only ever name the pinning
+ * position: clearing the second-worst lane used to mean clearing the worst first and
+ * waiting for the list to re-derive. */
+function StuckLanes({ lanes, total, onSkip }) {
+  if (!lanes || lanes.length === 0) return null
+  /* `total` is counted before the server caps the array, so a gap is lanes left out and
+   * not lanes that cleared: the two are read under one lock. Saying "5 retrying" over a
+   * page of 100 out of 500 is the one way this panel could mislead, since a list that
+   * looks complete is read as complete. */
+  const hidden = Math.max(0, (total ?? lanes.length) - lanes.length)
+
+  return html`
+    <section class="card">
+      <header>
+        Stuck lanes
+        <span class="note">
+          ${total ?? lanes.length} retrying; other lanes keep running
+        </span>
+        ${hidden > 0 &&
+        html`<span class="note" style=${{ color: 'var(--warn)' }}>
+          showing the ${lanes.length} worst; ${hidden} more not listed
+        </span>`}
+      </header>
+      <${DataTable}
+        label="Stuck lanes"
+        keyboard=${false}
+        columns=${[
+          {
+            key: 'lane',
+            header: 'Lane',
+            render: (row) => html`<code>${row.lane}</code>`,
+          },
+          {
+            key: 'position',
+            header: 'Pos',
+            align: 'right',
+            width: '80px',
+            render: (row) => html`<span class="mono">${row.position}</span>`,
+          },
+          {
+            key: 'attempt',
+            header: 'Tries',
+            align: 'right',
+            width: '70px',
+            render: (row) => html`<span class="mono">${row.attempt}</span>`,
+          },
+          {
+            /* The same component the effect list uses for the same field, rather than a
+             * `duration()` frozen until the next poll. Two tables in one view counting
+             * the same value down at different rates is the kind of thing a person
+             * notices and mistrusts. */
+            key: 'retry',
+            header: '',
+            width: '120px',
+            render: (row) => html`<${Countdown} ms=${row.retry_in_ms} />`,
+          },
+          {
+            key: 'error',
+            header: 'Error',
+            clip: true,
+            render: (row) => html`<span title=${row.error}>${row.error}</span>`,
+          },
+          {
+            key: 'skip',
+            header: '',
+            width: '70px',
+            render: (row) => html`
+              <button
+                type="button"
+                class="btn danger tiny"
+                onClick=${() => onSkip(row.position)}
+              >
+                Skip
+              </button>
+            `,
+          },
+        ]}
+        rows=${lanes}
+      />
+    </section>
   `
 }
 
