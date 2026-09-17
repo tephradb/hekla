@@ -392,7 +392,7 @@ projector Things {
     );
 }
 
-/// A read filter targets the key or an index-leading column, and the read API owns
+/// A read filter targets the key or a column of a declared index, and the read API owns
 /// `limit`, `cursor`, `after` and `timeout_ms` in the same query string. A filterable
 /// column named like one of those could never be filtered, so it is refused at load
 /// rather than left as a silent no-op at request time.
@@ -411,6 +411,39 @@ projector Things {
 
   on @thing.happened { thing_id, note } {
     put Thing { thing_id, cursor: note }
+  }
+}
+"#,
+        ),
+    ];
+    assert_error(&files, "reserved read query param");
+}
+
+/// The same gate, on a column that is not the index's *leading* one.
+///
+/// Worth its own test because this is where the gate widened: filtering used to reach
+/// only the leading column of each index, so a project spelling one of the reserved
+/// names further along an index loaded and simply could not be filtered there. It now
+/// fails to boot, which is a real break for such a project and the point of the gate:
+/// the alternative is a column that cannot be filtered and does not say so.
+#[test]
+fn a_reserved_name_further_along_an_index_is_an_error_too() {
+    let files = vec![
+        ("events/thing.hk", EVENTS),
+        (
+            "projectors/things.hk",
+            r#"
+projector Things {
+  entity Thing {
+    thing_id: Uuid @key,
+    bucket: String @max(200),
+    limit: String @max(200),
+
+    index (bucket, limit)
+  }
+
+  on @thing.happened { thing_id, note } {
+    put Thing { thing_id, bucket: note, limit: note }
   }
 }
 "#,

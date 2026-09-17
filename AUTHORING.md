@@ -322,8 +322,19 @@ Every `{Name}` below is a *declared* name, not a file stem: `command PlaceOrder`
   own is a typo far more often than it is spare data.
 - `GET /read/{Projector}/{Entity}/{key}` returns `{item, position}`, or 404.
 - `GET /read/{Projector}/{Entity}?<field>=<value>&limit=&cursor=` returns
-  `{items, next_cursor, position}`. Only the key and declared indexes are filterable; anything else
-  is a 400. Pagination is cursor-based, never offset.
+  `{items, next_cursor, position}`. A filter is equality across any **prefix** of one declared index,
+  optionally with a range on the column right after that prefix
+  (`?due_at.gte=&due_at.lt=`, plus `.gt` and `.lte`). So `index (shop_id, status, month)` answers
+  `shop_id`, `(shop_id, status)` and all three, and refuses `(status, month)`: reaching those rows
+  means visiting every shop, which is the table scan the read API exists to refuse. Anything it
+  cannot serve is a 400 naming what is declared. A range needs a column whose order means something,
+  so `Money` (stored as its decimal string), an enum (stored as its variant's spelling), `Bool` and
+  `Json` take equality only. Pagination is cursor-based, never offset.
+- **Declare the narrow index too if you filter on it alone.** A scan is ordered by the key, and the
+  key is appended to every generated index, so a filter using *all* of an index's columns is a pure
+  seek. A shorter prefix leaves a declared column between the filter and the key, and SQLite sorts
+  the match set on every page. `index (shop_id)` beside `index (shop_id, status)` is what makes both
+  questions cheap; the runtime picks the narrowest index that serves a given filter.
 - **Read-your-writes** is opt-in per read: pass `?after=<pos>` (the `positions.last` a command
   returned) and the read blocks until that projector reaches the position, then serves the normal
   snapshot. Bounded by `timeout_ms` (default 5s, capped at 30s); on timeout it fails closed with 503

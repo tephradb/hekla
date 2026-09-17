@@ -2,9 +2,10 @@
 //! projector to catch up, then read it back over HTTP through the in-process
 //! router. Exercises point reads, the indexed filter, the unindexed-filter 400,
 //! cursor-carrying responses, the projector position, and the replay route. Also
-//! covers limit clamping, bad cursors, the single-filter rule, filtered pagination,
-//! an integer-keyed entity, entities whose identifiers are SQL keywords, and what
-//! the read surface still serves once a projector has died.
+//! covers limit clamping, bad cursors, filtering on an index prefix and ranging over
+//! the column after it, filtered pagination, an integer-keyed entity, entities whose
+//! identifiers are SQL keywords, and what the read surface still serves once a
+//! projector has died.
 
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use tower::ServiceExt;
 mod support;
 
 use support::{
-    ALICE, BOB, MISSING, UUID_A, UUID_B, UUID_C, boot_example, boot_project, ctx, get,
+    ALICE, BOB, Harness, MISSING, UUID_A, UUID_B, UUID_C, boot_example, boot_project, ctx, get,
     register_user, send, wait_position_async, write_project,
 };
 
@@ -537,7 +538,7 @@ async fn scan_limit_is_clamped_and_validated() {
 }
 
 #[tokio::test]
-async fn a_bad_cursor_and_multiple_filters_are_rejected() {
+async fn a_bad_cursor_and_a_filter_spanning_two_indexes_are_rejected() {
     let harness = boot_example();
     register_user(&harness.rt, ALICE, "alice@example.com", "Alice");
     wait_position_async(&harness.rt, "Users", 1).await;
@@ -553,8 +554,10 @@ async fn a_bad_cursor_and_multiple_filters_are_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "invalid_input");
 
-    // Two filter fields: refused outright, never one arbitrary field applied and the
-    // other silently dropped (which would over-return rows and look like success).
+    // Two filter fields that are not a prefix of one index: refused outright, never one
+    // arbitrary field applied and the other silently dropped (which would over-return
+    // rows and look like success). `Users` declares `index (email)` and keys on
+    // `user_id`, so the pair is two separate access paths rather than one.
     let (status, body) = get(
         &app,
         &format!("/read/Users/User?email=alice@example.com&user_id={ALICE}"),
@@ -562,12 +565,10 @@ async fn a_bad_cursor_and_multiple_filters_are_rejected() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body["error"]["code"], "unindexed_filter");
+    let message = body["error"]["message"].as_str().unwrap();
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("single"),
-        "the message points at the single-filter rule: {body:?}"
+        message.contains("not a prefix of any declared index") && message.contains("index (email)"),
+        "the message names the rule and what is declared: {body:?}"
     );
 
     // A filter on the key column itself is allowed: it is filterable without an index.
@@ -609,13 +610,13 @@ fn catalog_project() -> TempDir {
     write_project(&[
         (
             "events/item.hk",
-            "event @item.added { id: Uuid, bucket: String @max(20) }\n",
+            "event @item.added { id: Uuid, bucket: String @max(20), shelf: String @max(20), rank: Int, price: Money(2) }\n",
         ),
         (
             "commands/add-item.hk",
             r#"
-command AddItem(id: Uuid, bucket: String) {
-  emit @item.added { id, bucket }
+command AddItem(id: Uuid, bucket: String, shelf: String, rank: Int, price: Money(2)) {
+  emit @item.added { id, bucket, shelf, rank, price }
 }
 "#,
         ),
@@ -626,15 +627,272 @@ projector Catalog {
   entity Item {
     id: Uuid @key,
     bucket: String @max(20) @index,
+    shelf: String @max(20),
+    rank: Int,
+    // Money is stored as its decimal string, so it takes equality and refuses a range.
+    // In no index at all, which also makes it the unfilterable column here.
+    price: Money(2),
+
+    // Three columns, so a filter can be a prefix of one, two or all three of them,
+    // and `rank` can carry a range under the two before it.
+    index (bucket, shelf, rank)
   }
 
-  on @item.added { id, bucket } {
-    put Item { id, bucket }
+  on @item.added { id, bucket, shelf, rank, price } {
+    put Item { id, bucket, shelf, rank, price }
   }
 }
 "#,
         ),
     ])
+}
+
+/// Add one row to a `catalog_project` harness, returning the log position it reached.
+fn add_item(harness: &Harness, id: &str, bucket: &str, shelf: &str, rank: i64) -> u64 {
+    let result = harness
+        .rt
+        .execute(
+            "AddItem",
+            json!({
+                "id": id,
+                "bucket": bucket,
+                "shelf": shelf,
+                "rank": rank,
+                "price": "1.00",
+            }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.status, 200, "AddItem failed: {:?}", result.body);
+    result.body["positions"]["last"].as_u64().unwrap()
+}
+
+/// The `id`s a scan of `uri` returns, which must be a single page.
+async fn scanned_ids(app: &Router, uri: &str) -> Vec<String> {
+    let (status, body) = get(app, uri).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert!(body["next_cursor"].is_null(), "expected one page: {body:?}");
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The `unindexed_filter`/`invalid_input` message a refused scan of `uri` carries.
+async fn refused(app: &Router, uri: &str, code: &str) -> String {
+    let (status, body) = get(app, uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body:?}");
+    assert_eq!(body["error"]["code"], code, "{uri}: {body:?}");
+    body["error"]["message"].as_str().unwrap().to_owned()
+}
+
+/// One row per id, spread so that every prefix of `index (bucket, shelf, rank)` picks
+/// out a different set and no two sets are accidentally equal.
+async fn seeded_catalog(harness: &Harness) {
+    let mut last = 0;
+    for (id, bucket, shelf, rank) in [
+        ("00000000-0000-0000-0000-000000000001", "a", "top", 1),
+        ("00000000-0000-0000-0000-000000000002", "a", "top", 5),
+        ("00000000-0000-0000-0000-000000000003", "a", "low", 5),
+        ("00000000-0000-0000-0000-000000000004", "b", "top", 5),
+        ("00000000-0000-0000-0000-000000000005", "a", "top", 9),
+    ] {
+        last = add_item(harness, id, bucket, shelf, rank);
+    }
+    wait_position_async(&harness.rt, "Catalog", last).await;
+}
+
+#[tokio::test]
+async fn a_scan_filters_on_any_prefix_of_a_declared_index() {
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    seeded_catalog(&harness).await;
+    let app = harness.app();
+
+    let one = scanned_ids(&app, "/read/Catalog/Item?bucket=a").await;
+    assert_eq!(one.len(), 4, "every bucket-a row: {one:?}");
+    let two = scanned_ids(&app, "/read/Catalog/Item?bucket=a&shelf=top").await;
+    assert_eq!(two.len(), 3, "{two:?}");
+    let three = scanned_ids(&app, "/read/Catalog/Item?bucket=a&shelf=top&rank=5").await;
+    assert_eq!(three, vec!["00000000-0000-0000-0000-000000000002"]);
+
+    // A query string carries no order, so the same three columns in any order are the
+    // same question. This is the assertion that would fail if the prefix match compared
+    // sequences rather than sets.
+    let shuffled = scanned_ids(&app, "/read/Catalog/Item?rank=5&bucket=a&shelf=top").await;
+    assert_eq!(shuffled, three);
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn a_scan_that_skips_an_index_column_is_refused_rather_than_scanned() {
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    seeded_catalog(&harness).await;
+    let app = harness.app();
+
+    // `shelf` is the index's second column. Reaching these rows means visiting every
+    // bucket, which is the table scan the read API exists to refuse. The `rank` pair
+    // skips a column in the middle, which is the same refusal for the same reason.
+    for uri in [
+        "/read/Catalog/Item?shelf=top",
+        "/read/Catalog/Item?bucket=a&rank=5",
+    ] {
+        let message = refused(&app, uri, "unindexed_filter").await;
+        assert!(
+            message.contains("not a prefix of any declared index")
+                && message.contains("index (bucket, shelf, rank)"),
+            "{uri}: the refusal names the rule and what is declared: {message}"
+        );
+    }
+
+    // A column in no index at all is the other shape of the same 400, and it is worth
+    // keeping separate: this one is answered before any index is consulted.
+    let message = refused(&app, "/read/Catalog/Item?price=1.00", "unindexed_filter").await;
+    assert!(message.contains("declare an index on it"), "{message}");
+
+    let message = refused(&app, "/read/Catalog/Item?nonesuch=1", "unindexed_filter").await;
+    assert!(
+        message.contains("is not a column of entity `Item`"),
+        "{message}"
+    );
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn a_scan_ranges_over_the_column_after_its_equality_prefix() {
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    seeded_catalog(&harness).await;
+    let app = harness.app();
+
+    let at_least = scanned_ids(&app, "/read/Catalog/Item?bucket=a&shelf=top&rank.gte=5").await;
+    assert_eq!(
+        at_least,
+        vec![
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000005",
+        ]
+    );
+    // Both ends at once, and the exclusive upper is what keeps rank 9 out: a bounded
+    // range is two clauses over one column rather than two range columns.
+    let between = scanned_ids(
+        &app,
+        "/read/Catalog/Item?bucket=a&shelf=top&rank.gt=1&rank.lt=9",
+    )
+    .await;
+    assert_eq!(between, vec!["00000000-0000-0000-0000-000000000002"]);
+
+    // The leading column of an index takes a range with no equality before it, because
+    // an empty prefix is still a prefix.
+    let leading = scanned_ids(&app, "/read/Catalog/Item?bucket.gte=b").await;
+    assert_eq!(leading, vec!["00000000-0000-0000-0000-000000000004"]);
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn a_range_is_refused_where_it_could_not_mean_what_it_says() {
+    let dir = catalog_project();
+    let harness = boot_project(dir.path());
+    seeded_catalog(&harness).await;
+    let app = harness.app();
+
+    // Money is stored as its decimal string, so `>=` would sort "2" above "10". The
+    // column filters for equality; it is the *range* that has no answer.
+    let message = refused(&app, "/read/Catalog/Item?price.gte=2", "unindexed_filter").await;
+    assert!(message.contains("declare an index on it"), "{message}");
+
+    // `rank` is an Int and ranges fine, but not two columns at once: an index orders
+    // one column after its equality prefix, and a second range would mean sorting.
+    let message = refused(
+        &app,
+        "/read/Catalog/Item?bucket.gte=a&rank.lte=5",
+        "unindexed_filter",
+    )
+    .await;
+    assert!(message.contains("ranges over one column"), "{message}");
+
+    // A misspelled operator names the four that exist rather than being read as a
+    // column called `rank.between`.
+    let message = refused(&app, "/read/Catalog/Item?rank.between=5", "invalid_input").await;
+    assert!(
+        message.contains("unknown filter operator `.between`") && message.contains(".gte"),
+        "{message}"
+    );
+
+    // A range bound still has to parse as its column's type, the same as an equality.
+    let message = refused(
+        &app,
+        "/read/Catalog/Item?bucket=a&shelf=top&rank.gte=abc",
+        "invalid_input",
+    )
+    .await;
+    assert!(message.contains("expected an integer"), "{message}");
+
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn a_money_column_ranges_only_where_an_index_would_have_admitted_it() {
+    // The refusal above is the *unindexed* one, because `price` is in no index, so it
+    // never reaches the comparability check. A column that is indexed and still cannot
+    // carry a range is the case that check exists for, and it needs its own entity.
+    let dir = write_project(&[
+        (
+            "events/priced.hk",
+            "event @priced { id: Uuid, amount: Money(2) }\n",
+        ),
+        (
+            "commands/price.hk",
+            "command Price(id: Uuid, amount: Money(2)) {\n  emit @priced { id, amount }\n}\n",
+        ),
+        (
+            "projectors/prices.hk",
+            r#"
+projector Prices {
+  entity Priced {
+    id: Uuid @key,
+    amount: Money(2) @index,
+  }
+
+  on @priced { id, amount } {
+    put Priced { id, amount }
+  }
+}
+"#,
+        ),
+    ]);
+    let harness = boot_project(dir.path());
+    let result = harness
+        .rt
+        .execute(
+            "Price",
+            json!({ "id": "00000000-0000-0000-0000-000000000001", "amount": "10.00" }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    let last = result.body["positions"]["last"].as_u64().unwrap();
+    wait_position_async(&harness.rt, "Prices", last).await;
+    let app = harness.app();
+
+    // Equality works: the column is indexed and the comparison is exact.
+    let matched = scanned_ids(&app, "/read/Prices/Priced?amount=10.00").await;
+    assert_eq!(matched.len(), 1, "{matched:?}");
+
+    let message = refused(&app, "/read/Prices/Priced?amount.gte=2", "invalid_input").await;
+    assert!(
+        message.contains("Money(2)") && message.contains("no order a range could use"),
+        "the refusal names the declared type and why: {message}"
+    );
+
+    harness.shutdown();
 }
 
 #[tokio::test]
@@ -658,17 +916,7 @@ async fn a_filtered_scan_paginates_without_dropping_or_repeating_rows() {
     ];
     let mut last = 0;
     for (id, bucket) in rows {
-        let result = harness
-            .rt
-            .execute(
-                "AddItem",
-                json!({ "id": id, "bucket": bucket }),
-                &ctx(),
-                None,
-            )
-            .unwrap();
-        assert_eq!(result.status, 200, "AddItem failed: {:?}", result.body);
-        last = result.body["positions"]["last"].as_u64().unwrap();
+        last = add_item(&harness, id, bucket, "top", 1);
     }
     wait_position_async(&harness.rt, "Catalog", last).await;
     let app = harness.app();

@@ -415,11 +415,164 @@ async fn read_one(
     }
 }
 
+/// A refused scan request: the code to report it under, and what to tell the author.
+struct FilterProblem {
+    code: &'static str,
+    message: String,
+}
+
+impl FilterProblem {
+    fn unindexed(message: String) -> FilterProblem {
+        FilterProblem {
+            code: "unindexed_filter",
+            message,
+        }
+    }
+
+    fn invalid(message: String) -> FilterProblem {
+        FilterProblem {
+            code: "invalid_input",
+            message,
+        }
+    }
+}
+
+/// Read the query string's leftover parameters as a filter, or say why they are not one.
+///
+/// A parameter whose name carries a `.` is a range bound (`?due_at.gte=`). Nothing
+/// declared can be spelled that way, because `is_sql_identifier` restricts a field name
+/// to ascii letters, digits and underscores, which is what lets the four range operators
+/// exist without reserving four more names that an entity could then not use for a
+/// column.
+///
+/// Whether the *combination* is servable is [`read_api::choose_index`]'s question, not
+/// this one. What is settled here is the shape: known columns, one bound per end, and
+/// one column carrying the range.
+fn parse_filter(
+    entity: &EntityDef,
+    raw: Vec<(String, String)>,
+) -> Result<read_api::Filter, FilterProblem> {
+    let mut filter = read_api::Filter::default();
+    for (name, value) in raw {
+        let (column, operator) = match name.split_once('.') {
+            Some((column, operator)) => (column.to_owned(), Some(operator.to_owned())),
+            None => (name, None),
+        };
+        if !read_api::is_filterable(entity, &column) {
+            let declared = entity.fields.iter().any(|(name, _)| *name == column);
+            return Err(FilterProblem::unindexed(if declared {
+                format!(
+                    "filter field `{column}` is not indexed; declare an index on it, or on it and \
+                     the columns it is asked with"
+                )
+            } else {
+                format!(
+                    "filter field `{column}` is not a column of entity `{}`",
+                    entity.name
+                )
+            }));
+        }
+        let Some(operator) = operator else {
+            if filter
+                .equals
+                .iter()
+                .any(|(existing, _)| *existing == column)
+            {
+                return Err(FilterProblem::invalid(format!(
+                    "filter `{column}` is given more than once"
+                )));
+            }
+            filter.equals.push((column, value));
+            continue;
+        };
+        let Some((_, lower, bound)) = read_api::RANGE_OPERATORS
+            .iter()
+            .find(|(name, _, _)| *name == operator)
+        else {
+            return Err(FilterProblem::invalid(format!(
+                "unknown filter operator `.{operator}`; the range operators are {}",
+                range_operator_list()
+            )));
+        };
+        if filter.range.is_none() {
+            filter.range = Some((column.clone(), read_api::Range::default()));
+        }
+        let (over, range) = filter.range.as_mut().expect("just set above");
+        // One range, because an index orders one column after its equality prefix. Two
+        // would mean sorting the second in memory, which is the work this API refuses.
+        if *over != column {
+            return Err(FilterProblem::unindexed(format!(
+                "a scan ranges over one column, and `{over}` and `{column}` are two; range over \
+                 whichever comes later in the index and filter the other for equality"
+            )));
+        }
+        let end = if *lower {
+            &mut range.lower
+        } else {
+            &mut range.upper
+        };
+        if end.is_some() {
+            return Err(FilterProblem::invalid(format!(
+                "filter `{column}` has two {} bounds",
+                if *lower { "lower" } else { "upper" }
+            )));
+        }
+        *end = Some((*bound, value));
+    }
+    // A column pinned to one value and bounded at the same time reads as a mistake, and
+    // `choose_index` would refuse it anyway (no index names a column twice) with a
+    // message about prefixes that would not explain what went wrong.
+    if let Some((over, _)) = &filter.range
+        && filter.equals.iter().any(|(column, _)| column == over)
+    {
+        return Err(FilterProblem::invalid(format!(
+            "filter `{over}` is given as both an equality and a range"
+        )));
+    }
+    Ok(filter)
+}
+
+/// `.gte`, `.gt`, `.lte` and `.lt`, for a message that has to list them.
+fn range_operator_list() -> String {
+    read_api::RANGE_OPERATORS
+        .iter()
+        .map(|(name, _, _)| format!(".{name}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Why nothing declared can serve this filter, and what to declare so it can.
+///
+/// It names the indexes the entity has, because the author's next move is either to
+/// filter on a prefix of one of them or to declare the one they meant, and neither is
+/// obvious from a refusal that only names what was asked.
+fn no_index_for(entity: &EntityDef, filter: &read_api::Filter) -> String {
+    let asked = filter.columns().join(", ");
+    let declared = entity
+        .indexes
+        .iter()
+        .map(|index| format!("index ({})", index.columns.join(", ")))
+        .collect::<Vec<_>>();
+    let declared = if declared.is_empty() {
+        format!(
+            "`{}` declares no index, so its key `{}` is the only column a filter can reach",
+            entity.name, entity.key
+        )
+    } else {
+        format!("`{}` declares {}", entity.name, declared.join(", "))
+    };
+    format!(
+        "filter on ({asked}) is not a prefix of any declared index: {declared}. A filter is \
+         equality on an index's leading columns, optionally with a range on the column after them."
+    )
+}
+
 /// `GET /read/{projector}/{entity}?<field>=<value>&limit=&cursor=`: an ordered,
-/// cursor-paginated scan. A filter on anything but the key or a declared index is
-/// a 400, never a table scan. An optional `?after=<pos>` first waits for the
-/// projector to reach that position (503 if it cannot within `timeout_ms`, default
-/// 5s), for read-your-writes.
+/// cursor-paginated scan. Equality across any prefix of a declared index, plus an
+/// optional range (`?<field>.gte=`, `.gt`, `.lte`, `.lt`) on the column after that
+/// prefix; anything else is a 400, never a table scan. An optional `?after=<pos>` first
+/// waits for the projector to reach that position (503 if it cannot within `timeout_ms`,
+/// default 5s), for read-your-writes.
 async fn read_scan(
     State(runtime): State<Shared>,
     Path((projector, entity)): Path<(String, String)>,
@@ -441,7 +594,7 @@ async fn read_scan(
         }
     };
 
-    let mut filters: Vec<(String, String)> = Vec::new();
+    let mut raw: Vec<(String, String)> = Vec::new();
     let mut limit = read_api::DEFAULT_LIMIT;
     let mut cursor: Option<String> = None;
     for (name, value) in params {
@@ -460,35 +613,27 @@ async fn read_scan(
             "cursor" => cursor = Some(value),
             // `after`/`timeout_ms` are consumed by parse_wait, so never a filter.
             _ if read_api::RESERVED_QUERY_PARAMS.contains(&name.as_str()) => {}
-            _ => filters.push((name, value)),
+            _ => raw.push((name, value)),
         }
     }
-    if filters.len() > 1 {
+    // Sorted, so the SQL a given request produces does not depend on `HashMap` order.
+    // The clause order is invisible to SQLite's planner but visible to anything that
+    // compares statements, and an unstable one would make the query-plan test flap.
+    raw.sort();
+    let filter = match parse_filter(&entity_def, raw) {
+        Ok(filter) => filter,
+        Err(problem) => return read_invalid(&projector, &entity, problem.code, &problem.message),
+    };
+    if read_api::choose_index(&entity_def, &filter).is_none() {
         return read_invalid(
             &projector,
             &entity,
             "unindexed_filter",
-            "only a single indexed filter field is supported",
+            &no_index_for(&entity_def, &filter),
         );
     }
-    let filter = filters.into_iter().next();
-    if let Some((field, value)) = &filter {
-        if !read_api::is_filterable(&entity_def, field) {
-            return read_invalid(
-                &projector,
-                &entity,
-                "unindexed_filter",
-                &format!("filter field `{field}` is not indexed; declare an index on it"),
-            );
-        }
-        if let Err(err) = read_api::check_filter(&entity_def, field, value) {
-            return read_invalid(
-                &projector,
-                &entity,
-                "invalid_input",
-                &format!("filter `{field}`: {err}"),
-            );
-        }
+    if let Err(err) = read_api::check_filter(&entity_def, &filter) {
+        return read_invalid(&projector, &entity, "invalid_input", &format!("{err:#}"));
     }
     let after_key = match &cursor {
         Some(raw) => match read_api::decode_cursor(raw) {
@@ -506,13 +651,10 @@ async fn read_scan(
     let db_path = shared.db_path.clone();
     let keystore = runtime.keystore().cloned();
     let task = tokio::task::spawn_blocking(move || {
-        let filter = filter
-            .as_ref()
-            .map(|(field, value)| (field.as_str(), value.as_str()));
         read_api::scan(
             &db_path,
             &entity_def,
-            filter,
+            &filter,
             after_key.as_deref(),
             limit,
             keystore.as_ref(),

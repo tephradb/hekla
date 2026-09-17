@@ -334,7 +334,8 @@ function Entity({ projector, entity, browsing, onBrowse }) {
           <strong>Read API</strong>
           <a href=${path} target="_blank" rel="noreferrer"><code>GET ${path}</code></a>
           <span class="faint">
-            filter on ${entity.filterable.join(', ') || 'nothing'}
+            filter on ${entity.filterable.join(', ') || 'nothing'}, as a prefix of one of
+            the indexes above
           </span>
         </div>
       </div>
@@ -412,8 +413,13 @@ function Rows({ projector, entity, field, value, cursor, openRow }) {
   /* Where we came from, so "newer" can walk back: the read API's cursor is forward
    * only, so the console keeps its own trail rather than pretending otherwise. */
   const [trail, setTrail] = useState([])
-  const filterable = new Set(entity.filterable)
-  const [draftField, setDraftField] = useState(field || entity.filterable[0] || entity.key)
+  /* The read API filters on any prefix of a declared index; this input carries one
+   * field, so the set it can reach is the columns filterable *alone*: the key, and each
+   * index's leading column. Derived from `indexes` rather than taken from `filterable`,
+   * which is the wider "may be named in a filter" set and would enable a column that
+   * 400s without the one before it. */
+  const alone = new Set([entity.key, ...entity.indexes.map((index) => index.columns[0])])
+  const [draftField, setDraftField] = useState(field || entity.key)
   const [draftValue, setDraftValue] = useState(value)
 
   const apply = () => {
@@ -497,12 +503,8 @@ function Rows({ projector, entity, field, value, cursor, openRow }) {
           >
             ${entity.fields.map(
               (column) => html`
-                <option
-                  key=${column.name}
-                  value=${column.name}
-                  disabled=${!filterable.has(column.name)}
-                >
-                  ${column.name}${filterable.has(column.name) ? '' : ' — not indexed'}
+                <option key=${column.name} value=${column.name} disabled=${!alone.has(column.name)}>
+                  ${column.name}${alone.has(column.name) ? '' : ' (not filterable alone)'}
                 </option>
               `,
             )}
@@ -534,8 +536,9 @@ function Rows({ projector, entity, field, value, cursor, openRow }) {
           </span>
         `}
         <span class="tiny faint">
-          only the key and each index's leftmost column can be filtered; the rest would
-          be a table scan, which the read API refuses
+          this input takes one field, so it offers the key and each index's leading
+          column; the read API itself filters on any prefix of a declared index, plus a
+          range on the column after it
         </span>
       </div>
 

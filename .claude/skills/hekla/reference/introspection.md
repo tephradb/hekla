@@ -325,15 +325,18 @@ leaves as a decimal string, `now` on a `Timestamp` emits an offset-carrying RFC 
 
 `/admin/projectors/{Name}` describes each entity's shape; `Rows →` on an entity card opens its data
 beneath it. The rows are fetched through the public read API rather than through `/admin`, so the page
-shows what an application sees over the same port: key order, one indexed filter, cursor paging, and
+shows what an application sees over the same port: key order, an indexed filter, cursor paging, and
 subject columns decrypted. The selection lives in the query string, so a row is a link:
 
 ```
 /admin/projectors/CustomerOrders?entity=Order&field=customer_id&value=42&cursor=<c>&row=<key>
 ```
 
-- The filter is a select over every column, with the ones that are not indexed disabled, so the read
-  API's `unindexed_filter` 400 is visible before you can hit it.
+- The filter is a select over every column, with the ones that cannot be filtered *alone* disabled,
+  so the read API's `unindexed_filter` 400 is visible before you can hit it. That is the key and each
+  index's leading column: the API itself takes any prefix of an index plus a range on the column
+  after it, and this input carries one field, so it offers the subset one field can reach. A wider
+  filter is a URL away.
 - A column the response omits reads as `null` where only null is possible, and `absent` where the
   subject's key may be gone. The read API drops both cases, and only the declaration says which one a
   given column can be in.

@@ -535,6 +535,12 @@ pub fn projector_detail(
 }
 
 /// One entity's declared shape, plus its row count when one was taken.
+///
+/// `filterable` is every column a filter may *name*, which is not every column a filter
+/// may use alone: a filter has to be a prefix of one declared index, so the second column
+/// of one is reachable only alongside the first. `indexes` right beside it carries the
+/// ordered columns that answer which combinations those are, so a console can work out
+/// what to offer without asking.
 fn self_entity(entity: &EntityDef, count: Option<&u64>) -> Value {
     let mut filterable: Vec<&str> = filterable_fields(entity).collect();
     filterable.sort_unstable();

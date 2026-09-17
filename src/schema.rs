@@ -131,6 +131,36 @@ impl FieldKind {
             other => other,
         }
     }
+
+    /// Whether a column of this kind has a stable total order in SQLite, which is what
+    /// the read API's pagination cursor needs. *Which* order hardly matters there: all a
+    /// cursor has to do is walk every row exactly once.
+    ///
+    /// `Money` has no usable order at all, being stored as its decimal string, so `"2"`
+    /// sorts above `"10"`. A `Bool` holds two values and would truncate a cursor to two
+    /// pages, `Json` is unordered, and an optional column can be NULL, which compares as
+    /// neither side of anything.
+    pub fn is_keyable(&self) -> bool {
+        matches!(
+            self,
+            FieldKind::Text { .. }
+                | FieldKind::I64
+                | FieldKind::Uuid
+                | FieldKind::Timestamp
+                | FieldKind::OneOf(_)
+        )
+    }
+
+    /// Whether SQLite's order over a column of this kind is the order the *declaration*
+    /// means, which is what a range filter needs and a cursor does not.
+    ///
+    /// Everything [`FieldKind::is_keyable`] refuses, and enums on top: a `OneOf` stores
+    /// the variant's spelling, so `priority.gte=Low` would walk the alphabet rather than
+    /// the severity that was declared. Fine for a cursor to page by, wrong to answer a
+    /// question with.
+    pub fn is_comparable(&self) -> bool {
+        self.is_keyable() && !matches!(self, FieldKind::OneOf(_))
+    }
 }
 
 /// A declared field: its type plus the per-field policy that governs tagging and
@@ -247,14 +277,53 @@ impl EntityDef {
         )
     }
 
+    /// The generated name of the declared index called `declared`: the name it carries
+    /// in SQLite, and the one a scan pins with `INDEXED BY`. Qualified by the table,
+    /// because index names share one namespace across a whole SQLite database and two
+    /// entities can both declare `by_shop_id`.
+    pub fn index_name(&self, declared: &str) -> String {
+        format!("{}_{}", self.name, declared)
+    }
+
+    /// The columns one declared index is built over: what was declared, then the key.
+    ///
+    /// **The trailing key is what makes a filtered scan a seek rather than a sort.** The
+    /// scan orders by the key, so an index that stops at the declared columns leaves
+    /// SQLite to sort every matching row into key order on *every page*. Equality on all
+    /// of the declared columns leaves the key as the next ordered one, so the rows arrive
+    /// in the order the scan wanted and `LIMIT` stops reading at the page boundary.
+    ///
+    /// It buys that for a filter that uses the whole index and not for a shorter prefix,
+    /// where a declared column still sits between the filter and the key.
+    /// `read_api::choose_index` is the other half: it takes the narrowest index that
+    /// serves a filter, so an entity declaring both `index (a)` and `index (a, b)` gets
+    /// the seek for `a` alone rather than the sort.
+    ///
+    /// Appended rather than declared, because it is hekla's storage decision and not
+    /// something an author asked for: heklang's digest covers the declared columns, so
+    /// adding it here moves no definition hash and rebuilds nothing. That is also why
+    /// [`crate::read_model::ReadModel::open`] reconciles the live index against this,
+    /// rather than trusting `CREATE INDEX IF NOT EXISTS` to notice.
+    pub fn index_columns(&self, ix: &IndexDef) -> Vec<String> {
+        let mut columns = ix.columns.clone();
+        if !columns.contains(&self.key) {
+            columns.push(self.key.clone());
+        }
+        columns
+    }
+
     pub fn create_index_sql(&self) -> Vec<String> {
         self.indexes
             .iter()
             .map(|ix| {
-                let columns: Vec<String> = ix.columns.iter().map(|col| quote_ident(col)).collect();
+                let columns: Vec<String> = self
+                    .index_columns(ix)
+                    .iter()
+                    .map(|col| quote_ident(col))
+                    .collect();
                 format!(
                     "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
-                    quote_ident(&format!("{}_{}", self.name, ix.name)),
+                    quote_ident(&self.index_name(&ix.name)),
                     quote_ident(&self.name),
                     columns.join(", ")
                 )
@@ -290,11 +359,9 @@ impl EntityDef {
             );
         };
         // The read API paginates by the key as an opaque cursor and binds it as a
-        // typed filter, so the key must be a present, orderable scalar. An optional
-        // key could be null; a bool (two values) or json (unordered) key would
-        // silently truncate cursor pagination; money is stored as its decimal string
-        // (so `ORDER BY` and the `key > ?` cursor would compare lexicographically:
-        // `"2" > "10"`), so it cannot key the ordered scan either.
+        // typed filter, so the key must be a present kind that orders. The nullable
+        // case is split out because `is_keyable` refuses an optional for a reason the
+        // author cannot act on by changing the type: it is the `?` that has to go.
         if key_meta.is_nullable() {
             anyhow::bail!(
                 "entity `{}`: key `{}` may not be optional",
@@ -302,10 +369,7 @@ impl EntityDef {
                 self.key
             );
         }
-        if matches!(
-            key_meta.kind.base(),
-            FieldKind::Bool | FieldKind::Json | FieldKind::Money { .. }
-        ) {
+        if !key_meta.kind.is_keyable() {
             anyhow::bail!(
                 "entity `{}`: key `{}` must be an orderable scalar, not {:?}",
                 self.name,
@@ -347,16 +411,20 @@ impl EntityDef {
                 }
             }
         }
-        // A read filter targets the key or an index-leading column, so a field named
-        // like a reserved read query param could never be filtered. Reject at load
+        // A read filter targets the key or a column of a declared index, so a field
+        // named like a reserved read query param could never be filtered. Reject at load
         // rather than surprising the author with a silent no-op at request time.
         //
         // Derived from `filterable_fields` rather than open-coded, because this gate is
         // the only thing stopping the OpenAPI generator from emitting a duplicate query
-        // parameter. Widen filterability there (to any prefix of a composite index, say)
-        // and an entity whose index leads on a column named `limit` would start loading
-        // while `scan_params` emitted a second `limit` parameter, shadowing the page-size
+        // parameter: an entity with a column named `limit` in an index would load while
+        // `scan_params` emitted a second `limit` parameter, shadowing the page-size
         // control with an invalid document.
+        //
+        // This widened when filtering did, from each index's leading column to every
+        // column of every index, so an entity that loaded before this and names a
+        // reserved param anywhere in an index stops loading. That break is the point:
+        // the alternative is a column that cannot be filtered and does not say so.
         for field in read_api::filterable_fields(self) {
             if RESERVED_QUERY_PARAMS.contains(&field) {
                 anyhow::bail!(

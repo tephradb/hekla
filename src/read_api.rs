@@ -45,45 +45,236 @@ pub fn find_entity<'a>(entities: &'a [EntityDef], name: &str) -> Option<&'a Enti
     entities.iter().find(|entity| entity.name == name)
 }
 
-/// Every field a scan may filter on, in declaration order: the primary key, then the
-/// leftmost column of each declared index.
+/// Every field a scan may mention in a filter, in declaration order: the primary key,
+/// then every column of every declared index.
 ///
-/// The single source of truth for both the 400 the scan handler returns and the query
-/// parameters the OpenAPI generator documents, so the two cannot drift apart.
+/// Naming a column here does not mean it can be filtered *alone*. A filter has to be a
+/// prefix of one index (see [`choose_index`]), so the second column of `index (a, b)` is
+/// reachable only alongside the first. This is the set a query parameter may be named
+/// after, which is what the OpenAPI generator and the reserved-param gate both need;
+/// which *combinations* are admissible is `choose_index`'s question.
 ///
-/// May repeat a name, when two indexes lead with the same column or one leads with the
-/// key. A caller that turns each into something name-addressed (an OpenAPI query
-/// parameter) has to deduplicate; a caller asking a membership question does not, and
-/// leaving it lazy keeps [`is_filterable`] allocation-free on the read path.
+/// May repeat a name, when two indexes share a column or one contains the key. A caller
+/// that turns each into something name-addressed (an OpenAPI query parameter) has to
+/// deduplicate, and under a prefix rule that is load-bearing rather than tidiness: every
+/// index contributes all of its columns. A caller asking a membership question does not,
+/// and leaving it lazy keeps [`is_filterable`] allocation-free on the read path.
 pub fn filterable_fields(entity: &EntityDef) -> impl Iterator<Item = &str> {
     iter::once(entity.key.as_str()).chain(
         entity
             .indexes
             .iter()
-            .filter_map(|index| index.columns.first())
+            .flat_map(|index| index.columns.iter())
             .map(String::as_str),
     )
 }
 
-/// Whether `field` can be filtered on: the primary key, or the leftmost column of
-/// some declared index. Anything else would be a table scan, which the read API
+/// Whether `field` may appear in a filter at all: the primary key, or a column of some
+/// declared index. A column no index covers would be a table scan, which the read API
 /// refuses; the caller returns a 400 telling the author to declare the index.
 ///
 /// Shares [`filterable_fields`] so the runtime's 400 and the parameters the OpenAPI
-/// generator documents cannot drift apart.
+/// generator documents cannot drift apart. Being filterable is necessary and not
+/// sufficient: [`choose_index`] decides whether the combination asked for is servable.
 pub fn is_filterable(entity: &EntityDef, field: &str) -> bool {
     filterable_fields(entity).any(|name| name == field)
 }
 
-/// Validate that a filter value parses as its column's declared type, so a
-/// mismatch (`?count=abc`, `?active=maybe`) is a 400 up front rather than a scan
-/// that silently matches nothing. `field` must already be validated as filterable,
-/// so it is a declared field; an unknown field is left for that check to reject.
-pub fn check_filter(entity: &EntityDef, field: &str, value: &str) -> anyhow::Result<()> {
-    match entity.fields.iter().find(|(name, _)| name == field) {
-        Some((_, meta)) => coerce_value(&meta.kind, value).map(|_| ()),
-        None => Ok(()),
+/// One end of a range, and whether it includes its own value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    Inclusive,
+    Exclusive,
+}
+
+impl Bound {
+    /// The SQL comparison for this bound at the given end. `lower` picks `>`/`>=` over
+    /// `<`/`<=`.
+    pub(crate) fn operator(self, lower: bool) -> &'static str {
+        match (lower, self) {
+            (true, Bound::Inclusive) => ">=",
+            (true, Bound::Exclusive) => ">",
+            (false, Bound::Inclusive) => "<=",
+            (false, Bound::Exclusive) => "<",
+        }
     }
+}
+
+/// The suffixes that spell a range bound in a query string, with the end and bound each
+/// one means. A declared field can never carry a `.`, because `is_sql_identifier`
+/// restricts a name to ascii letters, digits and underscores, so none of these can
+/// collide with a column and none of them has to be reserved.
+pub const RANGE_OPERATORS: [(&str, bool, Bound); 4] = [
+    ("gte", true, Bound::Inclusive),
+    ("gt", true, Bound::Exclusive),
+    ("lte", false, Bound::Inclusive),
+    ("lt", false, Bound::Exclusive),
+];
+
+/// A range over one column: either end, both, or (transiently, while parsing) neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Range {
+    pub lower: Option<(Bound, String)>,
+    pub upper: Option<(Bound, String)>,
+}
+
+impl Range {
+    /// Both ends, lower first, which is the order a statement binds them in.
+    pub(crate) fn bounds(&self) -> impl Iterator<Item = &(Bound, String)> {
+        self.lower.iter().chain(self.upper.iter())
+    }
+}
+
+/// What a scan was asked to match: equality on some columns, plus at most one column
+/// carrying a range.
+///
+/// That is the shape a B-tree index serves, and the reason the read API can promise it
+/// never scans a table: equality on columns 1 to n-1 of an index seeks straight to a
+/// contiguous run, and a range on column n walks a slice of it.
+///
+/// Owns its strings. A filter is parsed out of a request, validated, then carried onto a
+/// blocking thread to run, and borrowing across that would cost the handler an owned
+/// mirror of this whole shape to borrow *from*.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+    pub equals: Vec<(String, String)>,
+    pub range: Option<(String, Range)>,
+}
+
+impl Filter {
+    pub fn is_empty(&self) -> bool {
+        self.equals.is_empty() && self.range.is_none()
+    }
+
+    /// The range column, if one was asked for.
+    fn range_column(&self) -> Option<&str> {
+        self.range.as_ref().map(|(column, _)| column.as_str())
+    }
+
+    /// Every column mentioned, equality first then the range, for a diagnostic that has
+    /// to name what was asked.
+    pub fn columns(&self) -> Vec<&str> {
+        self.equals
+            .iter()
+            .map(|(column, _)| column.as_str())
+            .chain(self.range_column())
+            .collect()
+    }
+}
+
+/// How a scan will reach its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access<'a> {
+    /// Through the primary key, which has no index to name. An `INTEGER` key *is* the
+    /// rowid and a text key's index is SQLite's own `sqlite_autoindex_*`, so there is
+    /// nothing stable to write in an `INDEXED BY` and the pin is left off. The planner
+    /// has no scan to fall back to here in any case.
+    Key,
+    /// Through a declared index, pinned by this name.
+    Index(&'a str),
+}
+
+/// The index a filter will be served by, or `None` when nothing declared can serve it.
+///
+/// The rule is the one a B-tree can actually answer: the equality columns must be a
+/// **prefix** of the index, and the range column (if any) must be the column right after
+/// that prefix. `index (shop_id, status, month)` answers `shop_id`, `(shop_id, status)`
+/// and `(shop_id, status, month)`, plus a range on `status` under `shop_id` and one on
+/// `month` under both. It cannot answer `(status, month)`, because reaching those rows
+/// means visiting every `shop_id`, which is the table scan this API exists to refuse.
+///
+/// Equality is matched as a **set**: a query string carries no order, so
+/// `?status=x&shop_id=1` and `?shop_id=1&status=x` are the same question.
+///
+/// **Where several indexes qualify, the narrowest wins**, and that is a performance
+/// decision rather than a cosmetic one. The scan orders by the key, and the key sits at
+/// the end of every generated index (`EntityDef::index_columns`), so the rows only arrive
+/// already in key order when the filter uses up *all* of an index's declared columns.
+/// Filtering `shop_id` through `index (shop_id, status)` leaves `status` ahead of the key
+/// and costs a sort of the whole match set on every page; through `index (shop_id)` it
+/// costs nothing. Taking the shortest qualifying index is how an entity that declares
+/// both gets the better plan. Ties go to declaration order, so the choice is stable: it
+/// is pinned into the SQL and asserted by a query-plan test.
+///
+/// A prefix shorter than every index that serves it still sorts. That is a real cost and
+/// there is no way around it short of generating an index per prefix; declaring the
+/// narrower index is the author's lever, and `EXPLAIN QUERY PLAN` is where it shows.
+pub fn choose_index<'a>(entity: &'a EntityDef, filter: &Filter) -> Option<Access<'a>> {
+    let equals: Vec<&str> = filter
+        .equals
+        .iter()
+        .map(|(column, _)| column.as_str())
+        .collect();
+    let range = filter.range_column();
+    // The key is its own index, and the only one that can serve a bare scan. It is
+    // tried first so an entity that also declares an index leading with its key does
+    // not change which plan a key filter gets.
+    let key_only = equals.iter().all(|column| *column == entity.key)
+        && range.is_none_or(|column| column == entity.key);
+    if key_only {
+        return Some(Access::Key);
+    }
+    entity
+        .indexes
+        .iter()
+        .filter(|index| {
+            let Some(prefix) = index.columns.get(..equals.len()) else {
+                return false;
+            };
+            let covered = equals
+                .iter()
+                .all(|column| prefix.iter().any(|declared| declared == column));
+            covered
+                && match range {
+                    Some(column) => index
+                        .columns
+                        .get(equals.len())
+                        .is_some_and(|next| next == column),
+                    None => true,
+                }
+        })
+        // `min_by_key` keeps the first of equal keys, so declaration order breaks ties.
+        .min_by_key(|index| index.columns.len())
+        .map(|index| Access::Index(index.name.as_str()))
+}
+
+/// Validate that a filter's values parse as their columns' declared types, so a mismatch
+/// (`?count=abc`, `?active=maybe`) is a 400 up front rather than a scan that silently
+/// matches nothing. A column that is not declared is left for [`is_filterable`] to
+/// reject, which has the better message for it.
+///
+/// A range carries the extra requirement that the column's order has to *mean*
+/// something: a `Money` column holds its decimal string, so `?fee.gte=10` would put
+/// `"2"` above it. [`FieldKind::is_comparable`] is that question, and `describe()` puts
+/// the declared type in the message so the answer is actionable.
+pub fn check_filter(entity: &EntityDef, filter: &Filter) -> anyhow::Result<()> {
+    let kind = |field: &str| {
+        entity
+            .fields
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, meta)| &meta.kind)
+    };
+    for (field, value) in &filter.equals {
+        if let Some(kind) = kind(field) {
+            coerce_value(kind, value).with_context(|| format!("filter `{field}`"))?;
+        }
+    }
+    if let Some((field, range)) = &filter.range {
+        let Some(kind) = kind(field) else {
+            return Ok(());
+        };
+        if !kind.is_comparable() {
+            anyhow::bail!(
+                "filter `{field}` is {}, which has no order a range could use; filter it for equality instead",
+                kind.describe()
+            );
+        }
+        for (_, value) in range.bounds() {
+            coerce_value(kind, value).with_context(|| format!("filter `{field}`"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Encode a row key as an opaque forward cursor.
@@ -214,13 +405,15 @@ pub(crate) fn typed_from_string(kind: &FieldKind, text: String) -> Value {
     }
 }
 
-/// Scan an entity, optionally filtered by one indexed column and resumed after a
-/// cursor, plus the projector position, in one read snapshot. `filter`'s column
-/// must already be validated as filterable.
+/// Scan an entity, filtered over a declared index and resumed after a cursor, plus the
+/// projector position, in one read snapshot. `filter` must already have been through
+/// [`choose_index`] and [`check_filter`]; this re-chooses the index rather than taking
+/// one, so the statement cannot be built against a different index than the handler
+/// validated against.
 pub fn scan(
     db_path: &Path,
     entity: &EntityDef,
-    filter: Option<(&str, &str)>,
+    filter: &Filter,
     after_key: Option<&str>,
     limit: usize,
     keystore: Option<&KeyStore>,

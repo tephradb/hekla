@@ -26,6 +26,16 @@ projector Tickets {
     watchers: List(String)?,
     labels: Map(String, String)?,
     meta: Json,
+
+    // A compound index, so a scan can ask for one organisation's urgent tickets due
+    // this month in one query. `org_id` already carries a single-column index above:
+    // this one is the wider question, and the read API picks whichever of them the
+    // filter is a prefix of.
+    //
+    // `due_at` last, because it is the only one of the three a range can run over. An
+    // enum sorts by the spelling of its variant rather than by severity, so `priority`
+    // takes equality and nothing else.
+    index (org_id, priority, due_at)
   }
 
   // An `Int @key`, which orders numerically in SQL and lexicographically as text. The

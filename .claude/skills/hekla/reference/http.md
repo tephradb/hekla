@@ -90,7 +90,8 @@ not_found` with the message `no such row`. Unknown entity or projector: `404 not
 
 | Query parameter | Means |
 | --- | --- |
-| `<field>=<value>` | filter; only the key and declared indexes are filterable, and **only one at a time** |
+| `<field>=<value>` | equality filter; the columns given must be a **prefix** of one declared index (or the key) |
+| `<field>.gte=`, `.gt=`, `.lte=`, `.lt=` | range on the column **after** that prefix; one column only, both ends may be given |
 | `limit` | page size, default 50, clamped to 1..500 (so `limit=0` is one row, not an error) |
 | `cursor` | the previous page's `next_cursor`; opaque (it is the key, base64) |
 | `after` | wait until the projector reaches this log position before reading |
@@ -98,12 +99,29 @@ not_found` with the message `no such row`. Unknown entity or projector: `404 not
 
 `next_cursor` is `null` on the last page. Pagination is cursor-based over the key, never offset.
 
+`index (shop_id, status, month)` answers `?shop_id=`, `?shop_id=&status=` and all three, plus
+`?shop_id=&status.gte=` and `?shop_id=&status=&month.lt=`. It refuses `?status=&month=`: reaching
+those rows means visiting every shop. The chosen index is pinned with `INDEXED BY`, so a filter the
+handler admits is one SQLite cannot decide to answer with a scan.
+
+Two things follow that are worth knowing before declaring:
+
+- **A range needs a column whose order means something.** `Money` is stored as its decimal string
+  (so `>=` would sort `"2"` above `"10"`) and an enum as its variant's spelling (so a range would
+  walk the alphabet, not the severity). Those, plus `Bool`, `Json` and optional columns, take
+  equality only, and asking for a range on one is a 400 naming the declared type.
+- **Declare the narrow index too if you filter on it alone.** The key is appended to every generated
+  index, so a filter using all of an index's columns is a pure seek; a shorter prefix leaves a
+  declared column between the filter and the key and SQLite sorts the match set on every page. The
+  runtime picks the narrowest index that serves a filter, so `index (shop_id)` beside
+  `index (shop_id, status)` makes both questions cheap.
+
 Errors are `{error: {code, message}}` (no correlation ids outside `/commands`):
 
 | Status | `code` | When |
 | --- | --- | --- |
-| 400 | `unindexed_filter` | ``filter field `f` is not indexed; declare an index on it``, or `only a single indexed filter field is supported` |
-| 400 | `invalid_input` | `limit must be a positive integer`, `cursor is not valid`, or ``filter `f`: expected an integer`` and its siblings |
+| 400 | `unindexed_filter` | ``filter on (a, b) is not a prefix of any declared index``, ``filter field `f` is not indexed; declare an index on it``, ``filter field `f` is not a column of entity `E` ``, or `a scan ranges over one column` |
+| 400 | `invalid_input` | `limit must be a positive integer`, `cursor is not valid`, ``filter `f`: expected an integer``, ``unknown filter operator `.between` ``, or ``filter `f` is Money(2), which has no order a range could use`` |
 | 404 | `not_found` | no such projector, entity or row |
 | 503 | `not_caught_up` | the `after` wait timed out, with `Retry-After: 1` |
 | 503 | `rebuilding` | a rebuild is in flight; carries `Retry-After: 1` because it resolves on its own |

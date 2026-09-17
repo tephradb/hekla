@@ -2448,7 +2448,7 @@ Honest scope:
   and not through a sealed one. That column is asserted in `tests/tickets.rs` instead, and the
   omission is written down where it sits.
 
-## Phase 37: a scan filters on what was declared, not on its first column (planned)
+## Phase 37: a scan filters on what was declared, not on its first column (done)
 
 heklang has declared compound indexes for a while and hekla already creates them: `create_index_sql`
 emits `CREATE INDEX ... ON t (a, b)` with every column in declared order. The index is in SQLite. It
@@ -2469,8 +2469,26 @@ The safety property survives unchanged: **you may only ask what you declared, ne
 - A range on the column after the equality prefix, which is the standard index-prefix shape:
   equality on columns 1 to n-1, a range on column n.
 - The index chosen explicitly in Rust from the declared set and pinned with `INDEXED BY`, so the
-  planner cannot quietly choose a scan, with a query-plan test in the mould of
-  `the_invocation_join_reads_the_primary_key_rather_than_scanning`.
+  planner cannot quietly choose a scan, with query-plan tests in the mould of
+  `the_invocation_join_reads_the_primary_key_rather_than_scanning`. Both of them fail with
+  `USE TEMP B-TREE FOR ORDER BY` when the key append is reverted, which is what makes them worth
+  having rather than restatements of the code.
+
+Two things turned up in the writing that the plan above does not say, and both changed what shipped.
+
+**Pinning an index is a regression until the key is appended to it.** A scan orders by the key, and a
+declared index ends at its declared columns, so `INDEXED BY` leaves SQLite sorting the whole match set
+into key order on *every page* of a paginated scan. The `USE TEMP B-TREE FOR ORDER BY` that appears in
+the plan is not a detail: it is per page, so it is worse under a cursor than without one. Appending
+the key to every generated index removes it, which is why that half of Phase 38 moved here rather than
+landing after the thing it pays for.
+
+**Appending it only helps a filter that uses the whole index.** `index (a, b)` generates `(a, b, key)`,
+so filtering `a` alone still leaves `b` between the filter and the key and still sorts. The answer is
+in the chooser rather than the DDL: among the indexes that serve a filter, take the **narrowest**, so
+an entity declaring both `index (a)` and `index (a, b)` gets the seek for either question. A prefix
+shorter than every index serving it still sorts, and declaring the narrower index is the author's
+lever.
 
 Decisions worth keeping:
 
@@ -2479,29 +2497,52 @@ Decisions worth keeping:
   ascii letters, digits and underscores. That is what keeps `EntityDef::validate`'s reserved-param
   gate exactly as strict as it is, and it is why the range half of this phase carries no
   compatibility risk at all.
-- **`filterable_fields` stays the one source.** The comment on that gate is explicit that it is the
-  only thing stopping the OpenAPI generator from emitting a duplicate query parameter, and it names
-  widening to an index prefix as the change that would expose it. The gate keeps deriving from the
-  same function, and `RESERVED_QUERY_PARAMS` is re-checked against the wider set.
-- **Deduplication stops being a nicety.** `filterable_fields` may repeat a name, and a prefix-based
-  version repeats far more, because every index contributes every prefix. `scan_params` dedups and
-  `introspect::self_entity` sorts and dedups today as a convenience; both now depend on it.
-- **The cursor does not move.** Ordering stays the primary key, so the cursor stays the plaintext key
+- **A range needs an order that means what the declaration says, which is a narrower question than a
+  cursor's.** `EntityDef::validate` already decided it once for keys, so it became two predicates
+  sharing a core: `FieldKind::is_keyable` (a stable total order, all a cursor needs, since it only has
+  to walk every row once) and `is_comparable` (that order is the declared one). They differ on exactly
+  one kind. An enum stores its variant's spelling, so it keys a cursor perfectly well and would answer
+  `priority.gte=Low` by walking the alphabet rather than the severity; `Money` (a decimal string, so
+  `"2" > "10"`), `Bool`, `Json` and optionals fail both. The OpenAPI generator emits range parameters
+  only where `is_comparable` holds, which is also what stops the document growing four parameters per
+  column for columns that could never take one.
+- **The reconcile is `pragma_index_info`, not a schema version and not `sqlite_master.sql`.** A
+  generated-DDL change is invisible to every rebuild trigger there is: `reconcile_from` compares
+  heklang's digest, and the digest covers the columns an author declared rather than the key hekla
+  appends to them. So `CREATE INDEX IF NOT EXISTS` would match the old index by name and adopt its
+  shape forever. Comparing the live column list against the wanted one, and dropping on a mismatch,
+  needs no version to bump and no text to match, and it reconciles an index written by any older hekla
+  rather than only the one shape this release changed.
+- **`filterable_fields` stays the one source.** The comment on that gate was explicit that it is the
+  only thing stopping the OpenAPI generator from emitting a duplicate query parameter, and named this
+  widening as what would expose it. The gate still derives from the same function.
+- **Deduplication stopped being a nicety.** Every index now contributes every one of its columns, so
+  a name repeating is ordinary rather than unusual. `scan_params` dedups and `introspect::self_entity`
+  sorts and dedups; both now depend on it, and a test asserts no parameter is named twice.
+- **The cursor did not move.** Ordering stays the primary key, so the cursor stays the plaintext key
   computed before decryption, and the property that decrypting a page cannot affect pagination is
   untouched.
 
 Honest scope:
 
-- **Widening filterability widens what `validate()` rejects at load.** An entity carrying a column
+- **Widening filterability widened what `validate()` rejects at load.** An entity carrying a column
   named `limit`, `cursor`, `after` or `timeout_ms` anywhere in an index stops loading where it used
   to load if that column was not previously leftmost. That is the gate doing its job, and it is a
   clear error at boot rather than a silent shadowing at request time, but it is a real break and
   belongs in the release note.
-- **Ordering by anything but the key is Phase 38.** It is the half that moves the cursor and the
-  generated DDL, and it is split out so the payoff lands before the migration does.
-- **The console's filter UI still takes one field.** The prose beside it ("only the key and each
-  index's leftmost column can be filtered") stops being true, so it changes with this phase even
-  though the input does not.
+- **A partial prefix still sorts.** Covered above; there is no way around it short of generating an
+  index per prefix, and the cost is bounded by the match set rather than the table.
+- **Ordering by anything but the key is Phase 38**, which is now purely `order_by` and the tuple
+  cursor: the DDL it needed came forward to here.
+- **The console's filter UI still takes one field**, so it offers the key and each index's leading
+  column, derived client-side from the `indexes` introspection already reports rather than from the
+  widened `filterable`. Using the wider list would have enabled options that 400 on their own and lost
+  the property that the console makes `unindexed_filter` visible before you can hit it.
+- **No example declares a compound index.** `examples/orders` has only two plaintext columns (the key
+  and `customer_id`; the rest receive sealed content, which `validate` refuses to index), so
+  demonstrating a prefix there means adding a column to an example whose subject is erasure. The
+  coverage is in `tests/fixtures/tickets`, which declares `index (org_id, priority, due_at)` and
+  reaches every case including both refused ranges.
 
 ## Phase 38: an ordering is a declared index, and the cursor is its tuple (planned)
 
@@ -2512,8 +2553,8 @@ sort is the half still missing, so an application punts to paging and sorting in
 - `order_by` naming a declared index, with the whole tuple reversed or none of it.
 - The cursor over the index tuple plus the primary key as a final tiebreak, resumed with a row-value
   comparison the index serves.
-- The primary key appended to every generated index, and an index reconcile so an existing read model
-  gets the new shape.
+- Nothing in the DDL: Phase 37 already appends the primary key to every generated index and
+  reconciles an existing read model onto the new shape, because pinning an index needed it first.
 
 Decisions worth keeping:
 
@@ -2542,14 +2583,21 @@ Decisions worth keeping:
 
 Honest scope:
 
-- **Appending the key to a generated index needs a reconcile, not a rebuild.** A projector's
-  definition hash is heklang's digest and does not cover hekla's DDL choices, so
-  `CREATE INDEX IF NOT EXISTS` is a no-op against an existing model and the old shape would survive
-  forever. The reconcile compares against `sqlite_master` and recreates on mismatch, which is cheap,
-  and it removes the sorter from the existing single-column filter case as well.
+- **Appending the key to a generated index needed a reconcile rather than a rebuild**, and that
+  shipped with Phase 37: a projector's definition hash is heklang's digest and does not cover hekla's
+  DDL choices, so `CREATE INDEX IF NOT EXISTS` is a no-op against an existing model and the old shape
+  would survive forever. `ReadModel::open` compares `pragma_index_info` against the wanted columns and
+  recreates on mismatch. Nothing here has to touch it again.
 - **Nothing is asked of heklang, by either this phase or Phase 37.** `EntityDef.indexes` already
   carries every column in declared order and the digest already hashes them, so there is no language
-  change and no version bump for the pair.
+  change and no version bump for the pair. Phase 37 did edit one sentence of
+  `heklang/docs/projectors.md`, which said the runtime could filter only on an index's leftmost
+  column; a doc correction in the sibling repo, not a language change.
+- **`?order_by=` names the generated index name**, which is derived (`by_org_id_priority_due_at`)
+  rather than authored, because heklang holds that index naming is a storage concern. So this phase
+  is where a derived name becomes part of hekla's public request surface. Worth deciding
+  deliberately rather than inheriting: the alternative is letting an author name an index, which is a
+  heklang change and reopens a question it already answered.
 
 ## Phase 39: a subject can be deleted with its tenant (planned, decision first)
 
@@ -2651,9 +2699,9 @@ forward. Collected here so they are not lost in the prose of the phase that intr
   it is total and typechecked against the deployed declarations; it folds the *log* rather than the
   derived read models, so it can ask things no read model materialised; and it needs none of the
   private table layout, which stays behind the generated read API as section 10 says it must.
-- **Multi-field (composite-prefix) scan filters** (Phase 3): **scheduled.** A scan supports a single
-  indexed filter field only. Phase 37 widens it to any prefix of a declared index plus a range on the
-  column after it, and Phase 38 adds an ordering over one.
+- **Multi-field (composite-prefix) scan filters** (Phase 3): **closed.** Phase 37 widened a scan to
+  equality across any prefix of a declared index plus a range on the column after it. Phase 38 adds
+  an ordering over one, which is the remaining half.
 - **Automatic dead-lettering** (Phase 4): the manual `POST /effects/{name}/skip/{position}` is the only
   escape hatch; a wedged effect is never advanced automatically.
 - **`hekla fmt` and `hekla lsp`** (Phase 21): both were Starlark tooling wrapped in hekla's project

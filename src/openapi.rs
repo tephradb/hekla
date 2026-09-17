@@ -635,17 +635,18 @@ fn scan_path(projector: &ProjectorSurface, entity: &EntityDef, names: &Component
             "summary": format!("scan the `{}` entity", entity.name),
             "description": format!(
                 "An ordered, cursor-paginated scan of `{}`, ordered by its `{}` key. \
-                 Filtering is restricted to the key and the leftmost column of a \
-                 declared index, and at most one filter per request: anything else \
-                 would be a table scan, so it is a 400 rather than a slow \
-                 query. {READ_YOUR_WRITES}",
+                 A filter is equality across any prefix of one declared index, \
+                 optionally with a range (`.gte`, `.gt`, `.lte`, `.lt`) on the column \
+                 after that prefix. A combination no declared index leads with would be \
+                 a table scan, so it is a 400 rather than a slow query. \
+                 {READ_YOUR_WRITES}",
                 entity.name, entity.key,
             ),
             "parameters": scan_params(entity),
             "responses": {
                 "200": response("one page of rows, and the position they were read at", page),
                 "400": response(
-                    "a malformed parameter, or a filter on a field that is neither the key nor an index's leftmost column",
+                    "a malformed parameter, or a filter no declared index can serve",
                     schema_ref("Error"),
                 ),
                 "404": response("no such projector or entity", schema_ref("Error")),
@@ -686,8 +687,10 @@ fn scan_params(entity: &EntityDef) -> Vec<Value> {
     ];
     params.extend(wait_params());
     // Deduplicated here rather than in `filterable_fields`, which stays lazy for the
-    // read path's membership check. Two indexes leading with the same column would
-    // otherwise emit that query parameter twice, which is not a valid operation.
+    // read path's membership check. Under a prefix rule this is load-bearing rather than
+    // tidiness: every index contributes every one of its columns, so two indexes sharing
+    // one (or containing the key) is ordinary rather than unusual, and a repeated query
+    // parameter is not a valid operation.
     let mut filters: Vec<&str> = Vec::new();
     for field in read_api::filterable_fields(entity) {
         if !filters.contains(&field) {
@@ -696,11 +699,12 @@ fn scan_params(entity: &EntityDef) -> Vec<Value> {
     }
     for field in filters {
         params.push(filter_param(entity, field));
+        params.extend(range_params(entity, field));
     }
     params
 }
 
-/// One indexed-filter query param. Only the key and each index's leftmost column
+/// One equality-filter query param. Only the key and the columns of declared indexes
 /// reach here, which is [`read_api::filterable_fields`]' contract and the same source
 /// the handler's 400 is decided from.
 ///
@@ -709,17 +713,10 @@ fn scan_params(entity: &EntityDef) -> Vec<Value> {
 /// reason that would otherwise matter here: a filter arrives as plaintext and the
 /// column holds ciphertext, so it could only ever match nothing.
 fn filter_param(entity: &EntityDef, field: &str) -> Value {
-    // Not an `Option`: `EntityDef::validate` rejects a key or an index column that is
-    // not a declared field, so a miss here is a broken invariant. Falling back to a
-    // bare string would emit a silently wrong type for a `uint` column instead.
-    let (_, meta) = entity
-        .fields
-        .iter()
-        .find(|(name, _)| name == field)
-        .expect("a filterable field is a declared field");
+    let meta = filterable_meta(entity, field);
     let mut notes = vec![format!(
-        "Filter on `{field}`. At most one filter may be supplied per request; a second \
-         is a 400."
+        "Filter `{field}` for equality. {}",
+        prefix_note(entity, field)
     )];
     if field == entity.key {
         notes.push("This is the entity's key.".to_owned());
@@ -732,6 +729,89 @@ fn filter_param(entity: &EntityDef, field: &str) -> Value {
         );
     }
     query_param(field, &notes.join(" "), field_schema(&meta.kind))
+}
+
+/// The range-bound params for one filterable column, or none when its kind has no order
+/// a range could use.
+///
+/// Emitting these only for a comparable column is what keeps the document from growing
+/// four parameters per column for columns that could never accept one: a `Money` column
+/// holds its decimal string and a `OneOf` its variant's spelling, so a `.gte` over either
+/// would answer by an order nobody declared. [`FieldKind::is_comparable`] is the same
+/// question `read_api::check_filter` refuses on, so the document and the runtime agree.
+fn range_params(entity: &EntityDef, field: &str) -> Vec<Value> {
+    let meta = filterable_meta(entity, field);
+    if !meta.kind.is_comparable() {
+        return Vec::new();
+    }
+    read_api::RANGE_OPERATORS
+        .iter()
+        .map(|(operator, lower, bound)| {
+            let end = if *lower { "at or above" } else { "at or below" };
+            let end = match bound {
+                read_api::Bound::Inclusive => end.to_owned(),
+                read_api::Bound::Exclusive => end.replace("at or ", ""),
+            };
+            query_param(
+                &format!("{field}.{operator}"),
+                &format!(
+                    "Match rows whose `{field}` is {end} this. At most one column per \
+                     request may carry a range, and it must be the column directly after \
+                     the equality filters in the index serving them. Both ends may be \
+                     given together to bound it.",
+                ),
+                field_schema(&meta.kind),
+            )
+        })
+        .collect()
+}
+
+/// Which index prefixes reach `field`, as a sentence for the parameter that filters on
+/// it. A column that is not an index's leading one cannot be filtered alone, and saying
+/// so on the parameter itself is the difference between a reader discovering the prefix
+/// rule and discovering a 400.
+fn prefix_note(entity: &EntityDef, field: &str) -> String {
+    if field == entity.key {
+        return "Filterable on its own.".to_owned();
+    }
+    let mut leads = false;
+    let mut needs: Vec<String> = Vec::new();
+    for index in &entity.indexes {
+        let Some(at) = index.columns.iter().position(|column| column == field) else {
+            continue;
+        };
+        if at == 0 {
+            leads = true;
+        } else {
+            needs.push(format!("`{}`", index.columns[..at].join("`, `")));
+        }
+    }
+    match (leads, needs.is_empty()) {
+        (true, true) => "Filterable on its own.".to_owned(),
+        (true, false) => format!(
+            "Filterable on its own, and alongside {} to reach a wider index.",
+            needs.join(" or ")
+        ),
+        (false, _) => format!(
+            "Not filterable on its own: supply {} alongside it, since a filter has to be \
+             a prefix of one declared index.",
+            needs.join(" or ")
+        ),
+    }
+}
+
+/// The declared metadata for a filterable column.
+///
+/// Not an `Option`: `EntityDef::validate` rejects a key or an index column that is not a
+/// declared field, so a miss here is a broken invariant. Falling back to a bare string
+/// would emit a silently wrong type for a `uint` column instead.
+fn filterable_meta<'a>(entity: &'a EntityDef, field: &str) -> &'a FieldMeta {
+    entity
+        .fields
+        .iter()
+        .find(|(name, _)| name == field)
+        .map(|(_, meta)| meta)
+        .expect("a filterable field is a declared field")
 }
 
 fn wait_params() -> Vec<Value> {
@@ -2607,11 +2687,14 @@ fn entity_field_notes(
     if name == entity.key {
         notes.push("The entity's key. Unique, and always filterable.".to_owned());
     } else if filterable {
-        notes.push("Filterable: the leftmost column of a declared index.".to_owned());
+        notes.push(format!(
+            "Filterable: a column of a declared index. {}",
+            prefix_note(entity, name)
+        ));
     } else {
         notes.push(
-            "Not filterable. Only the key and the leftmost column of each declared index \
-             are, so filtering on this is a 400."
+            "Not filterable. Only the key and the columns of declared indexes are, so \
+             filtering on this is a 400."
                 .to_owned(),
         );
     }
@@ -3204,8 +3287,10 @@ fn entity_detail_schema() -> Value {
             "filterable": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "The fields `GET /read/...` accepts as a filter: the key plus \
-                    each index's leftmost column.",
+                "description": "The fields `GET /read/...` accepts in a filter: the key plus \
+                    every column of every declared index. Naming a column here does not mean \
+                    it can be filtered alone; a filter has to be a prefix of one index, so \
+                    read `indexes` for which combinations those are.",
             },
             "rows": {
                 "type": ["integer", "null"],
@@ -3571,7 +3656,14 @@ mod tests {
     }
 
     /// A projector whose entity exercises every branch the generator has: a key, an
-    /// indexed column, an unindexed one, a subject-encrypted one, and an optional.
+    /// index's leading column, a trailing one that is filterable only alongside it, an
+    /// unindexed column, a subject-encrypted one, and an optional.
+    ///
+    /// `status` is the one that keeps `only_filterable_fields_become_query_params`
+    /// honest. Every other column of `by_shop` is either the index's leading column or
+    /// the key, so without a trailing column that is neither, the fixture could not tell
+    /// "the leftmost column of an index" from "any column of an index" and the test would
+    /// pass under both rules.
     fn entity() -> EntityDef {
         EntityDef {
             name: "user_summary".to_owned(),
@@ -3579,6 +3671,13 @@ mod tests {
             fields: vec![
                 ("user_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
                 ("shop_id".to_owned(), FieldMeta::plain(FieldKind::I64)),
+                (
+                    "status".to_owned(),
+                    FieldMeta::plain(FieldKind::OneOf(vec![
+                        "active".to_owned(),
+                        "closed".to_owned(),
+                    ])),
+                ),
                 (
                     "display_name".to_owned(),
                     FieldMeta::plain(FieldKind::Text { max_length: None }),
@@ -3596,7 +3695,11 @@ mod tests {
             ],
             indexes: vec![IndexDef {
                 name: "by_shop".to_owned(),
-                columns: vec!["shop_id".to_owned(), "user_id".to_owned()],
+                columns: vec![
+                    "shop_id".to_owned(),
+                    "status".to_owned(),
+                    "user_id".to_owned(),
+                ],
             }],
         }
     }
@@ -3988,16 +4091,44 @@ mod tests {
         assert!(params.contains(&"user_id"), "the key is filterable");
         assert!(
             params.contains(&"shop_id"),
-            "an index's leftmost column is filterable"
+            "an index's leading column is filterable"
         );
         assert!(
-            !params.contains(&"display_name"),
-            "an unindexed field must not be documented as filterable"
+            params.contains(&"status"),
+            "a trailing index column is filterable too, alongside the ones before it"
         );
-        assert!(
-            !params.contains(&"note"),
-            "a non-leftmost / unindexed column must not be documented as filterable"
-        );
+        for unindexed in ["display_name", "note"] {
+            assert!(
+                !params.contains(&unindexed),
+                "`{unindexed}` is in no index and must not be documented as filterable"
+            );
+        }
+
+        // Range params exist only where the column's order means what it says. An
+        // enum stores its variant's spelling, so `status` takes equality and no range;
+        // the same rule `read_api::check_filter` refuses on at request time.
+        for bound in [".gte", ".gt", ".lte", ".lt"] {
+            assert!(
+                params.contains(&&*format!("shop_id{bound}")),
+                "an Int column takes a `{bound}` bound"
+            );
+            assert!(
+                !params.contains(&&*format!("status{bound}")),
+                "an enum has no order a `{bound}` could use"
+            );
+            assert!(
+                !params.contains(&&*format!("display_name{bound}")),
+                "an unfilterable column takes no bound either"
+            );
+        }
+
+        // Every parameter is named once. Under a prefix rule an index contributes all
+        // of its columns, so the key appearing in one is ordinary rather than unusual,
+        // and a repeated query parameter is not a valid operation.
+        let mut unique = params.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), params.len(), "duplicate params in {params:?}");
     }
 
     /// A subject column is removed from a row when its key was erased, so declaring

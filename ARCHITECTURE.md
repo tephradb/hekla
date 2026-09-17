@@ -833,8 +833,11 @@ consistent copy is not required for them.
   committed replays that commit's response, positions and original correlation and causation
   included; a key whose first attempt rejected has nothing in the log to replay, so it re-decides.
 - **Read API generated from entity schemas**: `GET /read/{Projector}/{Entity}/{key}` and an indexed
-  filter/scan endpoint. Both names are declared names, so `GET /read/CustomerOrders/Order/{id}`. Only declared indexes are filterable; an unindexed filter is a 400 telling
-  the author to declare the index, never a table scan. Pagination is cursor-based, not offset. Every
+  filter/scan endpoint. Both names are declared names, so `GET /read/CustomerOrders/Order/{id}`. A
+  filter is equality across any prefix of one declared index plus an optional range on the column
+  after it, chosen and pinned with `INDEXED BY` in Rust so the planner cannot fall back to a scan;
+  anything else is a 400 telling the author to declare the index, never a table scan. Pagination is
+  cursor-based, not offset. Every
   read response includes the projector's log position, and an optional `?after=<pos>` waits for the
   projector to reach that position before reading (read-your-writes), failing closed with 503 on
   timeout (section 6).

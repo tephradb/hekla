@@ -734,7 +734,7 @@ impl Run<'_> {
             let page = read_api::scan(
                 &shared.db_path,
                 def,
-                None,
+                &read_api::Filter::default(),
                 cursor.as_deref(),
                 64,
                 rt.keystore(),

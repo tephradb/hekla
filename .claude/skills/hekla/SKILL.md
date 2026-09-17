@@ -94,7 +94,7 @@ one under `tests/` does.
 | --- | --- |
 | expose an operation to a client | declare the command under `commands/`; it is `POST /commands/{Name}` |
 | keep an operation off the network | declare it under `commands/internal/`; only `invoke` reaches it |
-| make data queryable | declare a projector entity; the key and each `@index` become the filters |
+| make data queryable | declare a projector entity; the key and any prefix of an `index` become the filters |
 | let a client read its own write | have it pass `?after=<positions.last>` from the command's 200 |
 | make a retried request safe | give the command a slice on its own id, or send `Idempotency-Key` |
 | know why an effect is stuck | `GET /status`, then `GET /admin/effects/{Name}/invocations` |
@@ -174,8 +174,9 @@ right by construction. `reference/introspection.md` covers it.
 4. **A read right after a command can 404.** The projector is asynchronous. Pass
    `?after=<positions.last>` to wait for it (default 5s, capped at 30s, `503 not_caught_up` on
    timeout), or accept the race deliberately.
-5. **Only the key and declared indexes are filterable.** Anything else is a `400 unindexed_filter`
-   telling you to declare the index, never a table scan.
+5. **A filter is a prefix of one declared index**, optionally with a range (`.gte`, `.gt`, `.lte`,
+   `.lt`) on the column after it. Anything else is a `400 unindexed_filter` telling you what is
+   declared, never a table scan.
 6. **An absent column is omitted from a read response**, not serialised as `null`. An erased subject's
    column looks exactly like a column that was never written.
 7. **`/status` reports an effect's durable watermark, not what it is working on**, and under lanes

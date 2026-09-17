@@ -18,6 +18,7 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, Row, Transaction, params_from_iter};
 use tephra::Position;
 
+use crate::read_api::{Access, Filter, choose_index};
 use crate::schema::{EntityDef, EntityOpKind, FieldKind, FieldMeta};
 
 /// The projector's internal tables: the checkpoint, co-located with the read-model
@@ -58,6 +59,8 @@ impl ReadModel {
         for entity in entities {
             conn.execute_batch(&entity.create_table_sql())
                 .with_context(|| format!("creating table `{}`", entity.name))?;
+            drop_reshaped_indexes(&conn, entity)
+                .with_context(|| format!("reconciling indexes on table `{}`", entity.name))?;
             for stmt in entity.create_index_sql() {
                 conn.execute_batch(&stmt)
                     .with_context(|| format!("indexing table `{}`", entity.name))?;
@@ -247,7 +250,7 @@ impl ReadModel {
     /// Read every row of an entity back as a JSON object (NULL columns omitted),
     /// ordered by key. For inspection and display.
     pub fn rows(&self, entity: &EntityDef) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.scan(entity, None, None, i64::MAX as usize)
+        self.scan(entity, &Filter::default(), None, i64::MAX as usize)
     }
 
     /// Read one row by key, as a JSON object (NULL columns omitted), or `None`.
@@ -263,46 +266,25 @@ impl ReadModel {
         rows.next()?.map(|row| row_to_json(entity, row)).transpose()
     }
 
-    /// Scan an entity ordered by key, optionally filtered by one column and
-    /// resumed after a key (cursor pagination). `filter`'s column must be a
-    /// declared field; the caller enforces that it is indexed. Values bind as
-    /// typed parameters, never interpolated.
+    /// Scan an entity ordered by key, filtered over a declared index and resumed after
+    /// a key (cursor pagination). The caller has already put `filter` through
+    /// `read_api::choose_index`, so the index this pins is the one it was validated
+    /// against. Values bind as typed parameters, never interpolated.
     pub fn scan(
         &self,
         entity: &EntityDef,
-        filter: Option<(&str, &str)>,
+        filter: &Filter,
         after_key: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
-        let columns = column_list(entity);
-        let mut clauses = Vec::new();
-        let mut binds: Vec<SqlValue> = Vec::new();
-        if let Some((column, value)) = filter {
-            clauses.push(format!("{} = ?", quote_ident(column)));
-            let kind = entity
-                .fields
-                .iter()
-                .find(|(name, _)| name == column)
-                .map(|(_, meta)| &meta.kind);
-            binds.push(match kind {
-                Some(kind) => bind_or_text(kind, value),
-                None => text(value),
-            });
-        }
+        let access = choose_index(entity, filter).with_context(|| {
+            format!("no declared index on `{}` serves this filter", entity.name)
+        })?;
+        let sql = scan_sql(entity, filter, access, after_key.is_some());
+        let mut binds = filter_binds(entity, filter);
         if let Some(after) = after_key {
-            clauses.push(format!("{} > ?", quote_ident(&entity.key)));
             binds.push(bind_or_text(key_kind(entity), after));
         }
-        let where_clause = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", clauses.join(" AND "))
-        };
-        let key = quote_ident(&entity.key);
-        let sql = format!(
-            "SELECT {columns} FROM {}{where_clause} ORDER BY {key} LIMIT ?",
-            quote_ident(&entity.name)
-        );
         binds.push(SqlValue::Integer(limit as i64));
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(binds))?;
@@ -312,6 +294,137 @@ impl ReadModel {
         }
         Ok(out)
     }
+
+    /// The query plan [`ReadModel::scan`] actually gets, for the test that pins it to an
+    /// index seek rather than a scan and a sort.
+    #[cfg(test)]
+    fn explain_scan(
+        &self,
+        entity: &EntityDef,
+        filter: &Filter,
+        after_key: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let access = choose_index(entity, filter).context("no index serves this filter")?;
+        let sql = scan_sql(entity, filter, access, after_key.is_some());
+        let mut stmt = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        // The planner sees bound values, so they have to be present and in the order the
+        // statement declares them for the plan to be the one the real call gets.
+        let mut binds = filter_binds(entity, filter);
+        if let Some(after) = after_key {
+            binds.push(bind_or_text(key_kind(entity), after));
+        }
+        binds.push(SqlValue::Integer(1));
+        let rows = stmt.query_map(params_from_iter(binds), |row| row.get::<_, String>(3))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?.join("\n"))
+    }
+}
+
+/// The statement [`ReadModel::scan`] runs, built once so the test that explains the plan
+/// and the code that executes it cannot describe different queries.
+///
+/// `INDEXED BY` is what turns "you may only ask what you declared" from a rule the
+/// handler enforces into one the database enforces: without it the planner is free to
+/// decide a table scan looks cheaper, and the refusal upstream would be the only thing
+/// that ever made the promise true. It is left off for [`Access::Key`], which names no
+/// index: an `INTEGER` key is the rowid and a text key's index is SQLite's own
+/// `sqlite_autoindex_*`, and there is no scan for the planner to prefer either way.
+///
+/// Binds are positional, so their order here is the order [`filter_binds`] produces:
+/// equality in filter order, then the range's lower and upper bounds, then the cursor,
+/// then the limit.
+fn scan_sql(entity: &EntityDef, filter: &Filter, access: Access<'_>, after_key: bool) -> String {
+    let mut clauses = Vec::new();
+    for (column, _) in &filter.equals {
+        clauses.push(format!("{} = ?", quote_ident(column)));
+    }
+    if let Some((column, range)) = &filter.range {
+        let column = quote_ident(column);
+        if let Some((bound, _)) = &range.lower {
+            clauses.push(format!("{column} {} ?", bound.operator(true)));
+        }
+        if let Some((bound, _)) = &range.upper {
+            clauses.push(format!("{column} {} ?", bound.operator(false)));
+        }
+    }
+    if after_key {
+        clauses.push(format!("{} > ?", quote_ident(&entity.key)));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let pin = match access {
+        Access::Key => String::new(),
+        Access::Index(name) => format!(" INDEXED BY {}", quote_ident(&entity.index_name(name))),
+    };
+    format!(
+        "SELECT {} FROM {}{pin}{where_clause} ORDER BY {} LIMIT ?",
+        column_list(entity),
+        quote_ident(&entity.name),
+        quote_ident(&entity.key),
+    )
+}
+
+/// A filter's values as typed binds, in the order [`scan_sql`] names them.
+fn filter_binds(entity: &EntityDef, filter: &Filter) -> Vec<SqlValue> {
+    let kind = |column: &str| {
+        entity
+            .fields
+            .iter()
+            .find(|(name, _)| name == column)
+            .map(|(_, meta)| &meta.kind)
+    };
+    let bind = |column: &str, value: &str| match kind(column) {
+        Some(kind) => bind_or_text(kind, value),
+        None => text(value),
+    };
+    let mut binds: Vec<SqlValue> = filter
+        .equals
+        .iter()
+        .map(|(column, value)| bind(column, value))
+        .collect();
+    if let Some((column, range)) = &filter.range {
+        binds.extend(range.bounds().map(|(_, value)| bind(column, value)));
+    }
+    binds
+}
+
+/// Drop any index whose live columns differ from the ones its declaration now generates,
+/// so the `CREATE INDEX IF NOT EXISTS` that follows really creates it.
+///
+/// **`IF NOT EXISTS` matches on the name alone**, so an index whose *shape* changed is
+/// otherwise adopted silently and keeps its old columns forever. Nothing upstream catches
+/// it: a projector rebuilds when heklang's digest moves, and the digest covers the
+/// columns an author declared rather than the key hekla appends to them
+/// ([`EntityDef::index_columns`]), so a DDL change here moves no hash at all.
+///
+/// Reads `pragma_index_info` rather than comparing `sqlite_master.sql` as text, so it
+/// does not depend on how SQLite echoes a statement back, and an index written by an
+/// older hekla with different quoting reconciles instead of looking changed forever.
+fn drop_reshaped_indexes(conn: &Connection, entity: &EntityDef) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+    for ix in &entity.indexes {
+        let name = entity.index_name(&ix.name);
+        let live: Vec<String> = stmt
+            .query_map([&name], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        let wanted = entity.index_columns(ix);
+        // Absent is the ordinary case (a fresh model, or a rebuild), and is not a
+        // reshape: the create that follows is what makes it.
+        if live.is_empty() || live == wanted {
+            continue;
+        }
+        tracing::info!(
+            entity = %entity.name,
+            index = %name,
+            was = ?live,
+            now = ?wanted,
+            "recreating an index whose columns changed"
+        );
+        conn.execute_batch(&format!("DROP INDEX {}", quote_ident(&name)))?;
+    }
+    Ok(())
 }
 
 /// The entity's columns as a comma-separated `SELECT` list, in declared order so
@@ -496,6 +609,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::read_api::{Bound, Range};
     use crate::schema::IndexDef;
 
     fn users_entity() -> EntityDef {
@@ -517,6 +631,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let model = ReadModel::open(&dir.path().join("m.db"), entities).unwrap();
         (model, dir)
+    }
+
+    /// A filter of equality on each column, which is what most of these want.
+    fn equals(pairs: &[(&str, &str)]) -> Filter {
+        Filter {
+            equals: pairs
+                .iter()
+                .map(|(column, value)| ((*column).to_owned(), (*value).to_owned()))
+                .collect(),
+            range: None,
+        }
+    }
+
+    /// A filter of equality on `pairs`, then a range over `column`.
+    fn ranged(pairs: &[(&str, &str)], column: &str, range: Range) -> Filter {
+        Filter {
+            range: Some((column.to_owned(), range)),
+            ..equals(pairs)
+        }
     }
 
     fn put(model: &ReadModel, entity: &EntityDef, id: &str, email: &str) {
@@ -559,7 +692,9 @@ mod tests {
         let mut seen = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            let page = model.scan(&entity, None, after.as_deref(), 2).unwrap();
+            let page = model
+                .scan(&entity, &Filter::default(), after.as_deref(), 2)
+                .unwrap();
             if page.is_empty() {
                 break;
             }
@@ -576,12 +711,16 @@ mod tests {
 
     #[test]
     fn scan_filters_on_a_column() {
-        let entity = users_entity();
+        let mut entity = users_entity();
+        entity.indexes.push(IndexDef {
+            name: "by_email".to_owned(),
+            columns: vec!["email".to_owned()],
+        });
         let (model, _dir) = open_temp(slice::from_ref(&entity));
         put(&model, &entity, "u1", "match@x");
         put(&model, &entity, "u2", "other@x");
         let rows = model
-            .scan(&entity, Some(("email", "match@x")), None, 50)
+            .scan(&entity, &equals(&[("email", "match@x")]), None, 50)
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["user_id"], "u1");
@@ -598,7 +737,10 @@ mod tests {
                 ("user_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
                 ("active".to_owned(), FieldMeta::plain(FieldKind::Bool)),
             ],
-            indexes: vec![],
+            indexes: vec![IndexDef {
+                name: "by_active".to_owned(),
+                columns: vec!["active".to_owned()],
+            }],
         };
         let (model, _dir) = open_temp(slice::from_ref(&entity));
         for (id, active) in [("u1", true), ("u2", false), ("u3", true)] {
@@ -610,11 +752,11 @@ mod tests {
                 .unwrap();
         }
         let active = model
-            .scan(&entity, Some(("active", "true")), None, 50)
+            .scan(&entity, &equals(&[("active", "true")]), None, 50)
             .unwrap();
         assert_eq!(active.len(), 2);
         let inactive = model
-            .scan(&entity, Some(("active", "false")), None, 50)
+            .scan(&entity, &equals(&[("active", "false")]), None, 50)
             .unwrap();
         assert_eq!(inactive.len(), 1);
         assert_eq!(inactive[0]["user_id"], "u2");
@@ -652,12 +794,14 @@ mod tests {
         }
         assert_eq!(model.get(&entity, "g1").unwrap().unwrap()["select"], "a");
         let filtered = model
-            .scan(&entity, Some(("select", "b")), None, 50)
+            .scan(&entity, &equals(&[("select", "b")]), None, 50)
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["group"], "g2");
         // The cursor branch adds `key > ?` and the ORDER BY on the keyword key.
-        let after = model.scan(&entity, None, Some("g1"), 50).unwrap();
+        let after = model
+            .scan(&entity, &Filter::default(), Some("g1"), 50)
+            .unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0]["group"], "g2");
 
@@ -704,15 +848,17 @@ mod tests {
             .unwrap();
         }
 
-        // `IF NOT EXISTS` leaves the hand-built table and index alone; the quoted DDL
-        // must resolve to the same names, not conflict with them or duplicate them.
+        // `IF NOT EXISTS` leaves the hand-built table alone; the quoted DDL must resolve
+        // to the same names, not conflict with them or duplicate them. The index is the
+        // one thing that does move, because the generator now appends the key to it, and
+        // it moves by being reshaped in place rather than by growing a second index.
         let model = ReadModel::open(&path, slice::from_ref(&entity)).unwrap();
         assert_eq!(model.get(&entity, "u0").unwrap().unwrap()["email"], "old@x");
         put(&model, &entity, "u1", "new@x");
         assert_eq!(model.rows(&entity).unwrap().len(), 2);
         assert_eq!(
             model
-                .scan(&entity, Some(("email", "old@x")), None, 50)
+                .scan(&entity, &equals(&[("email", "old@x")]), None, 50)
                 .unwrap()
                 .len(),
             1
@@ -744,6 +890,259 @@ mod tests {
             indexes,
             vec!["users_by_email"],
             "the quoted CREATE INDEX names the existing index rather than adding one"
+        );
+        assert_eq!(
+            index_columns(&model, "users_by_email"),
+            vec!["email", "user_id"],
+            "the single-column index the old generator wrote is reshaped, not adopted"
+        );
+    }
+
+    /// The columns one live index is built over, in order.
+    fn index_columns(model: &ReadModel, index: &str) -> Vec<String> {
+        model
+            .conn
+            .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+            .unwrap()
+            .query_map([index], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// An entity with one compound index, which is what a prefix filter needs to have
+    /// something to be a prefix *of*. `bucket` and `rank` take equality, `rank` doubles
+    /// as the range column under a `bucket`, and `note` is in no index at all.
+    fn catalog_entity() -> EntityDef {
+        EntityDef {
+            name: "item".to_owned(),
+            key: "item_id".to_owned(),
+            fields: vec![
+                ("item_id".to_owned(), FieldMeta::plain(FieldKind::Uuid)),
+                (
+                    "bucket".to_owned(),
+                    FieldMeta::plain(FieldKind::Text { max_length: None }),
+                ),
+                ("rank".to_owned(), FieldMeta::plain(FieldKind::I64)),
+                (
+                    "note".to_owned(),
+                    FieldMeta::plain(FieldKind::Text { max_length: None }),
+                ),
+            ],
+            indexes: vec![IndexDef {
+                name: "by_bucket_rank".to_owned(),
+                columns: vec!["bucket".to_owned(), "rank".to_owned()],
+            }],
+        }
+    }
+
+    fn put_item(model: &ReadModel, entity: &EntityDef, id: &str, bucket: &str, rank: i64) {
+        model
+            .apply_one(
+                entity,
+                EntityOpKind::Put(
+                    json!({ "item_id": id, "bucket": bucket, "rank": rank, "note": "" })
+                        .to_string(),
+                ),
+            )
+            .unwrap();
+    }
+
+    fn catalog_model() -> (ReadModel, EntityDef, TempDir) {
+        let entity = catalog_entity();
+        let (model, dir) = open_temp(slice::from_ref(&entity));
+        for (id, bucket, rank) in [
+            ("i1", "a", 1),
+            ("i2", "a", 5),
+            ("i3", "a", 9),
+            ("i4", "b", 5),
+        ] {
+            put_item(&model, &entity, id, bucket, rank);
+        }
+        (model, entity, dir)
+    }
+
+    fn ids(rows: &[serde_json::Value]) -> Vec<String> {
+        rows.iter()
+            .map(|row| row["item_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn scan_filters_on_a_whole_index_and_on_its_prefix() {
+        let (model, entity, _dir) = catalog_model();
+        let prefix = model
+            .scan(&entity, &equals(&[("bucket", "a")]), None, 50)
+            .unwrap();
+        assert_eq!(ids(&prefix), vec!["i1", "i2", "i3"]);
+        let whole = model
+            .scan(
+                &entity,
+                &equals(&[("bucket", "a"), ("rank", "5")]),
+                None,
+                50,
+            )
+            .unwrap();
+        assert_eq!(ids(&whole), vec!["i2"]);
+        // The same two columns the other way round is the same question: a query string
+        // carries no order, so the match against the index is a set comparison.
+        let reversed = model
+            .scan(
+                &entity,
+                &equals(&[("rank", "5"), ("bucket", "a")]),
+                None,
+                50,
+            )
+            .unwrap();
+        assert_eq!(ids(&reversed), vec!["i2"]);
+    }
+
+    #[test]
+    fn scan_ranges_over_the_column_after_the_equality_prefix() {
+        let (model, entity, _dir) = catalog_model();
+        let half_open = ranged(
+            &[("bucket", "a")],
+            "rank",
+            Range {
+                lower: Some((Bound::Inclusive, "5".to_owned())),
+                upper: None,
+            },
+        );
+        assert_eq!(
+            ids(&model.scan(&entity, &half_open, None, 50).unwrap()),
+            vec!["i2", "i3"]
+        );
+        // Both ends together, and the exclusive upper is what keeps `i3` out: a bounded
+        // range is two clauses over one column, not two range columns.
+        let bounded = ranged(
+            &[("bucket", "a")],
+            "rank",
+            Range {
+                lower: Some((Bound::Exclusive, "1".to_owned())),
+                upper: Some((Bound::Exclusive, "9".to_owned())),
+            },
+        );
+        assert_eq!(
+            ids(&model.scan(&entity, &bounded, None, 50).unwrap()),
+            vec!["i2"]
+        );
+    }
+
+    #[test]
+    fn a_filter_no_declared_index_leads_with_is_refused_rather_than_scanned() {
+        let (model, entity, _dir) = catalog_model();
+        // `rank` is the index's *second* column, so reaching these rows means visiting
+        // every bucket. The handler refuses this first; the model refuses it too, so
+        // the promise does not rest on one caller remembering to ask.
+        let err = model
+            .scan(&entity, &equals(&[("rank", "5")]), None, 50)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no declared index"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_filtered_scan_reaches_rows_through_its_index_rather_than_scanning_and_sorting() {
+        // The temp-B-tree half is the one that pays for `EntityDef::index_columns`
+        // appending the key. Without it the pinned index stops at `(bucket, rank)`, the
+        // rows come out in index order rather than key order, and SQLite sorts the whole
+        // match set on *every page* of a paginated scan. The plan is the only place that
+        // difference is visible: the rows are identical either way, so no behavioural
+        // test can see it.
+        //
+        // Paginated deliberately (`Some("i1")`), because a first page could hide the
+        // cost: it is the cursor that makes the sort recur.
+        let (model, entity, _dir) = catalog_model();
+        let plan = model
+            .explain_scan(
+                &entity,
+                &equals(&[("bucket", "a"), ("rank", "5")]),
+                Some("i1"),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("USING INDEX item_by_bucket_rank"),
+            "the filter must be served by the declared index: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN item"),
+            "a table scan is what the read API refuses: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "the key is appended to the index so the scan's own order is free: {plan}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_filter_takes_the_narrowest_index_that_serves_it() {
+        // `index (bucket)` and `index (bucket, rank)` both serve a filter on `bucket`,
+        // and they are not equivalent: the generated indexes are `(bucket, item_id)` and
+        // `(bucket, rank, item_id)`, so only the first leaves the rows already in the key
+        // order the scan asks for. Declaration order puts the wider one first, so taking
+        // the first match rather than the narrowest would quietly pick the sort.
+        let mut entity = catalog_entity();
+        entity.indexes.push(IndexDef {
+            name: "by_bucket".to_owned(),
+            columns: vec!["bucket".to_owned()],
+        });
+        let (model, _dir) = open_temp(slice::from_ref(&entity));
+        put_item(&model, &entity, "i1", "a", 1);
+        let plan = model
+            .explain_scan(&entity, &equals(&[("bucket", "a")]), Some("i1"))
+            .unwrap();
+        assert!(
+            plan.contains("USING INDEX item_by_bucket "),
+            "the narrower index is the one that serves this without a sort: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "which is the whole reason to prefer it: {plan}"
+        );
+    }
+
+    #[test]
+    fn an_index_whose_columns_changed_is_reshaped_on_the_next_open() {
+        // A projector rebuilds when heklang's digest moves, and the digest covers the
+        // columns an author declared, not the ones hekla generates from them. So a
+        // change to the generated DDL reaches an existing read model through this and
+        // nothing else: `CREATE INDEX IF NOT EXISTS` matches on the name alone and would
+        // adopt the old shape forever.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let mut narrow = catalog_entity();
+        narrow.indexes[0].columns = vec!["bucket".to_owned()];
+        {
+            let model = ReadModel::open(&path, slice::from_ref(&narrow)).unwrap();
+            assert_eq!(
+                index_columns(&model, "item_by_bucket_rank"),
+                vec!["bucket", "item_id"]
+            );
+        }
+
+        let wide = catalog_entity();
+        let model = ReadModel::open(&path, slice::from_ref(&wide)).unwrap();
+        assert_eq!(
+            index_columns(&model, "item_by_bucket_rank"),
+            vec!["bucket", "rank", "item_id"]
+        );
+        let indexes: Vec<String> = model
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND tbl_name = 'item' AND sql IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            indexes,
+            vec!["item_by_bucket_rank"],
+            "reshaping replaces the index rather than leaving two behind"
         );
     }
 
