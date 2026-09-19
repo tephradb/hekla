@@ -3,7 +3,7 @@
 // plaintext; the read API decrypts on the way out.
 //
 // `GET /read/CustomerOrders/Order/{order_id}` returns one order with the personal
-// fields decrypted. After `hekla erase customer_id <id>` those two columns read back
+// fields decrypted. After `hekla erase Customer <id>` those two columns read back
 // absent while the row and its plaintext `customer_id` remain, which is what a
 // per-field subject buys: the shop's `order_total` is scoped to a different key and is
 // untouched, though this read model does not carry it.

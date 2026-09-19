@@ -1,7 +1,7 @@
 // `@order.placed` carries data for two different subjects: the customer and the shop.
-// Per-field subjects (rather than scoping the whole event to one) let each be erased
-// independently: shredding the customer leaves the shop's order record intact, and
-// shredding the shop never touches the customer's personal fields.
+// Per-field subjects (rather than scoping the whole event to one) let the customer be
+// erased without touching the shop's order record; a `Customer` sits under its `Shop`
+// (`lib/config.hk`), so shredding the shop takes its customers with it.
 //
 // The customer's two fields are optional, and that is load-bearing rather than
 // incidental. An erased subject's column reads back absent, so the type has to admit
