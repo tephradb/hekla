@@ -577,6 +577,49 @@ Failure modes:
   checks, and loud rather than skipped if it happens, because a key silently left under the master is
   the failure this exists to remove.
 
+## Upgrading a data directory written before v10
+
+Only for a directory last written by hekla 0.6.0 or earlier that has sealed at least one field.
+Everything else upgrades with nothing set, and a project that never declared a `@subject` never meets
+this at all.
+
+A subject key used to be filed under the **field** an `@subject` annotation named. It is now filed
+under the declared subject's own name, which is what `subject Customer(Int)` introduced. The wrapped
+secret carries across untouched, but the label does not, and nothing in the database records which
+field became which subject: only you know that. A key row under a label the program never looks up is
+unreachable, and every value sealed under it reads back **absent**, which no caller can tell from an
+erasure. So the upgrade refuses until it is told the mapping, rather than succeeding and leaving data
+that looks deleted.
+
+```
+$ hekla serve ./shop --data ./data
+Error: this database holds 1483 subject key row(s) under 2 namespace(s) written before a subject was
+a declared type, and nothing here says where they went: `customer_id`, `shop_id`. ...
+```
+
+The refusal names every namespace it found, which is the list you have to answer:
+
+```
+$ HEKLA_V10_SUBJECTS="customer_id=Customer,shop_id=Shop" hekla serve ./shop --data ./data
+```
+
+- **A namespace that should keep the spelling it has** is written as itself, `legacy_ref=legacy_ref`.
+  That is also what you write for one you have decided to abandon; it stays in the table and stays
+  unreachable. There is no keyword for this, because a subject can be named anything an identifier
+  can be, so any reserved word would be a name somebody could legitimately declare.
+- **Two namespaces can merge into one subject**, which is what an annotation renamed part-way through
+  a project's life leaves behind. Refused only if both hold a key for the same id, since one subject
+  files one key per id and the merge would otherwise have to drop a secret.
+- **An entry naming a namespace this directory has nothing under** is a warning, not a refusal: one
+  variable covering several data directories is the ordinary way to run the upgrade.
+- **The right-hand side is taken on trust.** The migration runs before any program is loaded, so
+  there are no declarations here to check a subject name against. Check it against your `.hk` files.
+- **A refused upgrade changes nothing**, including the schema version, so the previous release still
+  opens the directory and still reads the data while you work the mapping out.
+
+Unset the variable once the directory is upgraded. It is read only on the v9-to-v10 step and does
+nothing afterwards.
+
 ## Environment
 
 | Variable | Read by | Means |
@@ -585,6 +628,7 @@ Failure modes:
 | `HEKLA_MASTER_KEY_PREVIOUS` | the same | comma-separated prior masters, for unwrapping during rotation |
 | `HEKLA_MAX_ATTEMPTS` | `serve` | how many times a command re-decides after a DCB conflict before answering 409. Default 5, capped at 15, read once per process |
 | `HEKLA_UI_DIR` | `serve` | serve the admin console's assets from this directory instead of the ones compiled in |
+| `HEKLA_V10_SUBJECTS` | any command that migrates a data directory | `old_field=NewSubject` pairs, comma-separated, naming where each pre-v10 key namespace went. Read only while upgrading a directory written before subjects were declared types; see [Upgrading a data directory written before v10](#upgrading-a-data-directory-written-before-v10) |
 | `HEKLA_SECRET_<NAME>` | `serve`, `verify`, `plan`, `secrets` | the fallback source for a declared `secret NAME` that `[secrets]` does not name. Never read by `check` or `test` |
 | `RUST_LOG` | `serve`, `verify` | tracing filter, default `info`. An unparseable value is reported on stderr and ignored |
 | `NO_COLOR` | `serve`, `verify` | any non-empty value drops the ANSI colors from the log, the same as `--no-color`. Empty is not an opt-out |

@@ -9,7 +9,8 @@
 //! the short, single-statement operations the effect runtime calls under a shared
 //! lock.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::env;
 use std::iter;
 use std::path::Path;
 use std::time::Duration;
@@ -212,17 +213,26 @@ impl OpDb {
     pub fn open(path: &Path) -> anyhow::Result<OpDb> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening operational database {}", path.display()))?;
-        Self::from_connection(conn)
+        Self::from_connection(conn, V10Subjects::from_env()?)
     }
 
     /// Open an in-memory operational database. For tests.
     pub fn open_in_memory() -> anyhow::Result<OpDb> {
         let conn =
             Connection::open_in_memory().context("opening in-memory operational database")?;
-        Self::from_connection(conn)
+        Self::from_connection(conn, V10Subjects::default())
     }
 
-    fn from_connection(conn: Connection) -> anyhow::Result<OpDb> {
+    /// Open with the pre-v10 namespace mapping stated directly rather than read from the
+    /// environment, so the migration's refusals are testable without a process-global.
+    #[cfg(test)]
+    fn open_mapped(path: &Path, mapping: &str) -> anyhow::Result<OpDb> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening operational database {}", path.display()))?;
+        Self::from_connection(conn, V10Subjects::parse(mapping)?)
+    }
+
+    fn from_connection(conn: Connection, v10: V10Subjects) -> anyhow::Result<OpDb> {
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enabling foreign keys")?;
         // WAL keeps a journal write from blocking a concurrent read once the
@@ -235,7 +245,7 @@ impl OpDb {
         conn.busy_timeout(Duration::from_secs(5))
             .context("setting busy timeout")?;
         let mut db = OpDb { conn };
-        db.migrate()?;
+        db.migrate(&v10)?;
         Ok(db)
     }
 
@@ -1936,7 +1946,7 @@ impl OpDb {
     /// DDL and the `user_version` bump commit together, so a crash or a failure
     /// mid-migration leaves the database exactly at the version it was at rather
     /// than half-migrated and unopenable forever after.
-    fn migrate(&mut self) -> anyhow::Result<()> {
+    fn migrate(&mut self, v10: &V10Subjects) -> anyhow::Result<()> {
         let mut version: i64 = self.schema_version()?;
         if version > SCHEMA_VERSION {
             anyhow::bail!(
@@ -1959,27 +1969,17 @@ impl OpDb {
                 7 => tx.execute_batch(SCHEMA_V8).context("applying schema v8")?,
                 8 => tx.execute_batch(SCHEMA_V9).context("applying schema v9")?,
                 9 => {
-                    // The rows are carried across, but their namespace is not what it
-                    // was: a subject used to be spelled with the *field* name the
-                    // annotation pointed at and is now the declared type's name, and
-                    // nothing here knows the mapping between them. So a carried row is
-                    // reachable only if the project happened to name its subject exactly
-                    // what the field was called. Said out loud rather than left to be
-                    // discovered, because the symptom is every pre-existing sealed value
-                    // reading back absent, which is indistinguishable from an erasure.
-                    let carried: i64 = tx
-                        .query_row("SELECT count(*) FROM subject_key", [], |row| row.get(0))
-                        .context("counting subject keys before the v10 rebuild")?;
+                    // The bytes carry across untouched, but the namespace they are filed
+                    // under changed meaning: a subject used to be spelled with the *field*
+                    // the annotation pointed at and is now the declared type's name.
+                    // Nothing in the database knows the mapping between the two, and a row
+                    // under the wrong one is unreachable, so this refuses until it is
+                    // given one rather than carrying rows whose every sealed value would
+                    // read back absent and so be indistinguishable from an erasure.
+                    let renames = v10_renames(&tx, v10)?;
                     tx.execute_batch(SCHEMA_V10)
                         .context("applying schema v10")?;
-                    if carried > 0 {
-                        tracing::warn!(
-                            "carried {carried} subject key row(s) into schema v10. a subject is \
-                             now named by its declared type rather than by the field the \
-                             annotation named, so a row whose old spelling differs is \
-                             unreachable and everything sealed under it reads as erased"
-                        );
-                    }
+                    apply_v10_renames(&tx, &renames)?;
                 }
                 10 => tx
                     .execute_batch(SCHEMA_V11)
@@ -2237,6 +2237,234 @@ ALTER TABLE effect_invocation ADD COLUMN collapsed_from INTEGER;
 /// wrapped under exactly one thing, a master (a root) or a parent subject (a child).
 /// Neither would be unopenable and both would be ambiguous, so it is a database rule
 /// rather than a convention this module has to remember.
+/// Where the operator says each pre-v10 key namespace went.
+///
+/// Before schema v10 a subject key was filed under the **field** an `@subject` annotation
+/// named; it is now filed under the declared subject type's name. The wrapped secret
+/// carries across untouched either way, but the label does not, and a row under a label
+/// nothing declares is unreachable: every value sealed under it reads back absent, which
+/// is indistinguishable from an erasure. Only the operator knows which field became which
+/// type, so the migration asks rather than guesses.
+///
+/// `HEKLA_V10_SUBJECTS="customer_id=Customer,shop_id=Shop"`, one entry per namespace found
+/// in the database. A namespace meant to keep the spelling it already has is written as
+/// itself, `legacy_ref=legacy_ref`: that is the only way to say "carry it as it is", and it
+/// is spelled out rather than given a reserved word because a subject may be named anything
+/// an identifier may be, so any sentinel would be a name somebody could legitimately
+/// declare.
+///
+/// The right-hand side is taken on trust. The migration runs inside [`OpDb::open`], before
+/// any program is loaded, so there are no declarations here to check a subject name
+/// against. What is checked is everything the database itself can answer: that every
+/// namespace present is accounted for, that no entry names one that is not, and that no
+/// two of them collide on an id once renamed.
+const V10_SUBJECTS_ENV: &str = "HEKLA_V10_SUBJECTS";
+
+/// The parsed value of [`V10_SUBJECTS_ENV`], old spelling to new.
+#[derive(Debug, Default, Clone)]
+struct V10Subjects(BTreeMap<String, String>);
+
+impl V10Subjects {
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        let mut map = BTreeMap::new();
+        for entry in raw.split(',').map(str::trim).filter(|one| !one.is_empty()) {
+            let Some((old, new)) = entry.split_once('=') else {
+                anyhow::bail!(
+                    "`{V10_SUBJECTS_ENV}` entry `{entry}` is not `old=New`, so it says nothing \
+                     about where a namespace went"
+                );
+            };
+            let (old, new) = (old.trim(), new.trim());
+            if old.is_empty() || new.is_empty() {
+                anyhow::bail!("`{V10_SUBJECTS_ENV}` entry `{entry}` leaves one side empty");
+            }
+            if let Some(first) = map.insert(old.to_owned(), new.to_owned())
+                && first != new
+            {
+                anyhow::bail!(
+                    "`{V10_SUBJECTS_ENV}` sends `{old}` to both `{first}` and `{new}`, and a key \
+                     is filed under one name"
+                );
+            }
+        }
+        Ok(Self(map))
+    }
+
+    fn from_env() -> anyhow::Result<Self> {
+        match env::var(V10_SUBJECTS_ENV) {
+            Ok(raw) => Self::parse(&raw),
+            Err(env::VarError::NotPresent) => Ok(Self::default()),
+            Err(err) => Err(anyhow::anyhow!("reading `{V10_SUBJECTS_ENV}`: {err}")),
+        }
+    }
+}
+
+/// Backtick-quote and comma-join, which is how every refusal here names its offenders.
+fn quoted<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    names
+        .into_iter()
+        .map(|one| format!("`{one}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Check the stated mapping against the namespaces actually present, and return the
+/// renames the v10 rebuild should apply.
+///
+/// Two things are refused, and both are a row going somewhere the program will not look
+/// for it: a namespace the mapping does not account for, and two namespaces merging onto
+/// one id. A third, an entry this database has nothing under, is only warned about,
+/// because nothing here is at risk when everything present is accounted for.
+fn v10_renames(tx: &Connection, stated: &V10Subjects) -> anyhow::Result<Vec<(String, String)>> {
+    let mut present: Vec<(String, i64)> = tx
+        .prepare("SELECT subject_field, count(*) FROM subject_key GROUP BY subject_field")
+        .context("listing pre-v10 subject key namespaces")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .context("listing pre-v10 subject key namespaces")?
+        .collect::<Result<_, _>>()
+        .context("listing pre-v10 subject key namespaces")?;
+    present.sort();
+    if present.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let here: BTreeSet<&str> = present.iter().map(|(name, _)| name.as_str()).collect();
+    let unaccounted: Vec<&str> = here
+        .iter()
+        .copied()
+        .filter(|name| !stated.0.contains_key(*name))
+        .collect();
+    let absent: Vec<&str> = stated
+        .0
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !here.contains(*name))
+        .collect();
+
+    // The two are reported together rather than in turn, because a typo produces both at
+    // once and each half alone is the wrong half: an operator told only that
+    // `customer_id` is unaccounted for has no reason to suspect the `custmer_id=Customer`
+    // line they already wrote, and would add a second entry for a namespace they thought
+    // they had already mapped.
+    if !unaccounted.is_empty() {
+        let rows: i64 = present
+            .iter()
+            .filter(|(name, _)| unaccounted.contains(&name.as_str()))
+            .map(|(_, count)| count)
+            .sum();
+        let mut why = format!(
+            "this database holds {rows} subject key row(s) under {count} namespace(s) written \
+             before a subject was a declared type, and nothing here says where they went: \
+             {list}. A key used to be filed under the field an `@subject` annotation named and \
+             is now filed under the declared subject's own name, so carrying one across \
+             unmapped makes every value sealed under it read back absent, which no caller can \
+             tell from an erasure.",
+            count = unaccounted.len(),
+            list = quoted(unaccounted.iter().copied()),
+        );
+        if absent.is_empty() {
+            why.push_str(&format!(
+                " Set `{V10_SUBJECTS_ENV}` to the mapping, for example \
+                 `{V10_SUBJECTS_ENV}=\"{example}=Customer\"`, writing a namespace that should \
+                 keep the name it has as itself (`{example}={example}`)",
+                example = unaccounted[0],
+            ));
+        } else {
+            why.push_str(&format!(
+                " `{V10_SUBJECTS_ENV}` does carry {list}, which nothing here is filed under, so \
+                 that is where to look first: one of those is most likely one of these \
+                 misspelled",
+                list = quoted(absent.iter().copied()),
+            ));
+        }
+        anyhow::bail!("{why}");
+    }
+
+    // Said but not refused. Every namespace here is accounted for, so no data is at risk,
+    // and one `HEKLA_V10_SUBJECTS` covering several data directories is the ordinary way to
+    // hold it: an entry that is spent against this one is still load-bearing for the next.
+    if !absent.is_empty() {
+        tracing::warn!(
+            "`{V10_SUBJECTS_ENV}` maps {list}, which this database has no key rows under. \
+             everything here is accounted for, so the upgrade is going ahead; the entry is \
+             either spent or meant for another data directory",
+            list = quoted(absent.iter().copied()),
+        );
+    }
+
+    // Two namespaces may legitimately merge into one subject, but only where no id is in
+    // both: the rebuilt table is keyed on `(subject, subject_value)`, and two rows meeting
+    // there are two different secrets claiming one identity. Which of them survived would
+    // decide whose data stays readable, so neither is chosen here.
+    let mut merged: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (old, new) in &stated.0 {
+        merged.entry(new.as_str()).or_default().push(old.as_str());
+    }
+    for (new, olds) in merged.iter().filter(|(_, olds)| olds.len() > 1) {
+        let sql = format!(
+            "SELECT subject_value FROM subject_key WHERE subject_field IN ({}) \
+             GROUP BY subject_value HAVING count(*) > 1 ORDER BY subject_value LIMIT 1",
+            placeholders(olds.len()),
+        );
+        let clash: Option<String> = tx
+            .query_row(&sql, params_from_iter(olds.iter()), |row| row.get(0))
+            .optional()
+            .context("checking a v10 namespace merge for colliding ids")?;
+        if let Some(value) = clash {
+            anyhow::bail!(
+                "`{V10_SUBJECTS_ENV}` merges {list} into `{new}`, and each of them already holds \
+                 a key for id `{value}`. One subject files one key per id, so this would have to \
+                 drop a secret and with it everything sealed under it. Send them to different \
+                 subjects, or erase the ids you do not need before upgrading",
+                list = quoted(olds.iter().copied()),
+            );
+        }
+    }
+
+    Ok(stated
+        .0
+        .iter()
+        .filter(|(old, new)| old != new)
+        .map(|(old, new)| (old.clone(), new.clone()))
+        .collect())
+}
+
+/// Apply the renames [`v10_renames`] approved, after the rebuild has carried the rows.
+///
+/// Two hops through a namespace no identifier can spell, because the renames are a
+/// permutation and applying one at a time can collide part-way through even when the
+/// result does not: `a=B,b=A` ends with two distinct namespaces either way, but whichever
+/// half runs first lands on the other's rows. The intermediate makes the order irrelevant.
+fn apply_v10_renames(tx: &Connection, renames: &[(String, String)]) -> anyhow::Result<()> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    for (old, _) in renames {
+        tx.execute(
+            "UPDATE subject_key SET subject = ?1 WHERE subject = ?2",
+            params![format!("\u{1}{old}"), old],
+        )
+        .with_context(|| format!("staging the v10 rename of `{old}`"))?;
+    }
+    for (old, new) in renames {
+        tx.execute(
+            "UPDATE subject_key SET subject = ?1 WHERE subject = ?2",
+            params![new, format!("\u{1}{old}")],
+        )
+        .with_context(|| format!("renaming `{old}` to `{new}` for schema v10"))?;
+    }
+    tracing::info!(
+        "renamed {count} subject key namespace(s) into schema v10: {list}",
+        count = renames.len(),
+        list = renames
+            .iter()
+            .map(|(old, new)| format!("{old} -> {new}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    Ok(())
+}
+
 const SCHEMA_V10: &str = "
 CREATE TABLE subject_key_new (
     subject        TEXT NOT NULL,
@@ -2558,48 +2786,73 @@ mod tests {
             "and it is distinguishable from a known older version by exactly that"
         );
     }
-    /// The v10 rebuild carries existing key rows across, as roots.
+    /// Stand the key table back up in its pre-v10 shape with `rows` in it, and wind
+    /// `user_version` back to 9 so the next open runs the rebuild.
+    ///
+    /// `rows` are `(subject_field, subject_value, wrapped_key, master_key_id)`. The old
+    /// table is spelled out rather than kept as a constant because it is history: nothing
+    /// creates it any more, and a copy that drifted towards the current shape would test
+    /// the migration against a database that never existed.
+    fn stand_up_v9(path: &Path, rows: &[(&str, &str, &[u8], &str)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE subject_key;
+             CREATE TABLE subject_key (
+                 subject_field TEXT NOT NULL,
+                 subject_value TEXT NOT NULL,
+                 wrapped_key   BLOB NOT NULL,
+                 master_key_id TEXT NOT NULL,
+                 created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                 PRIMARY KEY (subject_field, subject_value)
+             );
+             CREATE INDEX subject_key_by_master ON subject_key (master_key_id);",
+        )
+        .unwrap();
+        for (index, (field, value, wrapped, master)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO subject_key
+                     (subject_field, subject_value, wrapped_key, master_key_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    field,
+                    value,
+                    wrapped,
+                    master,
+                    format!("2020-01-{:02}T00:00:00.000Z", index + 1),
+                ],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 9i64).unwrap();
+    }
+
+    /// The two rows every namespace test below starts from.
+    const V9_ROWS: &[(&str, &str, &[u8], &str)] = &[
+        ("customer_id", "42", &[0xDE, 0xAD, 0xBE, 0xEF], "master-A"),
+        ("shop_id", "7", &[0xC0, 0xFF, 0xEE], "master-B"),
+    ];
+
+    /// The v10 rebuild carries existing key rows across as roots, under the names the
+    /// operator said each old namespace became.
     ///
     /// The ladder runs on every fresh open, so the SQL is exercised constantly; what is
     /// not is the `INSERT ... SELECT` doing its job over rows that are actually there,
     /// which is the only part an upgrade depends on. This stands the table back up in its
     /// v3 shape, puts rows in it, winds `user_version` back and reopens.
     ///
-    /// What it deliberately does not claim is that the carried rows are *reachable*. The
-    /// namespace changed meaning in this version, from the field an annotation named to
-    /// the declared subject's name, and nothing here knows the mapping; the migration logs
-    /// a warning saying so. This is about not losing the bytes.
+    /// Reachability is the whole point of the mapping, so it is asserted at the name the
+    /// program will actually look under, not at the one the bytes were filed under before.
     #[test]
     fn the_v10_rebuild_carries_existing_key_rows_across_as_roots() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hekla.db");
         drop(OpDb::open(&path).unwrap());
+        stand_up_v9(&path, V9_ROWS);
 
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "DROP TABLE subject_key;
-                 CREATE TABLE subject_key (
-                     subject_field TEXT NOT NULL,
-                     subject_value TEXT NOT NULL,
-                     wrapped_key   BLOB NOT NULL,
-                     master_key_id TEXT NOT NULL,
-                     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                     PRIMARY KEY (subject_field, subject_value)
-                 );
-                 CREATE INDEX subject_key_by_master ON subject_key (master_key_id);
-                 INSERT INTO subject_key (subject_field, subject_value, wrapped_key, master_key_id, created_at)
-                     VALUES ('customer_id', '42', x'DEADBEEF', 'master-A', '2020-01-01T00:00:00.000Z'),
-                            ('shop_id', '7', x'C0FFEE', 'master-B', '2020-01-02T00:00:00.000Z');
-                 PRAGMA user_version = 9;",
-            )
-            .unwrap();
-        }
-
-        let db = OpDb::open(&path).unwrap();
+        let db = OpDb::open_mapped(&path, "customer_id=Customer,shop_id=Shop").unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
 
-        let carried = db.get_subject_key("customer_id", "42").unwrap().unwrap();
+        let carried = db.get_subject_key("Customer", "42").unwrap().unwrap();
         assert_eq!(
             carried.wrapped,
             vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -2611,12 +2864,13 @@ mod tests {
             "an existing row predates the hierarchy, so it is a root"
         );
         assert_eq!(
-            db.get_subject_key("shop_id", "7")
-                .unwrap()
-                .unwrap()
-                .wrapping,
+            db.get_subject_key("Shop", "7").unwrap().unwrap().wrapping,
             Wrapping::Master("master-B".to_owned()),
             "every row, and each under the master that actually wrapped it"
+        );
+        assert!(
+            db.get_subject_key("customer_id", "42").unwrap().is_none(),
+            "and nothing is left behind under the spelling it came in with"
         );
 
         // `created_at` survives, so an operator's inventory does not reset to today.
@@ -2629,7 +2883,7 @@ mod tests {
         assert!(page.iter().all(|row| row.parent.is_none()));
 
         // And the rebuilt table carries the constraint the old one had no room for.
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
         assert!(
             conn.execute(
                 "UPDATE subject_key SET master_key_id = NULL WHERE subject_value = '42'",
@@ -2637,6 +2891,241 @@ mod tests {
             )
             .is_err(),
             "the CHECK came with the rebuild"
+        );
+    }
+
+    /// An upgrade that would leave key rows unreachable refuses, and leaves the database
+    /// exactly where it was.
+    ///
+    /// This is the one that matters. Carrying the rows under their old spelling loses no
+    /// bytes and still makes every value sealed under them read back absent, which a
+    /// caller cannot tell from an erasure, so a silent success here is the worst outcome
+    /// available. Staying at v9 is what lets the operator put the previous release back
+    /// and read their data while they work out the mapping.
+    #[test]
+    fn a_pre_v10_namespace_nothing_accounts_for_refuses_the_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+        stand_up_v9(&path, V9_ROWS);
+
+        let err = OpDb::open(&path).map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("`customer_id`"), "{err}");
+        assert!(err.contains("`shop_id`"), "{err}");
+        assert!(err.contains("2 subject key row(s)"), "{err}");
+        assert!(
+            err.contains(V10_SUBJECTS_ENV),
+            "the repair is named, not implied: {err}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9, "a refused migration is not a half-applied one");
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM subject_key", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "and the rows it refused to relabel are all there");
+    }
+
+    /// A namespace whose spelling is already the subject's name is carried by saying so.
+    ///
+    /// There is no sentinel for "leave this one alone" because a subject may be named
+    /// anything an identifier may be, so the identity mapping is how it is said. It is
+    /// also what an operator writes for a namespace they have decided to abandon, which
+    /// is why nothing here tries to talk them out of it.
+    #[test]
+    fn a_pre_v10_namespace_can_be_carried_under_the_name_it_already_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+        stand_up_v9(&path, V9_ROWS);
+
+        let db = OpDb::open_mapped(&path, "customer_id=Customer,shop_id=shop_id").unwrap();
+        assert!(db.get_subject_key("Customer", "42").unwrap().is_some());
+        assert_eq!(
+            db.get_subject_key("shop_id", "7").unwrap().unwrap().wrapped,
+            vec![0xC0, 0xFF, 0xEE],
+            "carried as it is, bytes and all"
+        );
+    }
+
+    /// A typo is reported as both halves of itself, in one refusal.
+    ///
+    /// It is otherwise invisible in the worst way: the entry it was meant to be goes
+    /// unaccounted for, and an operator reading only that has no reason to suspect the
+    /// line they already wrote, so the obvious next move is a second entry for a namespace
+    /// they thought they had mapped. Naming the unmatched entry beside it is what makes it
+    /// one fix instead of two attempts.
+    #[test]
+    fn a_v10_mapping_typo_is_named_beside_the_namespace_it_left_unaccounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+        stand_up_v9(&path, V9_ROWS);
+
+        let err = OpDb::open_mapped(&path, "custmer_id=Customer,shop_id=Shop")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`customer_id`"),
+            "the namespace left unaccounted for: {err}"
+        );
+        assert!(
+            err.contains("`custmer_id`"),
+            "and the entry that was meant to be it: {err}"
+        );
+    }
+
+    /// An entry this database has nothing under is a warning, not a refusal.
+    ///
+    /// Everything here is accounted for, so no key row is going anywhere unreachable, and
+    /// one `HEKLA_V10_SUBJECTS` held across several data directories is the ordinary way to
+    /// run an upgrade: an entry spent against this one is still load-bearing for the next.
+    #[test]
+    fn a_v10_mapping_entry_for_another_data_directory_is_not_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+        stand_up_v9(&path, &[("customer_id", "42", &[0x01], "master-A")]);
+
+        let db = OpDb::open_mapped(&path, "customer_id=Customer,shop_id=Shop").unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert!(db.get_subject_key("Customer", "42").unwrap().is_some());
+    }
+
+    /// Two namespaces may merge into one subject, but not onto one id.
+    ///
+    /// The rebuilt table is keyed on `(subject, subject_value)`, so two rows meeting there
+    /// are two different secrets claiming one identity, and whichever survived would decide
+    /// whose data stays readable. Refused rather than resolved by insertion order.
+    #[test]
+    fn two_pre_v10_namespaces_merging_onto_one_id_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+        stand_up_v9(
+            &path,
+            &[
+                ("buyer_id", "42", &[0x01], "master-A"),
+                ("customer_id", "42", &[0x02], "master-A"),
+            ],
+        );
+
+        let err = OpDb::open_mapped(&path, "buyer_id=Customer,customer_id=Customer")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`buyer_id`") && err.contains("`customer_id`"),
+            "{err}"
+        );
+        assert!(err.contains("`42`"), "the id that collides is named: {err}");
+    }
+
+    /// The same merge lands when the two namespaces hold no id in common.
+    ///
+    /// The refusal above is about colliding ids, not about merging as such: an annotation
+    /// renamed part-way through a project's life leaves exactly this shape, and it is a
+    /// legitimate upgrade.
+    #[test]
+    fn two_pre_v10_namespaces_merge_when_their_ids_do_not_meet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+        stand_up_v9(
+            &path,
+            &[
+                ("buyer_id", "42", &[0x01], "master-A"),
+                ("customer_id", "43", &[0x02], "master-A"),
+            ],
+        );
+
+        let db = OpDb::open_mapped(&path, "buyer_id=Customer,customer_id=Customer").unwrap();
+        assert_eq!(
+            db.get_subject_key("Customer", "42")
+                .unwrap()
+                .unwrap()
+                .wrapped,
+            vec![0x01]
+        );
+        assert_eq!(
+            db.get_subject_key("Customer", "43")
+                .unwrap()
+                .unwrap()
+                .wrapped,
+            vec![0x02]
+        );
+    }
+
+    /// Two namespaces that swap names land on each other's rows, not on top of them.
+    ///
+    /// The renames are a permutation, and applying one at a time collides part-way through
+    /// even where the result does not: whichever half runs first writes onto rows the other
+    /// half has not moved yet. The staging hop is what makes the order irrelevant, and this
+    /// is the only test that can tell the two implementations apart.
+    #[test]
+    fn a_v10_rename_that_swaps_two_namespaces_lands_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+        stand_up_v9(
+            &path,
+            &[
+                ("shop", "1", &[0x01], "master-A"),
+                ("market", "1", &[0x02], "master-A"),
+            ],
+        );
+
+        let db = OpDb::open_mapped(&path, "shop=market,market=shop").unwrap();
+        assert_eq!(
+            db.get_subject_key("market", "1").unwrap().unwrap().wrapped,
+            vec![0x01],
+            "what was `shop` is now `market`"
+        );
+        assert_eq!(
+            db.get_subject_key("shop", "1").unwrap().unwrap().wrapped,
+            vec![0x02],
+            "and the other way round, with neither overwritten"
+        );
+    }
+
+    /// A database with no key rows at all upgrades without being told anything.
+    ///
+    /// Which is every project that never sealed a field, and the reason the refusal costs
+    /// nothing to anyone it is not about.
+    #[test]
+    fn a_v9_database_with_no_key_rows_upgrades_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+        stand_up_v9(&path, &[]);
+
+        let db = OpDb::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_v10_mapping_is_read_as_pairs_and_refuses_anything_else() {
+        let parsed = V10Subjects::parse(" customer_id = Customer , shop_id=Shop ").unwrap();
+        assert_eq!(
+            parsed.0["customer_id"], "Customer",
+            "space is not part of a name"
+        );
+        assert_eq!(parsed.0["shop_id"], "Shop");
+        assert!(V10Subjects::parse("").unwrap().0.is_empty());
+
+        for bad in ["customer_id", "customer_id=", "=Customer", "a=B,a=C"] {
+            assert!(
+                V10Subjects::parse(bad).is_err(),
+                "`{bad}` says nothing usable about where a namespace went"
+            );
+        }
+        assert!(
+            V10Subjects::parse("a=B,a=B").is_ok(),
+            "saying the same thing twice is not a contradiction"
         );
     }
 

@@ -270,6 +270,36 @@ rewrapped rows, so reads of a sealed column answer `500 internal` and `/admin` r
 `unreadable`. The server log names the master id it is missing. Restarting with the new key fixes it;
 nothing is lost.
 
+## Upgrading a directory written before a subject was a type
+
+Only for a data directory last written by hekla 0.6.0 or earlier that has sealed at least one field.
+Nothing else meets this, and a project that never declared a `@subject` never meets it at all.
+
+A key used to be filed under the **field** an `@subject` annotation named. It is now filed under the
+declared subject's own name. The wrapped secret carries across the migration untouched; the label
+does not, and nothing stored records which field became which subject. A row under a label the
+program never looks up is unreachable, and everything sealed under it reads back `absent`, which is
+precisely what an erased subject reads back. The two are indistinguishable by design, so this
+presents as a clean start serving data that quietly looks deleted.
+
+So the upgrade **refuses** until it is told the mapping, naming every namespace it found:
+
+```
+$ HEKLA_V10_SUBJECTS="customer_id=Customer,shop_id=Shop" hekla serve ./shop --data ./data
+```
+
+A refused upgrade writes nothing, including the schema version, so the previous release still opens
+the directory and still reads the data while the mapping is worked out. A namespace meant to keep the
+spelling it has is written as itself, `legacy_ref=legacy_ref`; that is also how a namespace is
+abandoned, and it stays unreachable. Two namespaces may merge into one subject, which is what an
+annotation renamed mid-life leaves behind, unless both hold a key for the same id: one subject files
+one key per id, so that merge would have to drop a secret and everything sealed under it.
+
+The right-hand side is taken on trust. The migration runs before any program is loaded, so there are
+no declarations to check a subject name against; a mistyped one leaves rows unreachable exactly as
+carrying them blind would. The difference is that it is now a thing an operator wrote down rather
+than a thing that happened to them. See `reference/cli.md` for the full rules.
+
 ## Where plaintext exists
 
 Only at the edges: a command's HTTP input (the client supplied it), a read-API response, an effect's

@@ -2826,10 +2826,9 @@ Honest scope:
   the annotation named and is now the declared type's name, and nothing in the migration knows the
   mapping between the two. A carried row is reachable only where a project happened to name its
   subject exactly what the field was called. The symptom is the bad one, every pre-existing sealed
-  value reading back absent and so indistinguishable from an erasure, which is why the migration
-  logs a warning naming the count rather than carrying them silently. Nothing is deployed against
-  this tree, so nothing more was built; a local data directory from before the change is the case
-  that meets it.
+  value reading back absent and so indistinguishable from an erasure. **Closed in Phase 41**, which
+  refuses the upgrade until an operator states the mapping; what is written here is what the warning
+  alone left open.
 - **A parent declared onto a project that is already running does not adopt the rows already there.**
   Those were wrapped under the master, so deleting the tenant misses them silently, which is the one
   failure a compliance feature cannot have. Left open here and closed in Phase 40, which does it at
@@ -3270,6 +3269,88 @@ store or says it did not, and a run with nothing else writing settles it, checke
 tenant afterwards and seeing it reach every member. Which branch a contended run takes is an
 interleaving no test can fix, and the loop's failure mode is a refusal rather than a silent hole,
 because the guarantee is held by `settled()` asking the store.
+
+## Phase 41: a key namespace written before v10 is renamed, not carried blind (done)
+
+Phase 39 changed what a subject key is filed under, from the **field** an `@subject` annotation
+named to the declared subject's own name. Schema v10 carries every `subject_key` row across, which
+loses no bytes, and files them under the old spelling, which the new code never looks up. The
+migration logged a warning naming the count and carried on.
+
+**That warning was the wrong shape for what it was reporting.** Every value sealed under a carried
+row reads back `absent`, and `absent` is exactly what an erased subject reads back: the surface
+cannot distinguish them and is not supposed to, because that indistinguishability is what the
+erasure guarantee *is*. So the failure presents as a successful start, a served project, and data
+that quietly looks deleted. A warning in a boot log is not proportionate to that, and the gap was
+recorded as acceptable on the premise that nothing was deployed against the tree. **Released hekla
+0.6.0 is schema v9**, so that premise expired the moment 0.6.0 shipped: every 0.6.0 directory that
+ever sealed a field is the case.
+
+- **The migration refuses rather than carrying a row it cannot place.** It reads the distinct
+  namespaces out of the pre-v10 table and stops unless each one is accounted for, naming all of
+  them, since the list is precisely what the operator has to answer.
+- **`HEKLA_V10_SUBJECTS="customer_id=Customer,shop_id=Shop"`** is the answer, read once on the
+  v9-to-v10 step. Only the operator knows which field became which subject; the migration runs
+  inside `OpDb::open`, before any program is loaded, so there are no declarations here to derive it
+  from or to check it against. Taken on trust, and said out loud in the doc comment rather than
+  implied.
+- **A rename, not a re-mint**, the same distinction Phase 40 turns on. The wrapped secret is what
+  every sealed value is encrypted under; only the label moves.
+
+Decisions worth keeping:
+
+- **The refusal happens before the rebuild, so a refused upgrade leaves the directory at v9.** It
+  would roll back anyway, since the whole ladder step is one transaction, but the ordering is what
+  makes the property easy to state and easy to test: the previous release still opens the directory
+  and still reads the data while the operator works out the mapping. That is the only actual way
+  back, and it exists only because nothing was written.
+- **The identity mapping is how "leave this one alone" is said**, `legacy_ref=legacy_ref`, and there
+  is no keyword for it. heklang puts no capitalisation rule on a subject name (`subject_item` checks
+  the id type and collisions with enums and records, and nothing else), so any reserved word would
+  be a name somebody could legitimately declare. A sentinel that a project can shadow is a sentinel
+  that fails silently in exactly the case it was added for.
+- **A merge is allowed; a collision is not.** Two namespaces going to one subject is what an
+  annotation renamed mid-life leaves behind, so it is legitimate. It is refused only where both hold
+  a key for the same id, because the rebuilt table is keyed on `(subject, subject_value)` and two
+  rows meeting there are two secrets claiming one identity. Which survived would decide whose data
+  stays readable, so neither is chosen. Checked up front so the operator gets the colliding id by
+  name; left to SQLite it surfaces as a bare constraint error inside a rename, which the mutation
+  test shows.
+- **An entry this directory has nothing under warns rather than refusing.** Everything present is
+  accounted for, so no row is going anywhere unreachable, and one variable held across several data
+  directories is the ordinary way to run an upgrade: an entry spent against one is load-bearing for
+  the next. The first draft refused, and the typo test is what showed it was wrong to.
+- **A typo is reported as both halves of itself, in one refusal.** `custmer_id=Customer` leaves
+  `customer_id` unaccounted for *and* leaves an entry matching nothing, and an operator told only
+  the first has no reason to suspect the line they already wrote: the obvious next move is a second
+  entry for a namespace they thought they had mapped. The two checks were separate and ordered, and
+  the test written for the typo case is what caught that the ordering hid the cause behind the
+  symptom.
+- **The renames go through a staging namespace.** They are a permutation, and applying them one at a
+  time collides part-way through even where the result does not: `shop=market,market=shop` ends with
+  two distinct namespaces either way, but whichever half runs first lands on rows the other has not
+  moved yet. Two hops through `\u{1}`-prefixed names, which no identifier can spell, makes the order
+  irrelevant. It is the only part of this a test can tell apart from the naive version.
+- **The mapping is a parsed value threaded from `open`, not an env read inside `migrate`.** The
+  refusals are the whole feature, so they have to be testable, and a process-global cannot be set
+  from a test that runs beside others. `V10Subjects::parse` is what the tests drive, through
+  `open_mapped`; `from_env` is one call site.
+
+Honest scope:
+
+- **Nothing checks the right-hand side is a subject the program actually declares.** It could be
+  checked later, at the point Phase 40's adoption already compares stored keys against declarations,
+  and it is not: a mistyped subject name leaves rows unreachable exactly as before, just by a
+  different route. What makes that tolerable and not a hole is that the failing case is now one the
+  operator chose explicitly and wrote down, rather than one that happened to them silently.
+- **`hekla plan` and `hekla verify` refuse an older schema rather than migrating it**, so neither
+  previews this. They stop with "schema version 9", which is a different message for the same
+  situation. Left alone: making them migrate would be the audit surface advancing state, which
+  `open_quiescent` exists to prevent.
+- **A directory already past v10 is not revisited.** If an operator upgraded on an earlier build,
+  took the warning, and served, their rows are already carried under the old spelling and this does
+  nothing for them. Phase 40's `hekla adopt` does not help either, since it moves a row's *wrapping*
+  and not its name. Rewriting a namespace after the fact is a different tool and is not built.
 
 ## Deferred, with triggers
 

@@ -1225,6 +1225,14 @@ serves, and refuses to serve if it cannot; a settled store pays one indexed coun
 - **`hekla adopt` runs the same pass ahead of a deploy**, through a follower and without the lock, so
   a large migration need not happen inside a boot. `hekla plan` counts what would move and
   `hekla verify` reports what has not.
+- **The same refusal shape guards the namespace the keys are filed under.** Before schema v10 a key
+  was filed under the *field* an annotation named rather than the subject's own name, and the v10
+  rebuild cannot derive the mapping: it runs inside `OpDb::open`, before any program is loaded. So it
+  refuses the upgrade and names the namespaces it found, rather than carrying rows the program will
+  never look up. `HEKLA_V10_SUBJECTS` is the operator's answer. The reason this is a stop and not a
+  warning is the same property erasure is built on: a key under an unreachable label and a key that
+  was shredded both read back `absent`, so nothing downstream can tell a botched upgrade from a
+  deletion that was meant.
 
 **What a parent gives up, said plainly.** Section 15 sells per-field subjects on exactly the opposite
 property: an `order.placed` has both a customer and a shop, so scoping the whole event to one would
