@@ -10,7 +10,7 @@ projector Bookings {
   entity Booking {
     booking_id: Uuid @key,
     room_id: Int @index,
-    guest_id: Int @index,
+    guest_id: Guest @index,
     // No `@subject` here: the seal propagates from the event field written into it,
     // and the read API decrypts it on the way out.
     email: String? @max(200),

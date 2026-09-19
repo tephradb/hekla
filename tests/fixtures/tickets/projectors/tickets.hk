@@ -10,8 +10,8 @@
 projector Tickets {
   entity Ticket {
     ticket_id: Uuid @key,
-    org_id: Int @index,
-    owner_id: Int @index,
+    org_id: Org @index,
+    owner_id: Owner @index,
     title: String @max(80),
     priority: Priority,
     due_at: Timestamp,
@@ -49,7 +49,7 @@ projector Tickets {
   // two disagree once the keys differ in digit count, and a comparison that walks both
   // orders at once is what `verify::keyed` had to be fixed for.
   entity OrgTotals {
-    org_id: Int @key,
+    org_id: Org @key,
     opened: Int,
     closed: Int,
     spend: Money(2),

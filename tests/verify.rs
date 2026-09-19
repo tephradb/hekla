@@ -406,8 +406,10 @@ fn a_missing_erase_entry_is_caught_without_shredding_a_key() {
         (
             "events/account.hk",
             r#"
+subject Account(Int)
+
 event @account.closed {
-  account_id: Int,
+  account_id: Account,
   email: String? @subject(account_id) @max(200),
 }
 "#,
@@ -415,7 +417,7 @@ event @account.closed {
         (
             "commands/close-account.hk",
             r#"
-command CloseAccount(account_id: Int, email: String?) {
+command CloseAccount(account_id: Account, email: String?) {
   emit @account.closed { account_id, email }
 }
 "#,
@@ -457,7 +459,7 @@ effect ShredAccount {
 
     let planted = keystore(data.path());
     planted
-        .encrypt_subject("account_id", "42", "email", "x")
+        .encrypt_subject("Account", "42", "email", "x")
         .unwrap();
     drop_journal(data.path(), "ShredAccount", "erase");
 
@@ -466,7 +468,7 @@ effect ShredAccount {
     assert!(text.contains("no journal entry"), "{text}");
     assert!(
         keystore(data.path())
-            .encrypt_subject_existing("account_id", "42", "email", "x")
+            .encrypt_subject_existing("Account", "42", "email", "x")
             .unwrap()
             .is_some(),
         "a sweep must not shred a key in the store it audits"
@@ -709,7 +711,7 @@ fn an_erased_subject_is_not_a_rebuild_mismatch() {
     ));
     assert!(
         hekla::crypto::KeyStore::new(opdb, master_keys())
-            .erase("customer_id", "7")
+            .erase("Customer", "7")
             .unwrap(),
         "the subject key must exist to be erased"
     );
@@ -801,8 +803,10 @@ fn an_effect_that_erases_what_it_revealed_is_not_reported_as_divergent() {
         (
             "events/customer.hk",
             r#"
+subject Customer(Int)
+
 event @customer.closed {
-  customer_id: Int,
+  customer_id: Customer,
   // Optional because an erased subject reads back absent, which is the whole point
   // of the scenario below.
   email: String? @subject(customer_id) @max(200),
@@ -812,7 +816,7 @@ event @customer.closed {
         (
             "commands/close-account.hk",
             r#"
-command CloseAccount(customer_id: Int, email: String?) {
+command CloseAccount(customer_id: Customer, email: String?) {
   emit @customer.closed { customer_id, email }
 }
 "#,
@@ -1092,7 +1096,7 @@ fn a_subject_erased_and_then_written_to_again_still_sweeps_clean() {
         open_ticket(&harness.rt, ALICE, 1, 10);
         support::quiesce(&harness);
 
-        harness.rt.keystore().unwrap().erase("org_id", "1").unwrap();
+        harness.rt.keystore().unwrap().erase("Org", "1").unwrap();
 
         // The same organisation opens another ticket, which mints a key under the
         // subject the erasure destroyed. ALICE's `budget` stays sealed under the old
@@ -1189,4 +1193,55 @@ fn an_operator_skip_is_uncovered_rather_than_a_violation() {
         report.to_string().contains("skipped by an operator"),
         "{report}"
     );
+}
+
+/// Erasing a tenant shreds every customer beneath it, and the sweep reports a clean
+/// rebuild rather than corruption.
+///
+/// This is the operator-facing half of the hierarchy. `verify` is believed, so it has to
+/// tell a shred from a broken read model, and a cascading erase reaches rows whose own key
+/// row is untouched: nothing about the customer's row changed, and yet its column no longer
+/// decrypts. A checker that compared the stored column against a rebuild without knowing
+/// that would report every customer of a departed tenant as corruption, which is the worst
+/// failure a tool whose value is being believed can have.
+#[test]
+fn erasing_a_tenant_shreds_its_customers_without_reporting_corruption() {
+    let data = tempfile::tempdir().unwrap();
+    let harness = Boot::new(example_dir("orders"))
+        .data_dir(data.path())
+        .with_master_key()
+        .start();
+    let position = place_order(&harness.rt, UUID_A, 7, "buyer@example.com");
+    let position = position.max(place_order(
+        &harness.rt,
+        support::UUID_B,
+        8,
+        "other@example.com",
+    ));
+    support::wait_position(&harness.rt, "CustomerOrders", position);
+    harness.shutdown();
+
+    assert!(
+        sweep(&example_dir("orders"), data.path()).is_clean(),
+        "clean before the erasure, so what follows is about the shred"
+    );
+
+    // The shop, not the customers. Both customers hang from it.
+    let opdb = std::sync::Arc::new(std::sync::Mutex::new(
+        hekla::opdb::OpDb::open(&data.path().join("hekla.db")).unwrap(),
+    ));
+    assert!(
+        hekla::crypto::KeyStore::new(opdb, master_keys())
+            .erase("Shop", "1")
+            .unwrap(),
+        "one row delete, and two customers go with it"
+    );
+
+    let report = sweep(&example_dir("orders"), data.path());
+    assert!(
+        report.is_clean(),
+        "a tenant erasure is a shred, not corruption: {:?}",
+        report.violations
+    );
+    assert!(report.projectors_checked >= 1, "the check really ran");
 }

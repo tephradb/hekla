@@ -312,13 +312,10 @@ fn drop_shredded(entity: &EntityDef, row: &mut Value, decryptor: Option<&RowDecr
         return;
     };
     for (name, meta) in &entity.fields {
-        let Some(subject_field) = &meta.subject else {
+        let Some(seal) = &meta.sealed_under else {
             continue;
         };
-        let Some(id) = object
-            .get(subject_field.as_str())
-            .and_then(scalar_to_string)
-        else {
+        let Some(id) = object.get(seal.id_field()).and_then(scalar_to_string) else {
             continue;
         };
         // A column that is absent or not text was never ciphertext, so there is nothing
@@ -327,7 +324,7 @@ fn drop_shredded(entity: &EntityDef, row: &mut Value, decryptor: Option<&RowDecr
             continue;
         };
         let readable = decryptor
-            .decrypt(subject_field, &id, name, ciphertext)
+            .decrypt(seal.subject(), &id, name, ciphertext)
             .unwrap_or(None)
             .is_some();
         if !readable && let Some(target) = row.as_object_mut() {

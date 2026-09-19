@@ -205,11 +205,11 @@ pub fn tickets() -> Scenario {
                 body: json!({ "ticket_id": ticket_id(thing), "org_id": org_id(group) }),
             },
             Op::EraseOwner(owner) => Act::Erase {
-                subject: "owner_id",
+                subject: "Owner",
                 id: owner_id(owner).to_string(),
             },
             Op::EraseGroup(group) => Act::Erase {
-                subject: "org_id",
+                subject: "Org",
                 id: org_id(group).to_string(),
             },
             Op::Restart | Op::Rebuild { .. } | Op::Verify => {
@@ -258,11 +258,11 @@ pub fn orders() -> Scenario {
                 }
             }
             Op::EraseOwner(owner) => Act::Erase {
-                subject: "customer_id",
+                subject: "Customer",
                 id: owner_id(owner).to_string(),
             },
             Op::EraseGroup(group) => Act::Erase {
-                subject: "shop_id",
+                subject: "Shop",
                 id: org_id(group).to_string(),
             },
             // An order is placed once and never changed: there is no command to run.
@@ -897,8 +897,8 @@ fn the_two_worlds_agree_on_a_walkthrough() {
         ("relabel:reject:no_such_ticket", 1),
         ("remove:ok[ticket.closed]", 1),
         ("remove:reject:no_such_ticket", 1),
-        ("erase:owner_id", 1),
-        ("erase:org_id", 1),
+        ("erase:Owner", 1),
+        ("erase:Org", 1),
         ("restart", 1),
         ("rebuild", 2),
         ("verify", 2),
@@ -1153,8 +1153,8 @@ fn a_soak_of_the_tickets_fixture_reaches_every_outcome() {
             "relabel:reject:no_such_ticket",
             "remove:ok[ticket.closed]",
             "remove:reject:no_such_ticket",
-            "erase:owner_id",
-            "erase:org_id",
+            "erase:Owner",
+            "erase:Org",
             "restart",
             "rebuild",
             "verify",
@@ -1179,8 +1179,8 @@ fn a_soak_of_the_orders_example_reaches_every_outcome() {
             "create:reject:sold_out",
             "relabel:unsupported",
             "remove:unsupported",
-            "erase:customer_id",
-            "erase:shop_id",
+            "erase:Customer",
+            "erase:Shop",
             "restart",
             "rebuild",
             "verify",

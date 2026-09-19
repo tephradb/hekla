@@ -195,7 +195,7 @@ fn erasing_a_subject_shreds_the_read_model_and_the_log() {
         .rt
         .keystore()
         .unwrap()
-        .erase("customer_id", "42")
+        .erase("Customer", "42")
         .unwrap();
     assert!(erased);
 
@@ -227,7 +227,7 @@ fn a_folded_subject_value_may_be_re_emitted_under_its_own_subject_and_no_other()
         (
             "commands/copy-order.hk",
             r#"
-command CopyOrder(order_id: Uuid, customer_id: Int) {
+command CopyOrder(order_id: Uuid, customer_id: Customer) {
   // Folds this customer's own address. The variable is sealed under `customer_id`,
   // and the emit below writes it into a field sealed under the same subject, so it
   // moves without ever being read.
@@ -265,10 +265,13 @@ command CopyOrder(order_id: Uuid, customer_id: Int) {
             (
                 "events/order.hk",
                 r#"
+subject Customer(Int)
+subject Shop(Int)
+
 event @order.placed {
   order_id: Uuid,
-  customer_id: Int,
-  shop_id: Int,
+  customer_id: Customer,
+  shop_id: Shop,
   email: String? @subject(customer_id) @max(100),
   contact: String? @subject(shop_id) @max(100),
 }
@@ -277,7 +280,7 @@ event @order.placed {
             (
                 "commands/copy-order.hk",
                 r#"
-command CopyOrder(order_id: Uuid, customer_id: Int, shop_id: Int) {
+command CopyOrder(order_id: Uuid, customer_id: Customer, shop_id: Shop) {
   fold email: String? = none
     on @order.placed(customer_id) { email } => email
 
@@ -299,20 +302,20 @@ fn a_read_does_not_resurrect_an_erased_subject_key() {
 
     // The key exists after the order.
     assert!(
-        ks.encrypt_subject_existing("customer_id", "42", "email", "x")
+        ks.encrypt_subject_existing("Customer", "42", "email", "x")
             .unwrap()
             .is_some()
     );
-    ks.erase("customer_id", "42").unwrap();
+    ks.erase("Customer", "42").unwrap();
     assert!(
-        ks.encrypt_subject_existing("customer_id", "42", "email", "x")
+        ks.encrypt_subject_existing("Customer", "42", "email", "x")
             .unwrap()
             .is_none()
     );
     // A read of the row (the read/query path) must not recreate the key.
     let _ = read_row(&harness, "Orders", "Order", ORDER, 1);
     assert!(
-        ks.encrypt_subject_existing("customer_id", "42", "email", "x")
+        ks.encrypt_subject_existing("Customer", "42", "email", "x")
             .unwrap()
             .is_none(),
         "the read path must not resurrect an erased subject key"
@@ -388,7 +391,7 @@ fn a_reveal_on_an_erased_subject_skips_terminally_without_wedging() {
         .rt
         .keystore()
         .unwrap()
-        .erase("customer_id", "42")
+        .erase("Customer", "42")
         .unwrap();
 
     // The terminal skip advances past the position instead of wedging forever.
@@ -466,9 +469,11 @@ fn a_projector_can_read_modify_write_a_subject_column() {
         (
             "events/order.hk",
             r#"
+subject Customer(Int)
+
 event @order.placed {
   order_id: Uuid,
-  customer_id: Int,
+  customer_id: Customer,
   email: String? @subject(customer_id) @max(100),
 }
 
@@ -490,7 +495,7 @@ command TouchOrder(order_id: Uuid) {
 projector Orders {
   entity Order {
     order_id: Uuid @key,
-    customer_id: Int @index,
+    customer_id: Customer @index,
     email: String? @max(100),
     touches: Int,
   }
@@ -543,7 +548,7 @@ fn a_stale_row_after_erase_and_reuse_reads_as_absent_not_error() {
         .rt
         .keystore()
         .unwrap()
-        .erase("customer_id", "42")
+        .erase("Customer", "42")
         .unwrap();
     // A new order for customer 42 mints a fresh key.
     place_order(&harness.rt, second, 42, "new@example.com");
@@ -592,11 +597,11 @@ fn erasing_a_subject_does_not_reopen_its_handle() {
 
     let ks = harness.rt.keystore().unwrap();
     assert!(
-        ks.erase("account_id", ALICE).unwrap(),
+        ks.erase("Account", ALICE).unwrap(),
         "the subject key must exist to be erased"
     );
     assert!(
-        ks.encrypt_subject_existing("account_id", ALICE, "email", "alice@example.com")
+        ks.encrypt_subject_existing("Account", ALICE, "email", "alice@example.com")
             .unwrap()
             .is_none(),
         "control: the erased account's scoped key is really gone"
@@ -670,7 +675,7 @@ fn a_scan_decrypts_each_row_under_its_own_subject_key() {
         .rt
         .keystore()
         .unwrap()
-        .erase("customer_id", "42")
+        .erase("Customer", "42")
         .unwrap();
     let rows = scan_rows(&harness, "Orders", "Order", 3);
     assert_eq!(rows.len(), 3, "an erasure removes columns, never rows");
@@ -697,9 +702,11 @@ fn a_scan_decrypts_each_row_under_its_own_subject_key() {
 /// Each is optional, which is forced rather than incidental: an erased subject's
 /// column reads back *absent*, and a type that cannot be absent could not say so.
 const TYPED_EVENTS: &str = r#"
+subject Customer(Int)
+
 event @order.placed {
   order_id: Uuid,
-  customer_id: Int,
+  customer_id: Customer,
   email: String? @subject(customer_id) @max(100),
   order_total: Money(2)? @subject(customer_id),
   loyalty_points: Int? @subject(customer_id),
@@ -709,7 +716,7 @@ event @order.placed {
 const TYPED_PLACE_ORDER: &str = r#"
 command PlaceOrder(
   order_id: Uuid,
-  customer_id: Int,
+  customer_id: Customer,
   email: String?,
   order_total: Money(2)?,
   loyalty_points: Int?,
@@ -722,7 +729,7 @@ const TYPED_PROJECTOR: &str = r#"
 projector Orders {
   entity Order {
     order_id: Uuid @key,
-    customer_id: Int @index,
+    customer_id: Customer @index,
     email: String? @max(100),
     order_total: Money(2)?,
     loyalty_points: Int?,
@@ -775,7 +782,7 @@ fn a_scanned_page_decrypts_typed_subject_columns_and_skips_erased_rows() {
         .rt
         .keystore()
         .unwrap()
-        .erase("customer_id", "42")
+        .erase("Customer", "42")
         .unwrap();
     let rows = scan_rows(&harness, "Orders", "Order", 3);
     assert_eq!(rows.len(), 3, "an erased subject drops columns, not rows");
@@ -961,4 +968,791 @@ fn an_effect_erase_is_journaled_under_successive_ordinals() {
         rows[0].2, rows[1].2,
         "identical calls share a key, so only the ordinal separates them"
     );
+}
+
+// --- a subject deleted with its tenant -------------------------------------
+
+/// A tenant and the people under it: `Member` declares `under Tenant`, so a member's key
+/// is wrapped under its tenant's rather than under the master.
+const NESTED_EVENTS: &str = r#"
+subject Tenant(Int)
+subject Member(Int) under Tenant
+
+event @member.joined {
+  member_id: Member,
+  tenant_id: Tenant,
+  // Optional because an erased subject's column reads back absent, and a type that
+  // cannot be absent could not say so.
+  email: String? @subject(member_id) @max(100),
+  // The tenant's own sealed value, so a test can tell "the tenant was shredded" from
+  // "everything was shredded".
+  plan: String? @subject(tenant_id) @max(100),
+}
+"#;
+
+const NESTED_COMMAND: &str = r#"
+command Join(member_id: Member, tenant_id: Tenant, email: String?, plan: String?) {
+  emit @member.joined { member_id, tenant_id, email, plan }
+}
+"#;
+
+const NESTED_PROJECTOR: &str = r#"
+projector Members {
+  entity Member {
+    member_id: Member @key,
+    tenant_id: Tenant @index,
+    email: String? @max(100),
+    plan: String? @max(100),
+  }
+
+  on @member.joined { member_id, tenant_id, email, plan } {
+    put Member { member_id, tenant_id, email, plan }
+  }
+}
+"#;
+
+fn nested_project() -> tempfile::TempDir {
+    write_project(&[
+        ("events/member.hk", NESTED_EVENTS),
+        ("commands/join.hk", NESTED_COMMAND),
+        ("projectors/members.hk", NESTED_PROJECTOR),
+    ])
+}
+
+fn join(harness: &Harness, member: u64, tenant: u64, email: &str) {
+    let body = json!({
+        "member_id": member,
+        "tenant_id": tenant,
+        "email": email,
+        "plan": "pro",
+    });
+    harness
+        .rt
+        .execute("Join", body, &ctx(), None)
+        .unwrap_or_else(|err| panic!("joining member {member}: {err:#}"));
+}
+
+fn member(harness: &Harness, id: u64, after: u64) -> Value {
+    read_row(harness, "Members", "Member", &id.to_string(), after).expect("the member row")
+}
+
+/// The whole of Phase 39, in one assertion: **one row delete shreds every key beneath it.**
+///
+/// Deleting the tenant's row is O(1) and touches nothing else. Every member's key is
+/// wrapped under a key derived from the tenant's secret, so destroying that secret makes
+/// them underivable at the same instant: no walk, no second write, and no enumeration
+/// projector to tell the runtime who the members were.
+///
+/// It asserts the member rows are *still there* on purpose. Unreachable is the guarantee;
+/// reclaiming the bytes is the sweeper's job and a separate one.
+#[test]
+fn erasing_a_tenant_shreds_every_member_beneath_it() {
+    let dir = nested_project();
+    let harness = boot(dir.path());
+    join(&harness, 1, 7, "ada@example.com");
+    join(&harness, 2, 7, "grace@example.com");
+    // A member of a different tenant, which must survive: the cascade follows the
+    // declared hierarchy rather than shredding every subject of that kind.
+    join(&harness, 3, 9, "alan@example.com");
+
+    assert_eq!(member(&harness, 1, 3)["email"], "ada@example.com");
+    assert_eq!(member(&harness, 3, 3)["email"], "alan@example.com");
+
+    let keystore = harness.rt.keystore().unwrap();
+    assert!(keystore.erase("Tenant", "7").unwrap(), "one row delete");
+
+    let ada = member(&harness, 1, 3);
+    assert!(
+        ada.get("email").is_none(),
+        "the member's key was wrapped under the tenant's, so it went with it: {ada}"
+    );
+    assert!(
+        ada.get("plan").is_none(),
+        "the tenant's own sealed column went too: {ada}"
+    );
+    assert_eq!(ada["tenant_id"].as_u64(), Some(7), "plaintext ids remain");
+
+    let grace = member(&harness, 2, 3);
+    assert!(grace.get("email").is_none(), "every member, not just one");
+
+    let alan = member(&harness, 3, 3);
+    assert_eq!(
+        alan["email"], "alan@example.com",
+        "another tenant's member is untouched: {alan}"
+    );
+
+    // Unreachable, not deleted. The rows survive until the sweep reclaims them, which is
+    // the storage half and deliberately not what the erase does.
+    assert!(
+        harness.rt.subject_key_exists("Member", "1").unwrap(),
+        "the child row survives its parent's deletion"
+    );
+    assert!(
+        !harness.rt.subject_key_exists("Tenant", "7").unwrap(),
+        "the parent row is the one that went"
+    );
+
+    harness.shutdown();
+}
+
+/// A member written *after* its tenant was erased gets a fresh tenant key and is readable,
+/// which is the point-in-time shred every subject already had, applied one level up.
+///
+/// The members from before stay shredded, because they are wrapped under the secret that
+/// was destroyed rather than under the one minted now.
+#[test]
+fn a_tenant_written_to_after_an_erasure_shelters_only_what_came_after() {
+    let dir = nested_project();
+    let harness = boot(dir.path());
+    join(&harness, 1, 7, "ada@example.com");
+
+    harness.rt.keystore().unwrap().erase("Tenant", "7").unwrap();
+    join(&harness, 2, 7, "grace@example.com");
+
+    let ada = member(&harness, 1, 2);
+    assert!(
+        ada.get("email").is_none(),
+        "written under the destroyed tenant secret, so still shredded: {ada}"
+    );
+    let grace = member(&harness, 2, 2);
+    assert_eq!(
+        grace["email"], "grace@example.com",
+        "written under the fresh one, so readable: {grace}"
+    );
+
+    harness.shutdown();
+}
+
+/// An unreachable child row reads as absent and is *replaced*, rather than failing the
+/// write that meets it.
+///
+/// Member 1's row outlives its tenant's erasure, so its wrapped key can never be opened
+/// again. Writing member 1 again must mint a fresh secret over that row rather than
+/// erroring: the old ciphertext is already unrecoverable, so refusing protects nothing and
+/// would wedge the write path for good.
+#[test]
+fn an_unwrappable_child_row_is_replaced_rather_than_failing_the_write() {
+    let dir = nested_project();
+    let harness = boot(dir.path());
+    join(&harness, 1, 7, "ada@example.com");
+
+    harness.rt.keystore().unwrap().erase("Tenant", "7").unwrap();
+    assert!(
+        harness.rt.subject_key_exists("Member", "1").unwrap(),
+        "the stale child row is still on disk, which is the case this is about"
+    );
+
+    // The same member again. Its row is there and unopenable; this must not error.
+    join(&harness, 1, 7, "ada2@example.com");
+    let ada = member(&harness, 1, 2);
+    assert_eq!(
+        ada["email"], "ada2@example.com",
+        "the replaced key reads back: {ada}"
+    );
+
+    harness.shutdown();
+}
+
+/// A rotation rewraps the roots and leaves the children alone, and both still read.
+///
+/// A child's wrapping key is derived from its parent's *secret*, which a rotation does not
+/// change: it rewraps that secret under a new master and the secret itself is untouched.
+/// So a child needs no rewrap at all, and the count reports only the roots. That is the
+/// whole of what a hierarchy costs a rotation, and it is a saving rather than a cost.
+#[test]
+fn a_rotation_rewraps_the_roots_and_leaves_the_children_readable() {
+    let dir = nested_project();
+    let data = tempfile::tempdir().unwrap();
+    let boot_at = |master: MasterKeys| {
+        Boot::new(dir.path())
+            .data_dir(data.path())
+            .http_status(200)
+            .master(master)
+            .try_start()
+    };
+
+    let harness = boot_at(MasterKeys::new(MASTER_KEY, vec![])).expect("the first boot");
+    join(&harness, 1, 7, "ada@example.com");
+    join(&harness, 2, 7, "grace@example.com");
+    harness.shutdown();
+
+    {
+        let opdb = Arc::new(Mutex::new(
+            OpDb::open(&data.path().join("hekla.db")).unwrap(),
+        ));
+        let keystore = KeyStore::new(opdb, MasterKeys::new(NEXT_MASTER_KEY, vec![MASTER_KEY]));
+        assert_eq!(
+            keystore.rotate().unwrap(),
+            1,
+            "one tenant root; its two members are wrapped under it and need no rewrap"
+        );
+        assert_eq!(keystore.rotate().unwrap(), 0, "a second pass is a no-op");
+    }
+
+    // The old master is gone. Both members still decrypt, each through its parent.
+    let harness = boot_at(MasterKeys::new(NEXT_MASTER_KEY, vec![])).expect("the rotated boot");
+    assert_eq!(member(&harness, 1, 2)["email"], "ada@example.com");
+    assert_eq!(member(&harness, 2, 2)["email"], "grace@example.com");
+
+    harness.shutdown();
+}
+
+/// hekla refuses at load what it could not file a key under at write time.
+///
+/// heklang refuses this too, at the annotation's span, which is the better message and
+/// the one an author sees first. hekla's copy is about a *deployment*: a directory
+/// reaches this runtime without going through `hek check`, and the failure it prevents is
+/// a write that cannot mint a key, in production, on the path that must not fail.
+#[test]
+fn an_event_sealing_under_a_child_without_its_parent_is_refused_at_load() {
+    assert_error(
+        &[(
+            "events/member.hk",
+            r#"
+subject Tenant(Int)
+subject Member(Int) under Tenant
+
+event @member.noted {
+  member_id: Member,
+  note: String? @subject(member_id) @max(100),
+}
+"#,
+        )],
+        "carries no `Tenant` field",
+    );
+}
+
+/// The storage half: unreadable rows are reclaimed, and only the unreachable ones.
+///
+/// Separate from the erase on purpose. Erasing a tenant is one row delete however many
+/// customers it has, which is the whole point; reclaiming their rows afterwards is
+/// bounded, chunked background work that no request waits on.
+#[test]
+fn the_sweep_reclaims_orphaned_keys_and_leaves_reachable_ones() {
+    let dir = nested_project();
+    let harness = boot(dir.path());
+    join(&harness, 1, 7, "ada@example.com");
+    join(&harness, 2, 7, "grace@example.com");
+    join(&harness, 3, 9, "alan@example.com");
+
+    harness.rt.keystore().unwrap().erase("Tenant", "7").unwrap();
+    assert!(
+        harness.rt.subject_key_exists("Member", "1").unwrap(),
+        "still on disk until the sweep runs"
+    );
+
+    hekla::effect::sweep_orphan_keys_now(&harness.rt).unwrap();
+
+    assert!(
+        !harness.rt.subject_key_exists("Member", "1").unwrap(),
+        "an orphan is reclaimed"
+    );
+    assert!(
+        !harness.rt.subject_key_exists("Member", "2").unwrap(),
+        "every orphan, not just one"
+    );
+    assert!(
+        harness.rt.subject_key_exists("Member", "3").unwrap(),
+        "a member whose tenant is alive is reachable and stays"
+    );
+    assert!(
+        harness.rt.subject_key_exists("Tenant", "9").unwrap(),
+        "a root is never an orphan"
+    );
+
+    harness.shutdown();
+}
+
+/// An orphaned key reads as absent from the moment its parent goes, not from whenever the
+/// sweeper happens to run.
+///
+/// The row is still on disk for that whole window, so answering from row existence would
+/// report `live` for a subject whose data is permanently unreadable, and would change its
+/// answer on a background timer. Reachability is the question every other erasure surface
+/// answers, and this is the one that used to disagree with them.
+#[test]
+fn a_subject_whose_parent_was_erased_reads_as_absent_before_the_sweep() {
+    let dir = nested_project();
+    let harness = boot(dir.path());
+    join(&harness, 1, 7, "ada@example.com");
+
+    assert!(harness.rt.subject_key_reachable("Member", "1").unwrap());
+    harness.rt.keystore().unwrap().erase("Tenant", "7").unwrap();
+
+    assert!(
+        harness.rt.subject_key_exists("Member", "1").unwrap(),
+        "the row is still on disk, which is exactly the window this is about"
+    );
+    assert!(
+        !harness.rt.subject_key_reachable("Member", "1").unwrap(),
+        "and nothing can open it, which is what `absent` has to mean"
+    );
+
+    // The sweep changes what is on disk and must not change the answer.
+    hekla::effect::sweep_orphan_keys_now(&harness.rt).unwrap();
+    assert!(
+        !harness.rt.subject_key_reachable("Member", "1").unwrap(),
+        "the same answer before and after the sweep"
+    );
+
+    harness.shutdown();
+}
+
+/// Two fields of the ancestor's type is refused, because nothing says which one the key
+/// hangs from.
+///
+/// `@subject(buyer)` disambiguates its *own* subject by naming a sibling; an ancestor gets
+/// no such syntax. Taking the first declared would make which shop a customer's key hangs
+/// from depend on field order, and an `erase` of the other shop would then leave that
+/// customer readable with nothing anywhere saying why.
+#[test]
+fn an_event_carrying_two_of_an_ancestors_type_is_refused_rather_than_guessed() {
+    assert_error(
+        &[(
+            "events/transfer.hk",
+            r#"
+subject Shop(Int)
+subject Customer(Int) under Shop
+
+event @transfer.made {
+  buyer: Customer,
+  from_shop: Shop,
+  to_shop: Shop,
+  note: String? @subject(buyer) @max(100),
+}
+"#,
+        )],
+        "nothing says which one its key hangs from",
+    );
+}
+
+/// A break two levels up names the whole hierarchy, not one link the author never wrote.
+///
+/// `Customer` sits under `Shop`, and `Shop` under `Market`. Reporting "`Customer`, which
+/// sits under `Market`" would teach the reader a relationship that does not exist, which
+/// is the thing a diagnostic about a hierarchy least wants to do.
+#[test]
+fn a_missing_grandparent_is_reported_against_the_whole_chain() {
+    assert_error(
+        &[(
+            "events/member.hk",
+            r#"
+subject Market(Int)
+subject Shop(Int) under Market
+subject Customer(Int) under Shop
+
+event @member.noted {
+  buyer: Customer,
+  shop: Shop,
+  note: String? @subject(buyer) @max(100),
+}
+"#,
+        )],
+        "which sits under `Shop` under `Market`, but carries no `Market` field",
+    );
+}
+
+// --- the hierarchy, proved at the key store ---------------------------------
+
+/// A key store over its own in-memory opdb, for the cases that are about wrapping rather
+/// than about a project.
+fn keystore() -> KeyStore {
+    let opdb = Arc::new(Mutex::new(OpDb::open_in_memory().unwrap()));
+    KeyStore::new(opdb, MasterKeys::new(MASTER_KEY, vec![]))
+}
+
+/// Three levels, not two. `Customer under Shop under Market`: minting the customer's key
+/// needs the shop's secret, and if the shop has no row yet that needs the market's, so
+/// both the mint and the unwrap recurse.
+///
+/// Depth one is the case where "wrap under the parent" and "wrap under the root" coincide,
+/// so it cannot tell a recursive implementation from a one-level one. This can: erasing the
+/// **market** has to reach the customer two links away, through a shop whose own row is
+/// untouched.
+#[test]
+fn a_grandparent_erasure_reaches_two_levels_down() {
+    let ks = keystore();
+    let chain = [("Customer", "88"), ("Shop", "7"), ("Market", "1")];
+    let sealed = ks
+        .encrypt_subject_in(&chain, "email", "ada@example.com")
+        .unwrap();
+    assert_eq!(
+        ks.decrypt_subject("Customer", "88", "email", &sealed)
+            .unwrap()
+            .as_deref(),
+        Some("ada@example.com"),
+        "a two-link chain reads back"
+    );
+
+    // The middle row is untouched, and the bottom one still exists. Only the top goes.
+    assert!(ks.erase("Market", "1").unwrap(), "one row delete");
+
+    assert_eq!(
+        ks.decrypt_subject("Customer", "88", "email", &sealed)
+            .unwrap(),
+        None,
+        "the customer is two links below the market and goes with it"
+    );
+    assert!(
+        ks.decrypt_subject("Shop", "7", "name", "not-a-real-ciphertext")
+            .unwrap()
+            .is_none(),
+        "so does the shop in between"
+    );
+}
+
+/// Two writers racing to replace one unreachable row must agree on a single key.
+///
+/// This is the case the replacement compare-and-set exists for, and keying it on the
+/// parent instead of the wrapped bytes made it wrong in the worst way: the replacement
+/// hangs from the same parent as the row it replaced, so each writer would have matched
+/// the *other's* fresh row and deleted a key already sealed under, leaving ciphertext
+/// nobody could read and no error anywhere.
+///
+/// The assertion is the one that would have caught it: whatever key each thread was
+/// handed, both have to open both ciphertexts afterwards.
+#[test]
+fn two_writers_replacing_one_unreachable_row_agree_on_a_key() {
+    let opdb = Arc::new(Mutex::new(OpDb::open_in_memory().unwrap()));
+    let masters = MasterKeys::new(MASTER_KEY, vec![]);
+    let seed = KeyStore::new(Arc::clone(&opdb), masters.clone());
+    let chain = [("Member", "1"), ("Tenant", "7")];
+    seed.encrypt_subject_in(&chain, "email", "before").unwrap();
+
+    // Erase the tenant. Member 1's row survives and nothing can ever open it again.
+    seed.erase("Tenant", "7").unwrap();
+    assert!(
+        opdb.lock()
+            .unwrap()
+            .subject_key_exists("Member", "1")
+            .unwrap(),
+        "the stale row is what both writers are about to replace"
+    );
+
+    let a = KeyStore::new(Arc::clone(&opdb), masters.clone());
+    let b = KeyStore::new(Arc::clone(&opdb), masters);
+    let (from_a, from_b) = thread::scope(|scope| {
+        let one = scope.spawn(|| a.encrypt_subject_in(&chain, "email", "ada").unwrap());
+        let two = scope.spawn(|| b.encrypt_subject_in(&chain, "email", "grace").unwrap());
+        (one.join().unwrap(), two.join().unwrap())
+    });
+
+    // One key persisted, so both ciphertexts open under it. If either writer's key was
+    // deleted by the other, the value it sealed is gone for good.
+    let reader = KeyStore::new(opdb, MasterKeys::new(MASTER_KEY, vec![]));
+    assert_eq!(
+        reader
+            .decrypt_subject("Member", "1", "email", &from_a)
+            .unwrap()
+            .as_deref(),
+        Some("ada"),
+        "the first writer's value survived"
+    );
+    assert_eq!(
+        reader
+            .decrypt_subject("Member", "1", "email", &from_b)
+            .unwrap()
+            .as_deref(),
+        Some("grace"),
+        "and so did the second's"
+    );
+}
+
+/// A wrapped child key moved to another row does not hand that row the other subject's
+/// secret.
+///
+/// Both rows hang from the same tenant, so the derived wrapping key is identical and the
+/// stolen bytes would unwrap cleanly on their own. What stops it is the associated data,
+/// which binds each child's own identity into its wrapping.
+///
+/// The assertion is deliberately about *reading another subject's content*, not about
+/// getting an error. A failed child unwrap reads as absent by design, so "it did not open"
+/// is indistinguishable from an ordinary shred and would pass with no binding at all.
+/// Without the binding the key opens, yields member 1's secret, and member 1's ciphertext
+/// then reads back in full under member 2's identity. That is the whole attack, and it is
+/// what this catches.
+#[test]
+fn a_child_key_moved_to_another_row_does_not_open() {
+    // File-backed so a second connection can reach the rows: moving bytes between them is
+    // the whole point, and no API does it because nothing should.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hekla.db");
+    let opdb = Arc::new(Mutex::new(OpDb::open(&path).unwrap()));
+    let ks = KeyStore::new(Arc::clone(&opdb), MasterKeys::new(MASTER_KEY, vec![]));
+    let ada = ks
+        .encrypt_subject_in(&[("Member", "1"), ("Tenant", "7")], "email", "ada")
+        .unwrap();
+    let grace = ks
+        .encrypt_subject_in(&[("Member", "2"), ("Tenant", "7")], "email", "grace")
+        .unwrap();
+
+    // Member 1's wrapped key onto member 2's row, under the same live tenant.
+    let stolen = opdb
+        .lock()
+        .unwrap()
+        .get_subject_key("Member", "1")
+        .unwrap()
+        .unwrap()
+        .wrapped;
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE subject_key SET wrapped_key = ?1 WHERE subject = 'Member' AND subject_value = '2'",
+        rusqlite::params![stolen],
+    )
+    .unwrap();
+
+    // Member 1's own ciphertext, offered under member 2's identity. If the stolen key
+    // opens, this reads back as "ada" and one subject has been read as another.
+    let stolen = ks.decrypt_subject("Member", "2", "email", &ada);
+    assert!(
+        !matches!(&stolen, Ok(Some(text)) if text == "ada"),
+        "a relocated wrapping must not open one subject's content under another's name: {stolen:?}"
+    );
+    // And it is reported as tampering rather than as a shred: the parent generation still
+    // matches, so the key this row was wrapped under has not moved and somebody wrote to
+    // the store. Telling an operator "erased" here would hide that.
+    assert!(stolen.is_err(), "{stolen:?}");
+    assert!(ks.decrypt_subject("Member", "2", "email", &grace).is_err());
+}
+
+/// A member whose tenant was erased and then written to again reads as **absent**, not as
+/// an error.
+///
+/// This is the root case (`a_stale_ciphertext_under_a_superseded_key_reads_as_none`) one
+/// level up, and it fails at a different layer. For a root, the superseded key still
+/// unwraps and it is the *data* that will not decrypt. For a child, the parent's secret is
+/// what its key was wrapped under, so a recreated parent breaks the **key** unwrap. If that
+/// reports `Err`, the read API 500s instead of omitting the column, and the write path
+/// hard-fails instead of replacing the dead row.
+#[test]
+fn a_member_whose_tenant_was_recreated_reads_as_absent_not_an_error() {
+    let ks = keystore();
+    let chain = [("Member", "1"), ("Tenant", "7")];
+    let sealed = ks
+        .encrypt_subject_in(&chain, "email", "ada@example.com")
+        .unwrap();
+
+    ks.erase("Tenant", "7").unwrap();
+    // Any write under the tenant mints it again, with a new secret.
+    ks.encrypt_subject_in(&[("Member", "2"), ("Tenant", "7")], "email", "grace")
+        .unwrap();
+
+    let read = ks.decrypt_subject("Member", "1", "email", &sealed);
+    assert!(
+        matches!(read, Ok(None)),
+        "unrecoverable data is absent, which is what every erasure surface expects: {read:?}"
+    );
+
+    // And the dead row is replaceable, rather than wedging every future write to it.
+    let again = ks
+        .encrypt_subject_in(&chain, "email", "ada2@example.com")
+        .unwrap();
+    assert_eq!(
+        ks.decrypt_subject("Member", "1", "email", &again)
+            .unwrap()
+            .as_deref(),
+        Some("ada2@example.com")
+    );
+}
+
+// --- a key store edited from outside -----------------------------------------
+
+/// A file-backed store plus a second connection to it, for the cases that are only
+/// reachable by writing rows hekla would never write.
+fn tamperable() -> (tempfile::TempDir, Arc<Mutex<OpDb>>, rusqlite::Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hekla.db");
+    let opdb = Arc::new(Mutex::new(OpDb::open(&path).unwrap()));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    (dir, opdb, conn)
+}
+
+/// A cycle in the parent pointers is refused, and refused *quickly*.
+///
+/// heklang checks the declared graph acyclic, so no project can produce this; a key store
+/// somebody edited can. Both walks over it have to terminate: the recursive unwrap in Rust,
+/// which would otherwise recurse until the stack went and take the process with it, and the
+/// reachability query in SQL, which would otherwise be an unbounded `UNION ALL` and hang the
+/// request holding the lock.
+///
+/// A hang is the worst of the three possible answers, because nothing reports it.
+#[test]
+fn a_cycle_in_the_parent_pointers_is_refused_rather_than_walked() {
+    let (_dir, opdb, conn) = tamperable();
+    let ks = KeyStore::new(Arc::clone(&opdb), MasterKeys::new(MASTER_KEY, vec![]));
+    let sealed = ks
+        .encrypt_subject_in(&[("Member", "1"), ("Tenant", "7")], "email", "ada")
+        .unwrap();
+
+    // Point the tenant at its own child. Nothing in hekla writes this.
+    conn.execute(
+        "UPDATE subject_key SET master_key_id = NULL, parent_subject = 'Member', \
+         parent_value = '1', parent_fingerprint = 'forged' \
+         WHERE subject = 'Tenant' AND subject_value = '7'",
+        [],
+    )
+    .unwrap();
+
+    let read = ks.decrypt_subject("Member", "1", "email", &sealed);
+    assert!(
+        read.is_err(),
+        "a cycle is a broken store and has to say so: {read:?}"
+    );
+    assert!(
+        format!("{:#}", read.unwrap_err()).contains("cycle"),
+        "and name what is wrong with it"
+    );
+
+    // The SQL walks terminate too, and answer in the safe direction.
+    let db = opdb.lock().unwrap();
+    assert!(!db.subject_key_reachable("Member", "1").unwrap());
+    assert!(db.descendant_key_count("Tenant", "7").unwrap() <= 2);
+}
+
+/// The schema refuses a row wrapped under neither a master nor a parent, and one wrapped
+/// under both.
+///
+/// `Wrapping::Neither` exists in the code as a value rather than a panic, for an operator
+/// who got a row into that state. This is the check that says they cannot: the constraint
+/// is the database's rather than a rule this module remembers, so no path in or out of the
+/// store has to re-establish it.
+#[test]
+fn a_key_row_is_wrapped_under_exactly_one_thing() {
+    let (_dir, opdb, conn) = tamperable();
+    let ks = KeyStore::new(Arc::clone(&opdb), MasterKeys::new(MASTER_KEY, vec![]));
+    ks.encrypt_subject_in(&[("Member", "1"), ("Tenant", "7")], "email", "ada")
+        .unwrap();
+
+    let neither = conn.execute(
+        "UPDATE subject_key SET parent_subject = NULL, parent_value = NULL, \
+         parent_fingerprint = NULL WHERE subject = 'Member'",
+        [],
+    );
+    assert!(neither.is_err(), "a row under nothing is unopenable");
+
+    let both = conn.execute(
+        "UPDATE subject_key SET master_key_id = 'm' WHERE subject = 'Member'",
+        [],
+    );
+    assert!(both.is_err(), "a row under two things is ambiguous");
+
+    let half = conn.execute(
+        "UPDATE subject_key SET parent_fingerprint = NULL WHERE subject = 'Member'",
+        [],
+    );
+    assert!(
+        half.is_err(),
+        "a parent without its generation is half a pointer"
+    );
+}
+
+/// The sweep reaches a grandchild, which one pass cannot.
+///
+/// A grandchild is not an orphan while its parent's row is still there, so it only becomes
+/// reclaimable once that parent has been swept. The loop repeats until a pass finds
+/// nothing for exactly this reason, and a version that swept once would leave the deeper
+/// rows on disk for ever.
+#[test]
+fn the_sweep_converges_on_a_grandchild() {
+    let dir = tempfile::tempdir().unwrap();
+    let opdb = Arc::new(Mutex::new(
+        OpDb::open(&dir.path().join("hekla.db")).unwrap(),
+    ));
+    let ks = KeyStore::new(Arc::clone(&opdb), MasterKeys::new(MASTER_KEY, vec![]));
+    ks.encrypt_subject_in(
+        &[("Customer", "88"), ("Shop", "7"), ("Market", "1")],
+        "email",
+        "ada",
+    )
+    .unwrap();
+    ks.erase("Market", "1").unwrap();
+
+    // One call, however many passes it takes inside.
+    let mut passes = 0;
+    loop {
+        let deleted = opdb
+            .lock()
+            .unwrap()
+            .sweep_orphan_subject_keys(1000)
+            .unwrap();
+        passes += 1;
+        if deleted == 0 {
+            break;
+        }
+    }
+    assert!(
+        passes > 2,
+        "the grandchild is only reachable after its parent is swept, so this needs more \
+         than one pass to have proved anything: {passes}"
+    );
+
+    let db = opdb.lock().unwrap();
+    assert!(
+        !db.subject_key_exists("Shop", "7").unwrap(),
+        "the child went"
+    );
+    assert!(
+        !db.subject_key_exists("Customer", "88").unwrap(),
+        "and so did the grandchild, which one pass could not have reached"
+    );
+}
+
+/// Many writers, one hierarchy, erases landing in the middle of it.
+///
+/// Every individual race here has its own test; this is the one that runs them together and
+/// asserts the property that matters at the end: whatever each writer was handed, the value
+/// it sealed is either readable or the subject was erased under it. What must never happen
+/// is a write reporting success over a key another thread then destroyed, which is
+/// unrecoverable and silent.
+#[test]
+fn concurrent_writers_and_erasers_never_lose_a_key_they_reported_success_for() {
+    let opdb = Arc::new(Mutex::new(OpDb::open_in_memory().unwrap()));
+    let masters = MasterKeys::new(MASTER_KEY, vec![]);
+    let sealed: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    thread::scope(|scope| {
+        for worker in 0..12u32 {
+            let opdb = Arc::clone(&opdb);
+            let masters = masters.clone();
+            let sealed = &sealed;
+            scope.spawn(move || {
+                let ks = KeyStore::new(opdb, masters);
+                for round in 0..60u32 {
+                    // Four members over two tenants, so writers collide constantly.
+                    let member = ((worker + round) % 4).to_string();
+                    let tenant = (round % 2).to_string();
+                    let chain = [("Member", member.as_str()), ("Tenant", tenant.as_str())];
+                    let text = format!("w{worker}r{round}");
+                    if round % 7 == 3 {
+                        // An erase in the middle of everyone else's writes.
+                        ks.erase("Tenant", &tenant).unwrap();
+                        continue;
+                    }
+                    let content = ks.encrypt_subject_in(&chain, "email", &text).unwrap();
+                    sealed.lock().unwrap().push((member, content));
+                }
+            });
+        }
+    });
+
+    // Nothing panicked and nothing errored, which is most of it. The rest: every ciphertext
+    // either reads back or its subject is gone, and no read is an error.
+    let ks = KeyStore::new(opdb, masters);
+    let (mut readable, mut shredded) = (0, 0);
+    for (member, content) in sealed.into_inner().unwrap() {
+        match ks.decrypt_subject("Member", &member, "email", &content) {
+            Ok(Some(_)) => readable += 1,
+            Ok(None) => shredded += 1,
+            Err(err) => {
+                panic!("a concurrent erase must read as absent, never as a broken store: {err:#}")
+            }
+        }
+    }
+    // Both outcomes actually happened, so the run exercised the races rather than
+    // serialising past them and asserting nothing.
+    assert!(
+        readable > 0,
+        "no write survived, so nothing was really tested"
+    );
+    assert!(shredded > 0, "no erase landed, so nothing was really raced");
 }

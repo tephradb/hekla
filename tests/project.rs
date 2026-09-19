@@ -44,7 +44,7 @@ projector ByName {
 const BY_CUSTOMER: &str = "\
 projector ByCustomer {
   entity PerCustomer {
-    customer_id: Int @key,
+    customer_id: Customer @key,
     orders: Int,
     last_email: String? @max(100),
   }
@@ -611,7 +611,7 @@ fn an_erased_subject_reads_absent_and_is_counted() {
         .rt
         .keystore()
         .expect("a key store")
-        .erase("customer_id", "2")
+        .erase("Customer", "2")
         .unwrap();
     assert!(erased);
     harness.shutdown();

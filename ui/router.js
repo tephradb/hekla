@@ -35,7 +35,7 @@ export const ROUTES = [
   { id: 'projections', path: '/admin/projections', title: 'Projections' },
   { id: 'schema', path: '/admin/schema', title: 'Schema' },
   { id: 'subjects', path: '/admin/subjects', title: 'Subjects' },
-  { id: 'subjects', path: '/admin/subjects/{field}/{value}', title: 'Subjects' },
+  { id: 'subjects', path: '/admin/subjects/{subject}/{value}', title: 'Subjects' },
   { id: 'system', path: '/admin/system', title: 'System' },
 ]
 

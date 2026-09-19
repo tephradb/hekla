@@ -8,7 +8,7 @@
 event @booking.made {
   booking_id: Uuid,
   room_id: Int,
-  guest_id: Int,
+  guest_id: Guest,
   // Encrypted under a key scoped to this guest, so erasing them is one key delete.
   // Optional because an erased subject's value reads back absent, and a type that
   // cannot be absent could not say so.

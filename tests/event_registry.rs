@@ -13,9 +13,11 @@ mod support;
 use support::{assert_clean, assert_error};
 
 const EVENTS: &str = r#"
+subject Customer(Int)
+
 event @order.placed {
   order_id: Uuid,
-  customer_id: Int,
+  customer_id: Customer,
   email: String? @subject(customer_id) @max(100),
 }
 "#;
@@ -45,7 +47,7 @@ fn one_event_type_is_declared_once() {
             ("events/order.hk", EVENTS),
             (
                 "events/again.hk",
-                "event @order.placed { order_id: Uuid, customer_id: Int }\n",
+                "event @order.placed { order_id: Uuid, customer_id: Customer }\n",
             ),
         ],
         "order.placed",
@@ -59,7 +61,7 @@ fn a_declared_type_emits_from_any_command() {
         (
             "commands/place.hk",
             r#"
-command Place(order_id: Uuid, customer_id: Int, email: String?) {
+command Place(order_id: Uuid, customer_id: Customer, email: String?) {
   emit @order.placed { order_id, customer_id, email }
 }
 "#,

@@ -40,7 +40,7 @@ hekla plan   <dir>    # what deploying this project over a data directory would 
 hekla project <file> <dir>  # fold an undeployed projector over the log once and print its rows
 hekla secrets <dir>   # every declared credential, where it is read from, and whether it is set
 hekla rewind <Effect> <position> <dir>  # take an effect back so it reprocesses. Irreversible
-hekla erase <field> <value> <dir>    # delete one subject's key. Irreversible
+hekla erase <Subject> <id> <dir>    # delete one subject's key. Irreversible
 hekla rotate <dir>    # rewrap every subject key under the current master
 ```
 
@@ -100,7 +100,8 @@ one under `tests/` does.
 | know why an effect is stuck | `GET /status`, then `GET /admin/effects/{Name}/invocations` |
 | get a wedged effect past one event | fix the code and restart, or `POST /effects/{Name}/skip/{position}` |
 | change a projector's shape | edit it and restart (`auto_rebuild`), or `POST /projectors/{Name}/replay` |
-| forget a person | `hekla erase <subject_field> <value> <dir>`, or `erase(...)` in an effect arm |
+| forget a person | `hekla erase <Subject> <id> <dir>` (prompts), or `erase(id)` in an effect arm |
+| forget a whole tenant | the same, on the parent subject: every key beneath it goes in one delete |
 | change the master key | set the new `HEKLA_MASTER_KEY`, keep the old in `HEKLA_MASTER_KEY_PREVIOUS`, `hekla rotate` |
 | give a project a webhook url or an API key | `secret NAME` in a `.hk` file, then `HEKLA_SECRET_<NAME>` or a `[secrets]` entry |
 | check a deploy has the credentials it needs | `hekla secrets`, or the `secrets` section of `hekla plan` |

@@ -93,7 +93,7 @@ hekla listening on http://127.0.0.1:8080
 Boot fails, before binding, when:
 
 - the project uses `@subject` anywhere and `HEKLA_MASTER_KEY` is unset:
-  `error: this project uses subject-scoped encryption (a field with subject = "..."), so HEKLA_MASTER_KEY must be set`
+  `error: this project declares a subject (`+"`"+`subject Customer(Int)`+"`"+`), so HEKLA_MASTER_KEY must be set`
 - another process holds the data directory:
   `error: the data directory at <path> is in use by another hekla process (database is locked); stop it, or run against a copy of the directory`
 
@@ -119,9 +119,9 @@ ok: no violations
 ```
 
 Exit is 1 on any violation, on a missing data directory (`error: no data directory at <path>`), and
-on a directory another process holds. A project that uses `@subject` is refused without a key, the
-same way `serve` is: `error: this project uses subject-scoped encryption (...), so HEKLA_MASTER_KEY
-must be set to verify it`. Run it with the key the server used.
+on a directory another process holds. A project that declares a `subject` is refused without a key, the
+same way `serve` is: `error: this project declares a subject (...), so HEKLA_MASTER_KEY must be set
+to verify it`. Run it with the key the server used.
 
 An invocation is **skipped**, not checked, when the effect's source hash has changed since the run
 was recorded, when its event cannot be read, when a `reveal` it makes needs a subject key that has
@@ -398,14 +398,39 @@ lock, so it runs anywhere `check` does and against a live deployment. Exits 1 wh
 credential is unset, so it is a pre-deploy gate on its own for the thing `serve` would otherwise
 refuse to start over. An unset `secret NAME?` is reported and exits 0.
 
-## `hekla erase <SUBJECT_FIELD> <SUBJECT_VALUE> [DIR] [--data-dir PATH]`
+## `hekla erase <SUBJECT> <SUBJECT_VALUE> [DIR] [--data-dir PATH] [--yes]`
 
 Deletes one subject's key from the operational database. Irreversible, O(1), and immediately visible
 across the log and every read model.
 
+`SUBJECT` is the subject's **declared name**, not the field an annotation pointed at: a key row is
+filed under `Customer`, so `subject Customer(Int)` plus `buyer: Customer` is erased as
+`hekla erase Customer 7`, whatever the field is called. It is the same pair a test writes as
+`erased Customer "7"`.
+
+It prints a summary and asks, the way `hekla rewind` does, because a subject may have children and
+naming it no longer bounds what goes:
+
 ```
-erased subject `customer_id` = `7`
-no key for subject `customer_id` = `7` (already erased or never created)
+subject `Shop` = `7`
+  key            present, and about to be deleted
+  beneath it     2 key(s), which become permanently unreadable
+
+This is irreversible. Every value scoped to these keys becomes unreadable
+across the log and every read model at once.
+Continue? [y/N]
+```
+
+`--yes` skips the question and never the summary. Off a terminal without it, the command refuses
+rather than exiting 0, so a script is never told an erasure happened that did not. Declining prints
+`nothing was erased` and exits 0.
+
+The count walks parent pointers and unwraps nothing, which is why the whole command still needs no
+master key.
+
+```
+erased subject `Customer` = `7`
+no key for subject `Customer` = `7` (already erased or never created)
 ```
 
 Both are exit 0, and the second does not distinguish "already erased" from "never existed". No master
@@ -471,20 +496,23 @@ Refusals: a held lock, an effect the project does not declare (it lists the ones
 directory with no database, `--live` on an effect with no `live` arm, and a `POSITION` ahead of
 the watermark (`... is at position N; M is ahead of it, not a rewind`, exit 0, nothing moved).
 
-**Why this prompts when `erase` does not.** An erase carries its blast radius in its own arguments,
-because you named the subject. `hekla rewind SendWelcome 0` tells you nothing about the four hundred
-emails it is about to re-send. That asymmetry is the whole reason for the summary and the prompt.
+**Why this prompts.** `hekla rewind SendWelcome 0` tells you nothing about the four hundred emails it
+is about to re-send, which is what the summary is for. `erase` used not to prompt, on the grounds
+that naming the subject bounded its blast radius; a subject that can have children made that false,
+and the two now read the same way.
 
 ## `hekla rotate [DIR] [--data-dir PATH]`
 
-Rewraps every subject key under the primary `HEKLA_MASTER_KEY`, unwrapping with
+Rewraps every **root** subject key under the primary `HEKLA_MASTER_KEY`, unwrapping with
 `HEKLA_MASTER_KEY_PREVIOUS` as needed. Ciphertext is untouched, so reads keep working throughout.
 
 ```
 rewrapped 2 subject key(s) under the primary master
 ```
 
-A second run rewraps 0 keys: everything is already under the primary. Failure modes:
+A second run rewraps 0 keys: everything is already under the primary. A nested subject is never
+counted: its key is derived from its parent's secret, which a rotation does not change, so it needs
+no rewrap. Failure modes:
 
 - `error: HEKLA_MASTER_KEY must be set to rotate`
 - ``error: no master `<id>` to unwrap subject `<field>``` when the key a row is wrapped under is

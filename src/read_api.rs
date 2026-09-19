@@ -525,16 +525,16 @@ pub(crate) fn decrypt_row(
         return Ok(());
     };
     for (name, meta) in &entity.fields {
-        let Some(subject_field) = &meta.subject else {
+        let Some(seal) = &meta.sealed_under else {
             continue;
         };
         let Some(ciphertext) = obj.get(name).and_then(Value::as_str).map(str::to_owned) else {
             continue; // absent / null column
         };
-        let subject_value = obj.get(subject_field).and_then(scalar_to_string);
+        let subject_value = obj.get(seal.id_field()).and_then(scalar_to_string);
         let plaintext = match &subject_value {
             Some(subject_value) => decryptor
-                .decrypt(subject_field, subject_value, name, &ciphertext)
+                .decrypt(seal.subject(), subject_value, name, &ciphertext)
                 .with_context(|| format!("decrypting column `{name}`"))?,
             // No subject id to key on: the value is unreadable.
             None => None,
@@ -553,7 +553,7 @@ pub(crate) fn decrypt_row(
                 // serves.
                 if let Some(tally) = tally.as_deref_mut()
                     && subject_value
-                        .is_some_and(|id| decryptor.key_present(subject_field, &id) == Some(true))
+                        .is_some_and(|id| decryptor.key_present(seal.subject(), &id) == Some(true))
                 {
                     tally.stale += 1;
                 }

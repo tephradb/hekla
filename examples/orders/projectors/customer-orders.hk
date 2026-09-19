@@ -11,7 +11,7 @@
 projector CustomerOrders {
   entity Order {
     order_id: Uuid @key,
-    customer_id: Int @index,
+    customer_id: Customer @index,
     email: String? @max(200),
     shipping_address: String? @max(200),
   }

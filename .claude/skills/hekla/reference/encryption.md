@@ -1,20 +1,47 @@
 # Subject-scoped encryption and erasure
 
 The language models a **seal**: a value carries the field, subject and id its key is filed under, and
-only `reveal` reads it out. hekla is what makes that real. A field declared
-`@subject(sibling_field)` is encrypted under a key scoped to `(subject_field, subject_value)` before
-it reaches storage: in the event payload, in the tag index, and in any read-model column that
-receives it.
+only `reveal` reads it out. hekla is what makes that real. A field declared `@subject(buyer)` is
+encrypted under a key scoped to `(subject, subject_value)` before it reaches storage: in the event
+payload, in the tag index, and in any read-model column that receives it.
 
 The language never sees a ciphertext and the store never sees a plaintext. Everything below is
 hekla's half.
 
+## Subjects are declared
+
+A subject is a declared type whose values are its ids, so the key namespace has a name of its own
+rather than being conjured by spelling a field:
+
+```hek
+subject Customer(Int)
+
+event @order.placed {
+  order_id: Uuid,
+  buyer: Customer,
+  email: String? @subject(buyer) @max(200),
+}
+```
+
+Two facts, and they are not the same one. `@subject(buyer)` names a **sibling field**, which is where
+the id is read from and is local to this declaration. `buyer`'s type is `Customer`, which is the
+**namespace**, and is what every key row is filed under. Rename the field and nothing moves; rename
+the subject and every key row does.
+
+That is why `hekla erase` takes `Customer 42` and not `buyer 42`, and why `from: Customer, to:
+Customer` on one event is two ids under one namespace.
+
+An id may be an `Int`, a `String` or a `Uuid` and nothing else, because a key is filed under text and
+those are the three with one canonical form to file it as.
+
 ## Keys
 
-- One **subject key** per `(subject_field, subject_value)` pair, minted on first write, stored in
+- One **subject key** per `(subject, subject_value)` pair, minted on first write, stored in
   `hekla.db` wrapped under the master.
-- **`HEKLA_MASTER_KEY`** is 32 bytes, base64. Required at boot if the project declares any
-  `@subject`, and boot fails with a subject-specific message when it is absent.
+- **`HEKLA_MASTER_KEY`** is 32 bytes, base64. Required at boot if the project declares any `subject`,
+  and boot fails with a subject-specific message when it is absent. Declaring one and sealing nothing
+  still requires it: a project that declares a namespace will use it, and finding out at the first
+  write is worse than finding out at boot.
 - **Losing the master is total, unrecoverable loss** of every subject-scoped value. Nothing else in
   the runtime fails this way.
 - **`HEKLA_MASTER_KEY_PREVIOUS`** is a comma-separated list of prior masters, used to unwrap rows that
@@ -26,17 +53,24 @@ hekla's half.
 ## What a subject field must look like
 
 - **The subject id itself stays plaintext.** It is how the runtime finds the key, and after an erasure
-  the log still shows `guest_id: 7` with the personal fields unreadable. That is standard
+  the log still shows `buyer: 7` with the personal fields unreadable. That is standard
   crypto-shredding.
+- **A subject id is an id and nothing else.** It stores, keys, indexes, ranges and pages exactly as
+  the scalar its ids are, so `buyer: Customer @key` and `index (buyer, status)` both work. What it
+  will not do is arithmetic, or mix with another subject.
 - **Per field, not per event.** An event with a customer and a shop wants `email` under the customer
   and `order_total` under the shop, so erasing one leaves the other's record intact.
 - **A sealed field wants to be optional** (`String?`), because an erased value reads back absent. A
   projector column that receives sealed content and is not optional is a `hekla check` error.
 - **A column's subject is propagated, never declared.** No entity column is written `@subject`: a
   column that receives sealed content becomes sealed, which is what lets a projector store a
-  credential it may never read.
+  credential it may never read. The column holding that subject's ids has to be on the same entity,
+  or hekla refuses the projector at load: without it there is no id to find the key with.
 - **An index over a sealed column is refused.** A filter arrives as plaintext and could never match
   ciphertext without the subject; filter by the plaintext subject id instead.
+- **A subject-typed column that is not the key needs a default**, because a subject id has no zero:
+  customer 0 is a customer rather than an absence, the same argument `Uuid` and `Timestamp` make
+  about nil and epoch-zero.
 - **A field appended with no subject can never be erased**, and nothing warns about it. Which fields
   are personal is a judgement hekla cannot make from a name, so decide it on day one.
 - **There is no cross-subject uniqueness on a sealed field.** "One account per email" would need
@@ -85,8 +119,9 @@ Needs heklang 0.9 or newer. Against 0.8 a composite seal reveals as a mismatch a
 
 ## Erasure
 
-`hekla erase <field> <value> <dir>` from the CLI, or `erase(...)` from an effect arm. It deletes the
-key. One O(1) operation makes every value scoped to that subject unreadable and unmatchable across the
+`hekla erase <Subject> <id> <dir>` from the CLI, naming the subject by its declared name, or
+`erase(id)` from an effect arm, where the value's type is the namespace and nothing is named at all.
+It deletes the key. One O(1) operation makes every value scoped to that subject unreadable and unmatchable across the
 log and every read model at once, with no rewrite, compaction or index rebuild.
 
 What each surface does afterwards:
@@ -97,7 +132,8 @@ What each surface does afterwards:
 | `GET /admin/events/...` | `data` keeps the stored ciphertext, and `subjects.<field>.state` is `erased` |
 | a projector rebuild | writes the column NULL: no read path ever mints a key |
 | an effect's `reveal` | fails the invocation **terminally**, which completes that position and advances |
-| `GET /admin/subjects/{field}/{value}` | `state: absent`, indistinguishable from never-created |
+| `GET /admin/subjects/{subject}/{value}` | `state: absent`, indistinguishable from never-created |
+| a subject **under** the erased one | the same, everywhere: its key was wrapped under this one |
 | an external system | unaffected. Erasure cannot un-send an email an effect already delivered |
 
 The CLI form takes no lock, so it works against a running server, and the next request sees it: the
@@ -107,10 +143,82 @@ decrypt cache lives for one request only.
 mints a fresh key, so values written after the erase are readable while everything before it stays
 shredded. Values written under the superseded key report `stale` rather than `erased`.
 
+## A subject can be deleted with its tenant
+
+A subject may declare a parent, and then its keys are wrapped under the parent's:
+
+```hek
+subject Shop(Int)
+subject Customer(Int) under Shop
+```
+
+Deleting the shop's key row is still **one row delete**, and every customer key beneath it becomes
+unopenable at the same instant. There is no walk, no second write, and no projector whose job is to
+enumerate a shop's customers so they can be erased one at a time. That enumeration, and the 50,000
+journal rows it produced, is what `under` removes.
+
+**Every event sealing under a child must carry its ancestors' ids.** The runtime learns which key to
+wrap under from the event in front of it and has nowhere else to look, so an event with a
+`Customer`-sealed field and no `Shop` field is refused: by `hek check` at the annotation, and again
+by hekla at load, before a deployment starts.
+
+**What a parent gives up.** Per-field subjects are sold on the opposite property: erasing a shop
+provably cannot touch a customer's `email`. Under a parent it does, deliberately, and there is no way
+to have both for one pair of subjects. Declare the parent when "delete this tenant" is a thing you
+must be able to do, and not otherwise.
+
+**What nothing can check.** The parent relation is asserted per event. If one event says customer 88
+is in shop 7 and another says shop 9, the key was minted once, under whichever arrived first;
+deleting shop 9 then leaves customer 88 readable, and deleting shop 7 destroys data the author
+believes is shop 9's. Both events are individually well formed, so neither heklang nor hekla has
+anything to point at. Getting the parent right is the author's.
+
+### Erased, or tampered with
+
+A child's key is wrapped under a key derived from its parent's secret, so a wrapping that
+will not open has two possible causes and the runtime tells them apart rather than
+guessing. Each key row records which *generation* of its parent it was wrapped under: a
+domain-separated digest of that parent's secret, which carries no key material.
+
+| What happened | How it reads | Why |
+| --- | --- | --- |
+| the parent's row is gone | **erased** | nothing will ever derive that key again |
+| the parent was erased and written to again | **erased** | the generation recorded on the child does not match the live one, so this row predates the shred |
+| the generation matches and the wrapping still will not open | **unreadable**, and a `500` from the read API | the key it was wrapped under has not moved, so the bytes were altered outside hekla |
+
+The distinction is worth the column. Collapsing the first two into "unreadable" would `500`
+every read of a legitimately shredded row and wedge its write path for good; collapsing the
+third into "erased" would tell an operator their shred worked when what actually happened
+is that somebody wrote to the key store.
+
+### What it costs
+
+- **O(1) deletes and O(1) journal rows, not O(1) storage.** The child rows stay on disk holding bytes
+  nobody can read. The hourly retention sweep reclaims them, in the same bounded chunks it sweeps the
+  effect journal with, repeating until a pass finds nothing so a grandchild is reached once its
+  parent is gone. Nothing waits on it: what it reclaims is already unreadable.
+- **A rotation gets cheaper, not dearer.** `hekla rotate` rewraps roots only. A child's wrapping key
+  is derived from its parent's *secret*, and a rotation rewraps that secret under a new master
+  without changing it, so every child stays correctly wrapped without being touched.
+- **`hekla erase` prompts now.** It used not to, on the grounds that naming the subject bounded the
+  blast radius. A subject with children makes that false, so it prints a summary (including how many
+  keys go with it) and asks, exactly as `hekla rewind` does. `--yes` skips the question and never the
+  summary.
+- **An unreachable child row is replaced, not repaired.** A child that outlives its parent's erasure
+  holds ciphertext nobody can ever open. Writing that subject again mints a fresh key over the row
+  rather than failing: the old content is already unrecoverable, so refusing would protect nothing
+  and would wedge the write path. The replacement is a compare-and-set on the bytes the writer
+  actually read, so two writers racing to replace one dead row cannot delete each other's fresh key.
+- **An erase landing mid-write sends that write round again**, rather than committing content that is
+  unreadable the moment it lands. The retry is bounded; a subject being erased and recreated in a
+  tight loop fails the write loudly instead of hanging.
+
 ## Rotation
 
-`hekla rotate` rewraps every subject key under the primary master, unwrapping with the previous ones
-as needed. Ciphertext is untouched, so the data does not move and reads keep working.
+`hekla rotate` rewraps every **root** subject key under the primary master, unwrapping with the
+previous ones as needed. Ciphertext is untouched, so the data does not move and reads keep working.
+A nested subject's key is derived from its parent's secret rather than wrapped under a master, so it
+needs no rewrap and the count reports only the roots.
 
 The order that matters:
 
@@ -142,10 +250,14 @@ plaintext an erasure was meant to shred.
 writing here in a way it would not be in an in-memory harness:
 
 ```hek
-erased guest_id "7"
+erased Guest "7"
 project Bookings
 expect Booking["1111..."] { email: none }
 ```
 
 The column really holds AES-SIV ciphertext and the key is really deleted. `expect skipped` is the
 effect-side counterpart: an arm that hits a shredded key.
+
+`erased` and `expect erase(Guest, "7")` both name a **key row**, which is a namespace and the id as a
+host files it, so they read as a pair rather than as a value. That is the same pair the CLI takes.
+The `erase(id)` statement in an arm names a value instead, and the value's type is the namespace.

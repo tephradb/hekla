@@ -2676,64 +2676,263 @@ Two findings from the same review are deliberately not acted on:
   failure got louder with `INDEXED BY` (a 500 rather than an unindexed scan), which is the argument
   for a name check whenever something else needs that pass.
 
-## Phase 39: a subject can be deleted with its tenant (planned, decision first)
+## Phase 39: a subject can be deleted with its tenant (done)
 
-`shop/redact` is one erase of `shop_id` plus one erase per `customer_ref` that shop ever produced.
-`erase` is journaled per call by design, so the row count is not something heklang can batch away: a
+`shop/redact` is one erase of the shop plus one erase per customer that shop ever produced. `erase`
+is journaled per call by design, so the row count is not something heklang can batch away: a
 50,000-customer shop writes 50,000 journal rows in one invocation, and the application has to carry a
 projector whose only purpose is to enumerate subjects for deletion. That is the mandatory-compliance
 path, with a legal deadline on it.
 
-Letting a subject declare a parent is what removes it. `customer_ref` keys are wrapped under
-`shop_id`'s key, so deleting the `shop_id` row makes every customer key beneath it unwrappable in one
-delete. It is ordinary key-hierarchy cryptography, and "delete this tenant" is the shape of the
-multi-tenant deployments hekla is most likely to land in.
+Letting a subject declare a parent is what removes it. A customer's key is wrapped under its shop's
+key, so deleting the shop's row makes every customer key beneath it unwrappable in one delete. It is
+ordinary key-hierarchy cryptography, and "delete this tenant" is the shape of the multi-tenant
+deployments hekla is most likely to land in.
 
 **This is a decision before it is a task, and the sequence is hekla commits, then heklang declares,
 then hekla implements.** A declaration the runtime does not act on is worse than no declaration,
 because it reads as a guarantee.
 
-heklang's share is small and is only the declaration: somewhere to say a subject has a parent, and
-the one check hekla cannot make, which is that every event carrying a `@subject(child)` field also
-carries the parent id field, non-optional and of the right type. Without it hekla meets an event it
-cannot file a key under, at write time, in production. Everything else is hekla's, and it is the bulk
-of the work: parent columns on `subject_key`, a recursive unwrap, presence checks that walk the
-chain, a rotation that walks roots, and a sweeper.
+### The decision: a subject becomes a declared type
+
+This phase budgeted heklang "somewhere to say a subject has a parent". That is not buildable as
+written, because **there is no subject to hang a parent on**. A subject today is an anonymous
+namespace conjured by writing a field name, and the field name *is* the identity:
+
+- `subject_field` (`heklang/src/parse.rs:9144`) resolves a subject by scanning every event in the
+  project and taking the first that has a field of that name. So `owner_id` on two unrelated events
+  is one key row and one erasure, and nothing says so.
+- Spell it `customer_id` in one event and `cust_id` in another and they are two different people,
+  erased independently. Nothing catches that either.
+- Nothing checks that two events spelling one subject agree on its type. The first found wins.
+- `erase(customer_id, some_other_int)` compiles, which `heklang/docs/effects.md` already records as
+  accepted: "erasing the wrong namespace destroys the wrong subject's key."
+
+A key hierarchy multiplies every one of those by the size of a tenant, so the namespace is fixed
+first and the parent rides on the fix. **A subject becomes a declared type whose values are its
+ids**, and the parent is a property of that type:
+
+```hek
+subject Shop(Int)
+subject Customer(Int) under Shop
+```
+
+```hek
+event @order.placed {
+  order_id: Uuid,
+  buyer: Customer,
+  shop: Shop,
+  email: String? @subject(buyer) @max(200),
+  order_total: Money(2) @subject(shop),
+}
+```
+
+Field names stop carrying identity: call it `buyer`, `cust` or `who` and it is still a `Customer`.
+The key row is filed under the subject's declared name, which is an identifier carrying a digest
+entry, so renaming one is a visible change rather than a silent re-partition of everybody's keys.
+
+**Three things close together**, which is why the type is worth more than the parent alone:
+
+- `erase(Customer, x)` accepts only a `Customer`, so the wrong-namespace hole becomes a type error.
+  That earns the type kind on its own: this feature's whole job is irreversible destruction, and the
+  thing selecting the target was an untyped string that doubled as a field name.
+- `from: Customer, to: Customer` on one event becomes expressible. Today both fields would have to be
+  literally named `customer_id`, so a transfer between two people of one kind cannot be written at
+  all.
+- "A `Customer` belongs to a `Shop`" is a statement about customers in general rather than about one
+  event or one field, so it is stated once on the declaration with nowhere to write a contradicting
+  copy.
 
 Decisions worth keeping:
 
-- **The write path already has what it needs.** `lower` builds an `ids` map of every scalar field's
-  plaintext before sealing anything, so the parent id is in hand at the one moment a child key is
-  minted. Everywhere else the parent pointer lives on the child's own `subject_key` row, so
-  `load_secret` walks it without a caller knowing. The parent is a creation-time fact and nothing
-  else, which is what keeps the projector write path unchanged.
-- **An unwrappable child row reads as absent, and is replaced.** A child row survives its parent's
-  deletion, so a re-created parent mints a fresh secret and leaves the old child row unwrappable.
-  `get_or_create_secret` would find that row and hard-fail on `unwrap_key` rather than minting a new
-  key. Such a row has to read as absent and be replaced, which is safe because its ciphertext is
-  already unrecoverable. This is designed in rather than discovered.
-- **`erase_subject` needs no master key today, deliberately, and that survives.** Deleting a parent
-  stays a plain row delete, and reachability is structural rather than cryptographic: `erased` and
-  `key_present` walk parent pointers checking row existence, with no master involved. So the
-  `hekla erase` CLI keeps working without one.
-- **`rotate()` becomes a walk rather than a scan.** Only root rows are wrapped under a master, so a
-  rotation touches fewer rows, and child rows are reachable only by unwrapping their parent first.
+- **Nominal inside, positional at the edge.** `{"buyer": 7}` reads as a `Customer` because the
+  declaration says that position is one. JSON carries no type tag, so nothing can verify that 7 is a
+  customer id rather than a shop id, and a caller that swaps two ids is not caught and cannot be.
+  What is caught is every mix-up past the boundary, `erase(Customer, ev.shop)` among them, which is
+  where the damage lives. Written down because "subjects are types" otherwise reads later as "the API
+  validates them".
+- **`@subject(...)` keeps naming a field, not the type.** The type is reachable from the field, and
+  naming the field is what keeps `from: Customer, to: Customer` disambiguable. The reference becomes
+  local to the declaration, like an `index (a, b)` column list, rather than a key into a global
+  namespace: that locality is the fix, not the annotation's spelling.
+- **One parent per subject, forever.** A `Customer` under a `Shop` cannot also sit under a
+  `Marketplace` in another flow. One hierarchy means one place a delete starts from, and a subject
+  reachable by two routes would have two answers to "is this erased".
+- **A subject id is an id and nothing else.** Equality within one subject type, yes. Use as an entity
+  key, in an index and in a range, yes, reading through to the underlying scalar as Phases 37 and 38
+  already do. Arithmetic, no. Mixing a `Customer` with a `Shop`, no, which is the point.
+- **The subject graph is over type names, so it is finite and statically acyclic.** Depth is bounded
+  by the number of declared subjects, which is what makes a recursive unwrap safe without a magic
+  cap, and cycle detection a check on one small graph at load rather than a runtime guard.
+
+### hekla's half
+
+The write path already has what it needs. `lower` (`src/heklang_host.rs:1255`) builds an `ids` map of
+every scalar field's plaintext in a complete pass before it seals anything, so the parent id is in
+hand at the one moment a child key is minted. `stored_seal` is the only mint site on the append path,
+and `RowWriter` goes through `encrypt_subject_existing` and never mints, so the projector write path
+is unchanged.
+
+- **`subject_key` grows a parent, and a row is wrapped under exactly one thing.** Schema v10 rebuilds
+  the table with a nullable `master_key_id` beside `parent_field`/`parent_value` and a
+  `CHECK ((master_key_id IS NULL) <> (parent_field IS NULL))`, so "a root or a child, never both and
+  never neither" is a database rule rather than a Rust convention. A rebuild rather than two
+  `ADD COLUMN`s, because SQLite cannot relax a `NOT NULL` in place and the check is worth the rebuild.
+- **The wrapping key is derived, not reused.** `wrap_key` takes a 32-byte AES-GCM key and a subject
+  secret is 64 bytes of AES-SIV, so a child wraps under a domain-separated SHA-256 of its parent's
+  secret. SHA-256 rather than HKDF because the input is already uniformly random, which is the case
+  HKDF-Extract exists to avoid needing. The child's own secret stays a fresh random 64 bytes, so **no
+  ciphertext moves**: acquiring a parent is a rewrap, never a re-encrypt.
+- **The chain walk falls out rather than being built.** `load_secret` recursing into its parent
+  answers everything: an ancestor row that is gone means no secret, which is `Ok(None)`, which every
+  one of the nine `None` consumers already treats as unreadable. "Presence checks that walk the
+  chain" overstated the work. `KeyStore::erased` is dead code with zero callers, and `verify.rs:301`
+  records why it was abandoned (it answers "does a key row exist" when the question is "do these
+  bytes decrypt"), so it is deleted rather than taught to walk.
+- **The two absences stay apart.** A missing ancestor row is permanent and reads as `Ok(None)`; a
+  missing master is a misconfiguration and stays `Err`. That split already exists and generalises
+  unchanged, and it is exactly what makes replacing an unwrappable child row safe, because only the
+  first case can trigger the replacement.
+- **Rotation gets simpler, not harder.** Only roots are wrapped under a master, so `all_subject_keys`
+  filters on `master_key_id IS NOT NULL`. Children need no rewrap at all: their wrapping key derives
+  from the parent's secret and a rotation leaves every secret untouched. This was called a walk over
+  roots; it is one `WHERE` clause.
+- **The sweeper gains a step.** `run_sweep` (`src/effect.rs:2101`) grows a bounded delete of child
+  rows whose parent row is gone, in the `SWEEP_CHUNK` and `SWEEP_CHUNK_PAUSE` discipline the journal
+  sweep already follows. A grandchild becomes an orphan only once its parent is swept, so the step
+  repeats until a pass deletes nothing, bounded by the depth of the subject graph.
 - **`hekla erase` grows the summary and the prompt `rewind` has.** Its no-prompt rationale is written
-  down as "an erase carries its blast radius in its own arguments, because you named the subject". A
-  cascading erase makes that false, and the asymmetry that justified the inconsistency goes with it.
+  down in two places (`src/cli.rs:504` and `reference/cli.md:474`) as "an erase carries its blast
+  radius in its own arguments, because you named the subject". A cascading erase makes that false,
+  and the asymmetry that justified the inconsistency goes with it. The summary can count descendants
+  exactly from a recursive CTE over the parent columns, with no master key, which is what keeps the
+  CLI master-free.
+- **hekla checks the declaration at load, not at write.** "Every event carrying a child-scoped field
+  also carries the parent id" was recorded as a check hekla cannot make. It can: it holds every
+  `EventDef`. heklang's is the better diagnostic because it points at a source span, and hekla's is
+  the one that refuses a deployment rather than a request. Both, for the same reason `check` and boot
+  both refuse a sealed column that cannot be absent.
 
 Honest scope:
 
-- **O(1) deletes and O(1) journal rows, not O(1) storage.** The child rows are still there and still
-  need a sweeper, which fits the hourly retention sweep. Worth being precise about, because the
-  50,000-row figure is the number this feature is justified against.
-- **Orphans accumulate until swept.** Shredding a parent leaves unreadable child rows behind. Not a
-  correctness problem, a growth one.
-- **`key_present` and `erased` get more expensive**, because both become a chain walk, and heklang's
-  `Keys::decrypt` returning `None` for an erased subject has to keep meaning exactly what it means
-  now.
-- **Rule 9's erase-then-reveal analysis in heklang is subject-blind**, so the wider blast radius
-  costs nothing there.
+- **O(1) deletes and O(1) journal rows, not O(1) storage.** Child rows survive unreadable until the
+  sweep reclaims them. That is the growth cost, and the 50,000-row figure this is justified against
+  is the journal rather than the disk.
+- **Declaring a parent gives up the independence the current design advertises.** `ARCHITECTURE.md`
+  and `reference/encryption.md` both sell per-field subjects on exactly this: erasing a shop provably
+  cannot touch a customer's `email`. Under a parent it does, deliberately, and there is no way to have
+  both for one pair of subjects. The docs have to say so beside the feature rather than keep the old
+  claim two sections away.
+- **A key row written before this does not follow its subject's rename.** Schema v10 carries every
+  `subject_key` row across, but the namespace it is filed under changed meaning: it was the *field*
+  the annotation named and is now the declared type's name, and nothing in the migration knows the
+  mapping between the two. A carried row is reachable only where a project happened to name its
+  subject exactly what the field was called. The symptom is the bad one, every pre-existing sealed
+  value reading back absent and so indistinguishable from an erasure, which is why the migration
+  logs a warning naming the count rather than carrying them silently. Nothing is deployed against
+  this tree, so nothing more was built; a local data directory from before the change is the case
+  that meets it.
+- **A parent declared onto a project that is already running does not adopt the rows already there.**
+  Those were wrapped under the master, so deleting the tenant misses them silently, which is the one
+  failure a compliance feature cannot have. Nothing is deployed against this tree, so it is not built
+  now, but it is the gap to close before anything is: the shape is a rewrap on write when a child's
+  row is still a root, plus a boot-time count of the un-adopted tail so it is visible rather than
+  silent.
+- **`key_present` reads through the chain**, so introspection's `erased`-versus-`stale` split keeps
+  meaning what it means, and `GET /admin/subjects/{field}/{value}` answering `absent` covers a row
+  that exists but whose parent is gone. Both surfaces answer "unreadable", which is the guarantee,
+  rather than "the row is there", which is not.
+- **Rule 9's erase-then-reveal analysis in heklang is subject-blind**, so the wider blast radius costs
+  nothing there.
+- **Three stale things this phase passes and should fix on the way.** `KeyStore::erased` is dead
+  (above); `schema.rs:405` names a `validate_subject_refs` that exists in neither repo; and
+  `encrypt_global` has no production caller, so `_hekla_global` survives only as an exclusion filter
+  and an erase refusal.
+
+
+### What implementing it changed
+
+Four things the design above did not have right, found by building it.
+
+- **The two names had to come apart in hekla too, and one expression hid it.** `FieldDef::subject`
+  on an *event* still holds the field name; `EntityField::subject` on an *entity* now holds the
+  subject's name, because `propagate_subject` reads it off the type. hekla copied both into one
+  `FieldMeta.subject` with the same line, so nothing failed to compile and instead
+  `read_api::decrypt_row` looked up a column named `Customer`, found nothing, and dropped every
+  sealed column as though erased. `FieldMeta` carries a `Seal` now, and the accessor is a method, so
+  every old field access was a compile error rather than a silent one. That was luck rather than
+  design, and it is the reason the adaptation was safe to do quickly.
+- **"Presence checks that walk the chain" was not work.** `load_secret` recursing into its parent
+  answers everything: a missing ancestor means no secret, which is `Ok(None)`, which all nine `None`
+  consumers already treat as unreadable. `KeyStore::erased` turned out to be dead code with no
+  callers at all (`verify.rs:301` records why it was abandoned), so it was deleted rather than taught
+  to walk.
+- **"A rotation that walks roots" is one `WHERE` clause, and the hierarchy makes rotation cheaper.**
+  A child's wrapping key derives from its parent's *secret*, which a rotation never changes, so a
+  child needs no rewrap at all. A tenant with 50,000 customers rotates one row.
+- **"The one check hekla cannot make" is one hekla should make, and does.** hekla holds every
+  `EventDef`, so it refuses at load an event that seals under a child without carrying its ancestor.
+  heklang keeps its own copy because it can point at the annotation's span, which is what an author
+  has to change; heklang's own comment says it keeps that copy *because* hekla would have one.
+
+The open gap is unchanged and is written above: **a parent declared onto a project that already has
+key rows does not adopt them.** Nothing is deployed against this tree, so nothing was built for it,
+and the shape it wants is recorded rather than guessed at later.
+
+
+### What the hardening pass changed
+
+Four correctness bugs, each found by writing the test before trusting the reasoning.
+
+- **A child whose parent was erased and then written to again reported an error, not an
+  absence.** The parent's new secret derives a different wrapping key, so the child's own
+  key no longer opens: that failed at the *key* layer where a root's equivalent fails at
+  the *data* layer, and the two have different error contracts. It meant a `500` on every
+  read of a legitimately shredded row instead of an omitted column, and a write path wedged
+  for that subject for good, since `get_or_create_secret_in` replaces a row that reads
+  absent and propagates one that errors. Each row now records which **generation** of its
+  parent it was wrapped under, so a superseded parent reads as a shred while a wrapping that
+  fails against the live generation reads as tampering. Collapsing the two either way is
+  wrong for the other.
+- **The replacement compare-and-set matched the parent, which is identical for the stale row
+  and the row replacing it.** Two writers racing to replace one orphan each matched the
+  *other's* fresh row and deleted a key already sealed under, with no error anywhere. It
+  matches the wrapped bytes now, which are unique per mint.
+- **An erase landing between a writer's insert and its read-back failed the write.** A
+  child's wrapping can only be opened through its parent's row, which is under a different
+  lock, so the atomicity a root enjoys is not available. The mint retries, bounded, and the
+  write lands on a freshly minted parent: the documented "a write after an erase gets a
+  fresh key" rule, applied to a write that merely *finished* after one. Committing under the
+  doomed key instead was the other option and is worse, because the command reports success
+  over content that is already unreadable.
+- **A cycle in the parent pointers hung the process.** Only a hand-edited store can produce
+  one, and the reachability walk was an unbounded `UNION ALL` that never terminated: a hang
+  is the worst of the three possible answers because nothing reports it. It deduplicates
+  now, and the recursive unwrap has a depth cap.
+
+Two smaller ones: the per-request decrypt cache did not cover the ancestors the new walk
+visits, so a page of one tenant's members re-read and re-unwrapped the tenant key once per
+row, defeating the only reason that cache exists; and the sweep was gated on whether the
+project *currently* declares a parent, which would have stranded the rows of one that used
+to.
+
+Every fix above is pinned by a test that fails when the fix is reverted, which is the only
+evidence worth having, and one of those checks silently passed at first because the revert
+did not apply.
+
+### Sequencing, as it actually went
+
+This planned for heklang to cut 0.9 with the sealed-composite fix first and do subjects as types
+afterwards, so Phase 36 would not wait behind a larger design. It did not go that way: both changes
+sit in one unreleased set, so 0.9 carries the fix **and** `3f79a60`, and Phase 36 and Phase 39
+unblock together. Nothing was lost by that, because hekla could not build against the new IR either
+way; what it costs is that the two phases land on one heklang version rather than two, so a bisect
+across the bump crosses both.
+
+hekla's half is two commits. The first adapts to the new model and changes no behaviour: the key
+namespace becomes the subject's declared name, `FieldMeta` carries the subject and the id field
+apart, and every fixture is rewritten. The second is the feature this phase is named for, and lands
+on top.
 
 ## Deferred, with triggers
 

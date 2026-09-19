@@ -1,3 +1,18 @@
+// The two key namespaces. A subject is a declared type whose values are its ids, so
+// `customer_id: Customer` is what says which keys `@subject(customer_id)` files under; the
+// field could be called `buyer` and it would still be the same namespace.
+//
+// Erasing a customer leaves the shop's order record intact, which is what per-field
+// subjects are for. The reverse is no longer true, and that is the trade `under` makes:
+// erasing the shop takes every one of its customers with it, deliberately.
+subject Shop(Int)
+// A customer belongs to a shop, so the customer's key is wrapped under the shop's and
+// deleting the shop's row makes every customer key beneath it unwrappable at once. That is
+// what `under` declares, and it is why every event sealing anything under a `Customer` has
+// to carry a `Shop` too: the runtime learns which key to wrap under from the event in
+// front of it, and there is nowhere else for it to look.
+subject Customer(Int) under Shop
+
 // How many orders a shop may take during the launch. Small enough that the example's
 // tests can reach it.
 const LAUNCH_ALLOCATION: Int = 3

@@ -211,7 +211,7 @@ pub struct Runtime {
     /// wrapping subject fields as opaque handles in a fold.
     events: Arc<EventDefs>,
     /// The subject-key store, present when a master key is configured. Required at
-    /// boot when the project uses subject-scoped encryption.
+    /// boot when the project declares any subject.
     keystore: Option<Arc<KeyStore>>,
     /// What this deployment supplies for the project's `secret` declarations, resolved
     /// once here rather than per invocation. Beside the keystore because the two are the
@@ -381,12 +381,12 @@ impl Runtime {
         // Event field metadata, shared with the projector and effect runtimes so a
         // fold or a `handle` sees subject fields as opaque handles.
         let events = Arc::clone(&project.events);
-        let uses_subjects = events
-            .values()
-            .any(|def| def.fields.iter().any(|(_, meta)| meta.subject.is_some()));
-        if uses_subjects && master.is_none() {
+        // The declarations rather than the sealed fields: a project that declares a
+        // subject and seals nothing today will seal something tomorrow, and finding out
+        // at the first write is worse than finding out at boot.
+        if !project.program.subjects.is_empty() && master.is_none() {
             anyhow::bail!(
-                "this project uses subject-scoped encryption (a field with subject = \"...\"), so HEKLA_MASTER_KEY must be set"
+                "this project declares a subject (`subject Customer(Int)`), so HEKLA_MASTER_KEY must be set"
             );
         }
         let effect_units: Vec<Arc<EffectUnit>> =
@@ -482,12 +482,9 @@ impl Runtime {
         // `reveal` fails before the host can mark the failure terminal, so the replay
         // check reports a divergence for every invocation. A healthy directory would
         // exit non-zero naming corruption that is not there.
-        let uses_subjects = events
-            .values()
-            .any(|def| def.fields.iter().any(|(_, meta)| meta.subject.is_some()));
-        if uses_subjects && master.is_none() {
+        if !project.program.subjects.is_empty() && master.is_none() {
             anyhow::bail!(
-                "this project uses subject-scoped encryption (a field with subject = \"...\"), so HEKLA_MASTER_KEY must be set to verify it"
+                "this project declares a subject (`subject Customer(Int)`), so HEKLA_MASTER_KEY must be set to verify it"
             );
         }
         // And the same reasoning again for rule 16's credentials. A sweep whose effects
@@ -1160,8 +1157,19 @@ impl Runtime {
         self.lock_opdb().subject_keys_page(after, limit)
     }
 
-    pub(crate) fn subject_key_exists(&self, field: &str, value: &str) -> anyhow::Result<bool> {
-        self.lock_opdb().subject_key_exists(field, value)
+    /// Whether a key row is on disk for this subject.
+    ///
+    /// Row existence, not reachability: a child whose parent has been erased still has a
+    /// row here and cannot be read through any path. `/admin/subjects` answers with this
+    /// and says so.
+    pub fn subject_key_exists(&self, subject: &str, value: &str) -> anyhow::Result<bool> {
+        self.lock_opdb().subject_key_exists(subject, value)
+    }
+
+    /// Whether anything scoped to this subject can still be read: its row is there and so
+    /// is every row above it. What `/admin/subjects/{subject}/{value}` answers.
+    pub fn subject_key_reachable(&self, subject: &str, value: &str) -> anyhow::Result<bool> {
+        self.lock_opdb().subject_key_reachable(subject, value)
     }
 
     pub(crate) fn master_key_ids(&self) -> anyhow::Result<Vec<String>> {
@@ -1213,6 +1221,12 @@ impl Runtime {
     ) -> anyhow::Result<Vec<u64>> {
         self.lock_opdb()
             .running_with_hash_mismatch(effect, current_hash)
+    }
+
+    /// Reclaim up to `limit` key rows whose parent row is gone. See
+    /// `crate::effect::sweep_orphan_keys` for why this is lazy.
+    pub(crate) fn sweep_orphan_subject_keys(&self, limit: usize) -> anyhow::Result<usize> {
+        self.lock_opdb().sweep_orphan_subject_keys(limit)
     }
 
     pub(crate) fn sweep_effect_journal(&self, cutoff: &str, limit: usize) -> anyhow::Result<usize> {

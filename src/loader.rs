@@ -291,7 +291,8 @@ pub struct Scratch<'a> {
 /// alongside the entry rather than inside it.
 ///
 /// An event and an enum are absent because their declarations carry no module at all,
-/// which is why the column this feeds is nullable.
+/// which is why the column this feeds is nullable. A subject does carry one, so it sits
+/// with the five that do.
 pub fn module_paths(program: &Program) -> HashMap<(Kind, String), String> {
     let mut out = HashMap::new();
     let mut add = |kind: Kind, name: &str, module: &Option<String>| {
@@ -299,6 +300,9 @@ pub fn module_paths(program: &Program) -> HashMap<(Kind, String), String> {
             out.insert((kind, name.to_owned()), module.clone());
         }
     };
+    for def in &program.subjects {
+        add(Kind::Subject, &def.name, &def.module);
+    }
     for def in &program.records {
         add(Kind::Record, &def.name, &def.module);
     }

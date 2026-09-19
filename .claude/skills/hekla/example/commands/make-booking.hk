@@ -8,7 +8,7 @@
 command MakeBooking(
   booking_id: Uuid,
   room_id: Int,
-  guest_id: Int,
+  guest_id: Guest,
   email: String?,
   night: Timestamp,
   rate: Money(2),

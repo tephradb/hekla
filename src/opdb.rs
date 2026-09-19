@@ -22,7 +22,7 @@ use crate::crypto;
 
 /// The current schema version, tracked in SQLite's `user_version`. Bump it and
 /// add a migration arm when the schema changes.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// How many rows a single sweep statement deletes, so a retention sweep never
 /// holds the connection across a long scan. The sweeper loops until a call
@@ -111,13 +111,73 @@ fn row_to_invocation(row: &rusqlite::Row) -> rusqlite::Result<InvocationRow> {
     })
 }
 
-/// One subject-key row: `(subject_field, subject_value, wrapped_key, master_key_id)`.
+/// How a stored key row is wrapped. Exactly one of these, which the table's `CHECK`
+/// enforces rather than this type hoping for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wrapping {
+    /// A root, wrapped under the master with this id.
+    Master(String),
+    /// A child, wrapped under a key derived from its parent's secret. Deleting the
+    /// parent's row is what makes this one unopenable, for good.
+    Parent(ParentRef),
+    /// Neither, which the `CHECK` forbids. Only a hand-edited database reaches it, and
+    /// it is a value rather than a panic so the operator who did it gets a message.
+    Neither,
+}
+
+impl Wrapping {
+    /// The three nullable columns this wrapping writes.
+    pub fn columns(&self) -> (Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+        match self {
+            Wrapping::Master(id) => (Some(id), None, None, None),
+            Wrapping::Parent(parent) => (
+                None,
+                Some(&parent.subject),
+                Some(&parent.value),
+                Some(&parent.fingerprint),
+            ),
+            Wrapping::Neither => (None, None, None, None),
+        }
+    }
+}
+
+/// The row a child's key is wrapped under, and which generation of it.
+///
+/// The fingerprint is what separates two failures that are otherwise identical bytes: a
+/// parent erased and written to again has a new secret, so nothing wrapped under the old
+/// one will ever open, and that is an ordinary shred. A wrapping that will not open while
+/// the fingerprint still matches is something else, because the key it was wrapped under
+/// has not changed: the bytes were altered outside hekla.
+///
+/// Without it those collapse into one answer, and the runtime would have to pick: report
+/// tampering as an erasure and lose the alarm, or report an erasure as tampering and 500
+/// every read of a legitimately shredded row. Neither is acceptable, so it records enough
+/// to tell them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentRef {
+    pub subject: String,
+    pub value: String,
+    /// A domain-separated digest of the parent's secret as it was when this key was
+    /// wrapped. A digest rather than the secret, so the column carries no key material,
+    /// and domain-separated from the wrapping key derived from the same secret.
+    pub fingerprint: String,
+}
+
+/// One subject-key row, without the identity it was read by.
+#[derive(Debug, Clone)]
+pub struct SubjectKey {
+    pub wrapped: Vec<u8>,
+    pub wrapping: Wrapping,
+}
+
+/// One root subject key, for a master-rotation rewrap:
+/// `(subject, subject_value, wrapped_key, master_key_id)`.
 pub type SubjectKeyRow = (String, String, Vec<u8>, String);
 
 /// One rewrap for a master rotation: a [`SubjectKeyRow`] with the new wrapped key and
 /// new master id, plus the master id the row was expected to be under (a compare-and-set
 /// guard so a concurrent erase-then-recreate of the same subject is not clobbered).
-/// `(subject_field, subject_value, new_wrapped_key, new_master_id, expected_master_id)`.
+/// `(subject, subject_value, new_wrapped_key, new_master_id, expected_master_id)`.
 pub type RewrapUpdate = (String, String, Vec<u8>, String, String);
 
 /// The state of an effect invocation after reserving it, deciding whether the
@@ -1047,19 +1107,46 @@ impl OpDb {
 
     // --- subject keys (field-level erasure) --------------------------------
 
-    /// The wrapped key material and the id of the master that wrapped it for a
-    /// subject, or `None` if the subject has no key (never created, or erased).
+    /// How a stored key row is wrapped: under a master (a root) or under another
+    /// subject's key (a child).
+    ///
+    /// Exactly one, which the table's `CHECK` enforces rather than this type hoping for
+    /// it. A row that is neither would be unopenable and a row that is both would be
+    /// ambiguous about which key actually holds it.
     pub fn get_subject_key(
         &self,
-        subject_field: &str,
+        subject: &str,
         subject_value: &str,
-    ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+    ) -> anyhow::Result<Option<SubjectKey>> {
         self.conn
             .query_row(
-                "SELECT wrapped_key, master_key_id FROM subject_key \
-                 WHERE subject_field = ?1 AND subject_value = ?2",
-                params![subject_field, subject_value],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+                "SELECT wrapped_key, master_key_id, parent_subject, parent_value, parent_fingerprint \
+                 FROM subject_key WHERE subject = ?1 AND subject_value = ?2",
+                params![subject, subject_value],
+                |row| {
+                    let wrapped: Vec<u8> = row.get(0)?;
+                    let master: Option<String> = row.get(1)?;
+                    let parent_subject: Option<String> = row.get(2)?;
+                    let parent_value: Option<String> = row.get(3)?;
+                    let fingerprint: Option<String> = row.get(4)?;
+                    Ok(SubjectKey {
+                        wrapped,
+                        wrapping: match (master, parent_subject, parent_value, fingerprint) {
+                            (Some(id), _, _, _) => Wrapping::Master(id),
+                            (None, Some(subject), Some(value), Some(fingerprint)) => {
+                                Wrapping::Parent(ParentRef {
+                                    subject,
+                                    value,
+                                    fingerprint,
+                                })
+                            }
+                            // Unreachable while the CHECK holds, and reported rather
+                            // than panicked on because a hand-edited database is a
+                            // thing an operator can do.
+                            (None, _, _, _) => Wrapping::Neither,
+                        },
+                    })
+                },
             )
             .optional()
             .context("reading a subject key")
@@ -1070,56 +1157,141 @@ impl OpDb {
     /// connection lock the caller holds, so a concurrent create races cleanly (first
     /// writer wins, both encrypt under the winner) and a concurrent erase cannot slip
     /// between them and leave the caller with nothing.
+    ///
+    /// `replacing` is the row a caller found unopenable and means to overwrite: a child
+    /// whose parent was erased holds ciphertext nobody can ever read again, so it reads
+    /// as absent and is replaced.
+    ///
+    /// **The compare-and-set is on the wrapped bytes, and it has to be.** Keying it on the
+    /// parent instead looks equivalent and is not: the replacement hangs from the same
+    /// parent as the row it replaced, so two writers racing to replace one stale row would
+    /// each match the *other's* fresh row and delete a key already sealed under. The bytes
+    /// are unique per mint (a random wrapping nonce), so this names exactly the row the
+    /// caller read and nothing else. A writer that arrives second matches nothing, its
+    /// `INSERT OR IGNORE` no-ops, and it reads back the winner's key, which is the
+    /// insert-race behaviour every other path here already has.
     pub fn get_or_insert_subject_key(
         &self,
-        subject_field: &str,
+        subject: &str,
         subject_value: &str,
-        candidate_wrapped: &[u8],
-        master_key_id: &str,
-    ) -> anyhow::Result<(Vec<u8>, String)> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO subject_key \
-                 (subject_field, subject_value, wrapped_key, master_key_id) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    subject_field,
-                    subject_value,
-                    candidate_wrapped,
-                    master_key_id
-                ],
+        candidate: &SubjectKey,
+        replacing: Option<&SubjectKey>,
+    ) -> anyhow::Result<SubjectKey> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("beginning a subject-key insert")?;
+        if let Some(stale) = replacing {
+            tx.execute(
+                "DELETE FROM subject_key WHERE subject = ?1 AND subject_value = ?2 \
+                 AND wrapped_key = ?3",
+                params![subject, subject_value, stale.wrapped],
             )
-            .context("inserting a subject key")?;
+            .context("replacing an unwrappable subject key")?;
+        }
+        let (master, parent_subject, parent_value, fingerprint) = candidate.wrapping.columns();
+        tx.execute(
+            "INSERT OR IGNORE INTO subject_key \
+             (subject, subject_value, wrapped_key, master_key_id, parent_subject, parent_value, \
+              parent_fingerprint) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                subject,
+                subject_value,
+                candidate.wrapped,
+                master,
+                parent_subject,
+                parent_value,
+                fingerprint
+            ],
+        )
+        .context("inserting a subject key")?;
+        tx.commit().context("committing a subject-key insert")?;
         // The row is guaranteed present under the held lock after insert-or-ignore.
-        self.get_subject_key(subject_field, subject_value)?
+        self.get_subject_key(subject, subject_value)?
             .ok_or_else(|| anyhow::anyhow!("subject key missing immediately after insert"))
     }
 
     /// Delete a subject's key, shredding every value encrypted under it. Returns
     /// whether a row was removed (`false` if it was already absent).
-    pub fn delete_subject_key(
-        &self,
-        subject_field: &str,
-        subject_value: &str,
-    ) -> anyhow::Result<bool> {
+    ///
+    /// Still one row even when the subject has children: a child's key is wrapped under
+    /// this one, so deleting this row makes every key beneath it unwrappable at the same
+    /// instant. The rows beneath survive as unreadable bytes until the sweep reclaims
+    /// them, which is storage rather than reachability.
+    pub fn delete_subject_key(&self, subject: &str, subject_value: &str) -> anyhow::Result<bool> {
         let changed = self
             .conn
             .execute(
-                "DELETE FROM subject_key WHERE subject_field = ?1 AND subject_value = ?2",
-                params![subject_field, subject_value],
+                "DELETE FROM subject_key WHERE subject = ?1 AND subject_value = ?2",
+                params![subject, subject_value],
             )
             .context("deleting a subject key")?;
         Ok(changed == 1)
+    }
+
+    /// How many key rows sit beneath this one, transitively.
+    ///
+    /// What `hekla erase` prints before it asks. Needs no master key, because
+    /// reachability here is structural: the walk reads parent pointers and never unwraps
+    /// anything, which is what keeps the CLI usable without one.
+    pub fn descendant_key_count(&self, subject: &str, subject_value: &str) -> anyhow::Result<u64> {
+        self.conn
+            .query_row(
+                "WITH RECURSIVE beneath(subject, subject_value) AS ( \
+                     SELECT subject, subject_value FROM subject_key \
+                       WHERE parent_subject = ?1 AND parent_value = ?2 \
+                     UNION \
+                     SELECT k.subject, k.subject_value FROM subject_key k \
+                       JOIN beneath b ON k.parent_subject = b.subject \
+                                     AND k.parent_value = b.subject_value \
+                 ) SELECT count(*) FROM beneath",
+                params![subject, subject_value],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .context("counting the keys beneath a subject")
+    }
+
+    /// Delete up to `limit` child rows whose parent row is gone.
+    ///
+    /// Orphans are unreadable the moment their parent is deleted, so this reclaims
+    /// storage rather than enforcing anything. One pass only reaches direct orphans: a
+    /// grandchild becomes one once its parent is swept, so the caller repeats until a
+    /// pass deletes nothing. The `rowid IN (SELECT ... LIMIT ?)` form rather than
+    /// `DELETE ... LIMIT`, which needs a compile-time option this build does not set.
+    pub fn sweep_orphan_subject_keys(&self, limit: usize) -> anyhow::Result<usize> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM subject_key WHERE rowid IN ( \
+                     SELECT k.rowid FROM subject_key k \
+                      WHERE k.parent_subject IS NOT NULL \
+                        AND NOT EXISTS ( \
+                          SELECT 1 FROM subject_key p \
+                           WHERE p.subject = k.parent_subject \
+                             AND p.subject_value = k.parent_value) \
+                      LIMIT ?1)",
+                params![limit as i64],
+            )
+            .context("sweeping orphaned subject keys")?;
+        Ok(deleted)
     }
 
     /// Every distinct master-key id referenced by a stored subject key. Boot checks
     /// each is configured before serving: a missing one means those rows cannot be
     /// unwrapped (a wrong or rotated-away master), which should fail fast rather than
     /// surface later as a read error.
+    ///
+    /// Roots only, because only a root is wrapped under a master. A child's wrapping key
+    /// is derived from its parent's secret, so it references no master of its own and a
+    /// rotation never touches it.
     pub fn distinct_master_key_ids(&self) -> anyhow::Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT master_key_id FROM subject_key")
+            .prepare(
+                "SELECT DISTINCT master_key_id FROM subject_key WHERE master_key_id IS NOT NULL",
+            )
             .context("preparing master-key id scan")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
@@ -1127,14 +1299,18 @@ impl OpDb {
         rows.collect::<Result<Vec<_>, _>>()
             .context("collecting master key ids")
     }
-
-    /// Every subject key, for a master-rotation rewrap. Returns
-    /// `(subject_field, subject_value, wrapped_key, master_key_id)` rows.
+    /// Every **root** subject key, for a master-rotation rewrap. Returns
+    /// `(subject, subject_value, wrapped_key, master_key_id)` rows.
+    ///
+    /// Roots only, and that is the whole of what a hierarchy costs a rotation: a child's
+    /// wrapping key is derived from its parent's secret, and a rotation changes no
+    /// secret, so every child stays wrapped correctly without being touched.
     pub fn all_subject_keys(&self) -> anyhow::Result<Vec<SubjectKeyRow>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT subject_field, subject_value, wrapped_key, master_key_id FROM subject_key",
+                "SELECT subject, subject_value, wrapped_key, master_key_id FROM subject_key \
+                 WHERE master_key_id IS NOT NULL",
             )
             .context("preparing subject-key scan")?;
         let rows = stmt
@@ -1168,15 +1344,13 @@ impl OpDb {
             .unchecked_transaction()
             .context("beginning a rotation transaction")?;
         let mut rewrapped = 0;
-        for (subject_field, subject_value, wrapped_key, master_key_id, expected_master_id) in
-            updates
-        {
+        for (subject, subject_value, wrapped_key, master_key_id, expected_master_id) in updates {
             rewrapped += tx
                 .execute(
                     "UPDATE subject_key SET wrapped_key = ?3, master_key_id = ?4 \
-                     WHERE subject_field = ?1 AND subject_value = ?2 AND master_key_id = ?5",
+                     WHERE subject = ?1 AND subject_value = ?2 AND master_key_id = ?5",
                     params![
-                        subject_field,
+                        subject,
                         subject_value,
                         wrapped_key,
                         master_key_id,
@@ -1441,12 +1615,12 @@ impl OpDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT subject_field, count(*) FROM subject_key \
-                 WHERE subject_field <> ?1 GROUP BY subject_field ORDER BY subject_field",
+                "SELECT subject, count(*) FROM subject_key \
+                 WHERE subject <> ?1 GROUP BY subject ORDER BY subject",
             )
             .context("preparing the subject key count query")?;
         let rows = stmt
-            .query_map(params![crypto::GLOBAL_SUBJECT_FIELD], |row| {
+            .query_map(params![crypto::GLOBAL_SUBJECT], |row| {
                 let count: i64 = row.get(1)?;
                 Ok((row.get(0)?, count as u64))
             })
@@ -1462,15 +1636,18 @@ impl OpDb {
         after: Option<(&str, &str)>,
         limit: usize,
     ) -> anyhow::Result<Vec<SubjectInfo>> {
-        const COLUMNS: &str = "SELECT subject_field, subject_value, master_key_id, created_at \
-                               FROM subject_key WHERE subject_field <> ?1";
-        const ORDER: &str = " ORDER BY subject_field, subject_value LIMIT ";
+        const COLUMNS: &str = "SELECT subject, subject_value, master_key_id, parent_subject, parent_value, created_at \
+             FROM subject_key WHERE subject <> ?1";
+        const ORDER: &str = " ORDER BY subject, subject_value LIMIT ";
         let read = |row: &rusqlite::Row| {
+            let parent_subject: Option<String> = row.get(3)?;
+            let parent_value: Option<String> = row.get(4)?;
             Ok(SubjectInfo {
-                subject_field: row.get(0)?,
+                subject: row.get(0)?,
                 subject_value: row.get(1)?,
                 master_key_id: row.get(2)?,
-                created_at: row.get(3)?,
+                parent: parent_subject.zip(parent_value),
+                created_at: row.get(5)?,
             })
         };
         // Two statements rather than one with a NULL-guarded keyset predicate: the
@@ -1479,7 +1656,7 @@ impl OpDb {
         let rows = match after {
             Some((field, value)) => {
                 let sql = format!(
-                    "{COLUMNS} AND (subject_field > ?2 OR (subject_field = ?2 AND subject_value > ?3)){ORDER}?4"
+                    "{COLUMNS} AND (subject > ?2 OR (subject = ?2 AND subject_value > ?3)){ORDER}?4"
                 );
                 let mut stmt = self
                     .conn
@@ -1487,7 +1664,7 @@ impl OpDb {
                     .context("preparing the subject key page query")?;
                 let rows = stmt
                     .query_map(
-                        params![crypto::GLOBAL_SUBJECT_FIELD, field, value, limit as i64],
+                        params![crypto::GLOBAL_SUBJECT, field, value, limit as i64],
                         read,
                     )
                     .context("querying subject keys")?;
@@ -1500,7 +1677,7 @@ impl OpDb {
                     .prepare(&sql)
                     .context("preparing the subject key page query")?;
                 let rows = stmt
-                    .query_map(params![crypto::GLOBAL_SUBJECT_FIELD, limit as i64], read)
+                    .query_map(params![crypto::GLOBAL_SUBJECT, limit as i64], read)
                     .context("querying subject keys")?;
                 rows.collect::<Result<Vec<_>, _>>()
             }
@@ -1514,14 +1691,52 @@ impl OpDb {
     /// Excludes the reserved global uniqueness secret, as the listing readers do. It is
     /// not a subject, and a point lookup that reported it would contradict the inventory
     /// that hides it.
+    /// Whether a key row is reachable: it exists, and so does every row above it.
+    ///
+    /// Reachability rather than existence, because that is what "is this subject erased"
+    /// means once a key can hang from another. A child outlives its parent's deletion by
+    /// however long the sweep takes to reclaim it, and for that whole window its row is
+    /// present and nothing can open it. Answering from existence would report `live` for a
+    /// subject whose data is permanently unreadable, and would change its answer when the
+    /// sweeper happened to run, which is not a thing an operator should be able to observe.
+    ///
+    /// Structural, so it needs no master key: the walk reads parent pointers and unwraps
+    /// nothing, which is what keeps `hekla erase` usable without one.
+    ///
+    /// `UNION` rather than `UNION ALL`, and it is not a preference: a hand-edited store
+    /// with a cycle in its parent pointers would make `UNION ALL` walk for ever and hang
+    /// the request. Deduplicating bounds the walk by the table, so a cycle reaches no root
+    /// and answers `false`, which is the safe direction for a question that gates reads.
+    pub fn subject_key_reachable(&self, subject: &str, value: &str) -> anyhow::Result<bool> {
+        self.conn
+            .query_row(
+                "WITH RECURSIVE above(subject, subject_value, parent_subject, parent_value) AS ( \
+                     SELECT subject, subject_value, parent_subject, parent_value \
+                       FROM subject_key WHERE subject = ?1 AND subject_value = ?2 \
+                     UNION \
+                     SELECT p.subject, p.subject_value, p.parent_subject, p.parent_value \
+                       FROM subject_key p JOIN above a ON p.subject = a.parent_subject \
+                                                      AND p.subject_value = a.parent_value \
+                 ) SELECT count(*) FROM above WHERE parent_subject IS NULL",
+                params![subject, value],
+                |row| row.get::<_, i64>(0),
+            )
+            // Exactly one row of the walk is a root, and only if the chain is unbroken:
+            // a missing link ends the recursion before it reaches one.
+            .map(|roots| roots == 1)
+            .context("checking whether a subject key is reachable")
+    }
+
+    /// Whether a key row is on disk, reachable or not. The storage question, which the
+    /// sweep and its tests ask; [`OpDb::subject_key_reachable`] is the erasure one.
     pub fn subject_key_exists(&self, field: &str, value: &str) -> anyhow::Result<bool> {
-        if field == crypto::GLOBAL_SUBJECT_FIELD {
+        if field == crypto::GLOBAL_SUBJECT {
             return Ok(false);
         }
         let found: Option<i64> = self
             .conn
             .query_row(
-                "SELECT 1 FROM subject_key WHERE subject_field = ?1 AND subject_value = ?2",
+                "SELECT 1 FROM subject_key WHERE subject = ?1 AND subject_value = ?2",
                 params![field, value],
                 |row| row.get(0),
             )
@@ -1556,6 +1771,29 @@ impl OpDb {
                 6 => tx.execute_batch(SCHEMA_V7).context("applying schema v7")?,
                 7 => tx.execute_batch(SCHEMA_V8).context("applying schema v8")?,
                 8 => tx.execute_batch(SCHEMA_V9).context("applying schema v9")?,
+                9 => {
+                    // The rows are carried across, but their namespace is not what it
+                    // was: a subject used to be spelled with the *field* name the
+                    // annotation pointed at and is now the declared type's name, and
+                    // nothing here knows the mapping between them. So a carried row is
+                    // reachable only if the project happened to name its subject exactly
+                    // what the field was called. Said out loud rather than left to be
+                    // discovered, because the symptom is every pre-existing sealed value
+                    // reading back absent, which is indistinguishable from an erasure.
+                    let carried: i64 = tx
+                        .query_row("SELECT count(*) FROM subject_key", [], |row| row.get(0))
+                        .context("counting subject keys before the v10 rebuild")?;
+                    tx.execute_batch(SCHEMA_V10)
+                        .context("applying schema v10")?;
+                    if carried > 0 {
+                        tracing::warn!(
+                            "carried {carried} subject key row(s) into schema v10. a subject is \
+                             now named by its declared type rather than by the field the \
+                             annotation named, so a row whose old spelling differs is \
+                             unreachable and everything sealed under it reads as erased"
+                        );
+                    }
+                }
                 other => anyhow::bail!("no migration from schema version {other}"),
             }
             version += 1;
@@ -1797,6 +2035,45 @@ const SCHEMA_V9: &str = "
 ALTER TABLE effect_invocation ADD COLUMN collapsed_from INTEGER;
 ";
 
+/// Schema v10 rebuilds the subject key store for two changes at once, because SQLite
+/// cannot relax a `NOT NULL` in place and one rebuild is cheaper than two.
+///
+/// The column is `subject` rather than `subject_field`: a subject stopped being a field
+/// name when heklang made it a declared type, so the old spelling names the wrong thing.
+/// And a row gains a parent, so a child's key can be wrapped under its parent's and
+/// deleting the parent makes every key beneath it unwrappable in one row delete.
+///
+/// The `CHECK` is the reason this is a rebuild rather than two `ADD COLUMN`s: a row is
+/// wrapped under exactly one thing, a master (a root) or a parent subject (a child).
+/// Neither would be unopenable and both would be ambiguous, so it is a database rule
+/// rather than a convention this module has to remember.
+const SCHEMA_V10: &str = "
+CREATE TABLE subject_key_new (
+    subject        TEXT NOT NULL,
+    subject_value  TEXT NOT NULL,
+    wrapped_key    BLOB NOT NULL,  -- AEAD-wrapped subject secret (nonce || ciphertext)
+    master_key_id  TEXT,           -- set iff this row is a root
+    parent_subject TEXT,           -- set iff this row is a child
+    parent_value   TEXT,
+    parent_fingerprint TEXT,       -- which generation of that parent, see `ParentRef`
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (subject, subject_value),
+    CHECK ((master_key_id IS NULL) <> (parent_subject IS NULL)),
+    CHECK ((parent_subject IS NULL) = (parent_value IS NULL)),
+    CHECK ((parent_subject IS NULL) = (parent_fingerprint IS NULL))
+);
+INSERT INTO subject_key_new (subject, subject_value, wrapped_key, master_key_id, created_at)
+    SELECT subject_field, subject_value, wrapped_key, master_key_id, created_at FROM subject_key;
+DROP TABLE subject_key;
+ALTER TABLE subject_key_new RENAME TO subject_key;
+-- The boot-time master check and a rotation both read the roots only, which the primary
+-- key does not cover; this keeps them from full-scanning subject_key.
+CREATE INDEX subject_key_by_master ON subject_key (master_key_id);
+-- The sweep looks for children whose parent is gone, and a cascading erase counts the
+-- descendants it is about to make unreadable. Both walk this way.
+CREATE INDEX subject_key_by_parent ON subject_key (parent_subject, parent_value);
+";
+
 /// What a rewind would discard, and what it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RewindCounts {
@@ -1898,15 +2175,37 @@ pub struct EffectState {
 /// been erased or never had a value encrypted under it; the two are indistinguishable
 /// here by construction, since erasure deletes the row.
 pub struct SubjectInfo {
-    pub subject_field: String,
+    pub subject: String,
     pub subject_value: String,
-    pub master_key_id: String,
+    /// The master this row is wrapped under, for a root. `None` for a child, whose
+    /// wrapping key is derived from its parent's secret and references no master.
+    pub master_key_id: Option<String>,
+    /// The row this one's key is wrapped under, for a child. Deleting it makes this row
+    /// unopenable, which is what the operator reading this list wants to see.
+    pub parent: Option<(String, String)>,
     pub created_at: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root key row, which is what every one of these is: the hierarchy has its own
+    /// tests and these are about the store beneath it.
+    fn root(wrapped: &[u8], master: &str) -> SubjectKey {
+        SubjectKey {
+            wrapped: wrapped.to_vec(),
+            wrapping: Wrapping::Master(master.to_owned()),
+        }
+    }
+
+    /// The master a root row is wrapped under, for a test that only ever makes roots.
+    fn master_of(row: &SubjectKey) -> String {
+        match &row.wrapping {
+            Wrapping::Master(id) => id.clone(),
+            other => panic!("expected a root, got {other:?}"),
+        }
+    }
 
     #[test]
     fn opens_at_current_schema_version() {
@@ -2041,11 +2340,133 @@ mod tests {
             "and it is distinguishable from a known older version by exactly that"
         );
     }
+    /// The v10 rebuild carries existing key rows across, as roots.
+    ///
+    /// The ladder runs on every fresh open, so the SQL is exercised constantly; what is
+    /// not is the `INSERT ... SELECT` doing its job over rows that are actually there,
+    /// which is the only part an upgrade depends on. This stands the table back up in its
+    /// v3 shape, puts rows in it, winds `user_version` back and reopens.
+    ///
+    /// What it deliberately does not claim is that the carried rows are *reachable*. The
+    /// namespace changed meaning in this version, from the field an annotation named to
+    /// the declared subject's name, and nothing here knows the mapping; the migration logs
+    /// a warning saying so. This is about not losing the bytes.
+    #[test]
+    fn the_v10_rebuild_carries_existing_key_rows_across_as_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE subject_key;
+                 CREATE TABLE subject_key (
+                     subject_field TEXT NOT NULL,
+                     subject_value TEXT NOT NULL,
+                     wrapped_key   BLOB NOT NULL,
+                     master_key_id TEXT NOT NULL,
+                     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                     PRIMARY KEY (subject_field, subject_value)
+                 );
+                 CREATE INDEX subject_key_by_master ON subject_key (master_key_id);
+                 INSERT INTO subject_key (subject_field, subject_value, wrapped_key, master_key_id, created_at)
+                     VALUES ('customer_id', '42', x'DEADBEEF', 'master-A', '2020-01-01T00:00:00.000Z'),
+                            ('shop_id', '7', x'C0FFEE', 'master-B', '2020-01-02T00:00:00.000Z');
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        }
+
+        let db = OpDb::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let carried = db.get_subject_key("customer_id", "42").unwrap().unwrap();
+        assert_eq!(
+            carried.wrapped,
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+            "the bytes are the point"
+        );
+        assert_eq!(
+            carried.wrapping,
+            Wrapping::Master("master-A".to_owned()),
+            "an existing row predates the hierarchy, so it is a root"
+        );
+        assert_eq!(
+            db.get_subject_key("shop_id", "7")
+                .unwrap()
+                .unwrap()
+                .wrapping,
+            Wrapping::Master("master-B".to_owned()),
+            "every row, and each under the master that actually wrapped it"
+        );
+
+        // `created_at` survives, so an operator's inventory does not reset to today.
+        let page = db.subject_keys_page(None, 10).unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(
+            page.iter()
+                .all(|row| row.created_at.starts_with("2020-01-"))
+        );
+        assert!(page.iter().all(|row| row.parent.is_none()));
+
+        // And the rebuilt table carries the constraint the old one had no room for.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE subject_key SET master_key_id = NULL WHERE subject_value = '42'",
+                [],
+            )
+            .is_err(),
+            "the CHECK came with the rebuild"
+        );
+    }
+
+    /// Replacing an unreachable row is a compare-and-set on the bytes, so the second
+    /// writer to arrive keeps the first one's key instead of deleting it.
+    ///
+    /// Keying it on the parent looks equivalent and is not, which is the whole reason this
+    /// exists: a replacement hangs from the *same* parent as the row it replaced, so a
+    /// parent-keyed delete matches the other writer's fresh row rather than the stale one
+    /// they both read. Each would then destroy a key the other had already sealed under,
+    /// with no error anywhere. Written against the two calls rather than two threads
+    /// because the failure is about what the statement matches, not about timing.
+    #[test]
+    fn replacing_an_unreachable_row_is_a_compare_and_set_on_its_bytes() {
+        let db = OpDb::open_in_memory().unwrap();
+        let child = |wrapped: &[u8]| SubjectKey {
+            wrapped: wrapped.to_vec(),
+            wrapping: Wrapping::Parent(ParentRef {
+                subject: "Tenant".to_owned(),
+                value: "7".to_owned(),
+                fingerprint: "fp".to_owned(),
+            }),
+        };
+        let stale = child(b"wrapped-under-the-old-tenant");
+        db.get_or_insert_subject_key("Member", "1", &stale, None)
+            .unwrap();
+
+        // Both writers read the same stale row, then each mints a replacement that hangs
+        // from the same parent.
+        let first = db
+            .get_or_insert_subject_key("Member", "1", &child(b"minted-by-A"), Some(&stale))
+            .unwrap();
+        assert_eq!(first.wrapped, b"minted-by-A", "the first replacement lands");
+
+        let second = db
+            .get_or_insert_subject_key("Member", "1", &child(b"minted-by-B"), Some(&stale))
+            .unwrap();
+        assert_eq!(
+            second.wrapped, b"minted-by-A",
+            "the second writer's stale CAS misses, so it reads back the winner's key \
+             rather than clobbering content already sealed under it"
+        );
+    }
 
     #[test]
     fn rewrap_is_a_compare_and_set_on_the_master_id() {
         let db = OpDb::open_in_memory().unwrap();
-        db.get_or_insert_subject_key("customer_id", "1", b"wrapped-under-A", "master-A")
+        db.get_or_insert_subject_key("Customer", "1", &root(b"wrapped-under-A", "master-A"), None)
             .unwrap();
         // A rotation snapshots the row under master-A, but the subject is erased and
         // recreated under a different master before the rewrap lands. The rewrap expects
@@ -2053,7 +2474,7 @@ mod tests {
         // rather than clobbered by the stale rewrap.
         let rewrapped = db
             .rewrap_subject_keys(&[(
-                "customer_id".into(),
+                "Customer".into(),
                 "1".into(),
                 b"stale-rewrap".to_vec(),
                 "master-C".into(),
@@ -2061,7 +2482,8 @@ mod tests {
             )])
             .unwrap();
         assert_eq!(rewrapped, 0, "a mismatched expected master rewraps nothing");
-        let (wrapped, master) = db.get_subject_key("customer_id", "1").unwrap().unwrap();
+        let row = db.get_subject_key("Customer", "1").unwrap().unwrap();
+        let (wrapped, master) = (row.wrapped.clone(), master_of(&row));
         assert_eq!(
             master, "master-A",
             "a mismatched expected master is a no-op"
@@ -2070,7 +2492,7 @@ mod tests {
         // A rewrap that expects the row's real current master applies.
         let rewrapped = db
             .rewrap_subject_keys(&[(
-                "customer_id".into(),
+                "Customer".into(),
                 "1".into(),
                 b"wrapped-under-C".to_vec(),
                 "master-C".into(),
@@ -2078,7 +2500,8 @@ mod tests {
             )])
             .unwrap();
         assert_eq!(rewrapped, 1, "a matching expected master rewraps the row");
-        let (wrapped, master) = db.get_subject_key("customer_id", "1").unwrap().unwrap();
+        let row = db.get_subject_key("Customer", "1").unwrap().unwrap();
+        let (wrapped, master) = (row.wrapped.clone(), master_of(&row));
         assert_eq!(master, "master-C");
         assert_eq!(wrapped, b"wrapped-under-C");
     }
@@ -2086,11 +2509,11 @@ mod tests {
     #[test]
     fn distinct_master_key_ids_lists_each_once() {
         let db = OpDb::open_in_memory().unwrap();
-        db.get_or_insert_subject_key("customer_id", "1", b"w", "master-A")
+        db.get_or_insert_subject_key("Customer", "1", &root(b"w", "master-A"), None)
             .unwrap();
-        db.get_or_insert_subject_key("customer_id", "2", b"w", "master-A")
+        db.get_or_insert_subject_key("Customer", "2", &root(b"w", "master-A"), None)
             .unwrap();
-        db.get_or_insert_subject_key("customer_id", "3", b"w", "master-B")
+        db.get_or_insert_subject_key("Customer", "3", &root(b"w", "master-B"), None)
             .unwrap();
         let mut ids = db.distinct_master_key_ids().unwrap();
         ids.sort();
@@ -2771,9 +3194,9 @@ mod tests {
             ("customer_id", "1"),
             ("customer_id", "2"),
             ("shop_id", "9"),
-            (crypto::GLOBAL_SUBJECT_FIELD, "global"),
+            (crypto::GLOBAL_SUBJECT, "global"),
         ] {
-            db.get_or_insert_subject_key(field, value, b"wrapped", "m1")
+            db.get_or_insert_subject_key(field, value, &root(b"wrapped", "m1"), None)
                 .unwrap();
         }
 
@@ -2787,17 +3210,17 @@ mod tests {
         assert_eq!(
             first
                 .iter()
-                .map(|row| (row.subject_field.as_str(), row.subject_value.as_str()))
+                .map(|row| (row.subject.as_str(), row.subject_value.as_str()))
                 .collect::<Vec<_>>(),
             vec![("customer_id", "1"), ("customer_id", "2")]
         );
         let last = first.last().unwrap();
         let next = db
-            .subject_keys_page(Some((&last.subject_field, &last.subject_value)), 2)
+            .subject_keys_page(Some((&last.subject, &last.subject_value)), 2)
             .unwrap();
         assert_eq!(
             next.iter()
-                .map(|row| (row.subject_field.as_str(), row.subject_value.as_str()))
+                .map(|row| (row.subject.as_str(), row.subject_value.as_str()))
                 .collect::<Vec<_>>(),
             vec![("shop_id", "9")],
             "the keyset cursor crosses a field boundary"

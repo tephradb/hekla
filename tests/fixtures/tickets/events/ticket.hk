@@ -8,8 +8,8 @@
 
 event @ticket.opened {
   ticket_id: Uuid,
-  org_id: Int,
-  owner_id: Int,
+  org_id: Org,
+  owner_id: Owner,
   title: String @max(80),
   priority: Priority,
   due_at: Timestamp,
@@ -36,6 +36,6 @@ event @ticket.opened {
 
 event @ticket.retitled { ticket_id: Uuid, title: String @max(80) }
 
-event @ticket.closed { ticket_id: Uuid, org_id: Int }
+event @ticket.closed { ticket_id: Uuid, org_id: Org }
 
 event @ticket.notified { ticket_id: Uuid }

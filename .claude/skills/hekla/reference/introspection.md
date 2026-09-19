@@ -23,7 +23,7 @@ which needs `[admin] projections = true` and answers `403` otherwise.
 | `/admin/commands`, `/admin/commands/{name}` | every command and its parameters, internal ones included |
 | `/admin/schema` | the loaded project: every declaration with its hash and signature hash |
 | `/admin/system` | version, uptime, data directory, op-DB schema version, keystore, effective config |
-| `/admin/subjects`, `/admin/subjects/{field}/{value}` | which subjects still hold key material, never the material |
+| `/admin/subjects`, `/admin/subjects/{subject}/{value}` | which subjects still hold key material, never the material |
 | `/admin/projections` | `GET`: the limits, and whether the `POST` is served. `POST`: fold an ad-hoc projector over the log |
 | `/admin/assets/{file}` | the console's own files; the one path under the prefix that is not negotiated |
 
@@ -145,11 +145,12 @@ The call list pages with `?cursor=`, so a truncated list never reads as the whol
 
 ## `/admin/subjects`
 
-The inventory: per subject field, how many live keys; per subject, when its key was created and which
-master it is wrapped under (`master_key_id`). Never the key material itself.
+The inventory: per subject, how many live keys; per key row, when it was created and which master it
+is wrapped under (`master_key_id`). Never the key material itself. A subject is named by its declared
+name (`Customer`), which is what a key row is filed under.
 
-`/admin/subjects/{field}/{value}` answers 200 either way, with
-`{"subject_field": ..., "subject_value": ..., "state": "live"}` or `"state": "absent"`. `absent` does
+`/admin/subjects/{subject}/{value}` answers 200 either way, with
+`{"subject": ..., "subject_value": ..., "state": "live"}` or `"state": "absent"`. `absent` does
 not distinguish erased from never-created: after a shred there is nothing left to tell them apart
 with.
 

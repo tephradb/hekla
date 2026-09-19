@@ -4,8 +4,8 @@
 
 command OpenTicket(
   ticket_id: Uuid,
-  org_id: Int,
-  owner_id: Int,
+  org_id: Org,
+  owner_id: Owner,
   title: String,
   priority: Priority,
   due_at: Timestamp,

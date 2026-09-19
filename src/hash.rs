@@ -13,6 +13,14 @@ use std::fmt::Write as _;
 
 use sha2::{Digest, Sha256};
 
+/// The raw SHA-256 of `bytes`.
+///
+/// Beside [`sha256_hex`] rather than behind it: a derived key wants the digest itself,
+/// and going through hex would be two conversions to reach bytes that were already there.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
 /// The lowercase-hex SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);

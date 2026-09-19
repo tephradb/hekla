@@ -600,9 +600,9 @@ async fn a_subject_field_decrypts_by_default_and_stays_ciphertext_when_asked() {
         "a decrypted value is re-typed to its declared kind"
     );
     assert_eq!(event["subjects"]["email"]["state"], "decrypted");
-    assert_eq!(event["subjects"]["email"]["subject"], "customer_id");
+    assert_eq!(event["subjects"]["email"]["subject"], "Customer");
     assert_eq!(event["subjects"]["email"]["subject_value"], "42");
-    assert_eq!(event["subjects"]["order_total"]["subject"], "shop_id");
+    assert_eq!(event["subjects"]["order_total"]["subject"], "Shop");
     assert_eq!(
         event["data"]["customer_id"], 42,
         "a subject id is not itself encrypted; subjects do not chain"
@@ -628,14 +628,14 @@ async fn an_erased_subject_is_marked_erased_rather_than_silently_vanishing() {
     let app = harness.app();
     post_command(&app, "PlaceOrder", order_body(), None).await;
 
-    let (_, before) = get(&app, "/admin/subjects/customer_id/42").await;
+    let (_, before) = get(&app, "/admin/subjects/Customer/42").await;
     assert_eq!(before["state"], "live");
 
     harness
         .rt
         .keystore()
         .unwrap()
-        .erase("customer_id", "42")
+        .erase("Customer", "42")
         .unwrap();
 
     let (_, event) = get(&app, "/admin/events/1").await;
@@ -653,7 +653,7 @@ async fn an_erased_subject_is_marked_erased_rather_than_silently_vanishing() {
         "erasing one subject leaves another subject's fields readable"
     );
 
-    let (_, after) = get(&app, "/admin/subjects/customer_id/42").await;
+    let (_, after) = get(&app, "/admin/subjects/Customer/42").await;
     assert_eq!(
         after["state"], "absent",
         "erasure deletes the row, so `erased` and `never existed` are one state on disk"
@@ -679,14 +679,14 @@ async fn the_subject_inventory_counts_live_keys_without_exposing_key_material() 
         .iter()
         .map(|c| {
             (
-                c["subject_field"].as_str().unwrap(),
+                c["subject"].as_str().unwrap(),
                 c["live_keys"].as_u64().unwrap(),
             )
         })
         .collect();
     assert_eq!(
         counts,
-        vec![("customer_id", 1), ("shop_id", 1)],
+        vec![("Customer", 1), ("Shop", 1)],
         "the reserved global uniqueness secret is not a subject and is excluded"
     );
 
@@ -697,7 +697,8 @@ async fn the_subject_inventory_counts_live_keys_without_exposing_key_material() 
             vec![
                 "created_at",
                 "master_key_id",
-                "subject_field",
+                "parent",
+                "subject",
                 "subject_value"
             ],
             "no key material, wrapped or otherwise"
@@ -705,7 +706,7 @@ async fn the_subject_inventory_counts_live_keys_without_exposing_key_material() 
     }
 
     // Only one half of the cursor is a client error, not a silently ignored parameter.
-    let (status, _) = get(&app, "/admin/subjects?after_field=customer_id").await;
+    let (status, _) = get(&app, "/admin/subjects?after_subject=Customer").await;
     assert_eq!(status, 400);
 
     harness.shutdown();
@@ -987,7 +988,7 @@ async fn a_key_that_cannot_be_unwrapped_marks_one_field_instead_of_failing_the_p
     {
         let conn = rusqlite::Connection::open(data.path().join("hekla.db")).unwrap();
         conn.execute(
-            "UPDATE subject_key SET wrapped_key = ?1 WHERE subject_field = 'customer_id'",
+            "UPDATE subject_key SET wrapped_key = ?1 WHERE subject = 'Customer'",
             rusqlite::params![vec![0u8; 8]],
         )
         .unwrap();
@@ -1031,7 +1032,7 @@ async fn a_subject_erased_and_then_recreated_reports_stale_rather_than_erased() 
         .rt
         .keystore()
         .unwrap()
-        .erase("customer_id", "42")
+        .erase("Customer", "42")
         .unwrap();
 
     // A second order for the same customer mints a fresh key for that subject. A
@@ -1042,7 +1043,7 @@ async fn a_subject_erased_and_then_recreated_reports_stale_rather_than_erased() 
     let (status, _) = post_command(&app, "PlaceOrder", second, None).await;
     assert_eq!(status, 200);
 
-    let (_, live) = get(&app, "/admin/subjects/customer_id/42").await;
+    let (_, live) = get(&app, "/admin/subjects/Customer/42").await;
     assert_eq!(live["state"], "live", "the second order recreated the key");
 
     let (_, first_event) = get(&app, "/admin/events/1").await;
@@ -1106,7 +1107,7 @@ async fn the_reserved_global_secret_is_not_a_subject_to_either_reader() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|entry| entry["subject_field"].as_str().unwrap())
+        .map(|entry| entry["subject"].as_str().unwrap())
         .collect();
     assert!(!fields.iter().any(|field| field.starts_with("_hekla_")));
 
@@ -1320,8 +1321,10 @@ async fn a_decrypted_field_reads_back_in_the_shape_a_plain_one_does() {
         (
             "events/reminder.hk",
             r#"
+subject User(Int)
+
 event @reminder.set {
-  user_id: Int,
+  user_id: User,
   plain_at: Timestamp,
   due_at: Timestamp @subject(user_id),
   count: Int @subject(user_id),
@@ -1333,7 +1336,7 @@ event @reminder.set {
             "commands/set-reminder.hk",
             r#"
 command SetReminder(
-  user_id: Int,
+  user_id: User,
   plain_at: Timestamp,
   due_at: Timestamp,
   count: Int,

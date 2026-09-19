@@ -1,7 +1,7 @@
 // Closing twice is a no-op rather than a refusal, so a retry is safe; closing something
 // that was never opened is a refusal, because it is a different mistake.
 
-command CloseTicket(ticket_id: Uuid, org_id: Int) {
+command CloseTicket(ticket_id: Uuid, org_id: Org) {
   fold opened: Bool = false
     on @ticket.opened(ticket_id) => true
 

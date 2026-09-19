@@ -1,3 +1,8 @@
+// The key namespace a guest's personal data is filed under. A subject is a declared
+// type whose values are its ids, so `guest_id: Guest` is what says which keys
+// `@subject(guest_id)` files under.
+subject Guest(Int)
+
 // Refusals and constants shared by more than one command. `lib/` is a convention:
 // nothing in hekla reads this directory, and a refusal used by one command is at home
 // in that command's file.

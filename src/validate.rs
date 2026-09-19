@@ -16,7 +16,7 @@ use heklang::{Defs, Program};
 use serde_json::{Value, json};
 
 use crate::loader::{Finding, LoadedProject, ProjectorUnit, Severity, Span};
-use crate::schema::{EventDef, FieldKind, event_type};
+use crate::schema::{EventDef, FieldKind, Subjects, event_type};
 use crate::tags::RESERVED_TAG_PREFIX;
 
 /// How much of an event a clause may pin before it looks like a copied `emit`. A
@@ -108,6 +108,11 @@ pub fn errors(findings: &[Finding]) -> usize {
 pub fn check(project: &LoadedProject) -> Vec<Finding> {
     let mut findings = Vec::new();
     check_events(&project.events, &mut findings);
+    check_ancestry(
+        &project.events,
+        &Subjects::of(&project.program),
+        &mut findings,
+    );
     check_entities(&project.projectors, &mut findings);
     check_secrets(project, &mut findings);
     let defs = Defs::of(&project.program);
@@ -116,6 +121,80 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
         check_boundary(command, &project.program, defs, &location, &mut findings);
     }
     findings
+}
+
+/// Every event that seals under a nested subject carries an id for each of its ancestors.
+///
+/// **heklang checks this too, and both copies earn their place.** heklang's points at the
+/// annotation's span, which is what an author has to change, and it runs in `hek check`
+/// before hekla is involved at all. hekla's refuses a *deployment*: a project reaches this
+/// runtime through a directory rather than through heklang's front end, and a declaration
+/// it cannot file a key under would otherwise fail at the first write, in production, on
+/// the one path that must not fail. heklang's own comment says it keeps its copy because
+/// hekla will have one.
+///
+/// hekla's is also the only one that can be right about hekla's chain, because
+/// [`crate::schema::Seal`] is where the ancestor ids are actually resolved: the check is
+/// that the chain is as long as the hierarchy, which is the same question asked of the
+/// data structure the write path will use rather than of the declaration it came from.
+fn check_ancestry(
+    events: &crate::schema::EventDefs,
+    subjects: &Subjects,
+    findings: &mut Vec<Finding>,
+) {
+    let mut sorted: Vec<(&String, &EventDef)> = events.iter().collect();
+    sorted.sort_by_key(|(event_type, _)| *event_type);
+    for (event_type, def) in sorted {
+        for (name, meta) in &def.fields {
+            let Some(seal) = &meta.sealed_under else {
+                continue;
+            };
+            let wanted = subjects.ancestors(seal.subject());
+            if seal.chain.len() == wanted.len() + 1 {
+                continue;
+            }
+            // The first ancestor the chain could not resolve. The whole hierarchy is
+            // rendered beside it, the way heklang renders its own, because "sits under
+            // `Marketplace`" names a link the author never wrote when the break is two
+            // levels up: `Customer` sits under `Shop`, and `Shop` under `Marketplace`.
+            let carried: Vec<&str> = seal.chain[1..]
+                .iter()
+                .map(|(subject, _)| subject.as_str())
+                .collect();
+            let Some(missing) = wanted.iter().find(|ancestor| !carried.contains(*ancestor)) else {
+                continue;
+            };
+            let hierarchy = wanted
+                .iter()
+                .map(|ancestor| format!("under `{ancestor}`"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // Two shapes reach here and the difference matters to whoever has to fix it:
+            // no field of that type at all, or more than one and so nothing to say which.
+            let carriers = def
+                .fields
+                .iter()
+                .filter(|(_, other)| other.identifies.as_deref() == Some(*missing))
+                .count();
+            let why = if carriers > 1 {
+                format!(
+                    "carries {carriers} `{missing}` fields, so nothing says which one its key \
+                     hangs from"
+                )
+            } else {
+                format!("carries no `{missing}` field")
+            };
+            findings.push(Finding::error(
+                "events",
+                format!(
+                    "event `{event_type}` seals `{name}` under `{}`, which sits {hierarchy}, but \
+                     {why}: a child's key is wrapped under its parent's, so each ancestor's id \
+                     has to be on the event the key is minted from, once and not optional",
+                    seal.subject()
+                ),
+            ));
+        }
+    }
 }
 
 /// One thing about an event's fields: that none of them occupies hekla's tag
@@ -159,7 +238,7 @@ fn check_entities(projectors: &[ProjectorUnit], findings: &mut Vec<Finding>) {
     for unit in projectors {
         for entity in &unit.entities {
             for (name, meta) in &entity.fields {
-                let Some(subject_field) = &meta.subject else {
+                let Some(subject) = meta.subject() else {
                     continue;
                 };
                 if matches!(meta.kind, FieldKind::Optional(_)) {
@@ -168,7 +247,7 @@ fn check_entities(projectors: &[ProjectorUnit], findings: &mut Vec<Finding>) {
                 findings.push(Finding::error(
                     unit.rel_path.clone(),
                     format!(
-                        "column `{name}` of entity `{}` is sealed under `{subject_field}`, so \
+                        "column `{name}` of entity `{}` is sealed under `{subject}`, so \
                          erasing that subject leaves it absent, but its declared type cannot \
                          be absent: make it optional",
                         entity.name

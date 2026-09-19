@@ -1,7 +1,10 @@
 //! Subject-scoped deterministic encryption and the per-subject key store.
 //!
-//! A field marked `subject = "sibling"` is encrypted under a key scoped to that
-//! subject's identity `(subject_field, subject_value)`. Encryption is deterministic
+//! A field marked `@subject(buyer)` is encrypted under a key scoped to the identity
+//! `(subject, subject_value)`, where the subject is the **declared name** of the type
+//! `buyer` has: `subject Customer(Int)` files every such key under `Customer`. The field
+//! the annotation names is where the id is read from and is local to one declaration;
+//! the subject is the namespace and is not. Encryption is deterministic
 //! (AES-SIV, RFC 5297): the same plaintext under the same key and field yields the
 //! same ciphertext, so it works as a tag the index can match on, a payload value,
 //! and a read-model column all at once. Erasing a subject is deleting its key row,
@@ -28,7 +31,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use zeroize::Zeroizing;
 
-use crate::opdb::{OpDb, RewrapUpdate};
+use crate::opdb::{OpDb, ParentRef, RewrapUpdate, SubjectKey, Wrapping};
 
 /// The AES-256-SIV key length: two 256-bit keys (S2V + CTR), so 64 bytes.
 const SIV_KEY_LEN: usize = 64;
@@ -42,7 +45,7 @@ const AD_VERSION: u8 = 1;
 
 /// The reserved subject that holds the global uniqueness secret. It backs the
 /// `unique` tags that must survive erasure, so it is never deletable.
-pub(crate) const GLOBAL_SUBJECT_FIELD: &str = "_hekla_global";
+pub(crate) const GLOBAL_SUBJECT: &str = "_hekla_global";
 const GLOBAL_SUBJECT_VALUE: &str = "global";
 
 /// The set of master keys the runtime holds, keyed by a fingerprint id. One is the
@@ -85,15 +88,11 @@ impl MasterKeys {
 /// the reserved global uniqueness secret. Returns whether a key was removed. No
 /// master key is needed: this is a plain row delete, so the `hekla erase` CLI can call
 /// it without one.
-pub fn erase_subject(
-    opdb: &OpDb,
-    subject_field: &str,
-    subject_value: &str,
-) -> anyhow::Result<bool> {
-    if subject_field == GLOBAL_SUBJECT_FIELD {
+pub fn erase_subject(opdb: &OpDb, subject: &str, subject_value: &str) -> anyhow::Result<bool> {
+    if subject == GLOBAL_SUBJECT {
         anyhow::bail!("the global uniqueness secret cannot be erased");
     }
-    opdb.delete_subject_key(subject_field, subject_value)
+    opdb.delete_subject_key(subject, subject_value)
 }
 
 /// A stable id for a master key: the full hex SHA-256 of its bytes. The full digest
@@ -147,17 +146,37 @@ impl KeyStore {
         KeyStore { opdb, masters }
     }
 
-    /// Encrypt `plaintext` under the subject `(subject_field, subject_value)`,
+    /// Encrypt `plaintext` under the subject `(subject, subject_value)`,
     /// creating the subject's key on first use. Returns the base64url ciphertext
     /// used as the tag value, the payload value, and the read-model column.
+    ///
+    /// For a subject that declares no parent. One that does goes through
+    /// [`KeyStore::encrypt_subject_in`], which takes the ancestor ids too.
     pub fn encrypt_subject(
         &self,
-        subject_field: &str,
+        subject: &str,
         subject_value: &str,
         field: &str,
         plaintext: &str,
     ) -> anyhow::Result<String> {
-        let secret = self.get_or_create_secret(subject_field, subject_value)?;
+        self.encrypt_subject_in(&[(subject, subject_value)], field, plaintext)
+    }
+
+    /// Encrypt `plaintext` under the first subject in `chain`, creating its key and
+    /// every ancestor's on first use.
+    ///
+    /// `chain` is the subject and its ancestors, nearest first: `[(\"Customer\", \"88\"),
+    /// (\"Shop\", \"7\")]` mints customer 88's key wrapped under shop 7's, so deleting
+    /// shop 7's row makes it unopenable. The caller supplies the whole chain because
+    /// only it has the ids: they live in the event being written, which is why heklang
+    /// insists every event sealing under a child carries its ancestors.
+    pub fn encrypt_subject_in(
+        &self,
+        chain: &[(&str, &str)],
+        field: &str,
+        plaintext: &str,
+    ) -> anyhow::Result<String> {
+        let secret = self.get_or_create_secret_in(chain)?;
         encrypt_with(&secret, field, plaintext.as_bytes())
     }
 
@@ -165,7 +184,7 @@ impl KeyStore {
     /// The resulting tag survives subject erasure, so a global uniqueness check
     /// still fires after the subject's own data is shredded.
     pub fn encrypt_global(&self, field: &str, plaintext: &str) -> anyhow::Result<String> {
-        let secret = self.get_or_create_secret(GLOBAL_SUBJECT_FIELD, GLOBAL_SUBJECT_VALUE)?;
+        let secret = self.get_or_create_secret_in(&[(GLOBAL_SUBJECT, GLOBAL_SUBJECT_VALUE)])?;
         encrypt_with(&secret, field, plaintext.as_bytes())
     }
 
@@ -175,12 +194,12 @@ impl KeyStore {
     /// makes the clause match nothing rather than minting a key.
     pub fn encrypt_subject_existing(
         &self,
-        subject_field: &str,
+        subject: &str,
         subject_value: &str,
         field: &str,
         plaintext: &str,
     ) -> anyhow::Result<Option<String>> {
-        self.load_secret(subject_field, subject_value)?
+        self.load_secret(subject, subject_value)?
             .map(|secret| encrypt_with(&secret, field, plaintext.as_bytes()))
             .transpose()
     }
@@ -193,12 +212,12 @@ impl KeyStore {
     /// or a corrupt key wrapping).
     pub fn decrypt_subject(
         &self,
-        subject_field: &str,
+        subject: &str,
         subject_value: &str,
         field: &str,
         ciphertext: &str,
     ) -> anyhow::Result<Option<String>> {
-        let Some(secret) = self.load_secret(subject_field, subject_value)? else {
+        let Some(secret) = self.load_secret(subject, subject_value)? else {
             return Ok(None);
         };
         Ok(plaintext_under(&secret, field, ciphertext))
@@ -206,8 +225,8 @@ impl KeyStore {
 
     /// Erase a subject by deleting its key. Refuses to delete the reserved global
     /// secret. Returns whether a key was removed.
-    pub fn erase(&self, subject_field: &str, subject_value: &str) -> anyhow::Result<bool> {
-        erase_subject(&self.lock(), subject_field, subject_value)
+    pub fn erase(&self, subject: &str, subject_value: &str) -> anyhow::Result<bool> {
+        erase_subject(&self.lock(), subject, subject_value)
     }
 
     /// Rewrap every subject key not already under the primary master, for a master
@@ -267,63 +286,263 @@ impl KeyStore {
         Ok(())
     }
 
-    /// Load and unwrap a subject secret, or `None` if the subject has no key row.
+    /// Load and unwrap a subject secret, or `None` if it cannot be reached.
+    ///
+    /// `None` covers two shapes and they mean the same thing to every caller: the row is
+    /// gone (erased, or never created), or the row is there and an ancestor's is not, so
+    /// nothing will ever unwrap it again. A parent's deletion is what makes the second
+    /// one true, and it is the whole of what a hierarchy buys: one row delete, and every
+    /// key beneath it stops being reachable at the same instant, with no walk and no
+    /// second write.
+    ///
+    /// `Err` stays what it was: a key that cannot be *obtained*, meaning a master that is
+    /// not configured or a wrapping that will not open under the right key. The split is
+    /// load-bearing, because it is what lets [`KeyStore::get_or_create_secret_in`]
+    /// replace an unreachable row without ever replacing a merely misconfigured one.
     fn load_secret(
         &self,
-        subject_field: &str,
+        subject: &str,
         subject_value: &str,
     ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
-        let Some((wrapped, master_id)) =
-            self.lock().get_subject_key(subject_field, subject_value)?
-        else {
+        self.load_secret_at(subject, subject_value, 0, None)
+            .map(|found| found.map(|(secret, _)| secret))
+    }
+
+    /// [`KeyStore::load_secret`] plus the wrapping the row was found under, which the
+    /// mint path needs to tell "no row" from "a row nothing can open".
+    fn load_secret_at(
+        &self,
+        subject: &str,
+        subject_value: &str,
+        depth: usize,
+        cache: Option<&RefCell<SecretCache>>,
+    ) -> anyhow::Result<Option<(Zeroizing<Vec<u8>>, Wrapping)>> {
+        // The subject graph is checked acyclic at parse time and is finite, so a real
+        // chain is shorter than this by a wide margin. The cap is here for a database
+        // somebody edited by hand, where a cycle would otherwise recurse until the stack
+        // ran out and take the process with it.
+        if depth > MAX_SUBJECT_DEPTH {
+            anyhow::bail!(
+                "subject `{subject}` is more than {MAX_SUBJECT_DEPTH} levels deep, which a declared hierarchy cannot be: the key store has a cycle in its parent pointers"
+            );
+        }
+        let Some(row) = self.lock().get_subject_key(subject, subject_value)? else {
             return Ok(None);
         };
-        let master = self.master_for(&master_id, subject_field)?;
-        Ok(Some(unwrap_key(master, &wrapped)?))
+        match &row.wrapping {
+            Wrapping::Master(master_id) => {
+                let master = self.master_for(master_id, subject)?;
+                Ok(Some((unwrap_key(master, &row.wrapped)?, row.wrapping)))
+            }
+            Wrapping::Parent(parent_ref) => {
+                let (parent_subject, parent_value) =
+                    (parent_ref.subject.as_str(), parent_ref.value.as_str());
+                // Through the cache, so a page of rows sharing a tenant unwraps that
+                // tenant once rather than once per row. Without it the recursion undoes
+                // the whole reason [`RowDecryptor`] exists, and undoes more of it the
+                // deeper the hierarchy goes.
+                let Some(parent) =
+                    self.cached_secret(parent_subject, parent_value, depth + 1, cache)?
+                else {
+                    // The parent is gone, so this row's ciphertext is unrecoverable and
+                    // the subject reads as erased. Exactly what deleting the parent was
+                    // for.
+                    return Ok(None);
+                };
+                // The generation first, because it is what tells a shred from tampering.
+                // A parent erased and written to again has a fresh secret, so nothing
+                // wrapped under the old one can ever open: this row is unreadable for the
+                // same reason an erased subject is, and reads the same way. Reporting
+                // `Err` for it would 500 every read of a legitimately shredded row and
+                // wedge its write path for good, because `get_or_create_secret_in`
+                // replaces a row that reads absent and propagates one that errors.
+                if parent_ref.fingerprint != parent_fingerprint(&parent) {
+                    tracing::debug!(
+                        "subject `{subject}` = `{subject_value}` was wrapped under an earlier `{parent_subject}` = `{parent_value}`, which has since been erased and recreated; reading as erased"
+                    );
+                    return Ok(None);
+                }
+                // The generation matches, so the key this was wrapped under has not
+                // moved and a wrapping that still will not open was altered outside
+                // hekla. That is the "cannot be obtained" case a root reports too, and it
+                // has to stay an error: reporting it as an erasure would tell an operator
+                // their shred worked when what actually happened is that somebody wrote
+                // to the key store.
+                let aad = child_aad(subject, subject_value, parent_subject, parent_value);
+                let secret = unwrap_key_under(&child_kek(&parent), &row.wrapped, &aad)?;
+                Ok(Some((secret, row.wrapping)))
+            }
+            Wrapping::Neither => anyhow::bail!(
+                "subject `{subject}` = `{subject_value}` is wrapped under neither a master nor a parent, which the schema forbids: the row has been edited outside hekla"
+            ),
+        }
+    }
+
+    /// [`KeyStore::load_secret_at`] through a cache, so a walk up the same chain from
+    /// many different children pays for each ancestor once.
+    ///
+    /// Caches absence too, which matters more here than for a leaf: an erased tenant is
+    /// the case a scan of its members hits on every single row.
+    fn cached_secret(
+        &self,
+        subject: &str,
+        subject_value: &str,
+        depth: usize,
+        cache: Option<&RefCell<SecretCache>>,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        let Some(cache) = cache else {
+            return Ok(self
+                .load_secret_at(subject, subject_value, depth, None)?
+                .map(|(secret, _)| secret));
+        };
+        let key = (subject.to_owned(), subject_value.to_owned());
+        if let Some(cached) = cache.borrow().get(&key) {
+            return Ok(cached.clone());
+        }
+        let loaded = self
+            .load_secret_at(subject, subject_value, depth, Some(cache))?
+            .map(|(secret, _)| secret);
+        cache.borrow_mut().insert(key, loaded.clone());
+        Ok(loaded)
     }
 
     /// The configured master that wrapped a stored subject key, or an error naming
     /// the master that is missing: without it the subject cannot be read at all.
-    fn master_for(
-        &self,
-        master_id: &str,
-        subject_field: &str,
-    ) -> anyhow::Result<&[u8; MASTER_KEY_LEN]> {
+    fn master_for(&self, master_id: &str, subject: &str) -> anyhow::Result<&[u8; MASTER_KEY_LEN]> {
         self.masters.get(master_id).ok_or_else(|| {
             anyhow!(
-                "cannot unwrap subject `{subject_field}`: master key `{master_id}` is not configured (was HEKLA_MASTER_KEY rotated away without keeping the previous key?)"
+                "cannot unwrap subject `{subject}`: master key `{master_id}` is not configured (was HEKLA_MASTER_KEY rotated away without keeping the previous key?)"
             )
         })
     }
 
-    /// Get the subject's secret, creating it on first use. Concurrency-safe: a
-    /// creating thread that loses the insert race re-reads and returns the secret
-    /// that actually persisted, never its own discarded one (which would produce
-    /// permanently unrecoverable ciphertext).
-    fn get_or_create_secret(
+    /// Get the secret for the first subject in `chain`, creating it and every ancestor
+    /// it needs on first use.
+    ///
+    /// `chain` is the subject and its ancestors, nearest first: `[(Customer, 88),
+    /// (Shop, 7)]`. It is passed whole rather than looked up, because only the caller has
+    /// it: a parent's *id* lives in the event being written and nowhere else, which is
+    /// why heklang insists every event sealing under a child carries its ancestors.
+    ///
+    /// Concurrency-safe in the same way it was: a creating thread that loses the insert
+    /// race uses the secret that actually persisted, never its own discarded one, which
+    /// would produce permanently unrecoverable ciphertext.
+    fn get_or_create_secret_in(
         &self,
-        subject_field: &str,
-        subject_value: &str,
+        chain: &[(&str, &str)],
     ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-        if let Some(secret) = self.load_secret(subject_field, subject_value)? {
-            return Ok(secret);
+        // Bounded retry, because one attempt can legitimately end with nothing to return:
+        // another writer wins the insert and its row is itself unreachable by the time
+        // this thread reads it back, which is what happens when an erase lands in between.
+        // That is a state this function already knows how to handle, observed one step too
+        // late, so the answer is to look again rather than to invent a key or to fail.
+        //
+        // Bounded rather than a `loop`: a store being erased in a tight cycle would
+        // otherwise hang the request, and a write that cannot find a stable key after this
+        // many tries is better off failing loudly.
+        for _ in 0..MINT_ATTEMPTS {
+            if let Some(secret) = self.try_mint_in(chain)? {
+                return Ok(secret);
+            }
         }
+        let (subject, subject_value) = chain[0];
+        anyhow::bail!(
+            "subject `{subject}` = `{subject_value}` is being erased and recreated faster than a key can be minted for it"
+        )
+    }
+
+    /// One attempt at [`KeyStore::get_or_create_secret_in`].
+    ///
+    /// `Ok(None)` means the store moved underneath this thread and the caller should look
+    /// again: it is not an absence, and no caller outside that retry sees it.
+    fn try_mint_in(&self, chain: &[(&str, &str)]) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        let Some(((subject, subject_value), ancestors)) = chain.split_first() else {
+            anyhow::bail!("a subject chain cannot be empty");
+        };
+        let (subject, subject_value) = (*subject, *subject_value);
+        if let Some((secret, _)) = self.load_secret_at(subject, subject_value, 0, None)? {
+            return Ok(Some(secret));
+        }
+        // A row may be present and unreachable, which happens when this subject outlived
+        // an ancestor's erasure. Its ciphertext is already unrecoverable, so the row reads
+        // as absent and is replaced rather than hard-failing on the unwrap. Safe precisely
+        // because `load_secret_at` said `Ok(None)` rather than `Err`: a master that is
+        // merely missing never reaches here.
+        let stale = self.lock().get_subject_key(subject, subject_value)?;
         let fresh = random_secret()?;
-        let (primary_id, primary) = self.masters.primary();
-        let wrapped = wrap_key(primary, &fresh)?;
+        // The parent's secret is kept, not just used: unwrapping the row that actually
+        // persists needs it again, and reaching for it a second time through
+        // `load_secret` is the redundant walk this exists to avoid.
+        let (candidate, parent) = match ancestors.split_first() {
+            None => {
+                let (primary_id, primary) = self.masters.primary();
+                let candidate = SubjectKey {
+                    wrapped: wrap_key(primary, &fresh)?,
+                    wrapping: Wrapping::Master(primary_id.to_owned()),
+                };
+                (candidate, None)
+            }
+            Some(((parent_subject, parent_value), _)) => {
+                // Minting the parent first, recursively, because wrapping under it needs
+                // its secret and it may not exist yet. An ancestor erased and written to
+                // again gets a fresh key here, which is the same point-in-time shred every
+                // subject has always had, applied one level up.
+                let parent = self.get_or_create_secret_in(ancestors)?;
+                let aad = child_aad(subject, subject_value, parent_subject, parent_value);
+                let candidate = SubjectKey {
+                    wrapped: wrap_key_under(&child_kek(&parent), &fresh, &aad)?,
+                    wrapping: Wrapping::Parent(ParentRef {
+                        subject: (*parent_subject).to_owned(),
+                        value: (*parent_value).to_owned(),
+                        fingerprint: parent_fingerprint(&parent),
+                    }),
+                };
+                (candidate, Some(parent))
+            }
+        };
         // Insert-if-absent and re-read atomically under one lock, so the persisted row
-        // (this thread's or a racing thread's) is always the one used, and a racing
-        // erase cannot leave us with nothing.
-        let (persisted, master_id) = self.lock().get_or_insert_subject_key(
-            subject_field,
+        // (this thread's or a racing thread's) is always the one used, and a racing erase
+        // cannot leave us with nothing.
+        let persisted = self.lock().get_or_insert_subject_key(
+            subject,
             subject_value,
-            &wrapped,
-            primary_id,
+            &candidate,
+            stale.as_ref(),
         )?;
-        let master = self.masters.get(&master_id).ok_or_else(|| {
-            anyhow!("cannot unwrap subject `{subject_field}`: master key `{master_id}` is not configured")
-        })?;
-        unwrap_key(master, &persisted)
+        // Whatever row persisted is the one to encrypt under, this thread's or a racing
+        // writer's. Using the discarded `fresh` when another row won would write
+        // ciphertext nothing could ever read back, which is the failure the insert-race
+        // handling exists for.
+        //
+        // Deliberately not short-circuiting on "the row is mine". Doing so would hand back
+        // a secret whose parent an eraser may have just deleted, committing a write whose
+        // content is unreadable the moment it lands. Opening the row instead means an
+        // erase that raced this write sends it round the retry, where the parent is minted
+        // again and the value is readable: the documented rule that a write after an erase
+        // gets a fresh key, applied to a write that merely finished after one.
+        match (&persisted.wrapping, &parent) {
+            (Wrapping::Master(master_id), _) => {
+                unwrap_key(self.master_for(master_id, subject)?, &persisted.wrapped).map(Some)
+            }
+            (Wrapping::Parent(parent_ref), Some(parent))
+                if (parent_ref.subject.as_str(), parent_ref.value.as_str()) == ancestors[0]
+                    && parent_ref.fingerprint == parent_fingerprint(parent) =>
+            {
+                let aad = child_aad(
+                    subject,
+                    subject_value,
+                    &parent_ref.subject,
+                    &parent_ref.value,
+                );
+                unwrap_key_under(&child_kek(parent), &persisted.wrapped, &aad).map(Some)
+            }
+            // The winner's row hangs from an ancestor, or a generation of one, that this
+            // write did not name, so its parent has to be loaded to open it. Reachable two
+            // ways: two events disagreeing about a subject's parent, which
+            // `docs/effects.md` says outright that nothing can check, and an erase landing
+            // between that writer's insert and this read.
+            _ => Ok(self.load_secret(subject, subject_value)?),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, OpDb> {
@@ -352,7 +571,7 @@ impl KeyStore {
     }
 }
 
-/// Unwrapped subject secrets cached by `(subject_field, subject_value)`; `None`
+/// Unwrapped subject secrets cached by `(subject, subject_value)`; `None`
 /// records an absent (erased or never-created) key so it is not re-loaded.
 type SecretCache = HashMap<(String, String), Option<Zeroizing<Vec<u8>>>>;
 
@@ -374,8 +593,8 @@ impl RowDecryptor<'_> {
     /// the key is gone (erasure, irreversible) or the key is present and this
     /// particular ciphertext will not decrypt under it (written under a superseded
     /// key, or corrupt).
-    pub fn key_present(&self, subject_field: &str, subject_value: &str) -> Option<bool> {
-        let cache_key = (subject_field.to_owned(), subject_value.to_owned());
+    pub fn key_present(&self, subject: &str, subject_value: &str) -> Option<bool> {
+        let cache_key = (subject.to_owned(), subject_value.to_owned());
         self.secrets.borrow().get(&cache_key).map(Option::is_some)
     }
 
@@ -386,23 +605,17 @@ impl RowDecryptor<'_> {
     /// cannot be obtained at all (a missing master or a corrupt key wrapping).
     pub fn decrypt(
         &self,
-        subject_field: &str,
+        subject: &str,
         subject_value: &str,
         field: &str,
         ciphertext: &str,
     ) -> anyhow::Result<Option<String>> {
-        let cache_key = (subject_field.to_owned(), subject_value.to_owned());
-        let secret = {
-            let mut cache = self.secrets.borrow_mut();
-            match cache.get(&cache_key) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let loaded = self.keystore.load_secret(subject_field, subject_value)?;
-                    cache.insert(cache_key, loaded.clone());
-                    loaded
-                }
-            }
-        };
+        // Through the store's own cached walk rather than a lookup here, so every ancestor
+        // on the way up lands in the same map. A page of one tenant's members unwraps the
+        // tenant once; doing the memoisation at this level only would unwrap it per row.
+        let secret = self
+            .keystore
+            .cached_secret(subject, subject_value, 0, Some(&self.secrets))?;
         match secret {
             Some(secret) => Ok(plaintext_under(&secret, field, ciphertext)),
             None => Ok(None),
@@ -491,13 +704,30 @@ fn random_secret() -> anyhow::Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Wrap a subject secret under a master key with AES-256-GCM, returning
-/// `nonce || ciphertext`.
+/// `nonce || ciphertext`. A root's wrapping, which binds no associated data.
 fn wrap_key(master: &[u8; MASTER_KEY_LEN], secret: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(master).map_err(|_| anyhow!("invalid master key"))?;
+    wrap_key_under(master, secret, &[])
+}
+
+/// Unwrap a subject secret produced by [`wrap_key`].
+fn unwrap_key(master: &[u8; MASTER_KEY_LEN], wrapped: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    unwrap_key_under(master, wrapped, &[])
+}
+
+/// Wrap a secret under any 32-byte AES-256-GCM key, binding `aad` into the result.
+///
+/// The key is a master for a root and [`child_kek`]'s derivation for a child; the `aad`
+/// is empty for the first and both identities for the second.
+fn wrap_key_under(
+    key: &[u8; MASTER_KEY_LEN],
+    secret: &[u8],
+    aad: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow!("invalid wrapping key"))?;
     let mut nonce = [0u8; WRAP_NONCE_LEN];
     getrandom::fill(&mut nonce).context("gathering entropy for key wrapping")?;
     let ciphertext = cipher
-        .encrypt(&nonce.into(), secret)
+        .encrypt(&nonce.into(), Payload { msg: secret, aad })
         .map_err(|_| anyhow!("wrapping a subject key failed"))?;
     let mut out = Vec::with_capacity(WRAP_NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce);
@@ -505,32 +735,117 @@ fn wrap_key(master: &[u8; MASTER_KEY_LEN], secret: &[u8]) -> anyhow::Result<Vec<
     Ok(out)
 }
 
-/// Unwrap a subject secret produced by [`wrap_key`].
-fn unwrap_key(master: &[u8; MASTER_KEY_LEN], wrapped: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+/// Unwrap a secret produced by [`wrap_key_under`] with the same key and `aad`.
+fn unwrap_key_under(
+    key: &[u8; MASTER_KEY_LEN],
+    wrapped: &[u8],
+    aad: &[u8],
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     if wrapped.len() <= WRAP_NONCE_LEN {
         anyhow::bail!("wrapped key is too short");
     }
     let (nonce, ciphertext) = wrapped.split_at(WRAP_NONCE_LEN);
-    let cipher = Aes256Gcm::new_from_slice(master).map_err(|_| anyhow!("invalid master key"))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow!("invalid wrapping key"))?;
     let nonce: [u8; WRAP_NONCE_LEN] = nonce.try_into().expect("checked length");
     let secret = cipher
-        .decrypt(&nonce.into(), ciphertext)
-        .map_err(|_| anyhow!("unwrapping a subject key failed (wrong master key?)"))?;
+        .decrypt(
+            &nonce.into(),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| anyhow!("unwrapping a subject key failed (wrong key?)"))?;
     Ok(Zeroizing::new(secret))
 }
 
-impl KeyStore {
-    /// Whether a subject's key is gone, which is the whole of what heklang models about
-    /// erasure (`heklang/docs/effects.md` rule 12).
-    ///
-    /// A subject that never had a key reads as erased, for the same reason a shredded
-    /// one does: nothing scoped to it can be read. Failing closed is the only safe
-    /// direction here, since the answer gates `reveal`.
-    pub fn erased(&self, subject_field: &str, subject_value: &str) -> anyhow::Result<bool> {
-        Ok(!self
-            .lock()
-            .subject_key_exists(subject_field, subject_value)?)
+/// The domain separator for a child's wrapping key, so the bytes derived here cannot be
+/// confused with the parent secret they come from or with anything derived from it later.
+const KEK_DOMAIN: &[u8] = b"hekla:subject-kek:v1";
+
+/// The domain separator for a parent generation's fingerprint. Distinct from
+/// [`KEK_DOMAIN`] so the value recorded in a column cannot be the key that opens anything,
+/// even though both are derived from the same secret.
+const PARENT_FP_DOMAIN: &[u8] = b"hekla:subject-parent-fp:v1";
+
+/// The version byte bound into a child's key wrapping, beside the identities. Separate
+/// from [`AD_VERSION`], which versions the *data* scheme: these two can move apart.
+const WRAP_AD_VERSION: u8 = 1;
+
+/// How deep a parent chain may go before hekla calls it a cycle. The declared graph is
+/// over type names, finite and checked acyclic at parse time, so no real hierarchy is
+/// near this; it is a backstop against a key store edited outside hekla.
+const MAX_SUBJECT_DEPTH: usize = 32;
+
+/// How many times a mint looks again after losing a race to a row that is itself already
+/// unreachable. Each attempt is one read plus one insert, and only a subject being erased
+/// concurrently costs more than the first.
+const MINT_ATTEMPTS: usize = 4;
+
+/// The 32-byte AES-GCM key a child's secret is wrapped under, derived from its parent's
+/// 64-byte AES-SIV secret.
+///
+/// A plain domain-separated SHA-256 rather than HKDF, and that is a judgement rather than
+/// a shortcut: the input is already a uniformly random 64 bytes from the OS, which is
+/// exactly the case HKDF-Extract exists to handle and therefore the case where it adds
+/// nothing. The domain separator is the part that matters. A subject secret is an AES-SIV
+/// key in its own right, and a key that both encrypts data and wraps other keys is the
+/// mistake this prevents: nothing derived here can be fed back into `encrypt_with`.
+///
+/// Deleting the parent's row destroys the only copy of the parent secret, so this key
+/// becomes underivable and every child wrapped under it becomes unopenable, at once and
+/// without touching a single child row. That is the whole feature.
+fn child_kek(parent_secret: &[u8]) -> [u8; MASTER_KEY_LEN] {
+    let mut input = Zeroizing::new(Vec::with_capacity(KEK_DOMAIN.len() + parent_secret.len()));
+    input.extend_from_slice(KEK_DOMAIN);
+    input.extend_from_slice(parent_secret);
+    crate::hash::sha256(&input)
+}
+
+/// Which generation of a parent a child was wrapped under: a domain-separated digest of
+/// the parent's secret.
+///
+/// Recorded on the child so a failed unwrap can be explained rather than guessed at. The
+/// secret is what the wrapping key is derived from, so a parent erased and recreated has a
+/// different one and every key beneath the old one is unopenable: that is a shred, and the
+/// fingerprint says so. A wrapping that will not open while the fingerprint still matches
+/// is not a shred, because the key it was wrapped under has not moved.
+///
+/// Safe to store beside the ciphertext it describes: it is a preimage-resistant digest, and
+/// it is domain-separated from the wrapping key derived from the same input, so holding it
+/// gives no way to derive that key.
+fn parent_fingerprint(parent_secret: &[u8]) -> String {
+    let mut input = Zeroizing::new(Vec::with_capacity(
+        PARENT_FP_DOMAIN.len() + parent_secret.len(),
+    ));
+    input.extend_from_slice(PARENT_FP_DOMAIN);
+    input.extend_from_slice(parent_secret);
+    crate::hash::sha256_hex(&input)
+}
+
+/// The associated data bound into a child's key wrapping: the version, and both
+/// identities, length-prefixed so no two different pairs can render the same bytes.
+///
+/// It stops a wrapped child key from being moved to another row. Without it, copying one
+/// row's `wrapped_key` onto another child of the same parent would hand that subject the
+/// first one's key, and the store would never notice. Roots carry no such binding today
+/// and are left alone: retrofitting one would make every existing row unopenable, and it
+/// buys less there, since a root's wrapping is not derived from anything an attacker with
+/// write access to this table could also reach.
+fn child_aad(
+    subject: &str,
+    subject_value: &str,
+    parent_subject: &str,
+    parent_value: &str,
+) -> Vec<u8> {
+    let parts = [subject, subject_value, parent_subject, parent_value];
+    let mut aad = Vec::with_capacity(1 + parts.iter().map(|part| part.len() + 4).sum::<usize>());
+    aad.push(WRAP_AD_VERSION);
+    for part in parts {
+        aad.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        aad.extend_from_slice(part.as_bytes());
     }
+    aad
 }
 
 #[cfg(test)]
@@ -630,7 +945,7 @@ mod tests {
             None
         );
         assert_eq!(
-            ks.decrypt_subject(GLOBAL_SUBJECT_FIELD, GLOBAL_SUBJECT_VALUE, "email", &global)
+            ks.decrypt_subject(GLOBAL_SUBJECT, GLOBAL_SUBJECT_VALUE, "email", &global)
                 .unwrap()
                 .as_deref(),
             Some("a@b.c")
@@ -641,10 +956,7 @@ mod tests {
     fn the_global_secret_cannot_be_erased() {
         let ks = store();
         ks.encrypt_global("email", "x").unwrap();
-        assert!(
-            ks.erase(GLOBAL_SUBJECT_FIELD, GLOBAL_SUBJECT_VALUE)
-                .is_err()
-        );
+        assert!(ks.erase(GLOBAL_SUBJECT, GLOBAL_SUBJECT_VALUE).is_err());
     }
 
     #[test]

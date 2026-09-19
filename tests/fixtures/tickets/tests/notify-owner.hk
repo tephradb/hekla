@@ -96,7 +96,7 @@ test "an erased owner skips rather than sending plaintext" {
     labels: ticket_labels(),
     meta: {},
   }
-  erased owner_id "10"
+  erased Owner "10"
   deliver NotifyOwner
   expect skipped
 }

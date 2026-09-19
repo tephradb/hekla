@@ -54,7 +54,7 @@ test "an erased guest skips rather than sending plaintext" {
     rate: 140.00,
     notes: "",
   }
-  erased guest_id "9"
+  erased Guest "9"
   deliver ConfirmBooking
   expect skipped
 }

@@ -194,7 +194,7 @@ export const api = {
     request('/admin/subjects', {
       signal,
       params: [
-        ['after_field', afterField],
+        ['after_subject', afterField],
         ['after_value', afterValue],
         ['limit', limit],
       ],

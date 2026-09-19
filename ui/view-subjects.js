@@ -19,7 +19,7 @@ const PAGE = 100
 
 export function SubjectsView({ params }) {
   return html`
-    <${Lookup} field=${params?.field} value=${params?.value} />
+    <${Lookup} field=${params?.subject} value=${params?.value} />
     <${Inventory} />
   `
 }
@@ -47,14 +47,14 @@ function Lookup({ field, value }) {
         <form class="row wrap" onSubmit=${submit}>
           <input
             value=${draftField}
-            placeholder="customer_id"
+            placeholder="Customer"
             onInput=${(event) => setDraftField(event.target.value)}
-            aria-label="Subject field"
+            aria-label="Subject"
             spellcheck="false"
           />
           <input
             value=${draftValue}
-            placeholder="c-42"
+            placeholder="42"
             onInput=${(event) => setDraftValue(event.target.value)}
             aria-label="Subject value"
             spellcheck="false"
@@ -70,7 +70,7 @@ function Lookup({ field, value }) {
               found &&
               html`
                 <p class="row" style=${{ marginBottom: 0 }}>
-                  <code>${found.subject_field}=${found.subject_value}</code>
+                  <code>${found.subject}=${found.subject_value}</code>
                   ${found.state === 'live'
                     ? html`<span class="pill ok">live</span>`
                     : html`<span class="pill err">absent</span>`}
@@ -94,17 +94,17 @@ function Inventory() {
   const page = useResource(
     (signal) =>
       api.subjects(
-        { afterField: after?.after_field, afterValue: after?.after_value, limit: PAGE },
+        { afterField: after?.after_subject, afterValue: after?.after_value, limit: PAGE },
         signal,
       ),
-    [after?.after_field, after?.after_value],
+    [after?.after_subject, after?.after_value],
   )
 
   const columns = [
     {
       key: 'field',
       header: 'Subject',
-      render: (row) => html`<code>${row.subject_field}</code>`,
+      render: (row) => html`<code>${row.subject}</code>`,
     },
     {
       key: 'value',
@@ -112,9 +112,17 @@ function Inventory() {
       render: (row) => html`<span class="mono">${row.subject_value}</span>`,
     },
     {
-      key: 'master',
-      header: 'Master key',
-      render: (row) => html`<span class="mono tiny dim">${shortHash(row.master_key_id)}</span>`,
+      key: 'wrapped',
+      header: 'Wrapped under',
+      // A root shows the master it is wrapped under; a child shows the row it hangs from,
+      // because deleting that row is what makes this one unreadable. Exactly one of the
+      // two is set, which the key store's own CHECK guarantees.
+      render: (row) =>
+        row.parent
+          ? html`<code class="tiny"
+              >${row.parent.subject}=${row.parent.subject_value}</code
+            >`
+          : html`<span class="mono tiny dim">${shortHash(row.master_key_id)}</span>`,
     },
     {
       key: 'created',
@@ -129,11 +137,11 @@ function Inventory() {
       render: (row) => html`
         <a
           class="tiny"
-          href=${`/admin/events?tag=${encodeURIComponent(`${row.subject_field}:${row.subject_value}`)}`}
+          href=${`/admin/events?tag=${encodeURIComponent(`${row.subject}:${row.subject_value}`)}`}
           onClick=${(clicked) => {
             clicked.preventDefault()
             go(
-              `/admin/events?tag=${encodeURIComponent(`${row.subject_field}:${row.subject_value}`)}`,
+              `/admin/events?tag=${encodeURIComponent(`${row.subject}:${row.subject_value}`)}`,
             )
           }}
         >
@@ -152,7 +160,7 @@ function Inventory() {
         html`
           <span class="tiny faint row" style=${{ textTransform: 'none', letterSpacing: 0 }}>
             ${page.data.counts.map(
-              (entry) => html`<span><code>${entry.subject_field}</code> ${count(entry.live_keys)}</span>`,
+              (entry) => html`<span><code>${entry.subject}</code> ${count(entry.live_keys)}</span>`,
             )}
           </span>
         `}
@@ -199,8 +207,10 @@ function Inventory() {
             </div>
           `}
           <p class="body tiny faint" style=${{ marginTop: 0 }}>
-            Live keys only. An erased subject has no row here, so use the lookup above to
-            confirm one is gone. Key material is never served.
+            An erased subject has no row here, so use the lookup above to confirm one is
+            gone. A row that is listed is not necessarily readable: one wrapped under a
+            parent that no longer appears here went with it, and is waiting to be swept.
+            Key material is never served.
           </p>
         `}
       <//>

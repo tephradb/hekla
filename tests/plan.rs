@@ -1206,15 +1206,17 @@ fn a_plan_without_replay_claims_no_coverage() {
 // had been checked.
 
 const SEALED_EVENTS: &str = "\
+subject Customer(Int)
+
 event @order.placed {
   order_id: Int,
-  customer_id: Int,
+  customer_id: Customer,
   email: String? @subject(customer_id) @max(100),
 }
 ";
 
 const SEALED_PLACE: &str = "\
-command PlaceOrder(order_id: Int, customer_id: Int, email: String) {
+command PlaceOrder(order_id: Int, customer_id: Customer, email: String) {
   emit @order.placed { order_id, customer_id, email }
 }
 ";
@@ -1293,7 +1295,7 @@ fn an_erased_subject_is_unreplayable_rather_than_a_divergence() {
 
     let opdb = hekla::opdb::OpDb::open(&data.path().join("hekla.db")).unwrap();
     assert!(
-        hekla::crypto::erase_subject(&opdb, "customer_id", "7").unwrap(),
+        hekla::crypto::erase_subject(&opdb, "Customer", "7").unwrap(),
         "the fixture wrote a key to erase"
     );
     drop(opdb);

@@ -77,7 +77,7 @@ test "an erased customer skips rather than sending plaintext" {
     order_total: 10.00,
     notes: "",
   }
-  erased customer_id "7"
+  erased Customer "7"
   deliver NotifyCustomer
   expect skipped
 }

@@ -250,8 +250,8 @@ enum Command {
     /// unreadable and unmatchable across the log and every read model at once. This
     /// is irreversible.
     Erase {
-        /// The subject field (e.g. `customer_id`).
-        subject_field: String,
+        /// The subject, by its declared name (e.g. `Customer`).
+        subject: String,
         /// The subject id value (e.g. `42`).
         subject_value: String,
         /// The project directory (to resolve the data directory).
@@ -260,6 +260,9 @@ enum Command {
         /// The data directory (operational DB). Defaults to `<dir>/data`.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Skip the confirmation prompt. The summary is still printed.
+        #[arg(long)]
+        yes: bool,
     },
     /// Move an effect back to a position, so it reprocesses everything after it and
     /// performs those side effects again. This is irreversible.
@@ -359,11 +362,12 @@ pub fn run() -> ExitCode {
         ),
         Command::Secrets { dir } => secrets(&dir),
         Command::Erase {
-            subject_field,
+            subject,
             subject_value,
             dir,
             data_dir,
-        } => erase(&subject_field, &subject_value, &dir, data_dir.as_deref()),
+            yes,
+        } => erase(&subject, &subject_value, &dir, data_dir.as_deref(), yes),
         Command::Rewind {
             effect,
             position,
@@ -462,13 +466,25 @@ fn rotate(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
     }
 }
 
-/// Erase a subject by deleting its key from the operational DB. No master key is
-/// needed: this is a row delete that shreds the ciphertext everywhere at once.
+/// Erase a subject by deleting its key from the operational DB, after saying what that
+/// costs.
+///
+/// No master key is needed, and that survives the hierarchy deliberately: this is a row
+/// delete, and the descendant count below is a walk of parent pointers that unwraps
+/// nothing. Reachability here is structural rather than cryptographic, so the whole
+/// command still works on a machine that holds no key material.
+///
+/// **It prompts now, where it used to not.** The rationale for the old asymmetry was that
+/// an erase carried its blast radius in its own arguments, because you named the subject.
+/// A subject with children makes that false: `hekla erase Shop 7` says nothing about the
+/// fifty thousand customers under it, which is exactly what `hekla rewind SendWelcome 0`
+/// said nothing about. The asymmetry went when the reason for it did.
 fn erase(
-    subject_field: &str,
+    subject: &str,
     subject_value: &str,
     dir: &Path,
     data_dir: Option<&Path>,
+    yes: bool,
 ) -> ExitCode {
     let db_path = match operational_db(dir, data_dir) {
         Ok(path) => path,
@@ -481,14 +497,58 @@ fn erase(
             return ExitCode::FAILURE;
         }
     };
-    match crypto::erase_subject(&opdb, subject_field, subject_value) {
+    let beneath = match opdb.descendant_key_count(subject, subject_value) {
+        Ok(count) => count,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let present = match opdb.subject_key_exists(subject, subject_value) {
+        Ok(present) => present,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("subject `{subject}` = `{subject_value}`");
+    if present {
+        println!("  key            present, and about to be deleted");
+    } else {
+        println!("  key            already absent (erased, or never created)");
+    }
+    match beneath {
+        0 => println!("  beneath it     no other keys"),
+        // Named as what it costs rather than as a row count: the rows stay, and what
+        // actually happens to them is that nothing can open them again.
+        n => println!("  beneath it     {n} key(s), which become permanently unreadable"),
+    }
+    println!();
+    println!("This is irreversible. Every value scoped to these keys becomes unreadable");
+    println!("across the log and every read model at once.");
+
+    if !yes {
+        // A prompt nobody can answer is a usage error, not a decline. Exiting zero here
+        // would tell a script the erasure happened.
+        if !io::stdin().is_terminal() {
+            eprintln!("error: not a terminal; pass --yes to confirm without a prompt");
+            return ExitCode::FAILURE;
+        }
+        if !confirm() {
+            println!("nothing was erased");
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    match crypto::erase_subject(&opdb, subject, subject_value) {
         Ok(true) => {
-            println!("erased subject `{subject_field}` = `{subject_value}`");
+            println!("erased subject `{subject}` = `{subject_value}`");
             ExitCode::SUCCESS
         }
         Ok(false) => {
             println!(
-                "no key for subject `{subject_field}` = `{subject_value}` (already erased or never created)"
+                "no key for subject `{subject}` = `{subject_value}` (already erased or never created)"
             );
             ExitCode::SUCCESS
         }
@@ -501,11 +561,11 @@ fn erase(
 
 /// Move an effect's watermark backwards so it reprocesses, after saying what that costs.
 ///
-/// **Why this prompts when `erase` does not**, which is a deliberate inconsistency: an
-/// erase carries its blast radius in its own arguments, because you named the subject.
 /// `hekla rewind SendWelcome 0` tells you nothing about the four hundred emails it is
-/// about to re-send. The asymmetry is the reason for the summary and the prompt, and the
-/// reason `--yes` suppresses only the question and never the summary.
+/// about to re-send, which is why it prints a summary and asks. `--yes` suppresses only
+/// the question and never the summary. `erase` reads the same way now, for the same
+/// reason: naming a subject stopped bounding the blast radius once one could have
+/// children.
 fn rewind(
     effect: &str,
     position: u64,
@@ -680,9 +740,9 @@ fn print_rewind(
     println!("This re-runs those positions and performs their side effects again.");
 }
 
-/// Ask. Only ever called on a terminal: a rewind that could be armed by a piped `yes` is a
-/// rewind waiting to happen in a script nobody read, so the caller refuses outright
-/// rather than reading an answer from a pipe.
+/// Ask. Only ever called on a terminal: an irreversible thing that could be armed by a
+/// piped `yes` is one waiting to happen in a script nobody read, so each caller refuses
+/// outright rather than reading an answer from a pipe.
 fn confirm() -> bool {
     print!("Continue? [y/N] ");
     let _ = io::stdout().flush();

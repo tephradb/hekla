@@ -43,7 +43,7 @@ use crate::http::{HttpClient, HttpRequest};
 use crate::metrics;
 use crate::opdb::OpDb;
 use crate::read_model::ReadModel;
-use crate::schema::{self, EmittedEvent, EventDef, EventDefs, FieldKind};
+use crate::schema::{self, EmittedEvent, EventDef, EventDefs, FieldKind, Seal};
 use crate::secrets::SecretStore;
 use crate::store::Store;
 
@@ -1268,8 +1268,8 @@ impl HeklaHost {
                 continue;
             };
             let json = from_heklang_json(&Json::from_value(value));
-            match &meta.subject {
-                Some(subject_field) => {
+            match &meta.sealed_under {
+                Some(seal) => {
                     // Rule 12: an absent optional was never encrypted, so there is no
                     // key behind it and nothing to seal. That is the row which must not
                     // collapse into the erased one.
@@ -1277,23 +1277,30 @@ impl HeklaHost {
                         payload.insert(name.clone(), serde_json::Value::Null);
                         continue;
                     }
+                    let subject = seal.subject();
                     let keystore = self.keystore.as_deref().ok_or_else(|| {
                         host_error(format!(
-                            "field `{name}` is scoped to `{subject_field}` but no master key is configured"
+                            "field `{name}` is sealed under `{subject}` but no master key is configured"
                         ))
                     })?;
-                    let subject_value = ids.get(subject_field.as_str()).ok_or_else(|| {
-                        host_error(format!("event `{ty}` has no subject id `{subject_field}`"))
-                    })?;
-                    let sealed = stored_seal(
-                        keystore,
-                        subject_field,
-                        subject_value,
-                        name,
-                        &meta.kind,
-                        value,
-                        &json,
-                    )?;
+                    // The whole chain, not just this subject: minting a child's key wraps
+                    // it under its parent's, and the parent's id is a field of this same
+                    // event. Each id comes off the sibling the declaration names, not off
+                    // the subject, so `from: Customer, to: Customer` seals two fields
+                    // under one subject and two different ids.
+                    let chain = seal
+                        .resolve(|field| ids.get(field).map(String::as_str))
+                        .ok_or_else(|| {
+                            host_error(format!(
+                                "event `{ty}` does not carry every id `{subject}`'s key is filed under: it needs {}",
+                                seal.chain
+                                    .iter()
+                                    .map(|(subject, field)| format!("`{field}` for `{subject}`"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                        })?;
+                    let sealed = stored_seal(keystore, &chain, name, &meta.kind, value, &json)?;
                     if meta.indexed {
                         derived.push((name.clone(), Some(sealed.clone())));
                     }
@@ -1372,13 +1379,13 @@ fn peeled(value: &Value) -> &Value {
 /// ciphertext and the destination would not be able to read it otherwise.
 fn stored_seal(
     keystore: &KeyStore,
-    subject_field: &str,
-    subject_value: &str,
+    chain: &[(&str, &str)],
     name: &str,
     kind: &FieldKind,
     value: &Value,
     json: &serde_json::Value,
 ) -> Result<String, Error> {
+    let (subject_name, subject_value) = chain[0];
     if let Value::Sealed {
         field,
         subject,
@@ -1386,7 +1393,7 @@ fn stored_seal(
         content,
     } = peeled(value)
     {
-        if field == name && subject == subject_field && id == subject_value {
+        if field == name && subject == subject_name && id == subject_value {
             return Ok(content.to_string());
         }
         let plaintext = keystore
@@ -1395,16 +1402,16 @@ fn stored_seal(
             .ok_or_else(|| {
                 host_error(format!(
                     "`{name}` holds content sealed under `{subject}` = `{id}`, whose key is gone, \
-                     so it cannot be re-sealed under `{subject_field}`"
+                     so it cannot be re-sealed under `{subject_name}`"
                 ))
             })?;
         return keystore
-            .encrypt_subject(subject_field, subject_value, name, &plaintext)
+            .encrypt_subject_in(chain, name, &plaintext)
             .map_err(host_error);
     }
     let text = seal_text(kind, json);
     keystore
-        .encrypt_subject(subject_field, subject_value, name, &text)
+        .encrypt_subject_in(chain, name, &text)
         .map_err(host_error)
 }
 
@@ -1460,7 +1467,7 @@ fn build_tags(pairs: &[(String, Option<String>)], extra: &[&str]) -> Result<Tags
 pub struct Shredded {
     /// One per dropped column write. A row written three times counts three.
     pub writes: u64,
-    /// One hash per distinct `(subject_field, subject_value)` behind those writes.
+    /// One hash per distinct `(subject, subject_value)` behind those writes.
     seen: HashSet<u64>,
 }
 
@@ -1470,9 +1477,9 @@ impl Shredded {
         self.seen.len()
     }
 
-    fn record(&mut self, subject_field: &str, subject_value: &str) {
+    fn record(&mut self, subject: &str, subject_value: &str) {
         let mut hasher = DefaultHasher::new();
-        subject_field.hash(&mut hasher);
+        subject.hash(&mut hasher);
         subject_value.hash(&mut hasher);
         self.writes += 1;
         self.seen.insert(hasher.finish());
@@ -1543,9 +1550,9 @@ impl heklang::host::Rows for RowWriter<'_> {
                 .find(|(name, _)| name == &field.name)
                 .map(|(_, meta)| meta);
             let kind = meta.map(|meta| &meta.kind);
-            let value = match (meta.and_then(|meta| meta.subject.as_deref()), raw) {
-                (Some(subject_field), Some(raw)) => {
-                    match self.decrypt_field(&stored, subject_field, &field.name, raw)? {
+            let value = match (meta.and_then(|meta| meta.sealed_under.as_ref()), raw) {
+                (Some(seal), Some(raw)) => {
+                    match self.decrypt_field(&stored, seal, &field.name, raw)? {
                         Some(plaintext) => sealed_column(&field.ty, kind, plaintext, defs)?,
                         // The key is gone, so the column is: the same answer `read_api`
                         // gives a reader, and what makes an erasure observable here.
@@ -1598,15 +1605,19 @@ impl heklang::host::Rows for RowWriter<'_> {
                 continue;
             };
             let json = from_heklang_json(&Json::from_value(value));
-            match &meta.subject {
-                Some(subject_field) if !json.is_null() => {
+            match &meta.sealed_under {
+                Some(seal) if !json.is_null() => {
+                    let subject = seal.subject();
                     let keystore = self.keystore.ok_or_else(|| {
                         host_error(format!(
-                            "column `{name}` is scoped to `{subject_field}` but no master key is configured"
+                            "column `{name}` is sealed under `{subject}` but no master key is configured"
                         ))
                     })?;
-                    let subject_value = ids.get(subject_field.as_str()).ok_or_else(|| {
-                        host_error(format!("row has no subject id `{subject_field}`"))
+                    let subject_value = ids.get(seal.id_field()).ok_or_else(|| {
+                        host_error(format!(
+                            "row has no `{}` to file `{subject}`'s key under",
+                            seal.id_field()
+                        ))
                     })?;
                     // A moved seal is opened here rather than passed through, which the
                     // append path can do. The reason is `column_form` below: a column
@@ -1629,9 +1640,10 @@ impl heklang::host::Rows for RowWriter<'_> {
                             // `_existing` miss below, reached one step earlier.
                             //
                             // Recorded against the *seal's* own subject rather than the
-                            // column's. They are usually the same, because a column's
-                            // scope is propagated from what is written into it, but the
-                            // key that was actually missing is the one this decrypt
+                            // column's. Both are declared subject names now, and a
+                            // column's scope is propagated from what is written into it,
+                            // so they agree in every case an author can write. The key
+                            // that was actually missing is still the one this decrypt
                             // asked for, and naming another would report the wrong
                             // subject as erased.
                             None => {
@@ -1660,7 +1672,7 @@ impl heklang::host::Rows for RowWriter<'_> {
                     // key the erasure destroyed and write readable content under it,
                     // undoing the shred by rebuilding a read model.
                     match keystore
-                        .encrypt_subject_existing(subject_field, subject_value, name, &text)
+                        .encrypt_subject_existing(subject, subject_value, name, &text)
                         .map_err(host_error)?
                     {
                         Some(sealed) => {
@@ -1672,7 +1684,7 @@ impl heklang::host::Rows for RowWriter<'_> {
                         None => {
                             stored.insert(name.clone(), serde_json::Value::Null);
                             if self.shredded.is_some() {
-                                dropped.push((subject_field.clone(), subject_value.clone()));
+                                dropped.push((subject.to_owned(), subject_value.clone()));
                             }
                         }
                     }
@@ -1770,13 +1782,14 @@ impl RowWriter<'_> {
     fn decrypt_field(
         &self,
         row: &serde_json::Value,
-        subject_field: &str,
+        seal: &Seal,
         field: &str,
         stored: &serde_json::Value,
     ) -> Result<Option<String>, Error> {
+        let subject = seal.subject();
         let Some(keystore) = self.keystore else {
             return Err(host_error(format!(
-                "column `{field}` is scoped to `{subject_field}` but no master key is configured"
+                "column `{field}` is sealed under `{subject}` but no master key is configured"
             )));
         };
         // Not text at all, so there is no seal here to open: a column written before the
@@ -1785,11 +1798,16 @@ impl RowWriter<'_> {
             return Ok(schema::scalar_to_string(stored).or_else(|| Some(stored.to_string())));
         };
         let subject_value = row
-            .get(subject_field)
+            .get(seal.id_field())
             .and_then(crate::schema::scalar_to_string)
-            .ok_or_else(|| host_error(format!("row has no subject id `{subject_field}`")))?;
+            .ok_or_else(|| {
+                host_error(format!(
+                    "row has no `{}` to file `{subject}`'s key under",
+                    seal.id_field()
+                ))
+            })?;
         match keystore
-            .decrypt_subject(subject_field, &subject_value, field, ciphertext)
+            .decrypt_subject(subject, &subject_value, field, ciphertext)
             .map_err(host_error)?
         {
             Some(plaintext) => Ok(Some(plaintext)),

@@ -122,7 +122,7 @@ pub const ADMIN_COMMAND_ROUTE: &str = "/admin/commands/{name}";
 pub const ADMIN_SCHEMA_ROUTE: &str = "/admin/schema";
 pub const ADMIN_SYSTEM_ROUTE: &str = "/admin/system";
 pub const ADMIN_SUBJECTS_ROUTE: &str = "/admin/subjects";
-pub const ADMIN_SUBJECT_ROUTE: &str = "/admin/subjects/{field}/{value}";
+pub const ADMIN_SUBJECT_ROUTE: &str = "/admin/subjects/{subject}/{value}";
 
 /// Ad-hoc projections. The one `/admin` path that answers a `POST`, and the one that
 /// runs code a caller supplied rather than reading what the project declared, which is
@@ -2088,19 +2088,20 @@ async fn admin_subjects(
         Ok(limit) => limit,
         Err(response) => return *response,
     };
-    let after_field = single(&params, "after_field").map(str::to_owned);
+    let after_subject = single(&params, "after_subject").map(str::to_owned);
     let after_value = single(&params, "after_value").map(str::to_owned);
-    if after_field.is_some() != after_value.is_some() {
-        return *bad_request("after_field and after_value must be given together");
+    if after_subject.is_some() != after_value.is_some() {
+        return *bad_request("after_subject and after_value must be given together");
     }
     blocking_json(move || {
-        let after = after_field.as_deref().zip(after_value.as_deref());
+        let after = after_subject.as_deref().zip(after_value.as_deref());
         let mut rows = runtime.subject_keys_page(after, limit + 1)?;
         let more = rows.len() > limit;
         rows.truncate(limit);
-        let next = more.then(|| rows.last()).flatten().map(
-            |row| json!({ "after_field": row.subject_field, "after_value": row.subject_value }),
-        );
+        let next = more
+            .then(|| rows.last())
+            .flatten()
+            .map(|row| json!({ "after_subject": row.subject, "after_value": row.subject_value }));
         // The counts are an aggregate no limit can bound, so they are taken once for a
         // listing rather than rescanned for every page of one. They cannot change
         // between pages of the same walk anyway.
@@ -2109,7 +2110,7 @@ async fn admin_subjects(
                 runtime
                     .subject_key_counts()?
                     .into_iter()
-                    .map(|(field, count)| json!({ "subject_field": field, "live_keys": count }))
+                    .map(|(subject, count)| json!({ "subject": subject, "live_keys": count }))
                     .collect::<Vec<_>>(),
             ),
             Some(_) => None,
@@ -2123,18 +2124,20 @@ async fn admin_subjects(
     .await
 }
 
-/// `GET /admin/subjects/{field}/{value}`: whether one subject still has a key.
+/// `GET /admin/subjects/{subject}/{value}`: whether one subject still has a key.
 async fn admin_subject(
     State(runtime): State<Shared>,
-    Path((field, value)): Path<(String, String)>,
+    Path((subject, value)): Path<(String, String)>,
 ) -> Response {
     blocking_json(move || {
-        let live = runtime.subject_key_exists(&field, &value)?;
+        let live = runtime.subject_key_reachable(&subject, &value)?;
         Ok(json!({
-            "subject_field": field,
+            "subject": subject,
             "subject_value": value,
-            // "absent" rather than "erased": a subject that never had a value
-            // encrypted under it looks exactly the same from here.
+            // "absent" rather than "erased": a subject that never had a value encrypted
+            // under it looks exactly the same from here, and so does one whose parent was
+            // erased. All three are the same answer to the only question worth asking,
+            // which is whether anything scoped to it can still be read.
             "state": if live { "live" } else { "absent" },
         }))
     })

@@ -71,12 +71,12 @@ fn master_keys_from_env_reads_the_primary_and_previous_keys() {
         let subject = index.to_string();
         let under_previous = KeyStore::new(db.clone(), MasterKeys::new(previous, vec![]));
         let ciphertext = under_previous
-            .encrypt_subject("customer_id", &subject, "email", "alice@example.com")
+            .encrypt_subject("Customer", &subject, "email", "alice@example.com")
             .unwrap();
 
         let under_env = KeyStore::new(db, masters.clone());
         let plaintext = under_env
-            .decrypt_subject("customer_id", &subject, "email", &ciphertext)
+            .decrypt_subject("Customer", &subject, "email", &ciphertext)
             .unwrap_or_else(|err| {
                 panic!("previous key {index} was dropped by the env parse: {err:#}")
             });
@@ -91,12 +91,12 @@ fn master_keys_from_env_reads_the_primary_and_previous_keys() {
     // them back: this pins which of the three keys the env made primary.
     let db = Arc::new(Mutex::new(OpDb::open_in_memory().unwrap()));
     let ciphertext = KeyStore::new(db.clone(), masters)
-        .encrypt_subject("customer_id", "9", "email", "bob@example.com")
+        .encrypt_subject("Customer", "9", "email", "bob@example.com")
         .unwrap();
     let primary_only = KeyStore::new(db, MasterKeys::new(PRIMARY, vec![]));
     assert_eq!(
         primary_only
-            .decrypt_subject("customer_id", "9", "email", &ciphertext)
+            .decrypt_subject("Customer", "9", "email", &ciphertext)
             .unwrap()
             .as_deref(),
         Some("bob@example.com"),

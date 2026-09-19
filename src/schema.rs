@@ -9,6 +9,7 @@
 //! decides what a declaration means, and this is the runtime's view of the result, so
 //! nothing here settles a question the checker has not already settled.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use heklang::ir::{self, Type};
@@ -114,6 +115,11 @@ impl FieldKind {
                     .map(|def| def.variants.clone())
                     .unwrap_or_default(),
             ),
+            // A subject id is an ordinary scalar at rest: `Customer` is stored, keyed,
+            // indexed and paged exactly as the `Int` its ids are. Which subject it
+            // names is a per-field fact rather than a storage one, so it rides on
+            // [`FieldMeta::identifies`] and never widens this.
+            Type::Subject(sub) => FieldKind::of(&sub.id, defs),
             // A record, a list and a map are stored as the JSON rule 8 already says
             // they are on the wire, so a column holds one encoding rather than two.
             Type::Record(_) | Type::List(_) | Type::Map(..) | Type::Json => FieldKind::Json,
@@ -163,26 +169,89 @@ impl FieldKind {
     }
 }
 
+/// Where a sealed value's key is filed, and where its id is read from.
+///
+/// Two facts, and they are not the same one. The **subject** is a declared type's name
+/// and is what a key store partitions by; the **id field** is a sibling of this field in
+/// the declaration it was written in, and is where the id value is looked up. heklang
+/// keeps them apart for the same reason (`heklang/src/ir.rs:117`): the annotation is
+/// local to one declaration and the namespace is not. They used to be one string,
+/// because a subject *was* a field name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Seal {
+    /// The subject and the field its id is read from, then each ancestor the same way,
+    /// nearest first: `[(Customer, buyer), (Shop, shop_id)]`.
+    ///
+    /// The ancestors ride here because minting a child's key needs its parent's secret,
+    /// and reaching that needs the parent's *id*, which lives in the event being written
+    /// and nowhere else. Resolved once at load rather than per write: the hierarchy is a
+    /// property of the declarations, and heklang has already refused any event that
+    /// seals under a child without carrying its ancestors.
+    ///
+    /// One entry for a subject with no parent, which is every subject until one declares
+    /// `under`. An entity column's seal carries one entry too: a projector never mints a
+    /// key, so it never needs an ancestor.
+    pub chain: Vec<(String, String)>,
+}
+
+impl Seal {
+    /// The declared subject whose key encrypts this field: `Customer`.
+    pub fn subject(&self) -> &str {
+        &self.chain[0].0
+    }
+
+    /// The sibling field or column holding this row's id for that subject: `buyer`.
+    pub fn id_field(&self) -> &str {
+        &self.chain[0].1
+    }
+
+    /// The chain as [`crate::crypto::KeyStore::encrypt_subject_in`] takes it, with each
+    /// id looked up by `ids`. `None` when any of them is missing from this write, which
+    /// heklang's ancestry check makes unreachable for a declared event.
+    pub fn resolve<'a>(
+        &'a self,
+        ids: impl Fn(&str) -> Option<&'a str>,
+    ) -> Option<Vec<(&'a str, &'a str)>> {
+        self.chain
+            .iter()
+            .map(|(subject, id_field)| Some((subject.as_str(), ids(id_field)?)))
+            .collect()
+    }
+}
+
 /// A declared field: its type plus the per-field policy that governs tagging and
 /// subject-scoped encryption. `indexed` decides whether the field becomes a store
-/// tag; `subject` names a sibling field whose per-subject key encrypts this field's
-/// value (in the tag, the payload, and any read-model column).
+/// tag; `sealed_under` says this field's value is ciphertext (in the tag, the payload,
+/// and any read-model column); `identifies` says this field *is* an id, which is what
+/// lets an operator see which columns a subject's erasure takes out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldMeta {
     pub kind: FieldKind,
     pub indexed: bool,
-    pub subject: Option<String>,
+    pub sealed_under: Option<Seal>,
+    pub identifies: Option<String>,
 }
 
 impl FieldMeta {
-    /// A plain field: indexed and unscoped. The default for every field that opts
-    /// into nothing.
+    /// A plain field: indexed, unsealed, and not an id. The default for every field
+    /// that opts into nothing.
     pub fn plain(kind: FieldKind) -> FieldMeta {
         FieldMeta {
             kind,
             indexed: true,
-            subject: None,
+            sealed_under: None,
+            identifies: None,
         }
+    }
+
+    /// The subject this field's value is sealed under, if it is sealed at all.
+    pub fn subject(&self) -> Option<&str> {
+        self.sealed_under.as_ref().map(Seal::subject)
+    }
+
+    /// The sibling field holding the id this field's key is filed under.
+    pub fn id_field(&self) -> Option<&str> {
+        self.sealed_under.as_ref().map(Seal::id_field)
     }
 
     pub fn is_nullable(&self) -> bool {
@@ -194,7 +263,7 @@ impl FieldMeta {
     /// regardless of the underlying kind; the read API decrypts and re-types it on
     /// the way out.
     pub fn sql_type(&self) -> &'static str {
-        if self.subject.is_some() {
+        if self.sealed_under.is_some() {
             "TEXT"
         } else {
             self.kind.sql_type()
@@ -393,17 +462,36 @@ impl EntityDef {
                 key_meta.kind.base()
             );
         }
-        if key_meta.subject.is_some() {
+        if key_meta.sealed_under.is_some() {
             anyhow::bail!(
                 "entity `{}`: key `{}` may not be subject-encrypted (the key is a plaintext cursor)",
                 self.name,
                 self.key
             );
         }
-        // A subject-scoped column needs its sibling subject-id column present so the
-        // read API can find the key to decrypt it; the `entity()` builtin's
-        // `validate_subject_refs` already enforces that (and rejects a chained or
-        // json subject), so it holds by the time we get here.
+        // A sealed column's key is found by its subject's id, and on an entity that id
+        // is whichever column has the subject's type. heklang propagates the seal onto
+        // the column but has no way to insist the id came with it, so this is hekla's to
+        // refuse: without it the column decrypts to nothing and reads back absent, which
+        // is indistinguishable from an erasure and is the wrong answer.
+        for (name, meta) in &self.fields {
+            let Some(seal) = &meta.sealed_under else {
+                continue;
+            };
+            if !self
+                .fields
+                .iter()
+                .any(|(other, _)| other == seal.id_field())
+            {
+                anyhow::bail!(
+                    "entity `{}`: column `{}` is sealed under `{}`, but no column of this entity holds a `{}`; add one so the key can be found",
+                    self.name,
+                    name,
+                    seal.subject(),
+                    seal.subject()
+                );
+            }
+        }
         for ix in &self.indexes {
             for col in &ix.columns {
                 match self.fields.iter().find(|(n, _)| n == col) {
@@ -417,7 +505,7 @@ impl EntityDef {
                     // as plaintext, and without the subject cannot derive the key)
                     // could never match it. Reject the index rather than surprise the
                     // author with a silent no-op. Filter by the plaintext subject id.
-                    Some((_, meta)) if meta.subject.is_some() => anyhow::bail!(
+                    Some((_, meta)) if meta.sealed_under.is_some() => anyhow::bail!(
                         "entity `{}`: index `{}` covers subject-encrypted column `{}`; filter by the plaintext subject id instead",
                         self.name,
                         ix.name,
@@ -487,7 +575,8 @@ impl EventDef {
     /// Whether `name` is a subject-scoped (encrypted) field. The single authority both
     /// command-response paths use to drop subject tags, so they cannot drift.
     pub fn is_subject(&self, name: &str) -> bool {
-        self.field(name).is_some_and(|meta| meta.subject.is_some())
+        self.field(name)
+            .is_some_and(|meta| meta.sealed_under.is_some())
     }
 }
 
@@ -612,21 +701,122 @@ fn bounded(kind: FieldKind, max_len: Option<usize>) -> FieldKind {
     }
 }
 
+/// The subject a field's values are ids of, looking through `Opt`. `None` for anything
+/// that is not a subject id, which is everything but a field declared `buyer: Customer`.
+pub fn identified_subject(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Subject(sub) => Some(sub.name.as_str()),
+        Type::Opt(inner) => identified_subject(inner),
+        _ => None,
+    }
+}
+
+/// The declared subject hierarchy, as the runtime reads it.
+///
+/// Each subject's parent and nothing else. heklang owns the graph: it refuses a parent
+/// that is not declared and refuses a cycle, both at parse time, so a walk here is finite
+/// and needs no visited set. What hekla adds is the join to the *fields*, which is the
+/// half heklang cannot make for a host: which column of this event carries the ancestor's
+/// id is a question about one declaration, and the answer is what a key gets filed under.
+#[derive(Debug, Clone, Default)]
+pub struct Subjects {
+    parents: BTreeMap<String, String>,
+}
+
+impl Subjects {
+    pub fn of(program: &Program) -> Subjects {
+        Subjects {
+            parents: program
+                .subjects
+                .iter()
+                .filter_map(|def| {
+                    def.parent
+                        .as_ref()
+                        .map(|parent| (def.name.clone(), parent.clone()))
+                })
+                .collect(),
+        }
+    }
+
+    /// `name`'s ancestors, nearest first. Empty for a subject that declares no parent,
+    /// which is every subject until one says `under`.
+    pub fn ancestors(&self, name: &str) -> Vec<&str> {
+        let mut chain = Vec::new();
+        let mut current = name;
+        // Bounded by the declaration count, which is what makes this safe without a
+        // visited set: heklang has already refused a cycle, and a program with more
+        // links than subjects would have to contain one.
+        while let Some(parent) = self.parents.get(current) {
+            if chain.len() >= self.parents.len() {
+                break;
+            }
+            chain.push(parent.as_str());
+            current = parent;
+        }
+        chain
+    }
+}
+
+/// The chain a sealed field's key is filed under: the subject and the sibling holding its
+/// id, then each ancestor the same way.
+///
+/// An ancestor with no field of its type on this event is dropped rather than guessed at.
+/// heklang's `check_ancestry` refuses exactly that at the declaration, and hekla refuses
+/// it again at load (`crate::validate`), so a short chain here is a project that never
+/// loads rather than a write that silently files a key one level up.
+fn seal_chain(
+    def: &ir::EventDef,
+    subject: &str,
+    id_field: &str,
+    subjects: &Subjects,
+) -> Vec<(String, String)> {
+    let mut chain = vec![(subject.to_owned(), id_field.to_owned())];
+    for ancestor in subjects.ancestors(subject) {
+        // Exactly one field of the ancestor's type, and an optional one does not count.
+        // Two would mean picking one, and nothing an author wrote says which: the seal
+        // annotation disambiguates its *own* subject by naming a sibling, and an ancestor
+        // gets no such syntax. Choosing the first declared would make which shop a
+        // customer's key hangs from depend on field order, so the chain stops short
+        // instead and `crate::validate` refuses the project.
+        let mut carriers = def
+            .fields
+            .iter()
+            .filter(|field| matches!(&field.ty, Type::Subject(sub) if sub.name == ancestor));
+        let (Some(field), None) = (carriers.next(), carriers.next()) else {
+            break;
+        };
+        chain.push((ancestor.to_owned(), field.name.clone()));
+    }
+    chain
+}
+
 impl EventDef {
     /// One declared event, as the runtime stores and tags it.
-    pub fn of(def: &ir::EventDef, defs: Defs<'_>) -> EventDef {
+    pub fn of(def: &ir::EventDef, defs: Defs<'_>, subjects: &Subjects) -> EventDef {
         EventDef {
             event_type: event_type(&def.path),
             fields: def
                 .fields
                 .iter()
                 .map(|field| {
+                    // The subject off the type and the id field off the annotation, which
+                    // is where heklang keeps the two. `@subject(buyer)` stores `buyer` on
+                    // the declaration and resolves `buyer`'s type to `Customer`, so a
+                    // field sealed under `from` and one sealed under `to` are two keys
+                    // even though both read `Customer`.
+                    let sealed_under = field.ty.subject().map(|subject| {
+                        let id_field = field.subject.clone().unwrap_or_else(|| subject.clone());
+                        Seal {
+                            chain: seal_chain(def, subject, &id_field, subjects),
+                        }
+                    });
                     (
                         field.name.clone(),
                         FieldMeta {
                             kind: bounded(FieldKind::of(&field.ty, defs), field.max_len),
                             indexed: field.indexed,
-                            subject: field.subject.clone(),
+                            sealed_under,
+                            identifies: identified_subject(&field.ty).map(str::to_owned),
                         },
                     )
                 })
@@ -637,10 +827,11 @@ impl EventDef {
     /// Every event a program declares.
     pub fn all(program: &Program) -> Vec<EventDef> {
         let defs = Defs::of(program);
+        let subjects = Subjects::of(program);
         program
             .events
             .iter()
-            .map(|def| EventDef::of(def, defs))
+            .map(|def| EventDef::of(def, defs, &subjects))
             .collect()
     }
 }
@@ -651,8 +842,24 @@ impl EntityDef {
     /// The subject is read off the column rather than off an annotation:
     /// `docs/projectors.md` rule 9 propagates a seal onto whichever column receives
     /// sealed content, so heklang has already worked out whose key a column needs.
+    ///
+    /// The id column is *found* rather than declared, which is the one place an entity
+    /// differs from an event. An event field carries `@subject(buyer)` and so names its
+    /// sibling outright; a column's seal arrived by propagation and names only the
+    /// subject, so the column holding that subject's ids is whichever one has its type.
+    /// [`EntityDef::validate`] refuses an entity where there is none.
     pub fn of(def: &ir::EntityDef, defs: Defs<'_>) -> EntityDef {
         let key = def.key_field().name.clone();
+        // The fallback is a column name that does not resolve, on purpose:
+        // [`EntityDef::validate`] refuses the entity before anything reads it, and it does
+        // so by *type*, so this never has to be a name nothing could collide with.
+        let id_column = |subject: &str| {
+            def.fields
+                .iter()
+                .find(|field| identified_subject(&field.ty) == Some(subject))
+                .map(|field| field.name.clone())
+                .unwrap_or_else(|| subject.to_owned())
+        };
         EntityDef {
             name: def.name.clone(),
             fields: def
@@ -666,12 +873,19 @@ impl EntityDef {
                             .indexes
                             .iter()
                             .any(|index| index.fields.contains(&field.name));
+                    // One entry, never a chain: a projector writes through
+                    // `encrypt_subject_existing` and so never mints a key, which is the
+                    // only thing an ancestor id would be needed for.
+                    let sealed_under = field.ty.subject().map(|subject| Seal {
+                        chain: vec![(subject.clone(), id_column(subject))],
+                    });
                     (
                         field.name.clone(),
                         FieldMeta {
                             kind: bounded(FieldKind::of(&field.ty, defs), field.max_len),
                             indexed,
-                            subject: field.subject.clone(),
+                            sealed_under,
+                            identifies: identified_subject(&field.ty).map(str::to_owned),
                         },
                     )
                 })

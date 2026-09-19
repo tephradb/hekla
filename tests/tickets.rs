@@ -367,15 +367,10 @@ fn a_field_younger_than_a_seal_reads_as_its_absent_literal_on_both_copies() {
             "filed_at": 1_700_000_000_000_000i64,
         });
         let seals = [
-            (
-                "contacted_at",
-                "owner_id",
-                "10",
-                "1700040000000000".to_owned(),
-            ),
-            ("reporter", "owner_id", "10", older.to_string()),
-            ("watchers", "org_id", "1", watchers().to_string()),
-            ("labels", "org_id", "1", labels().to_string()),
+            ("contacted_at", "Owner", "10", "1700040000000000".to_owned()),
+            ("reporter", "Owner", "10", older.to_string()),
+            ("watchers", "Org", "1", watchers().to_string()),
+            ("labels", "Org", "1", labels().to_string()),
         ];
         for (name, subject, id, text) in seals {
             let content = keystore.encrypt_subject(subject, id, name, &text).unwrap();
@@ -466,7 +461,7 @@ async fn a_seal_that_is_not_the_document_it_promises_wedges_rather_than_skipping
         // Sealed under the field name and the subject the declaration says, so it
         // decrypts: the fault is what comes out, not whether anything does.
         let content = keystore
-            .encrypt_subject("owner_id", "10", "reporter", "Ada Lovelace")
+            .encrypt_subject("Owner", "10", "reporter", "Ada Lovelace")
             .unwrap();
         // Every sealed field arrives here as text, because a seeded event is read at its
         // stored shape and a stored seal is a host's ciphertext. `contact` and `budget`
@@ -482,7 +477,7 @@ async fn a_seal_that_is_not_the_document_it_promises_wedges_rather_than_skipping
             "reporter".to_owned(),
             heklang::Value::Sealed {
                 field: "reporter".to_owned(),
-                subject: "owner_id".to_owned(),
+                subject: "Owner".to_owned(),
                 id: "10".to_owned(),
                 content: content.into(),
             },
@@ -636,12 +631,7 @@ fn each_subject_is_erased_without_touching_the_other() {
     let position = position.max(open(&harness, BOB, 1, 11, Some("bob@example.com")));
     quiesce(&harness);
 
-    harness
-        .rt
-        .keystore()
-        .unwrap()
-        .erase("owner_id", "10")
-        .unwrap();
+    harness.rt.keystore().unwrap().erase("Owner", "10").unwrap();
 
     let row = read_row(&harness, "Tickets", "Ticket", ALICE, position).expect("the row remains");
     absent(&row, "contact");
@@ -675,7 +665,7 @@ fn each_subject_is_erased_without_touching_the_other() {
     );
 
     // The other direction.
-    harness.rt.keystore().unwrap().erase("org_id", "1").unwrap();
+    harness.rt.keystore().unwrap().erase("Org", "1").unwrap();
     let row = read_row(&harness, "Tickets", "Ticket", ALICE, position).unwrap();
     absent(&row, "budget");
     absent(&row, "watchers");
@@ -862,12 +852,7 @@ fn a_subject_written_to_after_an_erasure_gets_a_new_key_and_keeps_the_old_data_s
     let position = open(&harness, ALICE, 1, 10, Some("ada@example.com"));
     support::wait_position(&harness.rt, "Tickets", position);
 
-    harness
-        .rt
-        .keystore()
-        .unwrap()
-        .erase("owner_id", "10")
-        .unwrap();
+    harness.rt.keystore().unwrap().erase("Owner", "10").unwrap();
 
     // The same owner opens another ticket, which seals a fresh address under a key
     // minted on the spot.

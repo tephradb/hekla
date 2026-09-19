@@ -242,16 +242,17 @@ impl<'a> Renderer<'a> {
             return Ok(subjects);
         };
         for (name, meta) in &def.fields {
-            let Some(subject_field) = &meta.subject else {
+            let Some(seal) = &meta.sealed_under else {
                 continue;
             };
             let Some(ciphertext) = obj.get(name).and_then(Value::as_str).map(str::to_owned) else {
                 continue; // absent or null in the stored payload
             };
-            let subject_value = obj.get(subject_field).and_then(scalar_to_string);
+            let subject = seal.subject();
+            let subject_value = obj.get(seal.id_field()).and_then(scalar_to_string);
             let state = match (&self.decryptor, &subject_value) {
                 (Some(decryptor), Some(subject_value)) => {
-                    match decryptor.decrypt(subject_field, subject_value, name, &ciphertext) {
+                    match decryptor.decrypt(subject, subject_value, name, &ciphertext) {
                         Ok(Some(text)) => {
                             // The payload decoder, not the column one: this seal was made by
                             // `stored_seal` out of the wire form, so a `Timestamp` in it is
@@ -265,7 +266,7 @@ impl<'a> Renderer<'a> {
                         // operator that data was irreversibly shredded when it may not
                         // have been. The decryptor just cached the answer, so separating
                         // them costs no further lookup.
-                        Ok(None) => match decryptor.key_present(subject_field, subject_value) {
+                        Ok(None) => match decryptor.key_present(subject, subject_value) {
                             // The key is gone. Irreversible, by design.
                             Some(false) | None => "erased",
                             // The key is live, but this value was written under a
@@ -284,7 +285,7 @@ impl<'a> Renderer<'a> {
                         Err(err) => {
                             tracing::warn!(
                                 "introspection could not obtain the key for `{name}` \
-                                 (subject {subject_field} = {subject_value}): {err:#}"
+                                 (subject {subject} = {subject_value}): {err:#}"
                             );
                             "unreadable"
                         }
@@ -297,7 +298,7 @@ impl<'a> Renderer<'a> {
             subjects.insert(
                 name.clone(),
                 json!({
-                    "subject": subject_field,
+                    "subject": subject,
                     "subject_value": subject_value,
                     "state": state,
                 }),
@@ -571,7 +572,8 @@ fn field(name: &str, meta: &FieldMeta) -> Value {
         "kind": meta.kind.describe(),
         "optional": meta.kind.is_nullable(),
         "indexed": meta.indexed,
-        "subject": meta.subject,
+        "subject": meta.subject(),
+        "identifies": meta.identifies,
     })
 }
 
@@ -672,9 +674,17 @@ pub fn declaration(row: &DeclarationRow) -> Value {
 /// One live subject key, without any key material.
 pub fn subject(info: &SubjectInfo) -> Value {
     json!({
-        "subject_field": info.subject_field,
+        "subject": info.subject,
         "subject_value": info.subject_value,
+        // Exactly one of these is set, which the table's `CHECK` enforces: a root is
+        // wrapped under a master and a child under its parent's key. Reported as two
+        // nullable fields rather than a tagged union, because a reader wants to ask
+        // "what is beneath this tenant" without learning a discriminator first.
         "master_key_id": info.master_key_id,
+        "parent": info.parent.as_ref().map(|(subject, value)| json!({
+            "subject": subject,
+            "subject_value": value,
+        })),
         "created_at": info.created_at,
     })
 }

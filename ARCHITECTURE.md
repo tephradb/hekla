@@ -118,9 +118,11 @@ old failure where a field forgotten from the tag list was unqueryable forever (a
 missed all prior events).
 
 ```
+subject Customer(Int)
+
 event @order.placed {
   order_id: Uuid,
-  customer_id: Int,
+  customer_id: Customer,
   email: String? @subject(customer_id) @max(200),
   // Free text nobody queries: opt out of tagging, and of being a huge tag.
   notes: String @max(2000) @no_index,
@@ -290,7 +292,7 @@ only writer.
 ```
 refusal TooManyOpen "too many open orders"
 
-command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?, total: Money(2)) {
+command PlaceOrder(order_id: Uuid, customer_id: Customer, email: String?, total: Money(2)) {
   fold open_orders: Int = 0
     on @order.placed(customer_id) => open_orders + 1
     on @order.cancelled(customer_id) => open_orders - 1
@@ -426,7 +428,7 @@ second list beside them to keep in step.
 projector CustomerOrders {
   entity Order {
     order_id: Uuid @key,
-    customer_id: Int @index,
+    customer_id: Customer @index,
     email: String? @max(200),
   }
 
@@ -1141,18 +1143,75 @@ really encrypts. The language never sees a ciphertext and the store never sees a
 
 ## 15. Subject-scoped encryption and erasure
 
-A field marked `@subject(sibling_field)` is encrypted under a key scoped to that subject's identity
-`(subject_field, subject_value)`, in the tag index, the event payload, and any read-model column, all
-before it reaches tephra. **Erasing a subject is deleting its key**, one O(1) operation that makes
-every value scoped to it unmatchable and unreadable across the log and every read model at once, with
-no rewrite, compaction, or index rebuild.
+A field marked `@subject(buyer)` is encrypted under a key scoped to the identity
+`(subject, subject_value)`, in the tag index, the event payload, and any read-model column, all
+before it reaches tephra.
 
-**Two ways to erase**, the same key delete either way. `hekla erase <field> <value>` is the operator
-path, for a one-off request handled by hand. `erase(customer_id)` is the effect statement, for
-erasure driven by an event: a provider webhook, a retention deadline, an `account.closed` your own
-command emitted. It recovers the subject from the value, which must be a field of the triggering
-event and may not itself be sealed; `erase(subject, value)` names the subject explicitly where the
-inference does not apply. It is journaled like every other side effect, so a replay skips it.
+**A subject is a declared type whose values are its ids.** `subject Customer(Int)` names the
+namespace; `buyer: Customer` says which keys `@subject(buyer)` files under. Two facts kept apart: the
+annotation names a **sibling field**, which is where the id is read from and is local to one
+declaration, and that field's **type** is the namespace every key row is filed under. It used to be
+one string, because a subject *was* a field name, resolved by scanning every event for a field so
+spelled. That made `owner_id` on two unrelated events one key row and `customer_id` against `cust_id`
+two different people, with nothing saying either, and it is why `erase` could destroy the wrong
+namespace.
+
+**Erasing a subject is deleting its key**, one O(1) operation that makes every value scoped to it
+unmatchable and unreadable across the log and every read model at once, with no rewrite, compaction,
+or index rebuild.
+
+**Two ways to erase**, the same key delete either way. `hekla erase <Subject> <id>` is the operator
+path, for a one-off request handled by hand, and it names the subject by its declared name because
+that is what a key row is filed under. `erase(buyer)` is the effect statement, for erasure driven by
+an event: a provider webhook, a retention deadline, an `account.closed` your own command emitted. It
+takes one argument, because the value's type is the namespace: `erase(e.shop)` destroys the shop's
+key and could not destroy the customer's by accident. It is journaled like every other side effect,
+so a replay skips it.
+
+**A subject may declare a parent, and then a tenant deletes with it.** `subject Customer(Int) under
+Shop` wraps every customer key under a key derived from its shop's secret, so deleting the shop's row
+makes them all underivable at once. One row delete, one journal row, and no projector whose only
+purpose is enumerating a shop's customers so they can be erased one at a time. That enumeration is
+what the feature removes: `erase` is journaled per call by design, so a 50,000-customer shop wrote
+50,000 rows in one invocation before this.
+
+The obligations that come with it, in the order they bite:
+
+- **Every event sealing under a child carries its ancestors' ids.** Minting customer 88's key wraps it
+  inside shop 7's at that moment, and the only place the runtime can learn "7" is the event in front
+  of it. heklang refuses the declaration at the annotation's span; hekla refuses the deployment at
+  load. Two copies of one check, and each catches what the other cannot reach: an author editing a
+  file, and a directory that never went through `hek check`.
+- **A rotation walks roots only.** A child's wrapping key derives from its parent's secret, and a
+  rotation rewraps that secret under a new master without changing it, so children stay correctly
+  wrapped without being touched. The hierarchy makes rotation cheaper.
+- **Unreachable is the guarantee; reclaiming is separate.** The child rows survive their parent's
+  deletion, holding bytes nobody can open. The hourly sweep reclaims them in bounded chunks,
+  repeating until a pass finds nothing so that a grandchild is reached once its parent has gone. This
+  is deliberately lazy: doing it inside the erase would make a tenant delete O(its customers) again,
+  which is the cost the hierarchy exists to remove.
+- **An unreachable row reads as absent and is replaced.** A child that outlives its parent's erasure
+  can never be opened, so writing that subject again mints a fresh key over the row rather than
+  failing. Safe precisely because the runtime can tell "an ancestor is gone" (`Ok(None)`, permanent)
+  from "a master is missing" (`Err`, a misconfiguration): only the first replaces anything. Each row
+  also records which *generation* of its parent it was wrapped under, so a parent erased and
+  recreated reads as a shred while a wrapping that fails against the live generation reads as
+  tampering. Without that the two are the same bytes, and picking either answer is wrong for the
+  other.
+- **`hekla erase` prompts.** Its no-prompt rationale was that an erase carried its blast radius in its
+  own arguments, because you named the subject. A subject with children makes that false, so the
+  asymmetry with `rewind` went when the reason for it did.
+
+**What a parent gives up, said plainly.** Section 15 sells per-field subjects on exactly the opposite
+property: an `order.placed` has both a customer and a shop, so scoping the whole event to one would
+destroy the other's record. Under a parent, erasing the shop does reach the customer's fields, on
+purpose, and there is no way to have both for one pair of subjects.
+
+**What nothing can check.** The parent relation is asserted per event. If one event says customer 88
+is in shop 7 and another says shop 9, the key was minted once under whichever arrived first; deleting
+shop 9 leaves customer 88 readable, and deleting shop 7 destroys data the author believes is shop
+9's. Both events are individually well formed, so there is nothing to point at. It is worth saying
+out loud beside a feature whose whole job is irreversible destruction.
 
 **`erase` returns nothing.** hekla's used to return whether a key was really deleted, and an author
 reading that was branching on whether someone else got there first: a race that is always already

@@ -195,7 +195,7 @@ fn an_erasure_racing_an_effect_either_delivers_the_plaintext_or_skips() {
             .rt
             .keystore()
             .unwrap()
-            .erase("owner_id", &owner.to_string())
+            .erase("Owner", &owner.to_string())
             .unwrap();
 
         quiesce(&harness);

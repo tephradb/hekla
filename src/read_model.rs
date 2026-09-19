@@ -567,7 +567,7 @@ fn to_sql(meta: &FieldMeta, value: &serde_json::Value) -> anyhow::Result<SqlValu
     if value.is_null() {
         return Ok(SqlValue::Null);
     }
-    if meta.subject.is_some() {
+    if meta.sealed_under.is_some() {
         return Ok(SqlValue::Text(
             value
                 .as_str()
@@ -635,7 +635,7 @@ fn text(value: &str) -> SqlValue {
 /// layer decrypts it (and re-types it to the underlying kind) on the way out.
 fn from_sql(meta: &FieldMeta, value: ValueRef) -> anyhow::Result<serde_json::Value> {
     use serde_json::Value as J;
-    if meta.subject.is_some() {
+    if meta.sealed_under.is_some() {
         return Ok(match value {
             ValueRef::Null => J::Null,
             ValueRef::Text(bytes) => J::String(
@@ -1514,7 +1514,10 @@ mod tests {
             let meta = FieldMeta {
                 kind: propgen::kind_of(&ty),
                 indexed: false,
-                subject: Some("owner".to_owned()),
+                sealed_under: Some(crate::schema::Seal {
+                    chain: vec![("Owner".to_owned(), "owner_id".to_owned())],
+                }),
+                identifies: None,
             };
             let stored = serde_json::Value::String(ciphertext);
             let bound = to_sql(&meta, &stored).unwrap();

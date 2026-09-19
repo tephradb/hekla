@@ -14,8 +14,8 @@ refusal SoldOut "this shop's launch allocation is gone"
 
 command PlaceOrder(
   order_id: Uuid,
-  customer_id: Int,
-  shop_id: Int,
+  customer_id: Customer,
+  shop_id: Shop,
   email: String?,
   shipping_address: String?,
   order_total: Money(2),

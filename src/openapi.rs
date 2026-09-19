@@ -331,7 +331,8 @@ const FIXED_SCHEMAS: [&str; 29] = [
 /// A `const`, a `refusal` and a `guard` are absent for a different reason: heklang
 /// inlines all three before a program exists, so their content is already inside every
 /// declaration that names them and they have no entry to record.
-const DECLARATION_KINDS: [&str; 7] = [
+const DECLARATION_KINDS: [&str; 8] = [
+    "subject",
     "event",
     "enum",
     "record",
@@ -1861,10 +1862,10 @@ fn subjects_path() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "subject_field": { "type": "string" },
+                        "subject": { "type": "string" },
                         "live_keys": { "type": "integer", "minimum": 0, "format": "int64" },
                     },
-                    "required": ["subject_field", "live_keys"],
+                    "required": ["subject", "live_keys"],
                     "additionalProperties": false,
                 },
             },
@@ -1872,10 +1873,10 @@ fn subjects_path() -> Value {
             "next": {
                 "type": ["object", "null"],
                 "properties": {
-                    "after_field": { "type": "string" },
+                    "after_subject": { "type": "string" },
                     "after_value": { "type": "string" },
                 },
-                "required": ["after_field", "after_value"],
+                "required": ["after_subject", "after_value"],
                 "additionalProperties": false,
                 "description": "Pass both back as query parameters for the next page.",
             },
@@ -1893,7 +1894,7 @@ fn subjects_path() -> Value {
                 row, so on disk the two are one state. The reserved global uniqueness secret is \
                 excluded, since it is not a subject and cannot be erased.",
             "parameters": [
-                query_param("after_field", "The previous page's `next.after_field`.", json!({ "type": "string" })),
+                query_param("after_subject", "The previous page's `next.after_subject`.", json!({ "type": "string" })),
                 query_param("after_value", "The previous page's `next.after_value`.", json!({ "type": "string" })),
                 admin_limit_param("subjects"),
             ],
@@ -1910,7 +1911,7 @@ fn subject_path() -> Value {
     let body = json!({
         "type": "object",
         "properties": {
-            "subject_field": { "type": "string" },
+            "subject": { "type": "string" },
             "subject_value": { "type": "string" },
             "state": {
                 "type": "string",
@@ -1920,7 +1921,7 @@ fn subject_path() -> Value {
                     deletes the row.",
             },
         },
-        "required": ["subject_field", "subject_value", "state"],
+        "required": ["subject", "subject_value", "state"],
         "additionalProperties": false,
     });
     json!({
@@ -1929,7 +1930,7 @@ fn subject_path() -> Value {
             "operationId": "get_subject",
             "summary": "whether one subject still has a key",
             "parameters": [
-                path_param("field", "The subject field, e.g. `customer_id`.", json!({ "type": "string" })),
+                path_param("subject", "The subject's declared name, e.g. `Customer`.", json!({ "type": "string" })),
                 path_param("value", "The subject id value.", json!({ "type": "string" })),
             ],
             "responses": {
@@ -2632,15 +2633,18 @@ fn event_schema(event_type: &str, def: &EventDef) -> Value {
 /// `x-hekla-*` so a generator can read it without parsing English.
 fn annotated_event_field(meta: &FieldMeta) -> Value {
     let mut extensions = vec![("x-hekla-indexed", Value::Bool(meta.indexed))];
-    if let Some(subject) = &meta.subject {
-        extensions.push(("x-hekla-subject", Value::String(subject.clone())));
+    if let Some(subject) = meta.subject() {
+        extensions.push(("x-hekla-subject", Value::String(subject.to_owned())));
+    }
+    if let Some(subject) = &meta.identifies {
+        extensions.push(("x-hekla-identifies", Value::String(subject.clone())));
     }
     annotated(&meta.kind, event_field_notes(meta), extensions)
 }
 
 fn event_field_notes(meta: &FieldMeta) -> Vec<String> {
     let mut notes = Vec::new();
-    if let Some(subject) = &meta.subject {
+    if let Some(subject) = meta.subject() {
         notes.push(format!(
             "Encrypted under the subject `{subject}`: stored as ciphertext, and readable \
              only through `reveal()` in an effect. Erasing that subject makes it \
@@ -2666,7 +2670,7 @@ fn entity_schema(projector: &ProjectorSurface, entity: &EntityDef) -> Value {
         // A NULL column is omitted from a row, and a subject column whose key was erased
         // (or that will not decrypt under the current key) is removed rather than nulled,
         // so neither can be required.
-        if !meta.kind.is_nullable() && meta.subject.is_none() {
+        if !meta.kind.is_nullable() && meta.sealed_under.is_none() {
             required.push(Value::String(name.clone()));
         }
     }
@@ -2706,8 +2710,11 @@ fn annotated_entity_field(entity: &EntityDef, name: &str, meta: &FieldMeta) -> V
     if name == entity.key {
         extensions.push(("x-hekla-is-key", Value::Bool(true)));
     }
-    if let Some(subject) = &meta.subject {
-        extensions.push(("x-hekla-subject", Value::String(subject.clone())));
+    if let Some(subject) = meta.subject() {
+        extensions.push(("x-hekla-subject", Value::String(subject.to_owned())));
+    }
+    if let Some(subject) = &meta.identifies {
+        extensions.push(("x-hekla-identifies", Value::String(subject.clone())));
     }
     annotated(
         &meta.kind,
@@ -2737,7 +2744,7 @@ fn entity_field_notes(
                 .to_owned(),
         );
     }
-    if let Some(subject) = &meta.subject {
+    if let Some(subject) = meta.subject() {
         notes.push(format!(
             "Encrypted under the subject `{subject}`, and decrypted on read. Absent from \
              the row when that subject's key has been erased or the value will not \
@@ -3548,14 +3555,27 @@ fn secret_entry_schema() -> Value {
 fn subject_entry_schema() -> Value {
     json!({
         "type": "object",
-        "description": "One live subject key, without any key material.",
+        "description": "One subject key row, without any key material. Exactly one of \
+                        `master_key_id` and `parent` is set: a root is wrapped under a \
+                        master, a child under its parent's key. Deleting a parent's row \
+                        makes every row beneath it permanently unreadable, so a row listed \
+                        here is not necessarily a readable one.",
         "properties": {
-            "subject_field": { "type": "string" },
+            "subject": { "type": "string" },
             "subject_value": { "type": "string" },
-            "master_key_id": { "type": "string" },
+            "master_key_id": { "type": ["string", "null"] },
+            "parent": {
+                "type": ["object", "null"],
+                "properties": {
+                    "subject": { "type": "string" },
+                    "subject_value": { "type": "string" },
+                },
+                "required": ["subject", "subject_value"],
+                "additionalProperties": false,
+            },
             "created_at": { "type": "string" },
         },
-        "required": ["subject_field", "subject_value", "master_key_id", "created_at"],
+        "required": ["subject", "subject_value", "master_key_id", "parent", "created_at"],
         "additionalProperties": false,
     })
 }
@@ -3690,7 +3710,10 @@ mod tests {
         FieldMeta {
             kind,
             indexed: true,
-            subject: Some(subject.to_owned()),
+            sealed_under: Some(crate::schema::Seal {
+                chain: vec![(subject.to_owned(), format!("{}_id", subject.to_lowercase()))],
+            }),
+            identifies: None,
         }
     }
 
@@ -4399,6 +4422,7 @@ mod tests {
         // hold. `Test` is the one kind deliberately left out: `Digest::entries` holds
         // tests back, so a declaration row can never carry it.
         let expected: Vec<&str> = [
+            Kind::Subject,
             Kind::Event,
             Kind::Enum,
             Kind::Record,

@@ -455,12 +455,12 @@ pub fn select<'a>(
 }
 
 /// The first sealed column this projector declares, and the sibling naming its key.
-fn sealed_column(entities: &[EntityDef]) -> Option<(&String, &String)> {
+fn sealed_column(entities: &[EntityDef]) -> Option<(&String, &str)> {
     entities.iter().find_map(|entity| {
         entity
             .fields
             .iter()
-            .find_map(|(name, meta)| meta.subject.as_ref().map(|subject| (name, subject)))
+            .find_map(|(name, meta)| meta.subject().map(|subject| (name, subject)))
     })
 }
 
@@ -554,7 +554,7 @@ fn read_entity(
     let sealed: Vec<(String, String)> = entity
         .fields
         .iter()
-        .filter_map(|(name, meta)| meta.subject.as_ref().map(|s| (name.clone(), s.clone())))
+        .filter_map(|(name, meta)| meta.subject().map(|s| (name.clone(), s.to_owned())))
         .collect();
 
     let mut revealed = read_api::Revealed::default();

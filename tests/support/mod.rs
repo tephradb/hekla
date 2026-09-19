@@ -274,9 +274,11 @@ pub fn drop_op_db(data_dir: &Path) {
 
 /// `order.placed` carries a customer-scoped `email`, the canonical subject field.
 pub const ORDER_EVENTS: &str = r#"
+subject Customer(Int)
+
 event @order.placed {
   order_id: Uuid,
-  customer_id: Int,
+  customer_id: Customer,
   // Optional because an erased subject's column reads back absent, and a type that
   // cannot be absent could not say so.
   email: String? @subject(customer_id) @max(100),
@@ -285,7 +287,7 @@ event @order.placed {
 
 /// The command that emits [`ORDER_EVENTS`]'s `@order.placed`.
 pub const PLACE_ORDER: &str = r#"
-command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?) {
+command PlaceOrder(order_id: Uuid, customer_id: Customer, email: String?) {
   emit @order.placed { order_id, customer_id, email }
 }
 "#;
@@ -295,7 +297,7 @@ pub const ORDERS_PROJECTOR: &str = r#"
 projector Orders {
   entity Order {
     order_id: Uuid @key,
-    customer_id: Int @index,
+    customer_id: Customer @index,
     email: String? @max(100),
   }
 
@@ -355,8 +357,10 @@ pub fn place_order(rt: &Runtime, order_id: &str, customer_id: u64, email: &str) 
 /// stays is a plaintext handle beside the sealed address, which is what a program can
 /// actually fold on.
 pub const ACCOUNT_EVENTS: &str = r#"
+subject Account(Uuid)
+
 event @account.registered {
-  account_id: Uuid,
+  account_id: Account,
   handle: String @max(100),
   email: String? @subject(account_id) @max(100),
 }
@@ -366,7 +370,7 @@ event @account.registered {
 pub const REGISTER_ACCOUNT: &str = r#"
 refusal HandleTaken "that handle is already registered"
 
-command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
+command RegisterAccount(account_id: Account, handle: String, email: String?) {
   fold taken: Bool = false
     on @account.registered(handle) => true
 

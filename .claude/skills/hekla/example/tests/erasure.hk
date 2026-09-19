@@ -15,7 +15,7 @@ test "erasing the guest takes their column and leaves the booking" {
     rate: 120.00,
     notes: "",
   }
-  erased guest_id "7"
+  erased Guest "7"
   project Bookings
   expect Booking["11111111-1111-1111-1111-111111111111"] {
     room_id: 12,
@@ -43,7 +43,7 @@ test "erasing one guest leaves another's booking readable" {
     rate: 130.00,
     notes: "",
   }
-  erased guest_id "7"
+  erased Guest "7"
   project Bookings
   expect Booking["11111111-1111-1111-1111-111111111111"] { email: none }
   expect Booking["22222222-2222-2222-2222-222222222222"] { email: "bo@example.com" }

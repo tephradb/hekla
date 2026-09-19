@@ -10,8 +10,8 @@
 event @order.placed {
   order_id: Uuid,
   // Subject ids stay plaintext: they are how the runtime finds the key.
-  customer_id: Int,
-  shop_id: Int,
+  customer_id: Customer,
+  shop_id: Shop,
   // Personal, scoped to the customer.
   email: String? @subject(customer_id) @max(200),
   shipping_address: String? @subject(customer_id) @max(200),

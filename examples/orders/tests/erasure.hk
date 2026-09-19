@@ -33,7 +33,7 @@ test "erasing the customer takes their columns and leaves the order" {
     order_total: 25.99,
     notes: "",
   }
-  erased customer_id "7"
+  erased Customer "7"
   project CustomerOrders
   expect Order["22222222-2222-2222-2222-222222222222"] {
     customer_id: 7,
@@ -63,7 +63,7 @@ test "erasing one customer leaves another's order alone" {
     order_total: 10.00,
     notes: "",
   }
-  erased customer_id "7"
+  erased Customer "7"
   project CustomerOrders
   expect Order["44444444-4444-4444-4444-444444444444"] {
     email: "bob@example.com",

@@ -360,9 +360,11 @@ fn an_index_over_a_sealed_column_is_an_error() {
             (
                 "events/thing.hk",
                 r#"
+subject Owner(Int)
+
 event @thing.happened {
   thing_id: Uuid,
-  owner: Int,
+  owner: Owner,
   secret: String? @subject(owner) @max(50),
 }
 "#,
@@ -373,7 +375,7 @@ event @thing.happened {
 projector Things {
   entity Thing {
     thing_id: Uuid @key,
-    owner: Int,
+    owner: Owner,
     // Receives sealed content, so rule 9 propagates the seal onto the column and
     // the index below covers ciphertext.
     secret: String? @max(50),
@@ -534,12 +536,12 @@ fn a_non_optional_sealed_column_is_an_error() {
         &[
             (
                 "events/order.hk",
-                "event @order.placed { order_id: Uuid, customer_id: Int, \
+                "subject Customer(Int)\n\nevent @order.placed { order_id: Uuid, customer_id: Customer, \
                  email: String @subject(customer_id) @max(100) }\n",
             ),
             (
                 "commands/place-order.hk",
-                "command PlaceOrder(order_id: Uuid, customer_id: Int, email: String) \
+                "command PlaceOrder(order_id: Uuid, customer_id: Customer, email: String) \
                  { emit @order.placed { order_id, customer_id, email } }\n",
             ),
             (
@@ -548,7 +550,7 @@ fn a_non_optional_sealed_column_is_an_error() {
 projector Orders {
   entity Order {
     order_id: Uuid @key,
-    customer_id: Int @index,
+    customer_id: Customer @index,
     email: String @max(100),
   }
 
@@ -571,12 +573,12 @@ fn an_optional_sealed_column_is_accepted() {
     assert_clean(&[
         (
             "events/order.hk",
-            "event @order.placed { order_id: Uuid, customer_id: Int, \
+            "subject Customer(Int)\n\nevent @order.placed { order_id: Uuid, customer_id: Customer, \
              email: String? @subject(customer_id) @max(100) }\n",
         ),
         (
             "commands/place-order.hk",
-            "command PlaceOrder(order_id: Uuid, customer_id: Int, email: String?) \
+            "command PlaceOrder(order_id: Uuid, customer_id: Customer, email: String?) \
              { emit @order.placed { order_id, customer_id, email } }\n",
         ),
         (
@@ -585,7 +587,7 @@ fn an_optional_sealed_column_is_accepted() {
 projector Orders {
   entity Order {
     order_id: Uuid @key,
-    customer_id: Int @index,
+    customer_id: Customer @index,
     email: String? @max(100),
   }
 
@@ -766,8 +768,10 @@ fn failed() -> String {
 }
 
 const ACCOUNT_EVENTS: &str = r#"
+subject Account(Uuid)
+
 event @account.registered {
-  account_id: Uuid,
+  account_id: Account,
   handle: String @max(100),
   email: String? @subject(account_id) @max(100),
 }
@@ -776,7 +780,7 @@ event @account.registered {
 const REGISTER_ACCOUNT: &str = r#"
 refusal HandleTaken "that handle is already registered"
 
-command RegisterAccount(account_id: Uuid, handle: String, email: String?) {
+command RegisterAccount(account_id: Account, handle: String, email: String?) {
   fold taken: Bool = false
     on @account.registered(handle) => true
 
@@ -857,9 +861,11 @@ test "the wrong handle" {
 }
 
 const THING_EVENTS: &str = r#"
+subject Owner(Int)
+
 event @thing.happened {
   thing_id: Uuid,
-  owner: Int,
+  owner: Owner,
   secret: String? @subject(owner) @max(50),
 }
 "#;
@@ -868,7 +874,7 @@ const THING_PROJECTOR: &str = r#"
 projector Things {
   entity Thing {
     thing_id: Uuid @key,
-    owner: Int @index,
+    owner: Owner @index,
     secret: String? @max(50),
   }
 
@@ -909,7 +915,7 @@ test "an erased subject's column reads back absent" {
     owner: 7,
     secret: "hunter2",
   }
-  erased owner "7"
+  erased Owner "7"
   project Things
   expect Thing["22222222-2222-2222-2222-222222222222"] {
     owner: 7,
@@ -1102,7 +1108,7 @@ test "shreds the owner" {
     secret: "hunter2",
   }
   deliver Shred
-  expect erase(owner, "7")
+  expect erase(Owner, "7")
 }
 "#,
             ),
@@ -1125,7 +1131,7 @@ test "an erased owner skips rather than sending plaintext" {
     owner: 7,
     secret: "hunter2",
   }
-  erased owner "7"
+  erased Owner "7"
   respond "https://relay.test/first" 200
   deliver Relay
   // The first call is made and journaled; the `reveal` behind the second is what

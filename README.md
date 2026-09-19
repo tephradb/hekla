@@ -24,10 +24,13 @@ which expressed the same model as WASM component modules.
 
 ```hek
 // events/order.hk
+subject Customer(Int)
+subject Shop(Int)
+
 event @order.placed {
   order_id: Uuid,
-  customer_id: Int,
-  shop_id: Int,
+  customer_id: Customer,
+  shop_id: Shop,
   // Encrypted under a key scoped to the customer, so erasing them is one key delete.
   // Optional because an erased column reads back absent, and a type that cannot be
   // absent could not say so.
@@ -37,7 +40,7 @@ event @order.placed {
 // commands/place-order.hk
 refusal SoldOut "this shop's launch allocation is gone"
 
-command PlaceOrder(order_id: Uuid, customer_id: Int, shop_id: Int, email: String?) {
+command PlaceOrder(order_id: Uuid, customer_id: Customer, shop_id: Shop, email: String?) {
   // `fold` is a read declaration, not a binding: it names a slice of the log, folds
   // it, and that slice is what the append conditions on. What you folded is what you
   // conflict on, so a concurrent write inside it loses rather than races.
@@ -204,7 +207,7 @@ deploying anything or waiting for a rebuild.
 ```sh
 cat > /tmp/by-customer.hk <<'EOF'
 projector ByCustomer {
-  entity PerCustomer { customer_id: Int @key, orders: Int }
+  entity PerCustomer { customer_id: Customer @key, orders: Int }
   on @order.placed { customer_id } { patch PerCustomer[customer_id] { orders: .orders + 1 } }
 }
 EOF

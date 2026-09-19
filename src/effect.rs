@@ -2103,7 +2103,54 @@ fn run_sweep(runtime: &Runtime, effect_days: u32) -> anyhow::Result<()> {
     while runtime.sweep_effect_journal(&effect_cutoff, SWEEP_CHUNK)? == SWEEP_CHUNK {
         thread::sleep(SWEEP_CHUNK_PAUSE);
     }
-    Ok(())
+    sweep_orphan_keys(runtime)
+}
+
+/// Run the orphan sweep once, now.
+///
+/// The sweeper is hourly, so a test that waited for it would take an hour. Public for
+/// that and for an operator who wants the reclaim to happen before the next tick; nothing
+/// about correctness depends on when it runs, because what it reclaims is already
+/// unreadable.
+pub fn sweep_orphan_keys_now(runtime: &Runtime) -> anyhow::Result<()> {
+    sweep_orphan_keys(runtime)
+}
+
+/// Reclaim key rows whose parent is gone.
+///
+/// Erasing a subject makes every key beneath it unopenable in one row delete, which is
+/// the guarantee; the rows themselves stay behind holding bytes nobody can read. This is
+/// the storage half, and it is lazy on purpose: doing it in the erase would make a
+/// tenant delete O(its customers) again, which is the cost the hierarchy exists to remove.
+///
+/// A pass only reaches *direct* orphans, because a grandchild still has its parent row
+/// until that parent is swept. So it repeats until a pass deletes nothing, which converges
+/// in as many passes as the hierarchy is deep. Nothing is lost by stopping early either:
+/// what is left is unreadable whether or not it is still on disk.
+fn sweep_orphan_keys(runtime: &Runtime) -> anyhow::Result<()> {
+    // No gate on whether the project declares a parent today. A project that *used* to
+    // still has child rows on disk, and those are exactly the ones nothing else will ever
+    // reclaim. The query is an index range over `subject_key_by_parent` and returns
+    // nothing on an all-roots store, so the gate bought a few microseconds an hour and
+    // cost a case.
+    loop {
+        let mut swept = 0;
+        loop {
+            let deleted = runtime.sweep_orphan_subject_keys(SWEEP_CHUNK)?;
+            swept += deleted;
+            if deleted < SWEEP_CHUNK {
+                break;
+            }
+            thread::sleep(SWEEP_CHUNK_PAUSE);
+        }
+        // Every delete counts, not only the full chunks: a pass that reclaims five rows
+        // can still have orphaned their children, and stopping on a short chunk would
+        // leave those for next hour.
+        if swept == 0 {
+            return Ok(());
+        }
+        thread::sleep(SWEEP_CHUNK_PAUSE);
+    }
 }
 
 // --- test support ----------------------------------------------------------

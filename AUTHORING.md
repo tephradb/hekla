@@ -165,13 +165,28 @@ rather than its syntax.
 ## 5. Subject-scoped encryption and erasure
 
 The language models a **seal**: a value carries the field, subject and id its key is filed under, and
-only `reveal` reads it out. hekla is what makes that real. A field marked `@subject(sibling_field)`
-is encrypted under a key scoped to `(subject_field, subject_value)` in the tag index, the event
-payload and any read-model column, all before it reaches storage.
+only `reveal` reads it out. hekla is what makes that real. A field marked `@subject(buyer)` is
+encrypted under a key scoped to `(subject, subject_value)` in the tag index, the event payload and
+any read-model column, all before it reaches storage.
 
-**Erasing a subject is deleting its key**: `hekla erase customer_id 42`, or `erase(customer_id)` from
-an effect arm. One O(1) operation makes every value scoped to that subject unmatchable and unreadable
-across the log and every read model at once, with no rewrite, compaction or index rebuild.
+**A subject is declared**, so the namespace has a name of its own: `subject Customer(Int)`, then
+`buyer: Customer`. The annotation names a sibling field, which is where the id is read from; that
+field's *type* is what every key row is filed under. Rename the field and nothing moves; rename the
+subject and every key row does. It is also what makes `from: Customer, to: Customer` on one event two
+ids under one namespace, which spelling a field name could not express.
+
+**Erasing a subject is deleting its key**: `hekla erase Customer 42`, or `erase(buyer)` from an
+effect arm, where the value's type says which keys it destroys. One O(1) operation makes every
+value scoped to that subject unmatchable and unreadable across the log and every read model at once,
+with no rewrite, compaction or index rebuild.
+
+**A subject may declare a parent**, and then its keys are wrapped under that parent's:
+`subject Customer(Int) under Shop`. Deleting the shop's key is still one row delete, and every
+customer key beneath it becomes unopenable at the same instant, which is what makes "delete this
+tenant" O(1) instead of one erase per customer plus a projector to enumerate them. The trade is real
+and is the whole of it: erasing a shop now does reach its customers' data, where per-field subjects
+otherwise guarantee it cannot. Every event sealing under a child has to carry its ancestors' ids,
+because that is where the runtime learns which key to wrap under.
 
 **Information flow.** Plaintext exists only at the HTTP command input (the client supplied it) and at
 read-API output, an effect's `reveal(...)`, or `GET /admin/events...` (the runtime decrypted it).
@@ -463,7 +478,7 @@ Two things it does that the raw API does not:
 | `hekla test <dir>` | Run the scenarios under `tests/`, against real tephra, a real read model and a real key store. |
 | `hekla serve <dir>` (`--addr`, `--data-dir`, `--verify`, `--no-color`) | Run the runtime and HTTP API. Logs are colored only when stdout is a terminal; `--no-color` and `NO_COLOR` turn that off there too. |
 | `hekla openapi <dir>` | Print the generated OpenAPI 3.1 document to stdout. Reads the project only (no data directory, no master key), so a committed `openapi.json` can be diffed in CI. Findings go to stderr, so redirecting stdout gives you pure JSON. |
-| `hekla erase <field> <value> <dir>` | Delete a subject's key. Irreversible. |
+| `hekla erase <Subject> <id> <dir>` | Delete a subject's key. Irreversible. |
 | `hekla rewind <Effect> <position> <dir>` | Take an effect back so it reprocesses, and performs, everything after that position. Refuses while a server is running, and prints what it would discard before asking. Irreversible. |
 | `hekla rotate <dir>` | Rewrap every subject key under the current `HEKLA_MASTER_KEY`. |
 
@@ -529,10 +544,13 @@ rotation.
 
 ```hek
 // events/order.hk
+subject Customer(Int)
+subject Shop(Int)
+
 event @order.placed {
   order_id: Uuid,
-  customer_id: Int,
-  shop_id: Int,
+  customer_id: Customer,
+  shop_id: Shop,
   // Optional because an erased subject's column reads back absent, and a type that
   // cannot be absent could not say so.
   email: String? @subject(customer_id) @max(200),
@@ -550,8 +568,8 @@ refusal SoldOut "this shop's launch allocation is gone"
 
 command PlaceOrder(
   order_id: Uuid,
-  customer_id: Int,
-  shop_id: Int,
+  customer_id: Customer,
+  shop_id: Shop,
   email: String?,
   shipping_address: String?,
   order_total: Money(2),
@@ -586,7 +604,7 @@ command PlaceOrder(
 projector CustomerOrders {
   entity Order {
     order_id: Uuid @key,
-    customer_id: Int @index,
+    customer_id: Customer @index,
     // No `@subject` here: the seal propagates from the event fields written into them.
     email: String? @max(200),
     shipping_address: String? @max(200),

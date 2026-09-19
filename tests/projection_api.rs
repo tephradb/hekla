@@ -53,7 +53,7 @@ projector ByName {
 const BY_CUSTOMER: &str = "\
 projector ByCustomer {
   entity PerCustomer {
-    customer_id: Int @key,
+    customer_id: Customer @key,
     orders: Int,
     last_email: String? @max(100),
   }
@@ -311,9 +311,13 @@ async fn a_fold_that_fails_after_the_check_is_not_the_callers_fault() {
     let data = tempfile::tempdir().unwrap();
     let harness = Boot::new(project.path()).data_dir(data.path()).start();
 
-    // A projector that seals a column, with no master key anywhere. The declaration half
-    // of that is a 400 from `check`; what is left for `run` to hit is the operational
-    // database, and this proves the two are told apart rather than both being 400.
+    // A projector refused at the declaration, which is the half this test is about: a
+    // 400 from the compile, before anything opens the operational database, so the two
+    // failure sources are told apart rather than both being 400.
+    //
+    // `@subject` is not an entity annotation: a column's seal is propagated from what
+    // is written into it, never authored. So this is refused at the declaration, before
+    // anything opens a database, which is the half this test is about.
     let sealed = "\
 projector Sealed {
   entity S {

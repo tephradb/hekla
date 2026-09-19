@@ -69,7 +69,7 @@ fn concrete(route: &str) -> String {
             "{position}" => "1",
             "{correlation_id}" => "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
             "{name}" => "SendWelcome",
-            "{field}" => "user_id",
+            "{subject}" => "Customer",
             "{value}" => "nobody",
             other if other.starts_with('{') => {
                 panic!("`{other}` in `{route}` has no test value; add one to `concrete`")

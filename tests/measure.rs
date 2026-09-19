@@ -107,9 +107,11 @@ fn a_command_fold_over_an_encrypted_boundary() {
         (
             "events/thing.hk",
             r#"
+subject Shop(Int)
+
 event @thing.happened {
   id: Uuid,
-  shop: Int,
+  shop: Shop,
   secret: String? @subject(shop) @max(100),
 }
 "#,
@@ -117,7 +119,7 @@ event @thing.happened {
         (
             "commands/do-thing.hk",
             r#"
-command DoThing(id: Uuid, shop: Int, secret: String?) {
+command DoThing(id: Uuid, shop: Shop, secret: String?) {
   emit @thing.happened { id, shop, secret }
 }
 "#,
@@ -127,7 +129,7 @@ command DoThing(id: Uuid, shop: Int, secret: String?) {
             r#"
 refusal Counted(seen: Int) "{seen}"
 
-command CountThing(id: Uuid, shop: Int) {
+command CountThing(id: Uuid, shop: Shop) {
   fold seen: Int = 0
     on @thing.happened(shop) => seen + 1
 
@@ -174,12 +176,12 @@ command CountThing(id: Uuid, shop: Int) {
     let dir = write_project(&[
         (
             "events/thing.hk",
-            "event @thing.happened { id: Uuid, shop: Int, secret: String? @max(100) }\n",
+            "event @thing.happened { id: Uuid, shop: Shop, secret: String? @max(100) }\n",
         ),
         (
             "commands/do-thing.hk",
             r#"
-command DoThing(id: Uuid, shop: Int, secret: String?) {
+command DoThing(id: Uuid, shop: Shop, secret: String?) {
   emit @thing.happened { id, shop, secret }
 }
 "#,
@@ -189,7 +191,7 @@ command DoThing(id: Uuid, shop: Int, secret: String?) {
             r#"
 refusal Counted(seen: Int) "{seen}"
 
-command CountThing(id: Uuid, shop: Int) {
+command CountThing(id: Uuid, shop: Shop) {
   fold seen: Int = 0
     on @thing.happened(shop) => seen + 1
 
