@@ -22,7 +22,7 @@ use crate::crypto;
 
 /// The current schema version, tracked in SQLite's `user_version`. Bump it and
 /// add a migration arm when the schema changes.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// How many rows a single sweep statement deletes, so a retention sweep never
 /// holds the connection across a long scan. The sweeper loops until a call
@@ -56,22 +56,27 @@ fn clamp_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+/// `?start, ?start+1, ... `, for an `IN` over a list whose length is not known until the
+/// call. Numbered rather than bare `?` so a caller can keep binding past the list, and
+/// offset so a statement can hold more than one such list.
+fn placeholders_from(start: usize, count: usize) -> String {
+    (start..start + count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`placeholders_from`] starting at `?1`.
+fn placeholders(count: usize) -> String {
+    placeholders_from(1, count)
+}
+
 /// The statement [`OpDb::invocations_at`] runs, built once so the test that explains
 /// the plan and the code that executes it cannot describe different queries.
 fn invocations_at_sql(effects: usize, positions: usize) -> String {
-    let mut next = 0;
-    let mut placeholders = |count: usize| {
-        (0..count)
-            .map(|_| {
-                next += 1;
-                format!("?{next}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let effect_list = placeholders(effects);
-    let position_list = placeholders(positions);
-    let limit = placeholders(1);
+    let position_list = placeholders_from(effects + 1, positions);
+    let limit = placeholders_from(effects + positions + 1, 1);
     format!(
         "SELECT effect, position, status FROM effect_invocation \
          WHERE effect IN ({effect_list}) AND position IN ({position_list}) LIMIT {limit}"
@@ -179,6 +184,17 @@ pub type SubjectKeyRow = (String, String, Vec<u8>, String);
 /// guard so a concurrent erase-then-recreate of the same subject is not clobbered).
 /// `(subject, subject_value, new_wrapped_key, new_master_id, expected_master_id)`.
 pub type RewrapUpdate = (String, String, Vec<u8>, String, String);
+
+/// One adoption: a root row moving under the parent its subject declares, carrying the
+/// **same secret** rewrapped, plus the wrapped bytes the caller read it as.
+///
+/// The bytes, not the master id. A row erased and recreated comes back under the *same*
+/// master, so a master-keyed guard matches it and writes the old secret over the new one,
+/// un-shredding what the erase destroyed and destroying what was written since. The bytes
+/// are unique per mint, so they name exactly the row that was read.
+/// `(subject, subject_value, new_wrapped_key, parent_subject, parent_value,
+/// parent_fingerprint, expected_wrapped_key)`.
+pub type AdoptUpdate = (String, String, Vec<u8>, String, String, String, Vec<u8>);
 
 /// The state of an effect invocation after reserving it, deciding whether the
 /// driver runs (or replays) the handler or skips a position already completed.
@@ -1363,6 +1379,167 @@ impl OpDb {
         Ok(rewrapped)
     }
 
+    /// How many **root** rows belong to a subject that now declares a parent.
+    ///
+    /// The question a boot asks every time: a row wrapped under the master whose subject
+    /// is declared `under` something is a key the hierarchy does not actually hold, so
+    /// deleting the tenant would miss it. Zero is the healthy answer and the common one,
+    /// and answering it off `subject_key_by_master` is what makes asking on every boot
+    /// affordable.
+    ///
+    /// `subjects` is what the *program* declares a parent for, so a subject that has
+    /// since stopped declaring one is not counted: its rows stay where they are, which
+    /// is deliberate (see [`crate::adopt`]).
+    pub fn count_roots_of(&self, subjects: &[&str]) -> anyhow::Result<u64> {
+        if subjects.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!(
+            "SELECT count(*) FROM subject_key WHERE master_key_id IS NOT NULL AND subject IN ({})",
+            placeholders(subjects.len())
+        );
+        let count: i64 = self
+            .conn
+            .query_row(&sql, params_from_iter(subjects.iter()), |row| row.get(0))
+            .context("counting roots of parented subjects")?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// A page of the rows [`OpDb::count_roots_of`] counts, as `(subject, subject_value)`.
+    ///
+    /// Paged so the operational lock is released between pages: the count this follows can
+    /// be every subject that existed before the declaration changed, and holding the lock
+    /// across one query for all of them would stall live work. The caller does hold the
+    /// whole set once it has read it, which is what bounds an adoption's memory.
+    ///
+    /// Ordered by the primary key so `after` is a stable cursor across the writes the
+    /// adoption itself is making.
+    pub fn roots_of(
+        &self,
+        subjects: &[&str],
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        if subjects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT subject, subject_value FROM subject_key \
+             WHERE master_key_id IS NOT NULL AND subject IN ({}) \
+             AND (?{} IS NULL OR (subject, subject_value) > (?{}, ?{})) \
+             ORDER BY subject, subject_value LIMIT ?{}",
+            placeholders(subjects.len()),
+            subjects.len() + 1,
+            subjects.len() + 1,
+            subjects.len() + 2,
+            subjects.len() + 3,
+        );
+        let mut args: Vec<SqlValue> = subjects
+            .iter()
+            .map(|subject| SqlValue::Text((*subject).to_owned()))
+            .collect();
+        match after {
+            Some((subject, value)) => {
+                args.push(SqlValue::Text(subject.to_owned()));
+                args.push(SqlValue::Text(value.to_owned()));
+            }
+            None => {
+                args.push(SqlValue::Null);
+                args.push(SqlValue::Null);
+            }
+        }
+        args.push(SqlValue::Integer(limit as i64));
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("preparing the parented-roots page")?;
+        let rows = stmt
+            .query_map(params_from_iter(args), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("scanning parented roots")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("collecting parented roots")
+    }
+
+    /// Move one root row under its declared parent.
+    ///
+    /// The twin of [`OpDb::rewrap_subject_keys`] and deliberately separate from it: that
+    /// one writes `wrapped_key` and `master_key_id`, and cannot clear the master while
+    /// setting the parent columns, which is exactly what an adoption is. The wrapped key
+    /// changes because the wrapping does; the **secret inside it does not**, which is
+    /// what keeps every value already sealed under this subject readable.
+    ///
+    /// A compare-and-set on the bytes the caller read, so a subject erased and recreated
+    /// between the read and this write is skipped rather than clobbered: its fresh row
+    /// holds a different secret, and writing the old one's wrapping over it would make
+    /// everything sealed since unreadable and everything the erase shredded readable.
+    /// Returns whether the row moved.
+    ///
+    /// One at a time, not a batch: each adoption is read back through the chain
+    /// afterwards and may have to be undone, so they cannot share a transaction. The pause
+    /// every `SWEEP_CHUNK` rows in [`crate::adopt`] is what keeps a long run off the
+    /// operational lock instead.
+    pub fn adopt_subject_key(&self, update: &AdoptUpdate) -> anyhow::Result<bool> {
+        let (subject, value, wrapped, parent_subject, parent_value, fingerprint, expected) = update;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE subject_key \
+                 SET wrapped_key = ?3, master_key_id = NULL, parent_subject = ?4, \
+                     parent_value = ?5, parent_fingerprint = ?6 \
+                 WHERE subject = ?1 AND subject_value = ?2 AND wrapped_key = ?7",
+                params![
+                    subject,
+                    value,
+                    wrapped,
+                    parent_subject,
+                    parent_value,
+                    fingerprint,
+                    expected
+                ],
+            )
+            .context("adopting a subject key")?;
+        Ok(changed > 0)
+    }
+
+    /// Put an adopted row back under a master, if it still holds the bytes the adoption
+    /// wrote. Returns whether it moved.
+    ///
+    /// **An update, never an insert.** This undoes an adoption whose parent was erased
+    /// underneath it, and the state it is called on looks identical to one where *this
+    /// subject* was erased a moment after the adoption committed: both read as absent.
+    /// Inserting would put the subject's old secret back and un-shred everything that
+    /// erase destroyed, which is the one thing a key store must never do. An update keyed
+    /// on the adopted bytes touches the row only if it is still the row this adoption
+    /// wrote, so an erase that raced it wins and stays won.
+    pub fn restore_root(
+        &self,
+        subject: &str,
+        subject_value: &str,
+        wrapped: &[u8],
+        master_key_id: &str,
+        expected_wrapped: &[u8],
+    ) -> anyhow::Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE subject_key \
+                 SET wrapped_key = ?3, master_key_id = ?4, parent_subject = NULL, \
+                     parent_value = NULL, parent_fingerprint = NULL \
+                 WHERE subject = ?1 AND subject_value = ?2 AND wrapped_key = ?5",
+                params![
+                    subject,
+                    subject_value,
+                    wrapped,
+                    master_key_id,
+                    expected_wrapped
+                ],
+            )
+            .context("restoring an adopted subject key")?;
+        Ok(changed > 0)
+    }
+
     // --- introspection readers ---------------------------------------------
     //
     // These share one mutex with every effect's hot path, so an unbounded scan would
@@ -1685,13 +1862,14 @@ impl OpDb {
         rows.context("collecting subject keys")
     }
 
-    /// Whether a subject still has a key. `false` covers both "erased" and "never
-    /// had one": erasure deletes the row, so the two are the same state on disk.
+    /// Whether a key row is reachable: it exists, and so does every row above it.
     ///
     /// Excludes the reserved global uniqueness secret, as the listing readers do. It is
     /// not a subject, and a point lookup that reported it would contradict the inventory
-    /// that hides it.
-    /// Whether a key row is reachable: it exists, and so does every row above it.
+    /// that hides it. [`OpDb::subject_key_exists`] carries the same guard, and this one did
+    /// not until recently: `/admin/subjects/{subject}/{value}` asked that one before the
+    /// hierarchy made reachability the right question, and moving the caller without
+    /// moving the guard put the internal key back on a public surface.
     ///
     /// Reachability rather than existence, because that is what "is this subject erased"
     /// means once a key can hang from another. A child outlives its parent's deletion by
@@ -1708,6 +1886,9 @@ impl OpDb {
     /// the request. Deduplicating bounds the walk by the table, so a cycle reaches no root
     /// and answers `false`, which is the safe direction for a question that gates reads.
     pub fn subject_key_reachable(&self, subject: &str, value: &str) -> anyhow::Result<bool> {
+        if subject == crypto::GLOBAL_SUBJECT {
+            return Ok(false);
+        }
         self.conn
             .query_row(
                 "WITH RECURSIVE above(subject, subject_value, parent_subject, parent_value) AS ( \
@@ -1727,8 +1908,14 @@ impl OpDb {
             .context("checking whether a subject key is reachable")
     }
 
-    /// Whether a key row is on disk, reachable or not. The storage question, which the
-    /// sweep and its tests ask; [`OpDb::subject_key_reachable`] is the erasure one.
+    /// Whether a key row is on disk, reachable or not. `false` covers both "erased" and
+    /// "never had one": erasure deletes the row, so the two are the same state on disk.
+    ///
+    /// The storage question, which `hekla erase` asks to preview what it is about to
+    /// delete, and which the tests ask;
+    /// [`OpDb::subject_key_reachable`] is the erasure one, for a caller asking whether
+    /// anything under this subject can still be read. Excludes the reserved global
+    /// uniqueness secret, as the listing readers do.
     pub fn subject_key_exists(&self, field: &str, value: &str) -> anyhow::Result<bool> {
         if field == crypto::GLOBAL_SUBJECT {
             return Ok(false);
@@ -1794,6 +1981,9 @@ impl OpDb {
                         );
                     }
                 }
+                10 => tx
+                    .execute_batch(SCHEMA_V11)
+                    .context("applying schema v11")?,
                 other => anyhow::bail!("no migration from schema version {other}"),
             }
             version += 1;
@@ -2072,6 +2262,34 @@ CREATE INDEX subject_key_by_master ON subject_key (master_key_id);
 -- The sweep looks for children whose parent is gone, and a cascading erase counts the
 -- descendants it is about to make unreadable. Both walk this way.
 CREATE INDEX subject_key_by_parent ON subject_key (parent_subject, parent_value);
+";
+
+/// The index the adoption count asks for, and the reason it is partial.
+///
+/// Every boot asks [`OpDb::count_roots_of`], so it has to be answerable without touching
+/// the rows it is not about. Neither existing index does: the primary key seeks on
+/// `subject` and then filters `master_key_id IS NOT NULL` row by row, so a settled store
+/// with ten million children under a tenant walked ten million entries to learn the
+/// answer was zero, and `subject_key_by_master` cannot seek an `IS NOT NULL` either.
+///
+/// Partial on `master_key_id IS NOT NULL`, which is the narrowest predicate SQLite can be
+/// given here: a partial index is a static thing and which subjects declare a parent is a
+/// property of the *program*, which changes without the schema. So it holds every **root**
+/// row, not only the roots that are in the wrong place. What that buys is the shape that
+/// matters: for a subject whose rows have been adopted the index holds none of them, so
+/// the count a boot asks is a seek that finds nothing rather than a walk over every child.
+/// What it costs is a duplicate of the primary key over the root rows of subjects that
+/// never declare a parent, where the count is never run at all because `count_roots_of`
+/// answers `0` without a query. That is the trade, said here rather than claimed away.
+///
+/// It carries `subject_value` as well as `subject` so the page that follows the count is a
+/// seek in the cursor's own order rather than a sort.
+///
+/// Verified by `the_adoption_count_is_answered_from_its_own_index`, which reads the query
+/// plan rather than trusting this comment: the claim was written here before it was true,
+/// and then described an empty index that is nothing of the kind.
+const SCHEMA_V11: &str = "
+CREATE INDEX subject_key_unadopted ON subject_key (subject, subject_value) WHERE master_key_id IS NOT NULL;
 ";
 
 /// What a rewind would discard, and what it did.
@@ -2419,6 +2637,362 @@ mod tests {
             )
             .is_err(),
             "the CHECK came with the rebuild"
+        );
+    }
+
+    /// A directory written at v10 gains the adoption index, and keeps its rows.
+    ///
+    /// v11 is one `CREATE INDEX`, which is the kind of migration that looks too small to
+    /// test until it is the one that did not run: the count it exists for is asked on
+    /// every boot, and without the index it silently goes back to filtering a scan. The
+    /// query-plan test below runs against a *fresh* schema, so this is what says an
+    /// upgraded directory gets the same answer.
+    #[test]
+    fn a_v10_directory_gains_the_adoption_index_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hekla.db");
+        drop(OpDb::open(&path).unwrap());
+
+        // Back to v10: drop the index this version adds and say so in `user_version`.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP INDEX subject_key_unadopted;
+                 INSERT INTO subject_key (subject, subject_value, wrapped_key, master_key_id)
+                     VALUES ('Customer', '88', x'C0FFEE', 'master-A');
+                 PRAGMA user_version = 10;",
+            )
+            .unwrap();
+        }
+
+        let db = OpDb::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION, "it migrated");
+        assert_eq!(
+            db.get_subject_key("Customer", "88")
+                .unwrap()
+                .unwrap()
+                .wrapped,
+            vec![0xC0, 0xFF, 0xEE],
+            "and carried the row across, which a `CREATE INDEX` must not disturb"
+        );
+        assert_eq!(
+            db.count_roots_of(&["Customer"]).unwrap(),
+            1,
+            "the count it was added for answers"
+        );
+        let plan: String = db
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT count(*) FROM subject_key \
+                 WHERE master_key_id IS NOT NULL AND subject IN (?1)",
+                params!["Customer"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("subject_key_unadopted"),
+            "off the index the migration added, not a scan: {plan}"
+        );
+    }
+
+    /// Undoing an adoption never brings back a row that was erased.
+    ///
+    /// The state this is called on is ambiguous by nature: an adoption reads back as
+    /// absent both when its parent went underneath it, which is what it undoes, and when
+    /// *this subject* was erased a moment after the write committed, which it must leave
+    /// alone. The two are the same answer from `load_secret`, so the write itself has to
+    /// be the thing that cannot resurrect: an update matches nothing, where an insert
+    /// would put the old secret back and un-shred everything the erase destroyed.
+    #[test]
+    fn undoing_an_adoption_never_resurrects_an_erased_row() {
+        let db = OpDb::open_in_memory().unwrap();
+        db.get_or_insert_subject_key(
+            "Customer",
+            "88",
+            &SubjectKey {
+                wrapped: b"under-the-shop".to_vec(),
+                wrapping: Wrapping::Parent(ParentRef {
+                    subject: "Shop".to_owned(),
+                    value: "7".to_owned(),
+                    fingerprint: "fp".to_owned(),
+                }),
+            },
+            None,
+        )
+        .unwrap();
+
+        // An operator erases the customer, after the adoption committed.
+        assert!(db.delete_subject_key("Customer", "88").unwrap());
+
+        assert!(
+            !db.restore_root(
+                "Customer",
+                "88",
+                b"back-under-the-master",
+                "primary",
+                b"under-the-shop",
+            )
+            .unwrap(),
+            "there is nothing to put back"
+        );
+        assert!(
+            db.get_subject_key("Customer", "88").unwrap().is_none(),
+            "and the erasure stands: putting the key back would un-shred every value it destroyed"
+        );
+
+        // The case it *is* for: the row is still there, holding what the adoption wrote.
+        db.get_or_insert_subject_key(
+            "Customer",
+            "88",
+            &SubjectKey {
+                wrapped: b"under-the-shop".to_vec(),
+                wrapping: Wrapping::Parent(ParentRef {
+                    subject: "Shop".to_owned(),
+                    value: "7".to_owned(),
+                    fingerprint: "fp".to_owned(),
+                }),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            db.restore_root(
+                "Customer",
+                "88",
+                b"back-under-the-master",
+                "primary",
+                b"under-the-shop",
+            )
+            .unwrap()
+        );
+        let back = db.get_subject_key("Customer", "88").unwrap().unwrap();
+        assert_eq!(back.wrapped, b"back-under-the-master".to_vec());
+        assert_eq!(back.wrapping, Wrapping::Master("primary".to_owned()));
+    }
+
+    /// A subject erased and recreated between the scan and the write is skipped.
+    ///
+    /// The row that comes back from an erase-and-recreate holds a **different secret** and
+    /// is wrapped under the **same master**, because nothing rotated. So a compare-and-set
+    /// on the master id matches it, and the adoption writes the old secret's wrapping over
+    /// the new row: everything sealed since the erase becomes unreadable, and everything
+    /// the erase shredded becomes readable again, both silently. Only the wrapped bytes
+    /// name the row the caller actually read, which is why the replacement in
+    /// [`OpDb::get_or_insert_subject_key`] is keyed on them too.
+    #[test]
+    fn an_adoption_does_not_overwrite_a_row_erased_and_recreated_under_it() {
+        let db = OpDb::open_in_memory().unwrap();
+        let root = |bytes: &[u8]| SubjectKey {
+            wrapped: bytes.to_vec(),
+            wrapping: Wrapping::Master("primary".to_owned()),
+        };
+        db.get_or_insert_subject_key("Customer", "88", &root(b"the-old-secret"), None)
+            .unwrap();
+
+        // What a concurrent erase and re-mint leaves behind: same identity, same master,
+        // different secret.
+        assert!(db.delete_subject_key("Customer", "88").unwrap());
+        db.get_or_insert_subject_key("Customer", "88", &root(b"the-new-secret"), None)
+            .unwrap();
+
+        // The adoption was computed from the row read before all that.
+        let stale = (
+            "Customer".to_owned(),
+            "88".to_owned(),
+            b"the-old-secret-under-the-shop".to_vec(),
+            "Shop".to_owned(),
+            "7".to_owned(),
+            "fp".to_owned(),
+            b"the-old-secret".to_vec(),
+        );
+        assert!(
+            !db.adopt_subject_key(&stale).unwrap(),
+            "the row it read is gone, so it must not write over the one that replaced it"
+        );
+        let live = db.get_subject_key("Customer", "88").unwrap().unwrap();
+        assert_eq!(
+            live.wrapped,
+            b"the-new-secret".to_vec(),
+            "the recreated key is untouched, so nothing sealed under it is lost"
+        );
+        assert_eq!(live.wrapping, Wrapping::Master("primary".to_owned()));
+    }
+
+    /// The adoption count is answered from its own index, not by filtering a scan.
+    ///
+    /// Every boot asks it, and the whole claim that asking is affordable rests on this. It
+    /// was not true when first written: the primary key seeks on `subject` and then tests
+    /// `master_key_id IS NOT NULL` per row, so a tenant with ten million healthy children
+    /// cost ten million index entries to learn the answer was zero. A comment cannot hold
+    /// that claim up, so this reads the plan.
+    #[test]
+    fn the_adoption_count_is_answered_from_its_own_index() {
+        let db = OpDb::open_in_memory().unwrap();
+        let plan = |sql: &str, args: &[&dyn rusqlite::ToSql]| {
+            let mut stmt = db.conn.prepare(sql).unwrap();
+            let rows = stmt.query_map(args, |row| row.get::<_, String>(3)).unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap().join(" / ")
+        };
+
+        let counting = plan(
+            "EXPLAIN QUERY PLAN SELECT count(*) FROM subject_key \
+             WHERE master_key_id IS NOT NULL AND subject IN (?1)",
+            &[&"Customer"],
+        );
+        assert!(
+            counting.contains("subject_key_unadopted"),
+            "the count must come off the partial index, not a filtered scan: {counting}"
+        );
+
+        let paging = plan(
+            "EXPLAIN QUERY PLAN SELECT subject, subject_value FROM subject_key \
+             WHERE master_key_id IS NOT NULL AND subject IN (?1) \
+             AND (?2 IS NULL OR (subject, subject_value) > (?2, ?3)) \
+             ORDER BY subject, subject_value LIMIT ?4",
+            &[&"Customer", &"Customer", &"1", &10i64],
+        );
+        assert!(
+            paging.contains("subject_key_unadopted") || paging.contains("subject_key_by_master"),
+            "and so must the page that follows it: {paging}"
+        );
+    }
+
+    /// The adoption readers see only roots of the subjects asked about, and page in a
+    /// stable order.
+    ///
+    /// The cursor is a row-value comparison over the primary key, which is the part worth
+    /// a test: a `(subject, subject_value) > (?, ?)` that SQLite would not take returns an
+    /// empty page rather than an error, and an adoption reading empty pages reports
+    /// success having done nothing.
+    #[test]
+    fn the_adoption_readers_page_roots_of_the_subjects_asked_about() {
+        let db = OpDb::open_in_memory().unwrap();
+        let root = |master: &str| SubjectKey {
+            wrapped: b"wrapped".to_vec(),
+            wrapping: Wrapping::Master(master.to_owned()),
+        };
+        for value in ["1", "2", "3"] {
+            db.get_or_insert_subject_key("Customer", value, &root("m"), None)
+                .unwrap();
+        }
+        db.get_or_insert_subject_key("Shop", "7", &root("m"), None)
+            .unwrap();
+        // A child of the same subject: already where it belongs, so never a candidate.
+        db.get_or_insert_subject_key(
+            "Customer",
+            "4",
+            &SubjectKey {
+                wrapped: b"wrapped".to_vec(),
+                wrapping: Wrapping::Parent(ParentRef {
+                    subject: "Shop".to_owned(),
+                    value: "7".to_owned(),
+                    fingerprint: "fp".to_owned(),
+                }),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.count_roots_of(&["Customer"]).unwrap(),
+            3,
+            "the three roots, and not the child"
+        );
+        assert_eq!(
+            db.count_roots_of(&[]).unwrap(),
+            0,
+            "a program declaring no parent asks about nothing"
+        );
+        assert_eq!(
+            db.count_roots_of(&["Shop"]).unwrap(),
+            1,
+            "a subject is counted only when it is the one asked about"
+        );
+
+        // Paged one at a time, so the cursor is exercised rather than stepped over. The
+        // bound is what makes a cursor that never advances fail here instead of hanging,
+        // which is the shape this gets wrong if the row-value comparison is not taken.
+        let mut seen = Vec::new();
+        let mut after: Option<(String, String)> = None;
+        for _ in 0..10 {
+            let cursor = after
+                .as_ref()
+                .map(|(subject, value)| (subject.as_str(), value.as_str()));
+            let page = db.roots_of(&["Customer"], cursor, 1).unwrap();
+            let Some(row) = page.first().cloned() else {
+                break;
+            };
+            seen.push(row.1.clone());
+            after = Some(row);
+        }
+        assert_eq!(
+            seen,
+            vec!["1", "2", "3"],
+            "every root exactly once, in primary-key order"
+        );
+    }
+
+    /// An adoption clears the master and sets the parent in one write, and skips a row
+    /// whose bytes moved underneath it.
+    ///
+    /// The compare-and-set is the point: a subject erased and recreated between the fold
+    /// and this write holds a *different* secret, so adopting it under a parent chosen for
+    /// the old one would wrap the wrong key and lose everything written in between.
+    #[test]
+    fn an_adoption_moves_a_root_under_its_parent_and_skips_a_moved_one() {
+        let db = OpDb::open_in_memory().unwrap();
+        let root = |bytes: &[u8]| SubjectKey {
+            wrapped: bytes.to_vec(),
+            wrapping: Wrapping::Master("m".to_owned()),
+        };
+        db.get_or_insert_subject_key("Customer", "1", &root(b"as-read"), None)
+            .unwrap();
+        db.get_or_insert_subject_key("Customer", "2", &root(b"moved-since"), None)
+            .unwrap();
+
+        let update = |value: &str, expected: &[u8]| {
+            (
+                "Customer".to_owned(),
+                value.to_owned(),
+                b"under-the-shop".to_vec(),
+                "Shop".to_owned(),
+                "7".to_owned(),
+                "fp".to_owned(),
+                expected.to_vec(),
+            )
+        };
+        assert!(
+            db.adopt_subject_key(&update("1", b"as-read")).unwrap(),
+            "the row whose bytes still match moves"
+        );
+        assert!(
+            !db.adopt_subject_key(&update("2", b"as-read")).unwrap(),
+            "and the one whose bytes moved is left alone"
+        );
+
+        let moved = db.get_subject_key("Customer", "1").unwrap().unwrap();
+        assert_eq!(
+            moved.wrapping,
+            Wrapping::Parent(ParentRef {
+                subject: "Shop".to_owned(),
+                value: "7".to_owned(),
+                fingerprint: "fp".to_owned(),
+            }),
+            "the master is cleared and the parent set in the same write"
+        );
+        assert_eq!(moved.wrapped, b"under-the-shop".to_vec());
+        assert_eq!(
+            db.get_subject_key("Customer", "2")
+                .unwrap()
+                .unwrap()
+                .wrapped,
+            b"moved-since".to_vec(),
+            "the row that moved keeps its own secret's wrapping, untouched"
+        );
+        assert_eq!(
+            db.count_roots_of(&["Customer"]).unwrap(),
+            1,
+            "and the adopted row is no longer a candidate"
         );
     }
 

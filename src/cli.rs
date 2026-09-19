@@ -109,6 +109,24 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Move every subject key under the parent its subject declares, for rows minted
+    /// before the parent was declared.
+    ///
+    /// `hekla serve` does this at boot and refuses to serve without it, so this exists to
+    /// run the work *ahead* of a deploy: point it at the new project and the live data
+    /// directory, and the boot that follows finds nothing left to do. Takes no lock and
+    /// changes no ciphertext, so a running server is unaffected.
+    Adopt {
+        /// The project directory, whose declarations say where each key belongs.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// The data directory (event log and operational DB). Defaults to `<dir>/data`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Do not draw the progress line.
+        #[arg(long)]
+        no_progress: bool,
+    },
     /// Print the generated OpenAPI 3.1 document for a project to stdout.
     ///
     /// Reads the project only: no data directory, no lock, and no master key, so it
@@ -323,6 +341,11 @@ pub fn run() -> ExitCode {
             verify(&dir, data_dir.as_deref())
         }
         Command::Rotate { dir, data_dir } => rotate(&dir, data_dir.as_deref()),
+        Command::Adopt {
+            dir,
+            data_dir,
+            no_progress,
+        } => adopt(&dir, data_dir.as_deref(), !no_progress),
         Command::Openapi { dir } => openapi(&dir),
         Command::Plan {
             dir,
@@ -1085,6 +1108,212 @@ fn plan(
                 println!("{plan}");
             }
             ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `hekla adopt`: put every subject key under the parent its subject declares.
+///
+/// The same pass `hekla serve` runs at boot, offered separately so the work can be done
+/// before a deploy rather than during one. It reads the log through a follower and takes
+/// no directory lock, so pointing it at the new project and a live data directory is the
+/// intended use: the server still serving the old declaration keeps running, and the boot
+/// that follows finds nothing left to do.
+///
+/// No confirmation, because it destroys nothing: the wrapping moves and the secret does
+/// not, so every value stays exactly as readable as it was.
+fn adopt(dir: &Path, data_dir: Option<&Path>, progress: bool) -> ExitCode {
+    if !dir.is_dir() {
+        eprintln!("error: `{}` is not a directory", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let project = LoadedProject::load(dir);
+    let findings = validate::findings(&project);
+    for finding in &findings {
+        eprintln!("{}", validate::render(finding));
+    }
+    let errors = validate::errors(&findings);
+    if errors > 0 {
+        eprintln!("refusing to adopt: the project has {errors} error(s)");
+        return ExitCode::FAILURE;
+    }
+    // Both answers before the master key is asked for, because neither needs one. A deploy
+    // script that runs this over every project would otherwise fail on the flat ones, and
+    // on a directory nothing has served yet, for want of a key there is nothing to use.
+    // Said apart from each other too: "no hierarchy" and "already in order" look identical
+    // from the key store and are different facts about the project.
+    if crate::schema::Subjects::of(&project.program)
+        .parented()
+        .is_empty()
+    {
+        println!("no subject declares a parent, so there is nothing to adopt");
+        return ExitCode::SUCCESS;
+    }
+    let data = runtime::resolve_data_dir(dir, data_dir);
+    if !data.join("hekla.db").exists() {
+        println!(
+            "nothing is deployed at {}, so there is nothing to adopt",
+            data.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    let master = match crypto::master_keys_from_env() {
+        Ok(Some(master)) => master,
+        Ok(None) => {
+            eprintln!("error: HEKLA_MASTER_KEY must be set to adopt");
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("error: reading the master key: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Before opening anything. `Runtime::open_following` goes through `OpDb::open`, which
+    // *migrates*, and this command's whole point is to be pointed at a directory a server
+    // is still serving from: silently rewriting that server's schema under it is the one
+    // thing it must not do. `plan` and `project` refuse the same way, for the same reason.
+    match opdb::recorded_schema_version(&data.join("hekla.db")) {
+        Ok(version) if version != opdb::SCHEMA_VERSION => {
+            eprintln!(
+                "error: the data directory is at schema version {version} and this build expects {}; run `hekla serve` against it once to migrate, or adopt with the build that wrote it",
+                opdb::SCHEMA_VERSION
+            );
+            return ExitCode::FAILURE;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("error: reading the operational database: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let runtime = match runtime::Runtime::open_following(&project, &data, Some(master)) {
+        Ok(Some(runtime)) => runtime,
+        // No log to fold, which is only good news if there is also nothing waiting. A
+        // directory whose `events/` was moved or restored separately still holds its key
+        // rows, and reporting success over those sent a deploy gate green on a store the
+        // boot then refuses. The parent lives in the events, so without them there is
+        // nothing that can place these and saying so is the whole of the help available.
+        Ok(None) => {
+            // Asked, not assumed. Both halves of this used `.unwrap_or(0)`, which turns
+            // "I could not find out" into "nothing is waiting": a directory restored
+            // without `events/` and with a corrupt `hekla.db` reported success, which is
+            // the precise shape this guard was added to stop.
+            let subjects = crate::schema::Subjects::of(&project.program);
+            let waiting = match OpDb::open(&data.join("hekla.db"))
+                .and_then(|db| db.count_roots_of(&subjects.parented()))
+            {
+                Ok(waiting) => waiting,
+                Err(err) => {
+                    eprintln!("error: reading the operational database: {err:#}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if waiting > 0 {
+                eprintln!(
+                    "error: {waiting} subject key(s) are waiting to be adopted, and there is no event log at {} to learn their parents from",
+                    data.join("events").display()
+                );
+                return ExitCode::FAILURE;
+            }
+            println!("no event log at {}: nothing to adopt", data.display());
+            return ExitCode::SUCCESS;
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The keystore is always there: a missing master was refused above and
+    // `open_following` builds one from whatever it is given. Named rather than unwrapped
+    // so a future change to either does not turn into a panic here.
+    let Some(keystore) = runtime.keystore() else {
+        eprintln!("error: no master key, so there are no keys to adopt");
+        return ExitCode::FAILURE;
+    };
+    // The same two refusals `serve` makes, and for the same reasons. Without them this
+    // command fails *differently* from the boot it is meant to run ahead of: a missing
+    // master surfaces halfway through, after rows have already moved, and a declaration
+    // that cannot read the log surfaces as a raw decode error at some position instead of
+    // naming the field and the `@absent` that answers it.
+    if let Err(err) = keystore.verify_masters_present() {
+        eprintln!("error: {err:#}");
+        return ExitCode::FAILURE;
+    }
+    let recorded = match runtime.opdb().lock() {
+        Ok(db) => db.recorded_entries(),
+        Err(poisoned) => poisoned.into_inner().recorded_entries(),
+    };
+    match recorded.and_then(|recorded| {
+        crate::heklang_host::history_faults(runtime.program(), &recorded, runtime.store())
+    }) {
+        Ok(unreadable) => {
+            if let Some(refusal) = crate::heklang_host::unreadable_refusal(
+                &unreadable,
+                "adopt",
+                "nothing has been moved and correcting the declaration is the whole of the repair",
+            ) {
+                eprintln!("error: {refusal}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let head = runtime.store().head().get();
+    let ticker = Progress::stderr(progress);
+    let done = crate::adopt::run(
+        runtime.program(),
+        runtime.events_map(),
+        runtime.store(),
+        keystore,
+        &mut |position, resolved| ticker.tick(position, head, resolved),
+    );
+    ticker.clear();
+    match done {
+        Ok(done) => {
+            for wrong in &done.disagreements {
+                eprintln!("warning: {}", crate::adopt::disagreement_line(wrong));
+            }
+            let (adopted, scanned) = (done.adopted, done.scanned);
+            if adopted == 0 && done.waiting == 0 {
+                println!("every subject key is already under its declared parent");
+            } else {
+                println!(
+                    "adopted {adopted} subject key(s) under their declared parent, reading {scanned} event(s)"
+                );
+            }
+            // The two endings are not the same here, and treating them alike made this
+            // command fail on the directory it exists for. A live deployment is still
+            // serving the *old* declaration while this runs, so it keeps minting roots
+            // this run will never catch: contention is the normal condition of a
+            // pre-flight, not a fault. The boot refuses on it because nothing else should
+            // be writing there; this says what is left and exits clean, so a deploy script
+            // can run it without pretending the store is quiet.
+            match crate::adopt::unfinished(&done) {
+                // Two of the three are faults wherever they are found: a subject no event
+                // accounts for, and a row the store could not move at all. Only the race
+                // with a live writer is ordinary here, and lumping the others in with it
+                // told an operator to go looking for a second process and exited clean.
+                Some(fault @ crate::adopt::Unfinished::Unaccounted { .. })
+                | Some(fault @ crate::adopt::Unfinished::Failed { .. }) => {
+                    eprintln!("error: {fault}");
+                    ExitCode::FAILURE
+                }
+                Some(contended) => {
+                    eprintln!("warning: {contended}");
+                    eprintln!(
+                        "  they will be moved by the boot that deploys this project, which runs with nothing else writing"
+                    );
+                    ExitCode::SUCCESS
+                }
+                None => ExitCode::SUCCESS,
+            }
         }
         Err(err) => {
             eprintln!("error: {err:#}");

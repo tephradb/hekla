@@ -9,7 +9,7 @@
 //! decides what a declaration means, and this is the runtime's view of the result, so
 //! nothing here settles a question the checker has not already settled.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use heklang::ir::{self, Type};
@@ -478,10 +478,17 @@ impl EntityDef {
             let Some(seal) = &meta.sealed_under else {
                 continue;
             };
+            // By **type**, which is what `EntityDef::of`'s fallback relies on and what the
+            // paragraph above says. Checking the *name* let a column that merely happens
+            // to be called `Org` stand in for one of type `Org`: `id_column` falls back to
+            // the subject's own name when it finds no column of that type, so the check
+            // then found the impostor and passed, and `RowWriter::decrypt_field` read that
+            // column's value as the subject id. The seal never opened and the column read
+            // back absent, which is exactly the erasure-shaped answer this refuses.
             if !self
                 .fields
                 .iter()
-                .any(|(other, _)| other == seal.id_field())
+                .any(|(_, other)| other.identifies.as_deref() == Some(seal.subject()))
             {
                 anyhow::bail!(
                     "entity `{}`: column `{}` is sealed under `{}`, but no column of this entity holds a `{}`; add one so the key can be found",
@@ -738,6 +745,16 @@ impl Subjects {
         }
     }
 
+    /// Every subject that declares a parent, sorted.
+    ///
+    /// What an adoption asks about: a key row of one of these that is still wrapped under
+    /// the master is a key the hierarchy does not really hold, so the tenant's erase would
+    /// miss it. A subject that declares no parent is never in this list, which is what
+    /// keeps a row whose subject *stopped* declaring one from being disturbed.
+    pub fn parented(&self) -> Vec<&str> {
+        self.parents.keys().map(String::as_str).collect()
+    }
+
     /// `name`'s ancestors, nearest first. Empty for a subject that declares no parent,
     /// which is every subject until one says `under`.
     pub fn ancestors(&self, name: &str) -> Vec<&str> {
@@ -929,6 +946,32 @@ impl InputSchema {
 /// Every declared event by its wire type, which is what the append and read paths look
 /// a definition up by.
 pub type EventDefs = std::collections::HashMap<String, EventDef>;
+
+/// The one field name that carries a subject's id, across every event that declares it,
+/// or `None` when the program spells it more than one way.
+///
+/// A tephra tag is `<field>:<value>`, derived from the field's *name*, while a key row is
+/// filed under the subject's *type*. So "the events for this subject" is only a question
+/// with an answer when the program spells the id one way: `org_id: Org` on one event and
+/// `owner: Org` on another are two different tags for one namespace, and there is no third
+/// tag that covers both.
+///
+/// The console asks this before offering the link, rather than building one out of the
+/// subject name, which is not a tag anything was ever written under.
+pub fn id_field_of(events: &EventDefs, subject: &str) -> Option<String> {
+    let mut spellings: BTreeSet<&str> = BTreeSet::new();
+    for def in events.values() {
+        for (name, meta) in &def.fields {
+            if meta.identifies.as_deref() == Some(subject) {
+                spellings.insert(name.as_str());
+            }
+        }
+    }
+    match spellings.len() {
+        1 => spellings.into_iter().next().map(str::to_owned),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {

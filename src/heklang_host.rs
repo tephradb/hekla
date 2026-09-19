@@ -1252,14 +1252,7 @@ impl HeklaHost {
 
         // The subject ids first: a field scoped to one needs that id's plaintext to
         // find the key, and a declaration may name them in either order.
-        let mut ids: BTreeMap<&str, String> = BTreeMap::new();
-        for (name, _) in &def.fields {
-            if let Some(value) = event.fields.get(name.as_str())
-                && let Some(text) = plaintext_scalar(value)
-            {
-                ids.insert(name.as_str(), text);
-            }
-        }
+        let ids = subject_ids(&def, event);
 
         let mut payload = serde_json::Map::new();
         let mut derived: Vec<(String, Option<String>)> = Vec::new();
@@ -1346,6 +1339,48 @@ impl HeklaHost {
             },
         ))
     }
+}
+
+/// Every scalar field's plaintext, keyed by field name: what a [`crate::schema::Seal`]
+/// resolves its chain of ids against.
+///
+/// Shared between the append path and [`crate::adopt`] rather than written twice,
+/// because the two have to agree about which key a value is filed under: one decides it
+/// at write time and the other reconstructs that decision from the log afterwards, and a
+/// copy that drifted would adopt rows under the wrong parent.
+///
+/// A sealed field contributes nothing, since its content is ciphertext and the id it is
+/// filed under lives in a sibling. That is what makes every link of a chain readable
+/// here: heklang refuses a subject id that is itself sealed, or optional.
+pub(crate) fn subject_ids<'a>(def: &'a EventDef, event: &Event) -> BTreeMap<&'a str, String> {
+    let mut ids: BTreeMap<&str, String> = BTreeMap::new();
+    for (name, _) in &def.fields {
+        if let Some(value) = event.fields.get(name.as_str())
+            && let Some(text) = plaintext_scalar(value)
+        {
+            ids.insert(name.as_str(), text);
+        }
+    }
+    ids
+}
+
+/// Whether this event actually sealed something into `field`, and so minted a key for the
+/// subject that field is scoped to.
+///
+/// Rule 12 again: an absent optional was never encrypted, so there is no key behind it and
+/// [`HeklaHost::lower`] skips it rather than minting one. [`crate::adopt`] has to ask the
+/// same question, because an event that mentions a subject without filing anything under it
+/// is **not** the event that decided where that subject's key lives. Reading it as the
+/// witness files the key under a parent the write path never chose.
+///
+/// `lower` asks it of the JSON it has already converted for other reasons rather than
+/// calling this, which is the one duplicated expression here; the rule is one line and
+/// this is the hot write path.
+pub(crate) fn seals_content(event: &Event, field: &str) -> bool {
+    event
+        .fields
+        .get(field)
+        .is_some_and(|value| !from_heklang_json(&Json::from_value(value)).is_null())
 }
 
 /// The plaintext scalar form of a value, or `None` for a container or a seal. A subject

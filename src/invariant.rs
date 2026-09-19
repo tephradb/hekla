@@ -29,6 +29,14 @@ pub enum Violation {
         from: u64,
         to: u64,
     },
+    /// Subject keys are wrapped under the master although their subject declares a
+    /// parent, so the tenant's erasure would not reach them.
+    ///
+    /// A served deployment cannot be in this state, because the boot that opened it
+    /// adopts them or refuses. Finding it here means either that the directory has not
+    /// been served since the parent was declared, or that an adoption did not happen
+    /// when it should have, and the second is worth a failed sweep.
+    UnadoptedKeys { subjects: Vec<String>, keys: u64 },
 }
 
 /// How a rebuilt row differs from the live one.
@@ -79,6 +87,15 @@ impl fmt::Display for Violation {
             } => write!(
                 f,
                 "{component} moved its checkpoint backwards, from {from} to {to}"
+            ),
+            Violation::UnadoptedKeys { subjects, keys } => write!(
+                f,
+                "{keys} key(s) of {} are wrapped under the master although their subject declares a parent, so erasing the tenant would not reach them; `hekla adopt` moves them, and `hekla serve` does it at boot",
+                subjects
+                    .iter()
+                    .map(|subject| format!("`{subject}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }

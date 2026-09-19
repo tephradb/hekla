@@ -2834,10 +2834,9 @@ Honest scope:
   that meets it.
 - **A parent declared onto a project that is already running does not adopt the rows already there.**
   Those were wrapped under the master, so deleting the tenant misses them silently, which is the one
-  failure a compliance feature cannot have. Nothing is deployed against this tree, so it is not built
-  now, but it is the gap to close before anything is: the shape is a rewrap on write when a child's
-  row is still a root, plus a boot-time count of the un-adopted tail so it is visible rather than
-  silent.
+  failure a compliance feature cannot have. Left open here and closed in Phase 40, which does it at
+  boot off a fold of the log rather than on write: the rows that need it are the dormant ones, and a
+  write-triggered repair reaches exactly the subjects an erasure request is least likely to name.
 - **`key_present` reads through the chain**, so introspection's `erased`-versus-`stale` split keeps
   meaning what it means, and `GET /admin/subjects/{field}/{value}` answering `absent` covers a row
   that exists but whose parent is gone. Both surfaces answer "unreadable", which is the guarantee,
@@ -2875,9 +2874,9 @@ Four things the design above did not have right, found by building it.
   heklang keeps its own copy because it can point at the annotation's span, which is what an author
   has to change; heklang's own comment says it keeps that copy *because* hekla would have one.
 
-The open gap is unchanged and is written above: **a parent declared onto a project that already has
-key rows does not adopt them.** Nothing is deployed against this tree, so nothing was built for it,
-and the shape it wants is recorded rather than guessed at later.
+The open gap was written above and is closed by Phase 40: **a parent declared onto a project that
+already has key rows does not adopt them.** The shape recorded here, a rewrap on write, turned out to
+be the wrong half of it.
 
 
 ### What the hardening pass changed
@@ -2933,6 +2932,346 @@ hekla's half is two commits. The first adapts to the new model and changes no be
 namespace becomes the subject's declared name, `FieldMeta` carries the subject and the id field
 apart, and every fixture is rewritten. The second is the feature this phase is named for, and lands
 on top.
+
+
+## Phase 40: a subject's key is where the declaration says it is (done)
+
+Phase 39 left one gap: **a parent declared onto a project that already has key rows does not adopt
+them.** A row's wrapping is chosen when it is first minted and never revisited, so adding
+`under Shop` to a live `Customer` leaves every existing row under the master. Customers minted after
+the edit hang from their shop; the ones from before do not, and erasing the shop reports success
+having missed them.
+
+It is the worst shape a failure in this area can take. Nothing looks wrong: reads work, `verify` is
+clean, no error anywhere, and the only symptom is a deletion that quietly did less than it claimed,
+discovered at the moment you are least able to check. It is also not a compatibility problem that
+ages out; it bites current hekla on current data and would still be there at 1.0.
+
+### What made it solvable
+
+The first read said the parent was unrecoverable, because events written before the declaration
+cannot carry a field that did not exist. That is wrong, and three refusals already in the tree are
+why:
+
+1. heklang's `check_ancestry` forces the ancestor's id onto every event that seals under a child, as
+   a required, plaintext field. Not optional and not itself sealed.
+2. hekla's `unanswered_history` refuses a boot that adds a required field to an event type with
+   stored instances, unless the declaration answers for the payloads already written.
+3. `value::stored_field` materialises that `@absent` value on read, so a fold sees it.
+
+So declaring `under` onto a log is only *possible* after the author has written
+`shop_id: Shop @absent(1)`, which **is** the statement of which shop the old events belong to. The
+fold reads parentage rather than guessing it, and there is no unresolvable tail. None of the three
+was built with this in mind; they compose into a guarantee none of them was aiming at.
+
+The tie-break needed no invention either. `encryption.md` already says a key is minted once, "under
+whichever arrived first", so adoption takes the parent from the earliest event that seals under the
+subject and replays the decision the write path would have made.
+
+### What the plan had wrong
+
+**Rewrap-on-write, the shape Phase 39 recorded, is the wrong half.** It adopts a subject the next
+time something writes to it, which covers active subjects and misses dormant ones. The people who
+ask you to delete their data are almost always the ones who left and will never generate another
+event, so a write-triggered repair reaches precisely the subjects an erasure request will not name.
+The work belongs at boot, ahead of traffic, off a fold.
+
+**A rewrap, never a re-mint.** The secret is what the content is encrypted with, so only the
+container changes. The test that pins this compares ciphertext written before the move against a
+read after it, and a mutation that mints a fresh secret fails that test and no other.
+
+**One direction only.** A row already under a parent is left alone whichever way the declaration
+moved. Re-parenting on sight would fight the "whichever arrived first" rule on every write, and
+un-parenting would narrow a shred somebody may rely on. Widening the blast radius is the only change
+safe to make unasked.
+
+### The bug it turned up in Phase 39
+
+A stress test added here failed about one run in three, but only under load and in a *different*
+test: two writers racing to replace one unreachable row could each destroy the other's key.
+
+The mint path read the row twice, once to judge it unreadable and once to get the bytes its
+compare-and-set names. Between those two reads another writer could insert a fresh row, so the CAS
+matched *that* and deleted a key already sealed under. This is the same failure the Phase 39 review
+fixed by keying the CAS on the bytes rather than the parent, arriving through a different window, and
+no ordering of two reads closes it: there has to be one. `load_secret_at` splits into a row read and
+an `open_row`, and the mint path uses one read for both jobs.
+
+It was found by reasoning, not by the flake, and then proved by injecting a delay into the window so
+the old code failed deterministically and the fixed code passed. Chasing it by re-running would have
+taken a long time: fifteen consecutive full runs did not reproduce it.
+
+### Surfaces
+
+- **Boot** adopts before starting projectors or effects, and refuses to serve if any row is left
+  unaccounted for. A settled store pays one indexed count.
+- **`hekla adopt`** runs the same pass ahead of a deploy, through a follower and without the lock,
+  against the live directory a server is still using.
+- **`hekla plan`** counts what would move, in prose and in `--json`, so a gate sees it first.
+- **`hekla verify`** reports rows that have not moved and never moves them: an audit that advances
+  state cannot re-run to check its own answer.
+- **A disagreement is a warning**, not a refusal: two events naming different parents is legal,
+  documented, and the expected shape of a migration where old rows take the `@absent` tenant and
+  newer ones name a real shop. Reported because this fold is the only thing that ever looks, and
+  honest about being what the pass noticed rather than an exhaustive audit, since the scan stops once
+  every waiting key has a parent.
+
+### What the review changed
+
+Three more correctness bugs, and a claim that was written before it was true.
+
+- **An event that sealed nothing decided where the key went.** Rule 12: an absent optional was
+  never encrypted, so `lower` mints no key for it. The fold did not ask, so an event holding
+  `email: null` while naming tenant 7 was read as the witness for a subject the write path had
+  filed under tenant 9, and because that resolved the subject the scan stopped before ever reaching
+  the event that minted it. Erasing the real tenant then left the content readable, silently, which
+  is the precise failure this phase exists to remove. The fold now asks
+  `heklang_host::seals_content`, so the witness is an event that actually minted a key.
+- **`settled()` asked its own bookkeeping instead of the store.** `adopt_in` legitimately declines
+  rows, and a declined subject is gone from `unresolved` while still sitting under the master, so a
+  boot could serve on exactly the state it refuses. It re-asks the key store now, and a run makes up
+  to three passes before reporting what is left, because a pass that moved less than it resolved is
+  answered by looking again.
+- **`hekla adopt` migrated the schema of the directory it was pointed at.** `Runtime::open_following`
+  opens `hekla.db` through `OpDb::open`, which migrates; `plan` and `project` guard against exactly
+  that and this did not, while advertising itself as the thing to run against a live directory.
+- **"One indexed count per boot" was false.** The primary key seeks on `subject` and then filters
+  `master_key_id IS NOT NULL` row by row, so a settled store with ten million children walked ten
+  million entries to learn the answer was zero. Schema v11 adds a partial index over exactly the rows
+  that are wrong, so on a healthy store it is empty and the count finds nothing rather than adding up
+  to nothing. The test reads the query plan, because a comment cannot hold that claim up and this one
+  did not.
+
+Plus: the disagreement list grew with the log rather than with the subjects, on what the docs
+themselves call the expected shape of a migration, and it is now one entry per subject and capped.
+
+### What the second review changed
+
+Three more, and the first two are the same mistake in two places.
+
+- **The adoption's compare-and-set guarded on `master_key_id`, which an erase-and-recreate does not
+  change.** The row that comes back holds a *different secret* under the *same* master, so the guard
+  matched it and wrote the old secret's wrapping over the new one: everything sealed since the erase
+  unreadable, everything the erase shredded readable again, silently, and reported as a successful
+  move. This is the Phase 39 bug (a compare-and-set keyed on something two different rows share)
+  arriving a third time, in code written to fix the second. It is keyed on the wrapped bytes now,
+  like the replacement in `get_or_insert_subject_key`, because only the bytes name the row that was
+  read.
+- **Undoing an adoption could resurrect an erased row.** `load_secret` answering `None` covers both
+  "the parent went underneath this" and "this subject was erased just after the write committed", and
+  the undo could not tell them apart, so an `insert` put the subject's old secret back and un-shredded
+  everything the erase destroyed. `OpDb::restore_root` is an **update**, never an insert: a row that
+  is gone matches nothing and stays gone.
+- **A subject that is only ever an ancestor was never resolved.** The fold read only the head of each
+  seal chain. `Member under Tenant` already deployed leaves tenant rows minted as ancestors, so
+  declaring `Tenant under Region` makes those the rows waiting while every event that could place
+  them still seals under `Member`. The boot refused permanently, telling the author to add the
+  `@absent` they had already added. Every link of the chain is registered now, except the last, which
+  has no ancestors to be filed under.
+
+Plus, from the same pass: `hekla adopt` made neither of the two refusals `serve` makes, so a wrong
+master failed halfway through a half-migrated directory and a missing `@absent` surfaced as a raw
+decode error; the boot could refuse *after* writing the declaration table, which is the "a boot that
+refuses must leave no trace" rule the same function states forty lines earlier; the disagreement
+sentence was duplicated between the boot and the CLI and had already drifted; a lost race still
+logged that it had re-created a tenant; a stuck row cost three full-log scans instead of one; and the
+boot fold said nothing for its whole duration while holding the directory lock.
+
+### What the third review changed
+
+Two that mattered, both of them in code written during the second round.
+
+- **`hekla adopt` exited non-zero on exactly the directory it exists for.** A run re-asks the key
+  store after each pass, and a live deployment serving the *old* declaration keeps minting roots the
+  whole time, so `remaining > 0` always and the refusal always fired. The two endings needed to come
+  apart: a subject no event accounts for is a declaration problem and is fatal anywhere, while a row
+  that merely did not move is a race with a live writer, which is the **normal condition** of a
+  pre-flight and a refusal only at boot, where nothing else should be writing. `Unfinished` names the
+  two, and `settled()` is defined as it answering `None` so the two definitions cannot drift.
+- **The boot's progress line underflowed on the second pass.** Every pass restarts its fold at the
+  head of the log, so the position goes backwards, and `position - last` panics in a debug build and
+  wraps in a release one, turning a line every 250,000 events into a line per event.
+
+Plus: `hekla adopt` demanded a master key before the two answers that need none (a project with no
+hierarchy, a directory with nothing deployed) and errored on a missing `hekla.db` rather than saying
+so; the unresolved list was uncapped in a message that could name a million rows, when the
+disagreement list had been capped for that reason; the tenant-resurrection notice asked whether the
+parent's *row* existed rather than whether it was *reachable*, so the case where a whole erased
+branch really is recreated was the one it stayed silent about; and the partial index's own comment
+claimed it was empty on a healthy store, which it is not: its predicate covers every root row,
+because which subjects declare a parent is a property of the program and a partial index is static.
+
+And one the review did not raise, surfaced by the tests it prompted: **`MINT_ATTEMPTS` was four, and
+four is too few.** A subject erased repeatedly while several threads write to it loses four races in
+a row without anything being wrong, and Phase 39's own concurrency test failed about one run in
+fifteen with `is being erased and recreated faster than a key can be minted`. That error is a refused
+write on a request that should simply have taken longer. It is thirty-two now, which is still bounded
+(a store erased in a tight loop for ever should say so rather than hang) but well clear of ordinary
+contention: zero failures in thirty runs of that test and twenty of the whole suite.
+
+### What the fourth review changed
+
+The first round to reach past the new module into what Phase 39 had already committed, and three of
+the five that mattered were there.
+
+- **The reserved global secret was back on a public surface.** `/admin/subjects/{subject}/{value}`
+  moved from `subject_key_exists` to `subject_key_reachable` when the hierarchy made reachability the
+  right question, and the guard that hides `_hekla_global` did not move with it, so a point lookup
+  reported `live` for a key the inventory deliberately hides. The rename had also merged the two
+  functions' doc comments, leaving the guard *described* on the function that no longer had it, which
+  is what let it through.
+- **An entity's id column was checked by name where the code it backs assumes type.**
+  `EntityDef::of` falls back to the subject's own name when it finds no column of that type, and its
+  comment says `validate` refuses that "by *type*". `validate` compared names, so a column merely
+  *called* `Org` satisfied the check, and `RowWriter::decrypt_field` then read that column as the
+  subject id: the seal never opened and the column read back absent, which is the erasure-shaped
+  answer the check exists to prevent.
+- **The console's "events" link could never match.** A tephra tag is `<field>:<value>`, built from
+  the field name, while a key row is filed under the subject's *type*. After the rename the console
+  built `Org:7` and always found nothing. There is no single right answer when a program spells one
+  subject's id two ways, so the API now reports the spelling when there is exactly one and the
+  console links only then.
+- **The tenant-resurrection notice fired on the happy path.** Changing it to ask reachability (the
+  third review's finding) did not fix what it could never know: an erased row and one that never
+  existed are the same absence, so the first member of every tenant claimed its tenant "had been
+  erased". It is a count taken once per run now, saying what happened and leaving why to whoever
+  knows whether they erased anything.
+- **One row that could not be minted abandoned the whole run**, which contradicted the contract the
+  third review had just established: `hekla adopt` calls contention ordinary, then treated one
+  contended row as fatal for all of them.
+
+Plus: the disagreement cap was applied per pass and not across them, so three passes could print
+sixty lines from a constant whose point is twenty; the refusal cloned the entire unresolved
+population to name twenty of it; and `placeholders` had been added beside a local closure of the same
+name that shadowed it.
+
+**And the memory bound, raised in every round and deferred in every round, is closed.** A pass takes
+at most fifty thousand identities, so a backlog larger than that is several passes rather than one
+allocation of the whole waiting population inside `Runtime::open`. The two reasons to go round again
+needed separating to make that safe: a pass that *filled* its batch found more work and does not
+count against the retry limit, while one that did not fill it saw everything and still left rows
+behind, which is contention and gets three tries. Without that split, bounding the batch would have
+turned a large migration into a refusal.
+
+### What the fifth review changed
+
+Back inside the adoption module, and the severity fell. One still mattered.
+
+- **A run the key store could not act on reported as contention, and exited zero.** Per-row errors
+  were dropped into a counter that never left the pass, so a corrupt wrapping or an ancestor under an
+  unconfigured master left `remaining` high exactly as a race does. `hekla adopt` then printed
+  "something else is writing to this data directory" and returned success, so a deploy gate went
+  green over a store that could not be adopted at all, and the boot that followed refused with the
+  same wrong explanation. The error text, meanwhile, only ever reached a `tracing::warn!` that this
+  command installs no subscriber for, so it went nowhere. `Unfinished` has a third ending now, ahead
+  of contention, and the two faults are fatal at both entry points.
+- **`hekla adopt` reported success over a directory whose event log was gone**, without ever asking
+  whether anything was waiting. The parent lives in the events, so a restored `hekla.db` with no
+  `events/` beside it is a store nothing can place, and saying so is the only help available.
+- **The unbounded orphan sweep never returned under continuous erasure.** Its doc says it converges
+  with the depth of the hierarchy, which is true only on a store nobody is erasing: fresh direct
+  orphans keep appearing, a pass always deletes something, and the sweeper thread stays there for
+  ever while the journal retention pass beside it never runs again. Bounded now, which the same doc
+  already argued for: what is left is unreadable whether or not it is still on disk.
+- Plus: `minted_ancestors` counted ancestors of rows that never moved, on the one line an operator
+  who erased a tenant is meant to be able to trust; `waiting` was latched to the first batch, so a
+  four-pass run reported a quarter of the truth; the ancestor probe ran once per row rather than once
+  per distinct ancestor, which on a full batch is fifty thousand round trips to learn one fact; and
+  the spelling lookup behind the console's link rescanned every event declaration once per row.
+
+**One finding was wrong, and checking it was the point.** The read API was reported as turning
+`?status=open&status=closed` into two contradictory equality clauses. It does not: that handler
+extracts `Query<HashMap<String, String>>`, which cannot hold two values for one key, and the comment
+saying so is correct. Confirmed by request rather than by reading: with the pairs reversed the row
+comes back every time, so one value reaches the filter and the last one wins.
+
+### What the scoped review changed
+
+Three reviews aimed at the previous round's diff alone, rather than at the whole phase. Two of the
+three findings were the previous round's fix, wrong in the opposite direction, which is the pattern
+this pass was run to look for.
+
+- **Classifying every `adopt_in` error as fatal inverted the fix it was.** `adopt_in` raises when the
+  mint retries run out, and that condition is *contention*: the chain is being erased and recreated
+  faster than a key can be minted. So `hekla adopt` against the live directory it exists for exited
+  non-zero and told the operator the store was corrupt, which is precisely the mirror of the bug
+  being fixed, and the file said both things at once. `mint_secret_in` reports exhaustion rather than
+  raising it, and `adopt_in` answers `Contended`; a *write* still fails loudly, because a write has
+  content in hand and nowhere to put it.
+- **A failure in one pass made a fully adopted store refuse to boot.** `failed` and `first_failure`
+  were summed across passes and checked before `remaining`, so a row that errored in pass one and
+  moved in pass two still reported a fault with nothing left under the master. `unfinished` asks the
+  store first now: if nothing is waiting the run is done, however badly a pass along the way went.
+  That is what `settled()`'s doc claimed all along and what reading the bookkeeping instead got wrong
+  in both directions.
+- **`minted_ancestors` was wrong in both directions, for the third time.** Neither half of the
+  inference holds: `Contended` and `Undone` both return *after* the mint, so they can have created a
+  key, and `Moved` does not imply one, because the mint stops at the first ancestor it can already
+  open and never visits the links above it. The comment asserting otherwise was simply false. It is
+  observed now rather than inferred: which ancestors were unreachable before the writes, and which of
+  those are reachable after. It does not care which row did it, which is why it is finally right.
+- Plus: the new no-log guard swallowed the errors it was written for behind two `unwrap_or(0)`s, so a
+  corrupt `hekla.db` reported success; `waiting` double-counted a row that waited through two passes,
+  having previously under-counted, and is now asked of the store once; a const was inserted inside a
+  function's doc block and swallowed its summary, which is the same defect the same round had just
+  fixed elsewhere; and two doc sentences named the wrong caller and the wrong tense.
+
+The lesson is in the shape rather than any one item. Three of the last four rounds found that a fix
+had introduced the failure it was fixing, mirrored. What broke the run of it here was not more care
+on the same approach: it was replacing derived state with a question to the store, in both
+`unfinished` and `minted_ancestors`. Bookkeeping that *describes* what happened can be wrong in a way
+the store cannot.
+
+### The scoped review, second pass
+
+Run again against the previous pass's diff alone. Three findings, and the shape finally changed:
+none of them was the fix inverted.
+
+- **The contention fix only covered the first link.** `adopt_in` mints its direct ancestor through
+  the tolerant path, but the recursion one level up still raised, so a chain of four links reproduced
+  the whole failure: a healthy store reported as one that "will not resolve by looking again".
+  Three levels hid it, because the tail of a three-link chain is a root and a root's mint cannot
+  exhaust. The recursion reports losing the race the same way at every level now, and since it no
+  longer carries back *which* level, the write path's refusal names the whole chain rather than
+  asserting it was the leaf.
+- **`Unaccounted` was the one verdict still decided without asking the store.** `run` broke on it
+  before refreshing `remaining`, so an operator who erased the offending subject while
+  `hekla adopt` was folding would be refused, and told to add an `@absent` for a key that no longer
+  exists. The refresh moved above the break and `remaining == 0` now wins outright, which is the same
+  "ask the store" that fixed the previous two.
+- **A diagnostic count could throw away a completed run.** The after-loop probe for minted ancestors
+  raises with `?`, *after* the writes have committed, so a transient database hiccup discarded
+  `adopted`, `failed` and everything the next pass needed, and failed the boot over a log line.
+
+Plus a doc that misattributed `/admin/subjects` to a wrapper with no production callers at all,
+which is the same false trail that once put the reserved global key on a public surface, one layer
+further up than where it was fixed.
+
+**One test was written and then removed.** It raced an eraser against a four-link mint to pin the
+first finding, and it passed against the reverted fix: with `MINT_ATTEMPTS` at thirty-two, losing
+thirty-two consecutive races is effectively unreachable, which is the same reason raising that bound
+stopped the Phase 39 stress test flaking. A green test that survives its own mutation is worse than
+no test, so that fix stands on the trace through `try_mint_in` rather than on coverage, and this says
+so rather than leaving a reassuring green line behind.
+
+### Closing what had no test
+
+Five paths were reachable and uncovered, found by looking rather than by being asked. Four are now
+pinned by mutation-verified tests: adoption through a two-link chain, the disagreement cap and
+deduplication, the v10-to-v11 migration, and the restore that puts a row back when its ancestor is
+erased mid-adoption.
+
+The last of those needed `adopt_in` to stop answering `bool`. Three of its four outcomes mean "did
+not move" and are not interchangeable, and collapsing them left the restore **unreachable from a
+test**: nothing could tell it from a lost compare-and-set. `Adopted` names them, and the test races
+an eraser against a two-link chain so the window is the whole span between minting the root and
+committing, rather than the tail of it.
+
+The fifth, the pass loop, is pinned only at its contract: a run beside an eraser either settles the
+store or says it did not, and a run with nothing else writing settles it, checked by erasing the
+tenant afterwards and seeing it reach every member. Which branch a contended run takes is an
+interleaving no test can fix, and the loop's failure mode is a refusal rather than a silent hole,
+because the guarantee is held by `settled()` asking the store.
 
 ## Deferred, with triggers
 

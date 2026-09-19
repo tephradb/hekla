@@ -672,10 +672,15 @@ pub fn declaration(row: &DeclarationRow) -> Value {
 }
 
 /// One live subject key, without any key material.
-pub fn subject(info: &SubjectInfo) -> Value {
+pub fn subject(info: &SubjectInfo, id_field: Option<String>) -> Value {
     json!({
         "subject": info.subject,
         "subject_value": info.subject_value,
+        // How an event spells this subject's id, when the program spells it one way. A tag
+        // is `<field>:<value>`, so this is what a link to "the events for this subject"
+        // has to be built from; `null` says the program has more than one spelling and no
+        // single tag covers them.
+        "id_field": id_field,
         // Exactly one of these is set, which the table's `CHECK` enforces: a root is
         // wrapped under a master and a child under its parent's key. Reported as two
         // nullable fields rather than a tagged union, because a reader wants to ask

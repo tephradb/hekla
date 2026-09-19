@@ -706,7 +706,7 @@ fn an_erased_subject_is_not_a_rebuild_mismatch() {
     // the runtime stopped.
     assert!(sweep(&example_dir("orders"), data.path()).is_clean());
 
-    let opdb = std::sync::Arc::new(std::sync::Mutex::new(
+    let opdb = Arc::new(Mutex::new(
         hekla::opdb::OpDb::open(&data.path().join("hekla.db")).unwrap(),
     ));
     assert!(
@@ -1227,7 +1227,7 @@ fn erasing_a_tenant_shreds_its_customers_without_reporting_corruption() {
     );
 
     // The shop, not the customers. Both customers hang from it.
-    let opdb = std::sync::Arc::new(std::sync::Mutex::new(
+    let opdb = Arc::new(Mutex::new(
         hekla::opdb::OpDb::open(&data.path().join("hekla.db")).unwrap(),
     ));
     assert!(

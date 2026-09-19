@@ -134,6 +134,28 @@ fn decode_master_key(encoded: &str) -> anyhow::Result<[u8; MASTER_KEY_LEN]> {
         .map_err(|_| anyhow!("master key must be exactly {MASTER_KEY_LEN} bytes (base64-encoded)"))
 }
 
+/// What one call to [`KeyStore::adopt_in`] did.
+///
+/// Three of the four mean the row did not move, and they are not interchangeable: one is
+/// nothing to do, one is worth another look, and one is a move that had to be taken back.
+/// A `bool` collapsed them, which made a caller unable to decide between refusing and
+/// retrying, and made [`Adopted::Undone`] unreachable from a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adopted {
+    /// The row moved under the parent its subject declares.
+    Moved,
+    /// Nothing to do: no row for this subject, or it is already a child.
+    Settled,
+    /// Another writer reached the row first, so the compare-and-set found nothing. The
+    /// row is wherever that writer left it, and looking again is the answer.
+    Contended,
+    /// The move committed and then could not be read, because the parent was erased
+    /// between minting it and writing the row. The secret was still in hand, so the row
+    /// was put back under the master rather than left hanging from a dead generation with
+    /// everything under it unrecoverable.
+    Undone,
+}
+
 /// The per-subject key store and the deterministic encryption built on it.
 #[derive(Clone)]
 pub struct KeyStore {
@@ -267,6 +289,143 @@ impl KeyStore {
         self.lock().rewrap_subject_keys(&updates)
     }
 
+    /// Move one subject's key under the parent its declaration now names, keeping the
+    /// secret the row already holds.
+    ///
+    /// `chain` is the subject and its ancestors, nearest first, exactly as
+    /// [`KeyStore::encrypt_subject_in`] takes it: `[(Customer, 88), (Shop, 7)]`.
+    ///
+    /// **A rewrap, never a re-mint**, and that is the whole of what makes it safe. The
+    /// secret is what every value already sealed under this subject is encrypted with, so
+    /// minting a fresh one here would shred all of it; only the container it sits in
+    /// changes. [`KeyStore::rotate`] is the same move from one master to another.
+    ///
+    /// **One direction only.** A row already wrapped under a parent is left alone, even
+    /// when the chain names a different one. A parent that disagrees with the declaration
+    /// is a state the docs already admit to (the key was minted once, under whichever
+    /// event arrived first), and re-parenting on sight would make two events naming
+    /// different shops move the row back and forth for ever. The other direction, a child
+    /// back to a master, would narrow a shred somebody may already rely on.
+    ///
+    /// Reports which of the four things happened, rather than just whether a row moved.
+    /// Three of them mean "did not move" and they are not the same: one is nothing to do,
+    /// one is worth another look, and one is a move that had to be taken back. A caller
+    /// deciding whether to refuse, retry or carry on needs to tell them apart, and a test
+    /// cannot reach [`Adopted::Undone`] at all if the answer is a `bool`.
+    pub fn adopt_in(&self, chain: &[(&str, &str)]) -> anyhow::Result<Adopted> {
+        let Some(((subject, subject_value), ancestors)) = chain.split_first() else {
+            anyhow::bail!("a subject chain cannot be empty");
+        };
+        let (subject, subject_value) = (*subject, *subject_value);
+        let Some(((parent_subject, parent_value), _)) = ancestors.split_first() else {
+            anyhow::bail!("subject `{subject}` declares no parent to be adopted under");
+        };
+        let Some(row) = self.lock().get_subject_key(subject, subject_value)? else {
+            return Ok(Adopted::Settled);
+        };
+        let Wrapping::Master(master_id) = &row.wrapping else {
+            return Ok(Adopted::Settled);
+        };
+        let secret = unwrap_key(self.master_for(master_id, subject)?, &row.wrapped)?;
+        // Minting the ancestors this row needs, exactly as a write to this subject would.
+        // An ancestor with no key yet is the ordinary case on a first adoption; one that
+        // was erased gets a *fresh* key here, which is the same "a write after an erase
+        // gets a fresh key" rule one level up, and nothing already shredded becomes
+        // readable because the old generation's fingerprint will not match the new one's.
+        //
+        // Not reported per row. The two cases are indistinguishable from the key store (an
+        // erased row and one that never existed are the same absence), so a notice here
+        // could only assert an erasure it cannot know about, and it fired on the happy
+        // path: the first member of every tenant claimed its tenant "had been erased". The
+        // count of ancestors that had no key is taken once per run instead, by
+        // [`crate::adopt`], which can say what happened without claiming why.
+        // Contention, not a failure, when the retries run out: the chain is being erased
+        // and recreated faster than a key can be minted for it, which resolves by looking
+        // again and is what this outcome exists to say.
+        let Some(parent) = self.mint_secret_in(ancestors)? else {
+            return Ok(Adopted::Contended);
+        };
+        let aad = child_aad(subject, subject_value, parent_subject, parent_value);
+        let wrapped = wrap_key_under(&child_kek(&parent), &secret, &aad)?;
+        let parent_ref = ParentRef {
+            subject: (*parent_subject).to_owned(),
+            value: (*parent_value).to_owned(),
+            fingerprint: parent_fingerprint(&parent),
+        };
+        let update = (
+            subject.to_owned(),
+            subject_value.to_owned(),
+            wrapped.clone(),
+            parent_ref.subject.clone(),
+            parent_ref.value.clone(),
+            parent_ref.fingerprint.clone(),
+            // The bytes this thread read, so a row erased and recreated under it (which
+            // comes back under the same master, holding a different secret) is skipped
+            // rather than overwritten with the old secret.
+            row.wrapped.clone(),
+        );
+        if !self.lock().adopt_subject_key(&update)? {
+            return Ok(Adopted::Contended);
+        }
+        // Read it back through the chain, because committing is not the same as being
+        // readable: an erase of the parent landing between the mint above and this write
+        // leaves the row hanging from a generation that no longer exists, and every value
+        // under it unrecoverable. The secret is still in hand, so that is undoable, and
+        // undoing it is the only move that cannot lose data an erase did not ask for.
+        if self.load_secret(subject, subject_value)?.is_none() {
+            let (primary_id, primary) = self.masters.primary();
+            // An **update**, never an insert, and that is the whole of what makes it safe.
+            // `Ok(None)` above covers two shapes: the parent went, which is what this
+            // undoes, and *this subject* was erased after the write committed, which it
+            // must not touch. Re-inserting would put the old secret back and every value
+            // that erase shredded would read again. Keyed on the bytes this adoption
+            // wrote, so a row erased or moved since matches nothing and stays as it is.
+            let restored = self.lock().restore_root(
+                subject,
+                subject_value,
+                &wrap_key(primary, &secret)?,
+                primary_id,
+                &wrapped,
+            )?;
+            if restored {
+                tracing::debug!(
+                    "subject `{subject}` = `{subject_value}` was left a root: `{parent_subject}` = `{parent_value}` was erased while it was being adopted"
+                );
+            }
+            return Ok(Adopted::Undone);
+        }
+        Ok(Adopted::Moved)
+    }
+
+    /// Whether anything scoped to this subject can still be read: its row exists and so
+    /// does every row above it.
+    ///
+    /// Reachability rather than presence, because [`crate::adopt`] uses it to notice an
+    /// ancestor coming back, and a present-but-unopenable row is one the mint *replaces*
+    /// with a fresh key. Answering "present" for that would miss the identity flipping
+    /// back to live in `/admin/subjects`, which is the thing worth reporting.
+    pub fn is_reachable(&self, subject: &str, subject_value: &str) -> anyhow::Result<bool> {
+        self.lock().subject_key_reachable(subject, subject_value)
+    }
+
+    /// How many key rows are waiting to be adopted: roots of a subject that now declares
+    /// a parent, which is the count a boot asks for every time. Zero is the healthy
+    /// answer, and the cheap one. See [`KeyStore::adopt_in`] and [`crate::adopt`].
+    pub fn pending_adoptions(&self, subjects: &[&str]) -> anyhow::Result<u64> {
+        self.lock().count_roots_of(subjects)
+    }
+
+    /// A page of the rows [`KeyStore::pending_adoptions`] counts, as
+    /// `(subject, subject_value)`, ordered so `after` is a stable cursor.
+    pub fn adoption_candidates(
+        &self,
+        subjects: &[&str],
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.lock().roots_of(subjects, after, limit)
+    }
+
     /// Verify every master key referenced by a stored subject row is configured, so a
     /// wrong or rotated-away `HEKLA_MASTER_KEY` fails fast at boot with a clear message
     /// rather than silently at first read. A stored id is the SHA-256 fingerprint of
@@ -305,18 +464,16 @@ impl KeyStore {
         subject_value: &str,
     ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         self.load_secret_at(subject, subject_value, 0, None)
-            .map(|found| found.map(|(secret, _)| secret))
     }
 
-    /// [`KeyStore::load_secret`] plus the wrapping the row was found under, which the
-    /// mint path needs to tell "no row" from "a row nothing can open".
+    /// [`KeyStore::load_secret`] at a given depth in a chain walk, through a cache.
     fn load_secret_at(
         &self,
         subject: &str,
         subject_value: &str,
         depth: usize,
         cache: Option<&RefCell<SecretCache>>,
-    ) -> anyhow::Result<Option<(Zeroizing<Vec<u8>>, Wrapping)>> {
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         // The subject graph is checked acyclic at parse time and is finite, so a real
         // chain is shorter than this by a wide margin. The cap is here for a database
         // somebody edited by hand, where a cycle would otherwise recurse until the stack
@@ -329,10 +486,29 @@ impl KeyStore {
         let Some(row) = self.lock().get_subject_key(subject, subject_value)? else {
             return Ok(None);
         };
+        self.open_row(subject, subject_value, &row, depth, cache)
+    }
+
+    /// Unwrap a row the caller has already read.
+    ///
+    /// Split from [`KeyStore::load_secret_at`] so the mint path can judge a row and
+    /// replace **that same row**, off one read. Reading twice was a real bug: a writer
+    /// whose first read said "unreadable" could, on its second, pick up a *fresh* row
+    /// another writer had just put there, and its compare-and-set then deleted a key that
+    /// writer had already sealed content under. Two reads cannot be made safe by ordering
+    /// them differently; there has to be one.
+    fn open_row(
+        &self,
+        subject: &str,
+        subject_value: &str,
+        row: &SubjectKey,
+        depth: usize,
+        cache: Option<&RefCell<SecretCache>>,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         match &row.wrapping {
             Wrapping::Master(master_id) => {
                 let master = self.master_for(master_id, subject)?;
-                Ok(Some((unwrap_key(master, &row.wrapped)?, row.wrapping)))
+                Ok(Some(unwrap_key(master, &row.wrapped)?))
             }
             Wrapping::Parent(parent_ref) => {
                 let (parent_subject, parent_value) =
@@ -369,8 +545,11 @@ impl KeyStore {
                 // their shred worked when what actually happened is that somebody wrote
                 // to the key store.
                 let aad = child_aad(subject, subject_value, parent_subject, parent_value);
-                let secret = unwrap_key_under(&child_kek(&parent), &row.wrapped, &aad)?;
-                Ok(Some((secret, row.wrapping)))
+                Ok(Some(unwrap_key_under(
+                    &child_kek(&parent),
+                    &row.wrapped,
+                    &aad,
+                )?))
             }
             Wrapping::Neither => anyhow::bail!(
                 "subject `{subject}` = `{subject_value}` is wrapped under neither a master nor a parent, which the schema forbids: the row has been edited outside hekla"
@@ -391,17 +570,13 @@ impl KeyStore {
         cache: Option<&RefCell<SecretCache>>,
     ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         let Some(cache) = cache else {
-            return Ok(self
-                .load_secret_at(subject, subject_value, depth, None)?
-                .map(|(secret, _)| secret));
+            return self.load_secret_at(subject, subject_value, depth, None);
         };
         let key = (subject.to_owned(), subject_value.to_owned());
         if let Some(cached) = cache.borrow().get(&key) {
             return Ok(cached.clone());
         }
-        let loaded = self
-            .load_secret_at(subject, subject_value, depth, Some(cache))?
-            .map(|(secret, _)| secret);
+        let loaded = self.load_secret_at(subject, subject_value, depth, Some(cache))?;
         cache.borrow_mut().insert(key, loaded.clone());
         Ok(loaded)
     }
@@ -431,6 +606,36 @@ impl KeyStore {
         &self,
         chain: &[(&str, &str)],
     ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        match self.mint_secret_in(chain)? {
+            Some(secret) => Ok(secret),
+            // A write that cannot find a stable key is better off failing loudly: it has
+            // content in hand and nowhere safe to put it.
+            // Names the chain rather than one link, because the exhaustion can be at any
+            // depth: the recursion reports losing the race the same way at every level and
+            // deliberately does not carry back which one it was.
+            None => {
+                let named = chain
+                    .iter()
+                    .map(|(subject, value)| format!("`{subject}` = `{value}`"))
+                    .collect::<Vec<_>>()
+                    .join(" under ");
+                anyhow::bail!(
+                    "{named} is being erased and recreated faster than a key can be minted for it"
+                )
+            }
+        }
+    }
+
+    /// [`KeyStore::get_or_create_secret_in`], with losing the race reported rather than
+    /// raised.
+    ///
+    /// The distinction is the caller's to make and it is not cosmetic. To a *write*,
+    /// exhausting the retries is a failure: there is content to store and no key to store
+    /// it under. To an *adoption* it is contention, which its whole contract calls
+    /// ordinary and answers by looking again. Raising it for both made `hekla adopt` exit
+    /// non-zero on a healthy store somebody was erasing from, and tell the operator it was
+    /// corrupt: the exact mirror of the bug that made errors read as contention.
+    fn mint_secret_in(&self, chain: &[(&str, &str)]) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         // Bounded retry, because one attempt can legitimately end with nothing to return:
         // another writer wins the insert and its row is itself unreachable by the time
         // this thread reads it back, which is what happens when an erase lands in between.
@@ -438,17 +643,13 @@ impl KeyStore {
         // late, so the answer is to look again rather than to invent a key or to fail.
         //
         // Bounded rather than a `loop`: a store being erased in a tight cycle would
-        // otherwise hang the request, and a write that cannot find a stable key after this
-        // many tries is better off failing loudly.
+        // otherwise hang the caller.
         for _ in 0..MINT_ATTEMPTS {
             if let Some(secret) = self.try_mint_in(chain)? {
-                return Ok(secret);
+                return Ok(Some(secret));
             }
         }
-        let (subject, subject_value) = chain[0];
-        anyhow::bail!(
-            "subject `{subject}` = `{subject_value}` is being erased and recreated faster than a key can be minted for it"
-        )
+        Ok(None)
     }
 
     /// One attempt at [`KeyStore::get_or_create_secret_in`].
@@ -460,15 +661,24 @@ impl KeyStore {
             anyhow::bail!("a subject chain cannot be empty");
         };
         let (subject, subject_value) = (*subject, *subject_value);
-        if let Some((secret, _)) = self.load_secret_at(subject, subject_value, 0, None)? {
+        // **One read, and the row it returns is the row the replacement below names.**
+        // Asking twice (once to judge, once to get the bytes to compare against) let a
+        // fresh row another writer had just inserted arrive in between, and the
+        // compare-and-set then matched *that* and deleted a key already sealed under. It
+        // is the same failure keying the replacement on the parent had, through a
+        // different window, and it only ever showed up as a rare flake under load.
+        let existing = self.lock().get_subject_key(subject, subject_value)?;
+        if let Some(row) = &existing
+            && let Some(secret) = self.open_row(subject, subject_value, row, 0, None)?
+        {
             return Ok(Some(secret));
         }
         // A row may be present and unreachable, which happens when this subject outlived
         // an ancestor's erasure. Its ciphertext is already unrecoverable, so the row reads
         // as absent and is replaced rather than hard-failing on the unwrap. Safe precisely
-        // because `load_secret_at` said `Ok(None)` rather than `Err`: a master that is
-        // merely missing never reaches here.
-        let stale = self.lock().get_subject_key(subject, subject_value)?;
+        // because `open_row` said `Ok(None)` rather than `Err`: a master that is merely
+        // missing never reaches here.
+        let stale = existing;
         let fresh = random_secret()?;
         // The parent's secret is kept, not just used: unwrapping the row that actually
         // persists needs it again, and reaching for it a second time through
@@ -487,7 +697,16 @@ impl KeyStore {
                 // its secret and it may not exist yet. An ancestor erased and written to
                 // again gets a fresh key here, which is the same point-in-time shred every
                 // subject has always had, applied one level up.
-                let parent = self.get_or_create_secret_in(ancestors)?;
+                //
+                // Losing the race up there is this attempt losing it, not a failure: it is
+                // the same "the store moved underneath, look again" this function reports
+                // with `Ok(None)` everywhere else. Raising it instead meant a *caller* that
+                // treats contention as ordinary, which is what `adopt_in` is, still saw an
+                // error for any chain deep enough to recurse: three links is the shallowest
+                // that reaches here with ancestors of its own.
+                let Some(parent) = self.mint_secret_in(ancestors)? else {
+                    return Ok(None);
+                };
                 let aad = child_aad(subject, subject_value, parent_subject, parent_value);
                 let candidate = SubjectKey {
                     wrapped: wrap_key_under(&child_kek(&parent), &fresh, &aad)?,
@@ -779,8 +998,15 @@ const MAX_SUBJECT_DEPTH: usize = 32;
 
 /// How many times a mint looks again after losing a race to a row that is itself already
 /// unreachable. Each attempt is one read plus one insert, and only a subject being erased
-/// concurrently costs more than the first.
-const MINT_ATTEMPTS: usize = 4;
+/// concurrently costs more than the first, so patience here is free on a quiet store and
+/// the only thing standing between a burst of erasures and a refused write.
+///
+/// Four was too few. A subject erased repeatedly while several threads write to it can
+/// lose four in a row without anything being wrong, and what the writer then gets is a
+/// hard error on a request that should simply have taken longer. Bounded rather than
+/// unbounded because a store being erased in a tight loop for ever should say so rather
+/// than hang, but the bound belongs well clear of ordinary contention.
+const MINT_ATTEMPTS: usize = 32;
 
 /// The 32-byte AES-GCM key a child's secret is wrapped under, derived from its parent's
 /// 64-byte AES-SIV secret.

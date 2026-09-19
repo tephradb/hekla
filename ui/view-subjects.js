@@ -134,20 +134,27 @@ function Inventory() {
       key: 'events',
       header: '',
       width: '110px',
-      render: (row) => html`
-        <a
-          class="tiny"
-          href=${`/admin/events?tag=${encodeURIComponent(`${row.subject}:${row.subject_value}`)}`}
-          onClick=${(clicked) => {
-            clicked.preventDefault()
-            go(
-              `/admin/events?tag=${encodeURIComponent(`${row.subject}:${row.subject_value}`)}`,
-            )
-          }}
-        >
-          events →
-        </a>
-      `,
+      // Only when the program spells this subject's id one way. A tag is
+      // `<field>:<value>`, so with `org_id: Org` on one event and `owner: Org` on another
+      // there is no single tag that covers both, and `id_field` is null. Building one out
+      // of the subject name instead gave a link that always found nothing.
+      render: (row) =>
+        row.id_field
+          ? html`
+              <a
+                class="tiny"
+                href=${`/admin/events?tag=${encodeURIComponent(`${row.id_field}:${row.subject_value}`)}`}
+                onClick=${(clicked) => {
+                  clicked.preventDefault()
+                  go(
+                    `/admin/events?tag=${encodeURIComponent(`${row.id_field}:${row.subject_value}`)}`,
+                  )
+                }}
+              >
+                events →
+              </a>
+            `
+          : '',
     },
   ]
 

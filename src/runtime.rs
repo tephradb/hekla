@@ -73,6 +73,13 @@ const SEGMENT_SIZE: usize = 256 * 1024 * 1024;
 /// that share nothing else either.
 pub const PROJECTION_SLOTS: usize = 2;
 
+/// How far the adoption fold advances between progress lines at boot.
+///
+/// Positions rather than seconds, so the cadence is the same whatever the machine: a log
+/// small enough to finish inside one of these says nothing at all, which is the common
+/// case and the right amount.
+const ADOPT_PROGRESS: u64 = 250_000;
+
 /// How many times a command re-runs its whole decision cycle on a DCB conflict
 /// before the runtime gives up and returns a concurrency conflict.
 ///
@@ -316,7 +323,7 @@ impl Runtime {
             .context("starting the write coordinator")?;
         let store = Store::writing(store);
 
-        let mut opdb = OpDb::open(&data_dir.join("hekla.db"))?;
+        let opdb = OpDb::open(&data_dir.join("hekla.db"))?;
         let now = now_rfc3339();
 
         // Generated before the project is taken apart below: `Surface` borrows the whole
@@ -359,10 +366,12 @@ impl Runtime {
             anyhow::bail!(refusal);
         }
 
-        // Recorded whole, and before the project is taken apart below: the digest covers
-        // every declaration, not just the three kinds that become units, so this is also
-        // where an event's shape is persisted. One write rather than one per module.
-        opdb.set_current_declarations(&declarations(&project), &now)?;
+        // Computed here, where the project is still whole (the digest covers every
+        // declaration, not just the three kinds that become units), and written further
+        // down once the refusals are behind us. Rule 16 again: a boot that refuses must
+        // leave no trace of having happened, and the adoption below can refuse. The write
+        // site says which failures are still not covered.
+        let declared = declarations(&project);
 
         let mut commands = HashMap::new();
         for unit in project.commands {
@@ -399,7 +408,26 @@ impl Runtime {
         // surfacing it as a read error after boot.
         if let Some(keystore) = &keystore {
             keystore.verify_masters_present()?;
+            // And put every key where this deployment's declarations say it belongs,
+            // before anything can read or write one. A subject that gained a parent since
+            // its rows were minted is still wrapped under the master, so erasing the
+            // tenant would miss it and say nothing; serving in that state is the one
+            // thing this must not do. Settled stores pay one indexed count for the
+            // question.
+            adopt(&project.program, &events, &store, keystore)?;
         }
+        // After the refusals that decide whether this deployment may run at all, which is
+        // what the adoption above is. `hekla plan` compares against this table, and a boot
+        // that bailed after writing it makes the next plan diff the candidate against
+        // itself and report no changes for a deploy that never served.
+        //
+        // Not *every* way out is behind this: starting the projectors and the effects can
+        // still fail below, and those leave the record written. That hole predates the
+        // adoption and closing it means unwinding a write on a path that has already begun
+        // creating read models, which is a larger change than this one.
+        opdb.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_current_declarations(&declared, &now)?;
         let keystore = keystore.map(Arc::new);
         let program = Arc::clone(&project.program);
 
@@ -1160,8 +1188,12 @@ impl Runtime {
     /// Whether a key row is on disk for this subject.
     ///
     /// Row existence, not reachability: a child whose parent has been erased still has a
-    /// row here and cannot be read through any path. `/admin/subjects` answers with this
-    /// and says so.
+    /// row here and cannot be read through any path. So this is the *storage* question,
+    /// and the admin surfaces do not ask it: the listing reads `subject_keys_page` and
+    /// `/admin/subjects/{subject}/{value}` reads `subject_key_reachable`, because what an
+    /// operator wants to know is whether anything scoped to the subject can still be read.
+    /// Kept for the tests that assert a row survives its parent's deletion until the sweep
+    /// reclaims it, which is a fact about storage and nothing else.
     pub fn subject_key_exists(&self, subject: &str, value: &str) -> anyhow::Result<bool> {
         self.lock_opdb().subject_key_exists(subject, value)
     }
@@ -1421,6 +1453,74 @@ fn tag_strings(tags: &[(String, Option<String>)]) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// Put every subject key under the parent this deployment's declarations name, and refuse
+/// to go further if any could not be placed.
+///
+/// Boot is where this belongs rather than a maintenance command, because the failure it
+/// removes is invisible: a key still wrapped under the master reads perfectly, verifies
+/// clean, and only shows itself as a tenant erase that silently missed it. A settled store
+/// pays one indexed count, so asking every time is affordable.
+///
+/// A disagreement is a warning rather than a refusal. The parent is asserted per event and
+/// two events naming different ones is a state the language admits and documents; the key
+/// goes under whichever came first, which is the rule a write would have followed.
+fn adopt(
+    program: &Program,
+    events: &EventDefs,
+    store: &Store,
+    keystore: &KeyStore,
+) -> anyhow::Result<()> {
+    let waiting = crate::adopt::waiting(program, keystore)?;
+    if waiting == 0 {
+        return Ok(());
+    }
+    tracing::info!(
+        "{waiting} subject key(s) predate the parent their subject now declares; adopting before serving"
+    );
+    // Said periodically, because this runs before the listener is up and while the
+    // directory lock is held: a store large enough for the fold to take minutes would
+    // otherwise look hung to whoever is watching the deploy, with one line of explanation
+    // and then silence.
+    // A run makes more than one pass when something else is writing, and every pass starts
+    // its fold at the beginning of the log again, so the position handed here goes
+    // *backwards*. Subtracting across that underflows: a panic in a debug build, and in a
+    // release build a wrapped value that is true for every event, which turns the line
+    // below into one per event.
+    let mut last = 0u64;
+    let done = crate::adopt::run(program, events, store, keystore, &mut |position, found| {
+        if position < last {
+            last = 0;
+        }
+        if position - last >= ADOPT_PROGRESS {
+            last = position;
+            tracing::info!("adopting: read to position {position}, {found} key(s) placed so far");
+        }
+    })?;
+    for wrong in &done.disagreements {
+        tracing::warn!("{}", crate::adopt::disagreement_line(wrong));
+    }
+    // Both kinds are fatal here. Nothing else should be writing to a directory this
+    // process is opening, so a contended run means the guarantee does not hold and the
+    // one thing this must not do is serve anyway.
+    if let Some(unfinished) = crate::adopt::unfinished(&done) {
+        anyhow::bail!("{unfinished}");
+    }
+    let (adopted, scanned) = (done.adopted, done.scanned);
+    tracing::info!(
+        "adopted {adopted} subject key(s) under their declared parent, reading {scanned} event(s)"
+    );
+    // Said because an operator who erased one of these will see its identity back in
+    // `/admin/subjects`. Whether it was erased or simply never had a key is not a thing
+    // the key store can tell, so this counts and does not explain.
+    if done.minted_ancestors > 0 {
+        let minted = done.minted_ancestors;
+        tracing::info!(
+            "created {minted} ancestor key(s) that had none; anything shredded under an earlier generation of one stays shredded"
+        );
+    }
+    Ok(())
 }
 
 /// Refuse a project that was loaded with a scratch module.

@@ -696,6 +696,9 @@ async fn the_subject_inventory_counts_live_keys_without_exposing_key_material() 
             keys,
             vec![
                 "created_at",
+                // The field name an event spells this subject's id with, so the console can
+                // build a tag link. A declaration, not key material.
+                "id_field",
                 "master_key_id",
                 "parent",
                 "subject",

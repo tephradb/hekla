@@ -2115,9 +2115,25 @@ async fn admin_subjects(
             ),
             Some(_) => None,
         };
+        // One answer per distinct subject name, not per row: the lookup walks every field
+        // of every event declaration, and a page of two hundred rows over a handful of
+        // subjects asked the same question two hundred times.
+        let mut spellings: HashMap<&str, Option<String>> = HashMap::new();
+        let subjects = rows
+            .iter()
+            .map(|row| {
+                let spelling = spellings
+                    .entry(row.subject.as_str())
+                    .or_insert_with(|| {
+                        crate::schema::id_field_of(runtime.events_map(), &row.subject)
+                    })
+                    .clone();
+                introspect::subject(row, spelling)
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "counts": counts,
-            "subjects": rows.iter().map(introspect::subject).collect::<Vec<_>>(),
+            "subjects": subjects,
             "next": next,
         }))
     })

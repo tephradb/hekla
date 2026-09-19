@@ -1202,6 +1202,30 @@ The obligations that come with it, in the order they bite:
   own arguments, because you named the subject. A subject with children makes that false, so the
   asymmetry with `rewind` went when the reason for it did.
 
+**A parent declared onto keys that already exist is adopted at boot.** A row's wrapping is decided
+the first time its subject is seen and never revisited, so adding `under Shop` to a `Customer` with
+rows already in the store would leave them wrapped under the master: erasing the shop would report
+success and miss every one, with nothing anywhere reading as wrong. The boot moves them before it
+serves, and refuses to serve if it cannot; a settled store pays one indexed count to ask.
+
+- **The parent is read, not guessed.** It lives in the events that sealed under the subject, so this
+  folds the log and takes the one the *earliest* such event named, which is the rule a write would
+  have followed. Events predating the declaration are covered because adding the ancestor's field to
+  an event type with stored instances is itself refused unless it carries `@absent`, so the author
+  has already said what those payloads mean. The three refusals that make this total (heklang's
+  `check_ancestry`, hekla's `unanswered_history`, and `@absent` on read) were each built for their
+  own reason and compose into a guarantee none of them was aiming at.
+- **A rewrap, never a re-mint.** The secret is what the content is encrypted with; only the container
+  changes. Minting a fresh one would shred everything it claims to protect, which is why the test
+  that pins this compares ciphertext written before the move against a read after it.
+- **One direction only.** A row already under a parent is left alone, whichever way the declaration
+  has moved. Re-parenting on sight would fight the "whichever arrived first" rule below on every
+  write, and un-parenting would narrow a shred someone may already rely on. Widening the blast radius
+  is the only change safe to make without being asked.
+- **`hekla adopt` runs the same pass ahead of a deploy**, through a follower and without the lock, so
+  a large migration need not happen inside a boot. `hekla plan` counts what would move and
+  `hekla verify` reports what has not.
+
 **What a parent gives up, said plainly.** Section 15 sells per-field subjects on exactly the opposite
 property: an `order.placed` has both a customer and a shop, so scoping the whole event to one would
 destroy the other's record. Under a parent, erasing the shop does reach the customer's fields, on

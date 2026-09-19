@@ -320,6 +320,14 @@ pub struct Plan {
     /// this one is not always computed, and a gate must not read "not asked" as "asked
     /// and clean".
     pub unreadable: Option<Vec<Unreadable>>,
+    /// Subject keys this deploy would move under the parent their subject declares,
+    /// because they were minted before it said so.
+    ///
+    /// Appended rather than attributed, like [`Plan::secrets`]: it is a fact about the
+    /// directory this would deploy over rather than an inference from the diff. It is
+    /// work the boot will do and cannot be skipped, so a gate that reads plans wants it
+    /// in front of the deploy rather than in a log afterwards.
+    pub adoptions: u64,
 }
 
 impl Plan {
@@ -334,6 +342,10 @@ impl Plan {
             // And for the same reason: a deploy that would refuse to boot is never
             // "nothing would change".
             && self.unreadable.as_deref().unwrap_or_default().is_empty()
+            // Keys the boot would move are work this deploy does to stored data, which
+            // is the one kind of change a reader of this most wants not to be surprised
+            // by.
+            && self.adoptions == 0
             && self
                 .projectors
                 .iter()
@@ -352,6 +364,9 @@ impl Plan {
         serde_json::json!({
             "declarations_compared": self.declarations_compared,
             "digest_version_mismatch": self.digest_version_mismatch,
+            // Always present: this one is always computable, for the reason `secrets`
+            // gives below.
+            "adoptions": self.adoptions,
             // Null when no event, record or enum moved, so this was never asked. An
             // empty array is a log that was read and found readable, which is the
             // other answer and a different one, as `divergences` has it.
@@ -510,6 +525,20 @@ impl fmt::Display for Plan {
             .unwrap_or_default()
         {
             writeln!(f, "    {sentence}")?;
+        }
+
+        // Beside them, and before the bail, for the same reason: keys in the wrong place
+        // is a fact about the directory rather than a comparison of declarations.
+        if self.adoptions > 0 {
+            let keys = self.adoptions;
+            writeln!(
+                f,
+                "  {keys} subject key(s) would move under the parent their subject declares, at boot"
+            )?;
+            writeln!(
+                f,
+                "    They predate the `under` that now covers them, so erasing the tenant would miss them until they move. `hekla adopt` does it ahead of the deploy."
+            )?;
         }
 
         // Every hash differs for one reason, so listing them all would bury it.
@@ -903,6 +932,12 @@ pub fn compute_with(
         recorded_entries = db.recorded_entries()?;
         plan.changes = diff(project, &recorded, &mut plan)?;
         repartitions = lane_repartitions(project, &db)?;
+        // A plain count over the key rows, so this needs no master key and stays a thing
+        // a plan can answer from a laptop. It is work the *deploy* will do rather than a
+        // difference between two declaration tables, which is why it rides alongside the
+        // diff the way the credential report does.
+        plan.adoptions =
+            db.count_roots_of(&crate::schema::Subjects::of(&project.program).parented())?;
     }
     // The one thing here that opens the event log without `--replay`, and it does so
     // only when the diff says a declaration that decodes one moved: a deploy that

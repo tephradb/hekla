@@ -2116,6 +2116,14 @@ pub fn sweep_orphan_keys_now(runtime: &Runtime) -> anyhow::Result<()> {
     sweep_orphan_keys(runtime)
 }
 
+/// How many orphan passes one sweep makes.
+///
+/// A declared hierarchy deeper than this cannot be *read* ([`crate::crypto`] caps the
+/// chain walk at the same number), so on a quiet store the loop finishes long before this;
+/// it is the bound that keeps a store under continuous erasure from holding the sweeper
+/// thread for ever. Whatever it defers waits an hour, not longer.
+const ORPHAN_PASSES: usize = 32;
+
 /// Reclaim key rows whose parent is gone.
 ///
 /// Erasing a subject makes every key beneath it unopenable in one row delete, which is
@@ -2133,7 +2141,14 @@ fn sweep_orphan_keys(runtime: &Runtime) -> anyhow::Result<()> {
     // reclaim. The query is an index range over `subject_key_by_parent` and returns
     // nothing on an all-roots store, so the gate bought a few microseconds an hour and
     // cost a case.
-    loop {
+    // Bounded, because "repeats until a pass deletes nothing" is only the same thing as
+    // "converges with the depth of the hierarchy" on a store nobody is erasing. A
+    // deployment erasing tenants continuously keeps producing fresh direct orphans, so a
+    // pass always deletes something and this never returns: the sweeper thread stays here
+    // for ever and the journal retention pass beside it never runs again. Stopping early
+    // costs nothing, which the paragraph above already says: what is left is unreadable
+    // whether or not it is still on disk, and the next hour picks it up.
+    for _ in 0..ORPHAN_PASSES {
         let mut swept = 0;
         loop {
             let deleted = runtime.sweep_orphan_subject_keys(SWEEP_CHUNK)?;
@@ -2151,6 +2166,7 @@ fn sweep_orphan_keys(runtime: &Runtime) -> anyhow::Result<()> {
         }
         thread::sleep(SWEEP_CHUNK_PAUSE);
     }
+    Ok(())
 }
 
 // --- test support ----------------------------------------------------------

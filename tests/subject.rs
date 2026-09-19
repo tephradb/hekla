@@ -27,11 +27,14 @@
 //! encrypt-a-filter path has no caller and neither do the two erased-subject cases that
 //! guarded its edges.
 
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use hekla::crypto::{KeyStore, MasterKeys};
+use base64::Engine;
+use hekla::crypto::{Adopted, KeyStore, MasterKeys};
 use hekla::effect::StubHttpClient;
 use hekla::opdb::OpDb;
 use hekla::read_api;
@@ -1755,4 +1758,1284 @@ fn concurrent_writers_and_erasers_never_lose_a_key_they_reported_success_for() {
         "no write survived, so nothing was really tested"
     );
     assert!(shredded > 0, "no erase landed, so nothing was really raced");
+}
+
+// --- a parent declared onto rows that already exist --------------------------
+
+/// The load-bearing property: adoption keeps the secret, so everything already sealed
+/// under the subject still reads.
+///
+/// A subject's secret is what its values are encrypted with. Adoption changes which key
+/// that secret is *wrapped* under and must not touch the secret itself, so the ciphertext
+/// written before the parent was declared has to come back byte-identical afterwards. The
+/// implementation that gets this wrong is the one that mints a fresh key and reports
+/// success, which shreds every value it claims to have protected.
+#[test]
+fn an_adoption_keeps_the_secret_so_everything_already_sealed_still_reads() {
+    let ks = keystore();
+    // Written while `Customer` was flat: a one-entry chain, so the row is a root.
+    let before = ks
+        .encrypt_subject_in(&[("Customer", "88")], "email", "ada@example.com")
+        .unwrap();
+    let also = ks
+        .encrypt_subject_in(&[("Customer", "88")], "address", "12 Bell Lane")
+        .unwrap();
+
+    // `under Shop` is declared, and the fold reports customer 88 belongs to shop 7.
+    assert_eq!(
+        ks.adopt_in(&[("Customer", "88"), ("Shop", "7")]).unwrap(),
+        Adopted::Moved,
+        "a root of a now-parented subject moves"
+    );
+
+    assert_eq!(
+        ks.decrypt_subject("Customer", "88", "email", &before)
+            .unwrap()
+            .as_deref(),
+        Some("ada@example.com"),
+        "the very bytes written before the declaration changed still open"
+    );
+    assert_eq!(
+        ks.decrypt_subject("Customer", "88", "address", &also)
+            .unwrap()
+            .as_deref(),
+        Some("12 Bell Lane"),
+        "every field of it, not just the one that happened to be checked"
+    );
+}
+
+/// And the point of the exercise: once adopted, the tenant's erase reaches it.
+///
+/// This is the failure the whole phase exists to remove. Before adoption, erasing shop 7
+/// leaves customer 88 perfectly readable and reports success, which is a deletion that
+/// quietly did less than it said.
+#[test]
+fn an_adopted_subject_is_shredded_by_the_tenant_that_now_owns_it() {
+    let ks = keystore();
+    let sealed = ks
+        .encrypt_subject_in(&[("Customer", "88")], "email", "ada@example.com")
+        .unwrap();
+
+    // The gap, demonstrated first: a flat root is untouched by its future tenant.
+    ks.erase("Shop", "7").unwrap();
+    assert_eq!(
+        ks.decrypt_subject("Customer", "88", "email", &sealed)
+            .unwrap()
+            .as_deref(),
+        Some("ada@example.com"),
+        "an unadopted root survives its tenant's erasure, which is the bug"
+    );
+
+    ks.adopt_in(&[("Customer", "88"), ("Shop", "7")]).unwrap();
+    assert!(ks.erase("Shop", "7").unwrap(), "one row delete");
+    assert_eq!(
+        ks.decrypt_subject("Customer", "88", "email", &sealed)
+            .unwrap(),
+        None,
+        "and now the tenant takes its customer with it"
+    );
+}
+
+/// Adoption runs twice without doing anything the second time, and never touches a row
+/// that is already a child.
+///
+/// Idempotence is what lets it run on every boot. The second half is the direction rule:
+/// a row wrapped under shop 9 while the chain says shop 7 stays under shop 9, because a
+/// parent that disagrees with the declaration is the documented "whichever event arrived
+/// first" case and re-parenting it would fight that rule on every write.
+#[test]
+fn an_adoption_is_idempotent_and_never_repoints_an_existing_child() {
+    let ks = keystore();
+    ks.encrypt_subject_in(&[("Customer", "88")], "email", "ada")
+        .unwrap();
+    assert_eq!(
+        ks.adopt_in(&[("Customer", "88"), ("Shop", "7")]).unwrap(),
+        Adopted::Moved
+    );
+    assert_eq!(
+        ks.adopt_in(&[("Customer", "88"), ("Shop", "7")]).unwrap(),
+        Adopted::Settled,
+        "the second pass finds a child and leaves it alone"
+    );
+
+    // Minted under shop 9 by a write, then offered shop 7 by a later event.
+    let sealed = ks
+        .encrypt_subject_in(&[("Customer", "99"), ("Shop", "9")], "email", "grace")
+        .unwrap();
+    assert_eq!(
+        ks.adopt_in(&[("Customer", "99"), ("Shop", "7")]).unwrap(),
+        Adopted::Settled,
+        "a child is where it is, whatever a later chain says"
+    );
+    assert!(ks.erase("Shop", "7").unwrap());
+    assert_eq!(
+        ks.decrypt_subject("Customer", "99", "email", &sealed)
+            .unwrap()
+            .as_deref(),
+        Some("grace"),
+        "erasing the shop it was never under does not touch it"
+    );
+}
+
+/// Adoption of a subject with no row does nothing, rather than creating one.
+///
+/// A key row is created by a write. Adoption is a repair of rows that already exist, and
+/// minting here would resurrect a subject that was erased between the fold that listed it
+/// and the write that acts on it.
+#[test]
+fn adopting_a_subject_with_no_key_creates_nothing() {
+    let ks = keystore();
+    assert_eq!(
+        ks.adopt_in(&[("Customer", "404"), ("Shop", "7")]).unwrap(),
+        Adopted::Settled,
+        "nothing to adopt"
+    );
+    assert!(
+        ks.decrypt_subject("Customer", "404", "email", "not-a-ciphertext")
+            .unwrap()
+            .is_none(),
+        "and no key was conjured for it"
+    );
+}
+
+/// The same project before `under` was declared. The event already carries the tenant id,
+/// because something else on it is sealed under the tenant, so declaring the parent later
+/// needs no new field at all: this is the migration as it actually looks.
+const FLAT_EVENTS: &str = r#"
+subject Tenant(Int)
+subject Member(Int)
+
+event @member.joined {
+  member_id: Member,
+  tenant_id: Tenant,
+  email: String? @subject(member_id) @max(100),
+  plan: String? @subject(tenant_id) @max(100),
+}
+"#;
+
+fn flat_project() -> tempfile::TempDir {
+    write_project(&[
+        ("events/member.hk", FLAT_EVENTS),
+        ("commands/join.hk", NESTED_COMMAND),
+        ("projectors/members.hk", NESTED_PROJECTOR),
+    ])
+}
+
+fn boot_at(project_dir: &Path, data_dir: &Path) -> Harness {
+    Boot::new(project_dir)
+        .http_status(200)
+        .with_master_key()
+        .data_dir(data_dir)
+        .start()
+}
+
+/// Declaring a parent onto a project that already has key rows moves those rows, at boot,
+/// before anything can read or write one.
+///
+/// This is the gap Phase 39 left open, end to end. Members written while `Member` was its
+/// own root are wrapped under the master; after the declaration changes they hang from
+/// their tenant, and erasing the tenant reaches them. Without the adoption the erase
+/// reports success and every one of these rows stays readable, which is the failure a
+/// deletion feature cannot have.
+#[test]
+fn declaring_a_parent_onto_a_running_project_adopts_the_keys_already_there() {
+    let data = tempfile::tempdir().unwrap();
+
+    // Boot one: `Member` is flat, so every member's key is a root under the master.
+    let flat = flat_project();
+    let harness = boot_at(flat.path(), data.path());
+    join(&harness, 1, 7, "ada@example.com");
+    join(&harness, 2, 7, "grace@example.com");
+    // A member of a different tenant, so the cascade is shown to follow the hierarchy
+    // rather than shredding every subject of that kind.
+    join(&harness, 3, 9, "alan@example.com");
+    assert_eq!(member(&harness, 1, 3)["email"], "ada@example.com");
+    assert!(
+        harness.rt.subject_key_exists("Member", "1").unwrap(),
+        "the row exists, and at this point it is a root"
+    );
+    harness.shutdown();
+
+    // Boot two: the same data directory, and now `Member under Tenant`.
+    let nested = nested_project();
+    let harness = boot_at(nested.path(), data.path());
+
+    // Everything written before the declaration changed still reads. The secret moved
+    // container, not value, which is what makes the adoption safe to do at all.
+    assert_eq!(
+        member(&harness, 1, 3)["email"],
+        "ada@example.com",
+        "a rewrap keeps the key, so nothing already sealed is lost"
+    );
+    assert_eq!(member(&harness, 3, 3)["email"], "alan@example.com");
+
+    // And the tenant now owns them, which it did not an instant ago.
+    let keystore = harness.rt.keystore().unwrap();
+    assert!(keystore.erase("Tenant", "7").unwrap(), "one row delete");
+    assert!(
+        member(&harness, 1, 3).get("email").is_none(),
+        "a member minted before the parent was declared is shredded with its tenant"
+    );
+    assert!(
+        member(&harness, 2, 3).get("email").is_none(),
+        "every one of them, not just the first"
+    );
+    assert_eq!(
+        member(&harness, 3, 3)["email"],
+        "alan@example.com",
+        "and the other tenant's member is untouched"
+    );
+    harness.shutdown();
+}
+
+/// The harder migration: the parent's id was not on the event at all, and `@absent` is
+/// what puts it there.
+///
+/// heklang refuses an event that seals under a child without carrying its ancestor, and
+/// hekla refuses a boot that adds a required field to an event type with stored instances
+/// unless it answers for the payloads already written. Together they mean the only way to
+/// declare `under` onto a log is to say what the old events' parent is, which is exactly
+/// what makes those rows adoptable rather than lost.
+const UNPARENTED_EVENTS: &str = r#"
+subject Member(Int)
+
+event @member.joined {
+  member_id: Member,
+  email: String? @subject(member_id) @max(100),
+}
+"#;
+
+const UNPARENTED_COMMAND: &str = r#"
+command Join(member_id: Member, email: String?) {
+  emit @member.joined { member_id, email }
+}
+"#;
+
+const ADOPTED_EVENTS: &str = r#"
+subject Tenant(Int)
+subject Member(Int) under Tenant
+
+event @member.joined {
+  member_id: Member,
+  tenant_id: Tenant @absent(1),
+  email: String? @subject(member_id) @max(100),
+}
+"#;
+
+const ADOPTED_COMMAND: &str = r#"
+command Join(member_id: Member, tenant_id: Tenant, email: String?) {
+  emit @member.joined { member_id, tenant_id, email }
+}
+"#;
+
+const SIMPLE_PROJECTOR: &str = r#"
+projector Members {
+  entity Member {
+    member_id: Member @key,
+    email: String? @max(100),
+  }
+
+  on @member.joined { member_id, email } {
+    put Member { member_id, email }
+  }
+}
+"#;
+
+fn unparented_project() -> tempfile::TempDir {
+    write_project(&[
+        ("events/member.hk", UNPARENTED_EVENTS),
+        ("commands/join.hk", UNPARENTED_COMMAND),
+        ("projectors/members.hk", SIMPLE_PROJECTOR),
+    ])
+}
+
+fn adopted_project(events: &str) -> tempfile::TempDir {
+    write_project(&[
+        ("events/member.hk", events),
+        ("commands/join.hk", ADOPTED_COMMAND),
+        ("projectors/members.hk", SIMPLE_PROJECTOR),
+    ])
+}
+
+#[test]
+fn a_parent_id_the_old_events_never_carried_is_read_from_its_absent_value() {
+    let data = tempfile::tempdir().unwrap();
+
+    let before = unparented_project();
+    let harness = boot_at(before.path(), data.path());
+    harness
+        .rt
+        .execute(
+            "Join",
+            json!({ "member_id": 1, "email": "ada@example.com" }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(member(&harness, 1, 1)["email"], "ada@example.com");
+    harness.shutdown();
+
+    // The same log, now read by a program that says those members belong to tenant 1.
+    let after = adopted_project(ADOPTED_EVENTS);
+    let harness = boot_at(after.path(), data.path());
+    assert_eq!(
+        member(&harness, 1, 1)["email"],
+        "ada@example.com",
+        "the value survives the move"
+    );
+
+    let keystore = harness.rt.keystore().unwrap();
+    assert!(
+        keystore.erase("Tenant", "1").unwrap(),
+        "the tenant the absent value named"
+    );
+    assert!(
+        member(&harness, 1, 1).get("email").is_none(),
+        "and it reaches a member whose event never carried a tenant id"
+    );
+    harness.shutdown();
+}
+
+/// Without `@absent`, the boot refuses rather than adopting under a guess.
+///
+/// The load-bearing half of the design: adoption never invents a parent, because it never
+/// has to. A declaration that does not say what the old payloads mean is refused before
+/// any of this runs, by a check that was already there.
+#[test]
+fn declaring_a_parent_without_answering_for_the_old_payloads_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+
+    let before = unparented_project();
+    let harness = boot_at(before.path(), data.path());
+    harness
+        .rt
+        .execute(
+            "Join",
+            json!({ "member_id": 1, "email": "ada@example.com" }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    harness.shutdown();
+
+    let unanswered = ADOPTED_EVENTS.replace(" @absent(1)", "");
+    let after = adopted_project(&unanswered);
+    let err = Boot::new(after.path())
+        .http_status(200)
+        .with_master_key()
+        .data_dir(data.path())
+        .try_start()
+        .err()
+        .expect("a required field no stored payload carries is refused");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("cannot read events that are already in the log"),
+        "refused for the reason that makes adoption possible: {message}"
+    );
+    assert!(
+        message.contains("tenant_id"),
+        "and it names the field: {message}"
+    );
+}
+
+/// The parent is the one the **earliest** event named, which is the rule a write would
+/// have followed.
+///
+/// A key is minted once, under whichever event arrived first; `encryption.md` says so,
+/// and an adoption that reconstructs that decision has to agree. Taking the latest
+/// instead would file the key under a tenant whose erasure the runtime never promised.
+#[test]
+fn an_adoption_takes_the_parent_the_earliest_event_named() {
+    let data = tempfile::tempdir().unwrap();
+    let flat = flat_project();
+    let harness = boot_at(flat.path(), data.path());
+    // Member 1 twice, naming two different tenants. The rest are here so the fold still
+    // has work to do when it reads the second one.
+    join(&harness, 1, 7, "ada@example.com");
+    join(&harness, 1, 9, "ada@example.com");
+    join(&harness, 2, 7, "grace@example.com");
+    join(&harness, 3, 7, "alan@example.com");
+    harness.shutdown();
+
+    let nested = nested_project();
+    let harness = boot_at(nested.path(), data.path());
+    let keystore = harness.rt.keystore().unwrap();
+
+    keystore.erase("Tenant", "9").unwrap();
+    assert_eq!(
+        member(&harness, 1, 4)["email"],
+        "ada@example.com",
+        "the tenant a later event named does not hold this key"
+    );
+    keystore.erase("Tenant", "7").unwrap();
+    assert!(
+        member(&harness, 1, 4).get("email").is_none(),
+        "the one the first event named does"
+    );
+    harness.shutdown();
+}
+
+fn adopt_cli(project: &Path, data: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_hekla"))
+        .arg("adopt")
+        .arg(project)
+        .arg("--data-dir")
+        .arg(data)
+        .arg("--no-progress")
+        .env(
+            "HEKLA_MASTER_KEY",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(MASTER_KEY),
+        )
+        .output()
+        .unwrap()
+}
+
+/// `hekla adopt` does the same work ahead of a deploy, and says what it noticed on the
+/// way.
+///
+/// The disagreement report is the only thing anywhere that looks at whether two events
+/// agree about a subject's parent. It is a warning rather than a refusal because the
+/// state is legal and documented, and because it is the expected shape of a migration:
+/// members that existed before the change take the absent tenant, and any of them written
+/// to afterwards name a real one too.
+#[test]
+fn the_adopt_command_moves_the_keys_and_reports_a_disagreement() {
+    let data = tempfile::tempdir().unwrap();
+    let flat = flat_project();
+    let harness = boot_at(flat.path(), data.path());
+    join(&harness, 1, 7, "ada@example.com");
+    join(&harness, 1, 9, "ada@example.com");
+    join(&harness, 2, 7, "grace@example.com");
+    join(&harness, 3, 7, "alan@example.com");
+    harness.shutdown();
+
+    let nested = nested_project();
+    let first = adopt_cli(nested.path(), data.path());
+    let out = String::from_utf8_lossy(&first.stdout).into_owned();
+    let err = String::from_utf8_lossy(&first.stderr).into_owned();
+    assert!(first.status.success(), "adopt failed: {out}{err}");
+    assert!(
+        out.contains("adopted 3 subject key(s)"),
+        "every member moved: {out}"
+    );
+    assert!(
+        err.contains("sits under `Tenant` = `7`") && err.contains("under `Tenant` = `9`"),
+        "the disagreement is named, both sides of it: {err}"
+    );
+
+    // Run again: nothing left, and nothing to say about it.
+    let second = adopt_cli(nested.path(), data.path());
+    let out = String::from_utf8_lossy(&second.stdout).into_owned();
+    assert!(
+        out.contains("already under its declared parent"),
+        "the second pass has nothing to do: {out}"
+    );
+
+    // And the boot that follows agrees, which is the point of running it early.
+    let harness = boot_at(nested.path(), data.path());
+    assert_eq!(member(&harness, 1, 4)["email"], "ada@example.com");
+    harness.rt.keystore().unwrap().erase("Tenant", "7").unwrap();
+    assert!(member(&harness, 1, 4).get("email").is_none());
+    harness.shutdown();
+}
+
+/// A root the log cannot account for refuses the boot rather than being served around.
+///
+/// Unreachable through the declarations: heklang requires the parent id on every event
+/// that seals under a child, so a key row exists only because some event minted it and
+/// that event carries the ancestor. The refusal is here because "unreachable" is a claim
+/// about today's checks, and a key silently left under the master is exactly the failure
+/// this phase exists to remove. Reached here by writing the row hekla would not write.
+#[test]
+fn a_root_no_event_accounts_for_refuses_the_boot() {
+    let data = tempfile::tempdir().unwrap();
+    let nested = nested_project();
+    let harness = boot_at(nested.path(), data.path());
+    join(&harness, 1, 7, "ada@example.com");
+    harness.shutdown();
+
+    // A `Member` root with no event naming its tenant. Nothing in hekla writes this.
+    {
+        let opdb = OpDb::open(&data.path().join("hekla.db")).unwrap();
+        let masters = MasterKeys::new(MASTER_KEY, vec![]);
+        let keystore = KeyStore::new(Arc::new(Mutex::new(opdb)), masters);
+        keystore
+            .encrypt_subject("Member", "404", "email", "nobody@example.com")
+            .unwrap();
+    }
+
+    let err = Boot::new(nested.path())
+        .http_status(200)
+        .with_master_key()
+        .data_dir(data.path())
+        .try_start()
+        .err()
+        .expect("a key the hierarchy does not hold must not be served around");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("no event in the log says which one"),
+        "refused for the right reason: {message}"
+    );
+    assert!(
+        message.contains("`Member` = `404`"),
+        "and it names the row: {message}"
+    );
+}
+
+/// Adoption running beside live writers and erasers never reports a broken store.
+///
+/// The realistic race, because `hekla adopt` is meant to run against a live server: the
+/// deployment still serving the old declaration keeps minting roots while this moves
+/// them. Three things then contend for one row, a writer that may mint it, an adopter
+/// that moves it, and an eraser destroying the tenant it is being moved under, and each
+/// has its own test above. This is the one that runs them together.
+///
+/// **The property is that no read is ever an `Err`**, which is a read API answering 500
+/// and a projector wedging. What each ciphertext ends up as depends on an interleaving
+/// this cannot pin, so the counts are not asserted: that an adopted key is shredded by
+/// its tenant is [`an_adopted_subject_is_shredded_by_the_tenant_that_now_owns_it`]'s job,
+/// where it is deterministic. What is asserted here is that the race really ran.
+#[test]
+fn adopting_beside_writers_and_erasers_never_reports_a_broken_store() {
+    let opdb = Arc::new(Mutex::new(OpDb::open_in_memory().unwrap()));
+    let masters = MasterKeys::new(MASTER_KEY, vec![]);
+    let sealed: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let moved = Mutex::new(0usize);
+
+    // Seeded before the threads start, so an adopter has work from the first instant
+    // rather than racing the writers for something to do. Without this the erasers drain
+    // long before the first key moves and the run exercises nothing.
+    {
+        let seed = KeyStore::new(Arc::clone(&opdb), masters.clone());
+        for member in 0..6u32 {
+            let member = member.to_string();
+            let content = seed
+                .encrypt_subject_in(&[("Member", member.as_str())], "email", "seeded")
+                .unwrap();
+            sealed.lock().unwrap().push((member, content));
+        }
+    }
+
+    thread::scope(|scope| {
+        // Writers on the old declaration: a one-entry chain, so they mint roots.
+        for worker in 0..4u32 {
+            let opdb = Arc::clone(&opdb);
+            let masters = masters.clone();
+            let sealed = &sealed;
+            scope.spawn(move || {
+                let ks = KeyStore::new(opdb, masters);
+                for round in 0..30u32 {
+                    let member = ((worker + round) % 6).to_string();
+                    let text = format!("w{worker}r{round}");
+                    let content = ks
+                        .encrypt_subject_in(&[("Member", member.as_str())], "email", &text)
+                        .unwrap();
+                    sealed.lock().unwrap().push((member, content));
+                }
+            });
+        }
+        // Adopters on the new one, moving those roots under their tenants.
+        for _ in 0..2 {
+            let opdb = Arc::clone(&opdb);
+            let masters = masters.clone();
+            let moved = &moved;
+            scope.spawn(move || {
+                let ks = KeyStore::new(opdb, masters);
+                for round in 0..30u32 {
+                    let member = (round % 6).to_string();
+                    let tenant = (round % 2).to_string();
+                    if ks
+                        .adopt_in(&[("Member", member.as_str()), ("Tenant", tenant.as_str())])
+                        .unwrap()
+                        == Adopted::Moved
+                    {
+                        *moved.lock().unwrap() += 1;
+                    }
+                }
+            });
+        }
+        // And an eraser destroying the tenants underneath all of it.
+        {
+            let opdb = Arc::clone(&opdb);
+            let masters = masters.clone();
+            scope.spawn(move || {
+                let ks = KeyStore::new(opdb, masters);
+                for round in 0..30u32 {
+                    ks.erase("Tenant", &(round % 2).to_string()).unwrap();
+                }
+            });
+        }
+    });
+
+    let ks = KeyStore::new(Arc::clone(&opdb), masters);
+    for (member, content) in sealed.into_inner().unwrap() {
+        if let Err(err) = ks.decrypt_subject("Member", &member, "email", &content) {
+            panic!("an adoption racing an erase must never break a read: {err:#}");
+        }
+    }
+    // The race really ran: keys moved, and a write after all of it still round-trips, so
+    // the store is not merely quiet because everything in it is broken.
+    assert!(
+        *moved.lock().unwrap() > 0,
+        "no adoption succeeded, so the thing under test never ran"
+    );
+    let after = ks
+        .encrypt_subject_in(&[("Member", "9"), ("Tenant", "9")], "email", "after")
+        .unwrap();
+    assert_eq!(
+        ks.decrypt_subject("Member", "9", "email", &after)
+            .unwrap()
+            .as_deref(),
+        Some("after"),
+        "the store still works when the race is over"
+    );
+}
+
+/// The witness is an event that actually **minted** the key, not merely one that mentions
+/// the subject.
+///
+/// Rule 12: an absent optional was never encrypted, so a sealed field holding nothing
+/// mints no key and `HeklaHost::lower` skips it. An event like that names a parent while
+/// having filed nothing under it, so treating it as the witness files the key under a
+/// tenant the write path never chose, and the fold then stops before ever reading the
+/// event that did the minting. Erasing the real tenant leaves the content readable, with
+/// nothing anywhere saying so, which is the failure this whole phase exists to remove.
+#[test]
+fn an_event_that_sealed_nothing_does_not_decide_where_the_key_goes() {
+    let data = tempfile::tempdir().unwrap();
+    let flat = flat_project();
+    let harness = boot_at(flat.path(), data.path());
+    // Mentions tenant 7 and seals nothing under member 1, so member 1 gets no key here.
+    harness
+        .rt
+        .execute(
+            "Join",
+            json!({ "member_id": 1, "tenant_id": 7, "email": null, "plan": "pro" }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    // This one mints it, under tenant 9.
+    join(&harness, 1, 9, "ada@example.com");
+    harness.shutdown();
+
+    let nested = nested_project();
+    let harness = boot_at(nested.path(), data.path());
+    let keystore = harness.rt.keystore().unwrap();
+
+    keystore.erase("Tenant", "7").unwrap();
+    assert_eq!(
+        member(&harness, 1, 2)["email"],
+        "ada@example.com",
+        "the tenant named by an event that sealed nothing does not hold this key"
+    );
+    keystore.erase("Tenant", "9").unwrap();
+    assert!(
+        member(&harness, 1, 2).get("email").is_none(),
+        "the tenant named by the event that minted it does"
+    );
+    harness.shutdown();
+}
+
+/// `hekla plan` counts the keys a deploy would move, before it moves them.
+///
+/// The adoption is work the boot does to stored data and cannot be skipped, so a gate
+/// that reads plans wants it in front of the deploy rather than in a log afterwards. It
+/// also has to make the plan non-empty: "nothing would change" about a boot that is about
+/// to rewrap rows is the one answer this must not give.
+#[test]
+fn a_plan_counts_the_keys_a_deploy_would_move() {
+    let data = tempfile::tempdir().unwrap();
+    let flat = flat_project();
+    let harness = boot_at(flat.path(), data.path());
+    join(&harness, 1, 7, "ada@example.com");
+    join(&harness, 2, 7, "grace@example.com");
+    harness.shutdown();
+
+    let nested = nested_project();
+    let project = hekla::loader::LoadedProject::load(nested.path());
+    let plan = hekla::plan::compute_with(&project, data.path(), hekla::plan::Replay::Off).unwrap();
+    assert_eq!(plan.adoptions, 2, "both members are waiting");
+    assert!(
+        !plan.is_empty(),
+        "a deploy that rewraps rows is not 'nothing would change'"
+    );
+    assert_eq!(
+        plan.json()["adoptions"],
+        2,
+        "and a gate reading the json sees it too"
+    );
+    assert!(
+        format!("{plan}").contains("would move under the parent"),
+        "and so does an operator reading it: {plan}"
+    );
+
+    // Once they have moved, the same plan says nothing about them.
+    adopt_cli(nested.path(), data.path());
+    let after = hekla::plan::compute_with(&project, data.path(), hekla::plan::Replay::Off).unwrap();
+    assert_eq!(after.adoptions, 0);
+    assert!(!format!("{after}").contains("would move under the parent"));
+}
+
+/// `hekla verify` reports keys that have not moved, and never moves them.
+///
+/// An audit that advances state cannot be re-run to check its own answer, which is why
+/// `open_quiescent` starts no threads either. The violation has to survive the sweep.
+#[test]
+fn verify_reports_keys_that_have_not_moved_without_moving_them() {
+    let data = tempfile::tempdir().unwrap();
+    let flat = flat_project();
+    let harness = boot_at(flat.path(), data.path());
+    join(&harness, 1, 7, "ada@example.com");
+    harness.shutdown();
+
+    let nested = nested_project();
+    let project = hekla::loader::LoadedProject::load(nested.path());
+    let report = hekla::verify::sweep(
+        &project,
+        data.path(),
+        Some(MasterKeys::new(MASTER_KEY, vec![])),
+    )
+    .unwrap();
+    let named = report
+        .violations
+        .iter()
+        .map(|violation| violation.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        named.contains("wrapped under the master although their subject declares a parent"),
+        "the sweep reports the unadopted key: {named}"
+    );
+    assert!(
+        named.contains("`Member`"),
+        "and names the subject to look at: {named}"
+    );
+
+    // Still there, so the audit reported rather than repaired.
+    let harness = boot_at(nested.path(), data.path());
+    assert_eq!(member(&harness, 1, 1)["email"], "ada@example.com");
+    harness.shutdown();
+}
+
+/// The audit names the subjects that actually have rows waiting, not every subject that
+/// declares a parent.
+///
+/// An operator reading a verify failure has to know where to look. Listing every parented
+/// subject sends them to ones that are fine, and makes the count-to-name ratio meaningless.
+#[test]
+fn the_audit_names_only_the_subjects_with_keys_waiting() {
+    let dir = write_project(&[(
+        "events/thing.hk",
+        r#"
+subject Tenant(Int)
+subject Member(Int) under Tenant
+subject Device(Int) under Tenant
+
+event @member.joined {
+  member_id: Member,
+  device_id: Device,
+  tenant_id: Tenant,
+  email: String? @subject(member_id) @max(100),
+  serial: String? @subject(device_id) @max(100),
+}
+"#,
+    )]);
+    let project = hekla::loader::LoadedProject::load(dir.path());
+    let opdb = Arc::new(Mutex::new(OpDb::open_in_memory().unwrap()));
+    let keystore = KeyStore::new(opdb, MasterKeys::new(MASTER_KEY, vec![]));
+    // A root for one of the two parented subjects, and a healthy child for the other.
+    keystore
+        .encrypt_subject("Member", "1", "email", "ada@example.com")
+        .unwrap();
+    keystore
+        .encrypt_subject_in(&[("Device", "9"), ("Tenant", "7")], "serial", "sn-1")
+        .unwrap();
+
+    let waiting = hekla::adopt::waiting_by_subject(&project.program, &keystore).unwrap();
+    assert_eq!(
+        waiting,
+        vec![("Member".to_owned(), 1)],
+        "only the subject with a root, and `Device` is not dragged in with it"
+    );
+}
+
+/// A run that resolved everything and moved nothing is **not** settled.
+///
+/// The predicate was the bug: it asked its own bookkeeping instead of the store.
+/// `adopt_in` legitimately declines rows (a compare-and-set lost, a row erased since the
+/// scan, an adoption undone because its parent went mid-flight), and a declined subject is
+/// gone from `unresolved` while still sitting under the master. Reading that as "done"
+/// serves, or exits zero, on exactly the state this phase exists to prevent.
+#[test]
+fn a_run_that_left_rows_under_the_master_is_not_settled() {
+    let moved_nothing = hekla::adopt::Adoption {
+        adopted: 0,
+        waiting: 3,
+        remaining: 3,
+        ..Default::default()
+    };
+    assert!(
+        !moved_nothing.settled(),
+        "rows are still under the master, whatever the fold resolved"
+    );
+    let unfinished = hekla::adopt::unfinished(&moved_nothing).expect("it has to say so");
+    assert!(
+        matches!(unfinished, hekla::adopt::Unfinished::Contended(3)),
+        "and say which of the two endings it is, because they need different answers: {unfinished:?}"
+    );
+    assert!(
+        unfinished
+            .to_string()
+            .contains("still wrapped under the master")
+    );
+
+    let unaccounted = hekla::adopt::Adoption {
+        unresolved: vec![("Member".to_owned(), "1".to_owned())],
+        // Still a root in the store. Without this the run is settled whatever the fold
+        // could not place, which is the point of asking the store first.
+        remaining: 1,
+        ..Default::default()
+    };
+    let unfinished = hekla::adopt::unfinished(&unaccounted).expect("this one too");
+    assert!(matches!(
+        unfinished,
+        hekla::adopt::Unfinished::Unaccounted { .. }
+    ));
+    let said = unfinished.to_string();
+    assert!(
+        said.contains("no event in the log says which one") && said.contains("`Member` = `1`"),
+        "the other ending names the row and the repair: {said}"
+    );
+
+    assert!(hekla::adopt::Adoption::default().settled());
+    assert!(hekla::adopt::unfinished(&hekla::adopt::Adoption::default()).is_none());
+}
+
+/// Adoption reaches through a whole chain, not just one link.
+///
+/// `Customer under Shop under Market`: moving the customer needs the shop's secret, and
+/// if the shop has no row yet that needs the market's, so the adoption mints both on the
+/// way. Depth one is the case where "wrap under the parent" and "wrap under the root"
+/// coincide and cannot tell a recursive implementation from a one-level one. This can:
+/// erasing the **market** has to reach a customer two links away.
+#[test]
+fn an_adoption_reaches_through_a_whole_chain() {
+    let ks = keystore();
+    // Written while `Customer` was flat, so its row is a root under the master.
+    let sealed = ks
+        .encrypt_subject_in(&[("Customer", "88")], "email", "ada@example.com")
+        .unwrap();
+    assert_eq!(
+        ks.adopt_in(&[("Customer", "88"), ("Shop", "7"), ("Market", "1")])
+            .unwrap(),
+        Adopted::Moved,
+        "a two-link chain is adopted in one move"
+    );
+    assert_eq!(
+        ks.decrypt_subject("Customer", "88", "email", &sealed)
+            .unwrap()
+            .as_deref(),
+        Some("ada@example.com"),
+        "and the secret came with it"
+    );
+
+    // The shop was minted on the way, under the market, so one delete at the top reaches
+    // both. If the adoption had wrapped the customer under a root shop, this would leave
+    // the customer readable.
+    assert!(ks.erase("Market", "1").unwrap(), "one row delete");
+    assert_eq!(
+        ks.decrypt_subject("Customer", "88", "email", &sealed)
+            .unwrap(),
+        None,
+        "the customer is two links below the market and goes with it"
+    );
+}
+
+/// The disagreement report is one line per subject, and bounded.
+///
+/// Two events naming different parents is the *expected* shape of a migration, not a rare
+/// fault: rows from before the change take the `@absent` tenant and anything written after
+/// names a real one. So a report that grew with the events rather than with the subjects
+/// would put one warning line on an operator's screen per event, and a subject argued over
+/// ten times would be named ten times. Both of those were true when this was first
+/// written.
+///
+/// The events are interleaved per member on purpose. The scan stops once every waiting key
+/// has a parent, so a run of "first events" followed by a run of "second events" would
+/// resolve everything and halt before noticing any disagreement at all.
+#[test]
+fn the_disagreement_report_names_each_subject_once_and_stops() {
+    let data = tempfile::tempdir().unwrap();
+    let flat = flat_project();
+    let harness = boot_at(flat.path(), data.path());
+    // Member 0 is argued over three times, so a report that did not deduplicate would
+    // name it twice.
+    join(&harness, 0, 1, "m0@example.com");
+    join(&harness, 0, 2, "m0@example.com");
+    join(&harness, 0, 3, "m0@example.com");
+    for member in 1..25u64 {
+        join(&harness, member, 1, &format!("m{member}@example.com"));
+        join(&harness, member, 2, &format!("m{member}@example.com"));
+    }
+    harness.shutdown();
+
+    let nested = nested_project();
+    let run = adopt_cli(nested.path(), data.path());
+    let err = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(
+        run.status.success(),
+        "a disagreement is a warning, not a refusal: {err}"
+    );
+
+    let warnings: Vec<&str> = err
+        .lines()
+        .filter(|line| line.contains("sits under"))
+        .collect();
+    assert!(
+        !warnings.is_empty(),
+        "the run has to have noticed some, or this asserts nothing: {err}"
+    );
+    assert!(
+        warnings.len() <= 20,
+        "the list is capped, so a migration-shaped log cannot flood the terminal: {} lines",
+        warnings.len()
+    );
+
+    let named: Vec<&str> = warnings
+        .iter()
+        .filter_map(|line| line.split("` = `").nth(1))
+        .filter_map(|rest| rest.split('`').next())
+        .collect();
+    let distinct: BTreeSet<&&str> = named.iter().collect();
+    assert_eq!(
+        named.len(),
+        distinct.len(),
+        "each subject is named once however many events argue over it: {named:?}"
+    );
+}
+
+/// An adoption whose ancestor is erased under it puts the row back, rather than leaving
+/// it hanging from a generation that no longer exists.
+///
+/// The window is between minting the ancestors and committing the move: the row lands
+/// wrapped under a parent that has just been destroyed, so everything already sealed under
+/// that subject becomes unreadable, and it was readable a moment earlier. That is data
+/// lost to an erase nobody asked to reach it. The secret is still in hand at that point,
+/// so the move is undoable, and undoing it is the only answer that cannot lose anything.
+///
+/// Raced rather than contrived, because nothing outside the function can reach that
+/// window. The chain is two links deep on purpose: erasing the **root** is wrong for the
+/// whole span between minting it and the commit, where erasing the immediate parent is
+/// only wrong for the tail of it, so this hits the case in a few hundred rounds rather
+/// than by luck.
+#[test]
+fn an_adoption_whose_ancestor_is_erased_under_it_puts_the_row_back() {
+    let opdb = Arc::new(Mutex::new(OpDb::open_in_memory().unwrap()));
+    let masters = MasterKeys::new(MASTER_KEY, vec![]);
+    let taken_back: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let rounds = 3000u32;
+
+    thread::scope(|scope| {
+        {
+            let opdb = Arc::clone(&opdb);
+            let masters = masters.clone();
+            scope.spawn(move || {
+                let ks = KeyStore::new(opdb, masters);
+                for _ in 0..rounds {
+                    ks.erase("Region", "1").unwrap();
+                }
+            });
+        }
+        {
+            let opdb = Arc::clone(&opdb);
+            let masters = masters.clone();
+            let taken_back = &taken_back;
+            scope.spawn(move || {
+                let ks = KeyStore::new(opdb, masters);
+                for round in 0..rounds {
+                    // A fresh root each round, written while the subject was still flat.
+                    let member = round.to_string();
+                    let sealed = ks
+                        .encrypt_subject_in(&[("Member", member.as_str())], "email", "ada")
+                        .unwrap();
+                    let outcome = ks
+                        .adopt_in(&[
+                            ("Member", member.as_str()),
+                            ("Tenant", "7"),
+                            ("Region", "1"),
+                        ])
+                        .unwrap();
+                    if outcome == Adopted::Undone {
+                        taken_back.lock().unwrap().push((member, sealed));
+                    }
+                }
+            });
+        }
+    });
+
+    let taken_back = taken_back.into_inner().unwrap();
+    assert!(
+        !taken_back.is_empty(),
+        "no adoption was undone in {rounds} rounds, so the path under test never ran"
+    );
+    // The whole point: what the adoption took back is still readable. Left hanging from
+    // the erased region instead, every one of these would read as shredded, by an erase
+    // that was never asked to reach them.
+    let ks = KeyStore::new(opdb, masters);
+    for (member, sealed) in &taken_back {
+        assert_eq!(
+            ks.decrypt_subject("Member", member, "email", sealed)
+                .unwrap()
+                .as_deref(),
+            Some("ada"),
+            "`Member` = `{member}` was put back under the master, so its content survived"
+        );
+    }
+}
+
+/// A run against a directory something else is writing to either settles it or says it
+/// did not, and a run with nothing else writing settles it.
+///
+/// This is the contract the pass loop exists for. One pass can move less than it
+/// resolved, because an eraser can take the tenant out from under a row between the scan
+/// and the write, so the run looks again. Bounded, so a directory under continuous erasure
+/// reports what is left rather than spinning; and what is left is the refusal, never a
+/// quiet success. The disjunction is asserted rather than the branch, because which one a
+/// run takes depends on an interleaving no test can pin.
+#[test]
+fn adopting_beside_an_eraser_either_settles_or_says_it_did_not() {
+    let data = tempfile::tempdir().unwrap();
+    let flat = flat_project();
+    let harness = boot_at(flat.path(), data.path());
+    for member in 1..8u64 {
+        join(&harness, member, 7, &format!("m{member}@example.com"));
+    }
+    harness.shutdown();
+
+    let nested = nested_project();
+    let stop = Arc::new(Mutex::new(false));
+    let erasing = {
+        let stop = Arc::clone(&stop);
+        let path = data.path().join("hekla.db");
+        thread::spawn(move || {
+            let opdb = Arc::new(Mutex::new(OpDb::open(&path).unwrap()));
+            let ks = KeyStore::new(opdb, MasterKeys::new(MASTER_KEY, vec![]));
+            while !*stop.lock().unwrap() {
+                ks.erase("Tenant", "7").unwrap();
+            }
+        })
+    };
+
+    let contended = adopt_cli(nested.path(), data.path());
+    *stop.lock().unwrap() = true;
+    erasing.join().unwrap();
+
+    let err = String::from_utf8_lossy(&contended.stderr).into_owned();
+    assert!(
+        contended.status.success(),
+        "contention is the normal condition of a pre-flight, not a failure: {err}"
+    );
+
+    // Nothing writing now, so this one has to settle it.
+    let quiet = adopt_cli(nested.path(), data.path());
+    let out = String::from_utf8_lossy(&quiet.stdout).into_owned();
+    let err = String::from_utf8_lossy(&quiet.stderr).into_owned();
+    assert!(quiet.status.success(), "{out}{err}");
+    let settled = adopt_cli(nested.path(), data.path());
+    assert!(
+        String::from_utf8_lossy(&settled.stdout).contains("already under its declared parent"),
+        "and leaves nothing behind for the next one: {}",
+        String::from_utf8_lossy(&settled.stdout)
+    );
+
+    // Asked of the store rather than of the command's own report, because "settled" is a
+    // claim about where the keys are: the tenant now reaches every member, which is the
+    // thing the whole run was for and the thing a clean exit would otherwise only assert
+    // about itself.
+    let harness = boot_at(nested.path(), data.path());
+    let readable = (1..8u64)
+        .filter(|id| member(&harness, *id, 7).get("email").is_some())
+        .count();
+    harness.rt.keystore().unwrap().erase("Tenant", "7").unwrap();
+    let survivors = (1..8u64)
+        .filter(|id| member(&harness, *id, 7).get("email").is_some())
+        .count();
+    assert_eq!(
+        survivors, 0,
+        "after the tenant goes, none of the {readable} readable members is left"
+    );
+    harness.shutdown();
+}
+
+/// A middle subject is adopted even when nothing seals directly under it.
+///
+/// `Member under Tenant` already deployed, so tenant rows exist as roots minted on the way
+/// to a member's key. Declaring `Tenant under Region` makes those roots the ones waiting,
+/// and the events that would say where they belong seal under **Member**, not under
+/// Tenant: their chain is `[Member, Tenant, Region]` and the tenant is a link in the
+/// middle of it. A fold that only reads the head of a chain never resolves them, and the
+/// boot then refuses for ever with advice the author has already followed.
+const MEMBER_ONLY_EVENTS: &str = r#"
+subject Tenant(Int)
+subject Member(Int) under Tenant
+
+event @member.joined {
+  member_id: Member,
+  tenant_id: Tenant,
+  email: String? @subject(member_id) @max(100),
+}
+"#;
+
+const REGION_EVENTS: &str = r#"
+subject Region(Int)
+subject Tenant(Int) under Region
+subject Member(Int) under Tenant
+
+event @member.joined {
+  member_id: Member,
+  tenant_id: Tenant,
+  region_id: Region @absent(1),
+  email: String? @subject(member_id) @max(100),
+}
+"#;
+
+const MEMBER_ONLY_COMMAND: &str = r#"
+command Join(member_id: Member, tenant_id: Tenant, email: String?) {
+  emit @member.joined { member_id, tenant_id, email }
+}
+"#;
+
+const REGION_COMMAND: &str = r#"
+command Join(member_id: Member, tenant_id: Tenant, region_id: Region, email: String?) {
+  emit @member.joined { member_id, tenant_id, region_id, email }
+}
+"#;
+
+fn middle_project(events: &str, command: &str) -> tempfile::TempDir {
+    write_project(&[
+        ("events/member.hk", events),
+        ("commands/join.hk", command),
+        ("projectors/members.hk", SIMPLE_PROJECTOR),
+    ])
+}
+
+#[test]
+fn a_subject_that_only_ever_appears_as_an_ancestor_is_still_adopted() {
+    let data = tempfile::tempdir().unwrap();
+    let before = middle_project(MEMBER_ONLY_EVENTS, MEMBER_ONLY_COMMAND);
+    let harness = boot_at(before.path(), data.path());
+    harness
+        .rt
+        .execute(
+            "Join",
+            json!({ "member_id": 1, "tenant_id": 7, "email": "ada@example.com" }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(member(&harness, 1, 1)["email"], "ada@example.com");
+    harness.shutdown();
+
+    // A region above the tenant. Nothing seals under `Tenant`, so the only events that
+    // name a region carry it as the *last* link of a member's chain.
+    let after = middle_project(REGION_EVENTS, REGION_COMMAND);
+    let harness = boot_at(after.path(), data.path());
+    assert_eq!(
+        member(&harness, 1, 1)["email"],
+        "ada@example.com",
+        "the boot adopted the tenant rather than refusing"
+    );
+
+    let keystore = harness.rt.keystore().unwrap();
+    assert!(keystore.erase("Region", "1").unwrap(), "one row delete");
+    assert!(
+        member(&harness, 1, 1).get("email").is_none(),
+        "and the region now reaches a member two links below it"
+    );
+    harness.shutdown();
+}
+
+/// A run the key store could not act on says so, rather than reading as contention.
+///
+/// The three endings send an operator to three different places, and two of them are
+/// faults. A run where every row errored leaves `remaining` high exactly as a contended
+/// one does, so collapsing them told whoever ran `hekla adopt` to go looking for a second
+/// process, and exited zero while doing it: a deploy gate went green over a store that
+/// could not be adopted at all. Worse, the error text only ever reached a `tracing::warn!`
+/// that this command installs no subscriber for, so it went nowhere.
+#[test]
+fn a_run_that_could_not_move_a_row_is_not_reported_as_contention() {
+    let failed = hekla::adopt::Adoption {
+        waiting: 3,
+        remaining: 3,
+        failed: 3,
+        first_failure: Some("the key store is a wreck".to_owned()),
+        ..Default::default()
+    };
+    let unfinished = hekla::adopt::unfinished(&failed).expect("it has to say so");
+    assert!(
+        matches!(unfinished, hekla::adopt::Unfinished::Failed { .. }),
+        "a failure is not a race: {unfinished:?}"
+    );
+    let said = unfinished.to_string();
+    assert!(
+        said.contains("the key store is a wreck"),
+        "and it names what actually went wrong: {said}"
+    );
+    assert!(
+        !said.contains("Something else is writing"),
+        "rather than sending them after a writer that is not there: {said}"
+    );
+
+    // Contention still reads as contention when nothing errored.
+    let contended = hekla::adopt::Adoption {
+        waiting: 3,
+        remaining: 3,
+        ..Default::default()
+    };
+    assert!(matches!(
+        hekla::adopt::unfinished(&contended),
+        Some(hekla::adopt::Unfinished::Contended(3))
+    ));
+}
+
+/// A row that failed once and moved on the next look is not a fault.
+///
+/// The bookkeeping and the store can disagree, and the store is right. A pass that errored
+/// on a row it later adopted left `failed` set for the whole run, so a fully adopted store
+/// reported a fault: `hekla adopt` exited non-zero and, worse, the **boot refused to
+/// start** on a store where every key was exactly where the declaration said. Asking
+/// `remaining` first is what makes `settled()`'s own doc ("asked of the store, not of the
+/// bookkeeping") true, after two rounds of it not being.
+#[test]
+fn a_failure_that_the_next_pass_resolved_is_not_reported() {
+    let recovered = hekla::adopt::Adoption {
+        waiting: 10,
+        adopted: 10,
+        remaining: 0,
+        failed: 1,
+        first_failure: Some("lost a race in the first pass".to_owned()),
+        ..Default::default()
+    };
+    assert!(
+        recovered.settled(),
+        "nothing is left under the master, so the run is done"
+    );
+    assert!(
+        hekla::adopt::unfinished(&recovered).is_none(),
+        "and it must not refuse a boot over a pass that has since been made good"
+    );
+
+    // Still left, and a failure is still not a race.
+    let stuck = hekla::adopt::Adoption {
+        remaining: 1,
+        failed: 1,
+        first_failure: Some("the key store is a wreck".to_owned()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        hekla::adopt::unfinished(&stuck),
+        Some(hekla::adopt::Unfinished::Failed { .. })
+    ));
 }

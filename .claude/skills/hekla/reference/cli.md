@@ -525,6 +525,58 @@ the rows are rewrapped it can no longer unwrap them: reads of a sealed column an
 `/admin` reports the field `unreadable`. Either start the process with the new primary and the old in
 `HEKLA_MASTER_KEY_PREVIOUS` before rotating, or restart it afterwards with the new key.
 
+## `hekla adopt [DIR] [--data-dir PATH] [--no-progress]`
+
+Moves every subject key under the parent its subject declares, for rows minted before the
+declaration said so. `hekla serve` does this at boot and refuses to serve without it, so this exists
+to do the work *ahead* of a deploy rather than during one.
+
+```
+adopted 3 subject key(s) under their declared parent, reading 3 event(s)
+```
+
+Point it at the **new** project and the live data directory. It reads the log through a follower and
+takes no lock, so the server still running the old declaration is unaffected, and the boot that
+follows finds nothing left to do. It changes no ciphertext and destroys nothing (the wrapping moves,
+the key does not), so there is no confirmation prompt.
+
+A second run reports `every subject key is already under its declared parent`. A project where no
+subject says `under` reports `no subject declares a parent, so there is nothing to adopt`.
+
+It also warns, on stderr, about a subject whose events name more than one parent:
+
+```
+warning: subject `Customer` = `88` sits under `Shop` = `7` by one event and under `Shop` = `9` by
+another; its key is filed under the first, which is the rule, and only that one's erasure reaches it
+```
+
+That is the documented "whichever arrived first" case rather than a fault, so it is a warning and the
+run still succeeds. It reports what the pass noticed on its way, not an exhaustive audit: the scan
+stops once every waiting key has a parent, it names each subject once however many events disagree
+about it, and it stops collecting after twenty. Disagreement is the *expected* shape of a migration
+(rows from before the change take the `@absent` tenant, anything written after names a real one), so
+an uncapped list would be one line per event rather than a report.
+
+A project where no subject says `under` reports `no subject declares a parent, so there is nothing to
+adopt`, and a data directory nothing has been deployed to reports `nothing is deployed at <path>`.
+Both exit 0 and neither needs a master key, so a deploy script can run this over every project it
+has without special-casing the flat ones.
+
+When something else is writing to the directory, the run reports what it could not move and still
+exits 0: a live deployment is serving the *old* declaration the whole time, minting roots this run
+will never catch, so contention is the normal condition of a pre-flight rather than a fault. The boot
+refuses on the same condition, because nothing else should be writing there.
+
+Failure modes:
+
+- `error: HEKLA_MASTER_KEY must be set to adopt`
+- a schema-version mismatch, refused before anything is opened. Like `plan` and `project`, this never
+  migrates the directory it is pointed at: doing so under a server that is still serving is a write
+  nobody asked for.
+- a refusal naming any key no event in the log accounts for. Unreachable through the declaration
+  checks, and loud rather than skipped if it happens, because a key silently left under the master is
+  the failure this exists to remove.
+
 ## Environment
 
 | Variable | Read by | Means |

@@ -173,6 +173,44 @@ deleting shop 9 then leaves customer 88 readable, and deleting shop 7 destroys d
 believes is shop 9's. Both events are individually well formed, so neither heklang nor hekla has
 anything to point at. Getting the parent right is the author's.
 
+### Declaring a parent onto keys that already exist
+
+A key row's wrapping is decided the first time the subject is seen and never revisited, so adding
+`under Shop` to a `Customer` that already has rows would leave every one of them wrapped under the
+master: new customers hang from their shop, older ones do not, and erasing the shop reports success
+having missed them.
+
+**hekla adopts them at boot**, before it serves anything, and refuses to serve if it cannot. A
+settled store pays one indexed count for the question, so this is free once it is done.
+
+The parent comes from the log rather than a guess. Every event sealing under a child carries its
+ancestors' ids in plaintext, so hekla folds the log and files each key under the parent the
+**earliest** such event named, which is the same rule a write would have followed. Events written
+before the parent was declared are covered too, because adding the ancestor's field to an event type
+that already has instances is itself refused unless the declaration says what the old payloads mean:
+
+```hek
+subject Customer(Int) under Shop
+
+event @order.placed {
+  customer_id: Customer,
+  // Added with the parent. Orders written before this belong to shop 1.
+  shop_id: Shop @absent(1),
+  email: String? @subject(customer_id) @max(200),
+}
+```
+
+`hekla adopt` runs the same pass ahead of a deploy, against a live directory and without taking the
+lock, so a large migration need not happen during a boot. `hekla plan` reports how many keys would
+move, and `hekla verify` reports any that have not.
+
+Three things it deliberately does not do. It never mints a new secret: the wrapping moves and the key
+does not, so every value already sealed stays exactly as readable as it was. It never re-parents a
+row that is already a child, because a parent that disagrees with the declaration is the
+"whichever arrived first" case above and re-filing it on sight would fight that rule on every write.
+And it never moves a child back to the master when `under` is removed, because that would narrow a
+shred somebody may already rely on.
+
 ### Erased, or tampered with
 
 A child's key is wrapped under a key derived from its parent's secret, so a wrapping that

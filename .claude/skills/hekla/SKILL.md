@@ -42,6 +42,7 @@ hekla secrets <dir>   # every declared credential, where it is read from, and wh
 hekla rewind <Effect> <position> <dir>  # take an effect back so it reprocesses. Irreversible
 hekla erase <Subject> <id> <dir>    # delete one subject's key. Irreversible
 hekla rotate <dir>    # rewrap every subject key under the current master
+hekla adopt  <dir>   # move keys under the parent their subject now declares, before a deploy
 ```
 
 Install with `cargo install hekla`, or `nix run git+https://git.tqwewe.com/tephra/hekla` to run it
@@ -102,6 +103,7 @@ one under `tests/` does.
 | change a projector's shape | edit it and restart (`auto_rebuild`), or `POST /projectors/{Name}/replay` |
 | forget a person | `hekla erase <Subject> <id> <dir>` (prompts), or `erase(id)` in an effect arm |
 | forget a whole tenant | the same, on the parent subject: every key beneath it goes in one delete |
+| add a parent to a subject that already has data | declare it and deploy: the boot moves the keys, or `hekla adopt` ahead of time |
 | change the master key | set the new `HEKLA_MASTER_KEY`, keep the old in `HEKLA_MASTER_KEY_PREVIOUS`, `hekla rotate` |
 | give a project a webhook url or an API key | `secret NAME` in a `.hk` file, then `HEKLA_SECRET_<NAME>` or a `[secrets]` entry |
 | check a deploy has the credentials it needs | `hekla secrets`, or the `secrets` section of `hekla plan` |

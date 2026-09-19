@@ -413,6 +413,21 @@ fn run_checks(
         )?);
     }
 
+    // Reported, never repaired: an audit that advances state cannot be re-run to check
+    // its own answer, which is the reason `open_quiescent` starts no threads either.
+    if let Some(keystore) = runtime.keystore() {
+        // Per subject, so the violation names the ones that actually have rows waiting.
+        // Reporting every subject that declares a parent would send an operator looking
+        // at ones that are fine.
+        let waiting = crate::adopt::waiting_by_subject(runtime.program(), keystore)?;
+        if !waiting.is_empty() {
+            report.absorb([Violation::UnadoptedKeys {
+                keys: waiting.iter().map(|(_, count)| count).sum(),
+                subjects: waiting.into_iter().map(|(subject, _)| subject).collect(),
+            }]);
+        }
+    }
+
     for unit in &project.effects {
         sweep_effect(runtime, unit, &mut report)?;
     }
