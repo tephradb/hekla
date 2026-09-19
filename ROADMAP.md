@@ -2312,7 +2312,7 @@ Honest scope:
   tables do and what `.table-wrap` is for, and the alternative was worse: clipping that column instead
   makes every column collapse on a phone rather than scroll, which was checked at both widths.
 
-## Phase 36: a sealed record round-trips (written, gated on the heklang release)
+## Phase 36: a sealed record round-trips (done)
 
 heklang 0.8.0's `Value::from_sealed` has no arm for a record, a list, a map or a `Json`, and `reveal`
 has no other decode path. So `ship_to: Address @subject(customer_ref)` does not merely fail in
@@ -2339,12 +2339,10 @@ because it is the one `heklang/docs/declarations.md` now recommends: one address
 parallel optional sealed fields, where adding a tenth is a schema-evolution event on every event that
 carries it.
 
-- The heklang version bump, which is the gate. Nothing here can land against 0.8.0, and
-  that is still true of the tree this is written in: the work is done and validated
-  against a `[patch.crates-io]` path override, and it is not committed until heklang 0.9
-  is published and the requirement moves with it. Removing the override without bumping
-  the requirement resolves the released 0.8.0, which compiles and wedges, so the two
-  edits are one edit.
+- The heklang version bump, which was the gate. Nothing here could land against 0.8.0, so the
+  work sat validated against a `[patch.crates-io]` path override until heklang 0.9.0 was
+  published. Removing the override without bumping the requirement would have resolved the
+  released 0.8.0, which compiles and wedges, so the two were one edit and are made as one.
 - A fixture sealing a record, a list and a map, in `tests/fixtures/tickets`, which already seals a
   `Money(2)` and a `String?`.
 - Coverage through the whole path: seal on append, store, read back, `reveal` in an effect, and a
