@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://git.tqwewe.com/tephra/hekla/compare/v0.6.0...v0.7.0) - 2026-09-19
+
+### Added
+
+- [**breaking**] a subject's key is adopted under its declared parent before a deploy serves
+- [**breaking**] a subject is a declared type whose values are its ids, and can be deleted with its tenant
+- a scan orders by a declared index, and its cursor is the index tuple
+- a scan filters on any prefix of a declared index, and ranges on the column after it
+- a sealed record, list or map round-trips through the read model and an effect
+- an operator can see every wedged lane, not just the one holding the watermark
+
+### Fixed
+
+- [**breaking**] a key namespace written before schema v10 is renamed rather than carried blind
+- a cursor is refused when its ordering changed width, and an optional column ranges
+
+### Other
+
+- the orders example says what a customer under a shop actually erases
+- heklang 0.9.0, where a subject is a type and a sealed composite decodes
+
 ## [0.6.0](https://git.tqwewe.com/tephra/hekla/compare/v0.5.1...v0.6.0) - 2026-09-15
 
 ### Added
