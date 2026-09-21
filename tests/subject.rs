@@ -30,6 +30,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -2727,22 +2728,40 @@ fn the_disagreement_report_names_each_subject_once_and_stops() {
 /// Raced rather than contrived, because nothing outside the function can reach that
 /// window. The chain is two links deep on purpose: erasing the **root** is wrong for the
 /// whole span between minting it and the commit, where erasing the immediate parent is
-/// only wrong for the tail of it, so this hits the case in a few hundred rounds rather
-/// than by luck.
+/// only wrong for the tail of it, so a round that is raced at all lands in the window
+/// almost every time rather than by luck.
+///
+/// **The eraser runs until the adopter stops**, rather than for a round count of its own.
+/// Matching counts read as fair and were not: erasing a subject that is not there costs
+/// one lookup, so the eraser spent all 3000 of its rounds while the adopter got through
+/// about thirty, and the window it exists to hold open was shut for the rest of the run.
+/// Losing that start by a scheduling hair shut the window before the first round, and the
+/// test then failed for want of a race rather than for a bug, which is how it read in CI.
 #[test]
 fn an_adoption_whose_ancestor_is_erased_under_it_puts_the_row_back() {
     let opdb = Arc::new(Mutex::new(OpDb::open_in_memory().unwrap()));
     let masters = MasterKeys::new(MASTER_KEY, vec![]);
     let taken_back: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    // Several undos rather than one, so a pass says the path runs rather than that it once
+    // did. The rounds are the adopter's patience rather than its workload: with the window
+    // held open the fifth lands inside the first few hundred, even with both threads on one
+    // core.
+    let wanted = 5usize;
     let rounds = 3000u32;
+    let stop = AtomicBool::new(false);
 
     thread::scope(|scope| {
         {
             let opdb = Arc::clone(&opdb);
             let masters = masters.clone();
+            let stop = &stop;
             scope.spawn(move || {
                 let ks = KeyStore::new(opdb, masters);
-                for _ in 0..rounds {
+                while !stop.load(Ordering::Relaxed) {
+                    // One lookup here against a round of minting, wrapping and reading back
+                    // over there, so a runner with a single core to give would spend most
+                    // of it in this loop without the yield.
+                    thread::yield_now();
                     ks.erase("Region", "1").unwrap();
                 }
             });
@@ -2751,6 +2770,7 @@ fn an_adoption_whose_ancestor_is_erased_under_it_puts_the_row_back() {
             let opdb = Arc::clone(&opdb);
             let masters = masters.clone();
             let taken_back = &taken_back;
+            let stop = &stop;
             scope.spawn(move || {
                 let ks = KeyStore::new(opdb, masters);
                 for round in 0..rounds {
@@ -2767,9 +2787,15 @@ fn an_adoption_whose_ancestor_is_erased_under_it_puts_the_row_back() {
                         ])
                         .unwrap();
                     if outcome == Adopted::Undone {
-                        taken_back.lock().unwrap().push((member, sealed));
+                        let mut taken_back = taken_back.lock().unwrap();
+                        taken_back.push((member, sealed));
+                        if taken_back.len() >= wanted {
+                            break;
+                        }
                     }
                 }
+                // However the loop ended, the eraser is waiting on this to go home.
+                stop.store(true, Ordering::Relaxed);
             });
         }
     });
