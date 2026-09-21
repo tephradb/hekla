@@ -716,8 +716,14 @@ one event name the lane it is processed in. Events in one lane are processed in 
 different lanes need not wait for each other. **This is an ordering guarantee the author chooses, not
 a parallelism hint**, and the difference matters: two warranty plans in one shop write variants onto
 the same remote product, so they must share a lane even though per-plan parallelism looks tempting.
-A lane is the key *alone*, across the effect's arms, so two arms touching one remote resource under
-one shop id share it.
+
+**A lane belongs to one effect.** A lane is the key *alone*, so two arms of one effect resolving the
+same key share one; two different effects never do, whatever keys they declare. Each effect reads the
+log on its own cursor, so the same key tuple in two effects names two lanes and their positions race.
+**Writers that must stay in log order against one remote resource therefore belong in one effect, as
+two arms**: that is what an effect groups, and declaring the same `@key` in both does not say it while
+reading as though it does. An effect is also the unit of quarantine, so that grouping is an
+operational choice as well as an ordering one.
 
 The reason is a production failure. Under one global lane, a single oversized order event stalled a
 warranty effect for every merchant on the platform for eight hours. What fixes that is not the
