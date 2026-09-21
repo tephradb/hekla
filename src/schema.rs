@@ -124,9 +124,12 @@ impl FieldKind {
             // they are on the wire, so a column holds one encoding rather than two.
             Type::Record(_) | Type::List(_) | Type::Map(..) | Type::Json => FieldKind::Json,
             // Not writable at a declared position: the checker rejects these long
-            // before a field could hold one. `Secret` is the strongest of the four,
-            // since rule 16 keeps one out of an `emit` and a projector write both.
-            Type::Rounding | Type::Response | Type::Outcome | Type::Secret => FieldKind::Json,
+            // before a field could hold one. `Secret` is the strongest of the five,
+            // since rule 16 keeps one out of an `emit` and a projector write both, and
+            // an `Event` is a record rather than a value, so only a `fn` returns one.
+            Type::Rounding | Type::Response | Type::Outcome | Type::Secret | Type::Event(_) => {
+                FieldKind::Json
+            }
         }
     }
 
