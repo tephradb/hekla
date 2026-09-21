@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://git.tqwewe.com/tephra/hekla/compare/v0.7.0...v0.7.1) - 2026-09-21
+
+### Other
+
+- the adoption race keeps erasing until the adopter is done rather than for a round count of its own
+- heklang 0.11.0, where an event is a type a fn can return
+- heklang 0.10.0
+
 ## [0.7.0](https://git.tqwewe.com/tephra/hekla/compare/v0.6.0...v0.7.0) - 2026-09-19
 
 ### Added
