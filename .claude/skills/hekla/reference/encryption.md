@@ -135,9 +135,19 @@ What each surface does afterwards:
 | `GET /admin/subjects/{subject}/{value}` | `state: absent`, indistinguishable from never-created |
 | a subject **under** the erased one | the same, everywhere: its key was wrapped under this one |
 | an external system | unaffected. Erasure cannot un-send an email an effect already delivered |
+| a dated copy taken before it | unaffected, and nothing can fix that for you. See below |
 
 The CLI form takes no lock, so it works against a running server, and the next request sees it: the
 decrypt cache lives for one request only.
+
+**A backup older than the erasure still holds the key.** A `hekla backup` target is kept current by
+the next run, which is why it replaces the state wholesale rather than versioning it, but a copy an
+operator has dated and filed away holds the key store as of that date, and there is no ledger to
+replay the erasure onto it: the row is gone, so an erased subject and one that never existed are the
+same state on disk. The `erase(id)` form needs nothing further, because the request is an event in
+the log and `erase` is journaled, so a restore whose journal predates the erase replays the arm,
+misses the journal and performs it again. `hekla erase` has to be re-run against anything restored
+from a copy older than it, and says so when it runs.
 
 **Erasure is a point-in-time shred, not a tombstone.** A later event writing the same subject's field
 mints a fresh key, so values written after the erase are readable while everything before it stays

@@ -86,8 +86,17 @@ enum Command {
     /// recorded effect invocation still replays without performing anything.
     ///
     /// Takes the data-directory lock, so it refuses to run against a directory a
-    /// server has open. Verify a copy of the directory, which checks the backup at
-    /// the same time.
+    /// server has open. Verify a `hekla backup` of the directory, which checks the
+    /// backup at the same time.
+    ///
+    /// A backup holds no read models, so a sweep over one reports `checked 0 projector(s)`:
+    /// rebuild equivalence compares a rebuild against a live model, and this builds none,
+    /// because it opens the directory quiescent. What it checks there is the half a bad copy
+    /// would break, that the log opens and every recorded invocation replays.
+    ///
+    /// Only serving from the copy builds the models, and that resumes the invocations that
+    /// were in flight when it was taken, performing their calls for real. It is not a step to
+    /// take to make this command report a larger number.
     Verify {
         /// The project directory.
         #[arg(default_value = ".")]
@@ -96,6 +105,40 @@ enum Command {
         /// `<dir>/data`.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+    /// Copy a deployment, consistently, while a server is still writing to it.
+    ///
+    /// SOURCE is a data directory, or a project holding one at `<dir>/data`, so
+    /// `hekla backup . /backups` and `hekla backup /var/lib/hekla /backups` both name one.
+    ///
+    /// The log is copied first and the operational database second, which is the only order
+    /// that works: a key store older than the log it is paired with has no key for what was
+    /// appended in between, and a missing key is indistinguishable from an erasure, so the
+    /// copy reads as though those subjects had been forgotten and nothing reports it. Then
+    /// every position the copy records is lowered to the head of the log it ended up with,
+    /// because the effect journal has the opposite constraint and the two share a file.
+    ///
+    /// Takes no lock on the source and loads no project, so it runs against a deployment
+    /// serving traffic, and needs no master key: the subject keys are copied as they are
+    /// stored, wrapped, which also means the backup is inert without the master it names.
+    ///
+    /// Read models are not copied, because a restore rebuilds them from the log. The target
+    /// is otherwise a data directory: check it with `hekla verify --data-dir`, or serve from
+    /// it. Run it again over the same target to update it, which copies only what changed.
+    Backup {
+        /// The deployment to copy, named either by its data directory or by the project that
+        /// holds one at `<dir>/data`. A server may have it open.
+        ///
+        /// There is no `--data-dir` here, unlike every other subcommand: those need the code
+        /// and the data together and only a project can say where the code is, while this
+        /// needs no project at all, so the flag would have nothing behind it.
+        source: PathBuf,
+        /// Where to put it. Created if it is not there, updated in place if it already holds
+        /// a backup, and refused if it holds anything else.
+        target: PathBuf,
+        /// Do not draw the progress line.
+        #[arg(long)]
+        no_progress: bool,
     },
     /// Rewrap every subject key under the primary master key (`HEKLA_MASTER_KEY`),
     /// unwrapping with the previous keys (`HEKLA_MASTER_KEY_PREVIOUS`) as needed. Run
@@ -267,6 +310,12 @@ enum Command {
     /// Erase a subject: delete its encryption key, making every value scoped to it
     /// unreadable and unmatchable across the log and every read model at once. This
     /// is irreversible.
+    ///
+    /// It leaves no trace, because an erased subject and one that never existed are the
+    /// same state on disk, so nothing can re-apply it for you: re-run it against any
+    /// directory restored from a backup taken before now. An erasure driven from an
+    /// effect does not need that, since the request is an event in the log and `erase`
+    /// is journaled, so a restore that predates it performs it again on its own.
     Erase {
         /// The subject, by its declared name (e.g. `Customer`).
         subject: String,
@@ -340,6 +389,11 @@ pub fn run() -> ExitCode {
             init_tracing(no_color);
             verify(&dir, data_dir.as_deref())
         }
+        Command::Backup {
+            source,
+            target,
+            no_progress,
+        } => backup(&source, &target, !no_progress),
         Command::Rotate { dir, data_dir } => rotate(&dir, data_dir.as_deref()),
         Command::Adopt {
             dir,
@@ -567,6 +621,10 @@ fn erase(
     match crypto::erase_subject(&opdb, subject, subject_value) {
         Ok(true) => {
             println!("erased subject `{subject}` = `{subject_value}`");
+            // Said here because this is the moment it is actionable, and because nothing
+            // else can say it later: the row is gone, so no restore can work out that it
+            // should go again.
+            println!("re-run this against any directory restored from a backup taken before now");
             ExitCode::SUCCESS
         }
         Ok(false) => {
@@ -1322,6 +1380,44 @@ fn adopt(dir: &Path, data_dir: Option<&Path>, progress: bool) -> ExitCode {
     }
 }
 
+/// Say so when a directory is a backup an interrupted `hekla backup` left behind.
+///
+/// A warning rather than a refusal: the directory is readable and recovering from it may be
+/// deliberate. But it has a log that has grown past the key store beside it, so sealed content
+/// written in between reads as erased, and nothing downstream can tell that from a real
+/// erasure. Checked by the two commands that open a directory to be believed, which is where
+/// the mistake would otherwise be confirmed rather than caught.
+fn warn_if_interrupted_backup(data: &Path) {
+    if crate::backup::interrupted(data) {
+        eprintln!(
+            "warning: {} is a backup an interrupted run left: its key store is older than its \
+             log, so anything sealed in between reads as erased. Re-run `hekla backup` into it.",
+            data.display()
+        );
+    }
+}
+
+/// `hekla backup`: a consistent copy of a data directory a server is still writing.
+///
+/// Nothing to resolve and nothing to load: both paths are given, and the module refuses
+/// anything it should not write to. The progress line is cleared on the way out of a failure
+/// as well as a success, so half a line never ends up under a diagnostic.
+fn backup(source: &Path, target: &Path, progress: bool) -> ExitCode {
+    let progress = Progress::stderr(progress);
+    let result = crate::backup::run(source, target, &progress);
+    progress.clear();
+    match result {
+        Ok(report) => {
+            println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `hekla verify`: the offline invariant sweep over a data directory.
 ///
 /// Exits non-zero on any violation, so it drops straight into CI or a nightly job.
@@ -1339,6 +1435,7 @@ fn verify(dir: &Path, data_dir: Option<&Path>) -> ExitCode {
         eprintln!("error: no data directory at {}", data.display());
         return ExitCode::FAILURE;
     }
+    warn_if_interrupted_backup(&data);
     let master = match crypto::master_keys_from_env() {
         Ok(master) => master,
         Err(err) => {
@@ -1390,6 +1487,7 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) 
         }
     };
     let data = runtime::resolve_data_dir(dir, data_dir);
+    warn_if_interrupted_backup(&data);
     let http: Arc<dyn HttpClient> = Arc::new(UreqClient::new());
     let master = match crypto::master_keys_from_env() {
         Ok(master) => master,

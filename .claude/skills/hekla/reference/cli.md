@@ -1,6 +1,7 @@
 # The CLI
 
-One binary, eleven subcommands, `<dir>` defaulting to `.` everywhere. `hekla --version` and
+One binary, thirteen subcommands, `<dir>` defaulting to `.` wherever one is taken. `backup` is the
+one that takes two paths instead, copying a deployment named by either spelling. `hekla --version` and
 `hekla <subcommand> --help` work.
 
 Logging is `tracing` behind `RUST_LOG`, default `info`. `serve` and `verify` initialise it; the other
@@ -142,6 +143,119 @@ recorded before that column existed fall back to the old reading, which can only
 that journaled nothing at all, and those are counted separately as journaling no call.
 
 A run that skipped everything still says `ok`, which is why the counts are printed.
+
+## `hekla backup <SOURCE> <TARGET> [--no-progress]`
+
+A consistent copy of a deployment a server is still writing. `SOURCE` is a data directory, or a
+project holding one at `<dir>/data`, so both `hekla backup . /backups/hekla` and
+`hekla backup /var/lib/hekla /backups/hekla` name the same deployment from a checkout and from a
+server. There is deliberately no `--data-dir`: every other subcommand has one because it needs the
+code and the data together and only a project can say where the code is, and this needs no project
+at all, so the flag would have nothing behind it. It loads nothing, needs no master key, and takes
+no lock on the source.
+
+```
+copied 2 file(s) (1.5 KiB) and reused 1, to /backups/hekla
+log head 918, schema v11
+1,204 subject key(s), wrapped under master 7f3a9c21: without it every sealed field reads as erased
+clamped to the log head: discarded 2 invocation(s), 5 journal row(s), 0 lane row(s), 0 quarantine(s), and lowered 1 cursor(s), 0 live boundary(ies)
+(or `clamped to the log head: nothing recorded sat above it`, for a settled directory)
+a restore rebuilds 2 read model(s): Orders, Shipments
+check it with `hekla verify <project> --data-dir /backups/hekla`
+```
+
+**Why this is a subcommand and not `cp -r`.** The log can be copied from under the writer safely: a
+segment is never rewritten or deleted and a batch counts only if every record validates by CRC and
+the run ends in a commit marker, so any copy is a committed prefix and a torn tail rolls back when
+it is opened. What cannot be worked out from outside is that the ordering invariant is two-sided:
+
+- **The key store must be at least as new as the log**, because a missing subject key is
+  indistinguishable from an erasure. A key store copied first makes everything appended in between
+  read as though those subjects had been forgotten, and nothing reports it.
+- **The effect tables must be no newer than the log**, because a restored log continues at
+  `head + 1` and an invocation is recorded against a position. A terminal row above the head makes a
+  *different* event report `AlreadyTerminal`, so its effect silently never runs.
+
+Both live in `hekla.db`, so no ordering of two snapshots satisfies both. The command copies the log
+first, snapshots the operational database with `VACUUM INTO` through a read-only connection, and
+then lowers every position the copy records to the head of the log it ended up with. That clamp is
+reported rather than silent: it discards work the source has recorded, and those positions are not
+in the copied log.
+
+Read models are not copied. A read model cannot be rewound, because its rows already reflect events
+above its checkpoint, and it is rebuildable from the log, so a restore builds them from scratch
+however `auto_rebuild` is set. Expect a restore's first boot to replay the log once per projector.
+
+That shapes what a sweep over a target can tell you: `hekla verify` reports `checked 0
+projector(s)`, because rebuild equivalence compares a rebuild against a live model and a backup has
+none. The sweep does not make one either: it opens the directory through `Runtime::open_quiescent`,
+which starts no projector and no effect, and skips a projector with no model on disk. What it does
+check is the half a bad copy would break, that the log opens and every recorded invocation still
+replays.
+
+**Only serving from the target builds the models, and that is a restore rather than a check.** A
+boot resumes the invocations that were in flight when the backup was taken and performs their calls
+for real: an `http.post` sent again, an `erase` carried out. Do it with the credentials taken away
+(hekla refuses to serve an effect whose credential is unset, which is the lever) and never where the
+effects can still reach production. The sweep is also not read-only in the other direction: it holds
+the lock, migrates the operational database, recovers the active segment and persists `.idx` files,
+so a target that has been verified is no longer byte-identical to the one that was written.
+
+The target is otherwise an ordinary data directory, holding `events/`, `hekla.db` and
+`hekla-backup.json`. Verify it with `hekla verify <project> --data-dir <target>`, or serve from it.
+**Repeat runs update it in place**: everything under `events/` is immutable except the segment being
+appended to, so a second run copies that and anything new (`reused` counts the rest), and the state
+is replaced wholesale. A copy is sparse: a 256 MiB segment holding a few events moves a few
+kilobytes.
+
+**The sparseness has a cost worth knowing.** tephra `fallocate`s a segment to its full size when it
+creates it and never extends it, so the original has its space reserved up front; the copy's tail is
+a hole, and nothing re-reserves it on a restore. A deployment serving from a restored copy can
+therefore hit ENOSPC part way through a segment the original was guaranteed room for. Give a restore
+room for a whole segment beyond what the directory appears to occupy.
+
+**It is inert without the master key.** A data directory never holds one, so the keys are copied
+wrapped, and the summary and manifest both name the master ids they are wrapped under. Keep that key
+somewhere else.
+
+**Erasure and dated copies.** Replacing the state wholesale is what carries an erasure into the
+target: it always holds the newest key store, so there is no older one in it to resurrect a key
+from. A copy *you* have dated and filed away holds the key store as of its date, and there is no
+ledger to put that right (an erased subject and one that never existed are the same state on disk).
+An erasure driven from an effect re-applies itself on a restore, because the request is an event in
+the log and `erase` is journaled, so a replay that finds no entry performs it again. `hekla erase`,
+the operator command, leaves no trace and has to be re-run.
+
+`hekla-backup.json` carries a **`complete`** flag, written `false` before the log is touched and
+`true` once the state has landed beside it. The window between those two is the one state a target
+must never be mistaken for a backup in: the log has grown and the key store has not, which on a
+restore is indistinguishable from erasing everything in between. A run that dies there leaves the
+flag `false`, the next run repairs the target, and until then it says what it is. The flag is also
+what claims a fresh target, so a first run that dies can be retried rather than leaving a non-empty
+directory with no manifest that every later run refuses.
+
+Failure modes, all of them refusals before anything is written:
+
+- `error: no data directory to back up: neither <source> nor <source>/data holds both an `events/`
+  directory and a `hekla.db``. Both places it looked, rather than a guess at which was meant: a
+  project directory has an `events/` of its own holding the modules, so there is no sound way to say
+  which half is missing without knowing which spelling the operator intended.
+- `error: <target> is not empty and holds no hekla-backup.json`, so a target that might be somebody's
+  data directory is never written over. The manifest is what marks a directory as a backup, and a
+  manifest that will not parse still counts as one: a half-written file says nothing useful, but it
+  must not be what stops the target being backed up into again.
+- `error: refusing to back up into <target>, which is in use`, when something holds the target's lock
+  (serving from a mirror is a legitimate way to restore one).
+- `error: the data directory is at schema version N and this build knows up to M`, when the source
+  was written by a *newer* hekla: it may record positions in tables this build cannot clamp. An
+  older version is fine and deliberately allowed, since a backup is what you want before an upgrade.
+- `error: <target> holds a backup of <other>, not of <source>`, compared on the canonical path, so
+  `./data` and `/var/lib/hekla` are one directory. A target belongs to one data directory: the reuse
+  check matches segments by name, so a second source's would interleave with the first's into one log
+  whose records all pass their CRC.
+- `error: <target> already holds a backup at log head N, which is ahead of the M at <source>`: an
+  append-only log cannot fall behind its own backup, so this is a deployment that was wiped and
+  started again at the same path.
 
 ## `hekla plan [DIR] [--data-dir PATH] [--json] [--replay] [--replay-limit N]`
 

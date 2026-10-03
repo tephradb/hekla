@@ -9,10 +9,29 @@ data/
   hekla.db               the operational DB: effect journals, subject keys, declarations
 ```
 
-Backup is copying the directory of a **stopped** process. A `cp -r` of a live one is not
-crash-consistent (SQLite WAL, a segment mid-append), and the sweep would then report divergence the
-copy caused. Projector databases are rebuildable from the log, so only `events/` and `hekla.db` are
-irreplaceable.
+Backup is `hekla backup <source> <target>`, and it runs against a live process. Copying the
+directory by hand only works on a **stopped** one: a `cp -r` of a live directory is not consistent
+(SQLite WAL, and the key store against the log), and the sweep would then report divergence the copy
+caused. Projector databases are rebuildable from the log, so only `events/` and `hekla.db` are
+irreplaceable, and `hekla backup` copies exactly those.
+
+Two invariants make the hand-copy wrong in ways nothing reports, and they point in opposite
+directions:
+
+- **The key store must be at least as new as the log.** A missing subject key is indistinguishable
+  from an erasure, so a key store copied before the log reads as though those subjects had been
+  forgotten.
+- **The effect tables must be no newer than the log.** A restored log continues at `head + 1`, and
+  an invocation is recorded against a position, so a terminal row above the head makes a *different*
+  event report `AlreadyTerminal` and skip its effect.
+
+Both are in `hekla.db`, so the command copies the log first (satisfying the key store) and then
+lowers every position the copy records to the head of the log it ended up with, reporting what that
+discarded. It takes no lock on the source, loads no project, and needs no master key.
+
+The target is a data directory: `hekla verify --data-dir <target>` checks it, and a restore is
+serving from it. Repeat runs update it in place, copying only the segment that grows and replacing
+the state wholesale. A backup is inert without the master key it names in `hekla-backup.json`.
 
 Opening those files directly is not a supported surface; the table layout is private.
 
@@ -249,7 +268,7 @@ Three invariants, two entry points.
   checkpoint without this guard, since a bounded rebuild legitimately lands behind.
 
 `hekla verify <dir>` sweeps offline, takes the lock, and exits non-zero on a violation: run it against
-a stopped instance or a copy of the directory, which exercises the backup at the same time.
+a stopped instance or a `hekla backup` of a running one, which exercises the backup at the same time.
 `serve --verify` (or `[verify] enabled = true`) runs the per-operation half continuously, at the cost
 of a second handler run per completed invocation.
 

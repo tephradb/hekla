@@ -51,9 +51,36 @@ pub fn recorded_schema_version(path: &Path) -> anyhow::Result<i64> {
     Ok(version)
 }
 
+/// Every table the effect runtime keys by a tephra position, in the order they must be
+/// discarded from.
+///
+/// Here, beside the migrations, because it is schema knowledge rather than a caller's
+/// business. [`crate::backup`] lowers every position a copy records to the head of the log it
+/// copied, and a table a later migration adds that is missing from this list is a position
+/// left above that head, which makes a restored deployment report `AlreadyTerminal` for a
+/// different event and skip its effect with nothing reported. `backup`'s
+/// `every_table_is_clamped_or_known_to_need_no_clamp` reads the built schema back and fails
+/// when a new table has not been accounted for.
+///
+/// `effect_journal` comes first because v1 declares its foreign key without `ON DELETE
+/// CASCADE`, so deleting an invocation that still had journal rows would abort rather than
+/// take them with it.
+pub const POSITIONED_TABLES: &[&str] = &[
+    "effect_journal",
+    "effect_invocation",
+    "effect_lane",
+    "effect_quarantine",
+];
+
+/// The same, for a position held as a watermark to be lowered rather than as a row to discard.
+pub const WATERMARK_COLUMNS: &[(&str, &str)] = &[
+    ("effect_cursor", "watermark"),
+    ("effect_activation", "live_boundary"),
+];
+
 /// Positions are stored signed, so a `u64::MAX` sentinel would bind as `-1` and match
 /// nothing. Saturate instead, which is the bound the caller meant.
-fn clamp_i64(value: u64) -> i64 {
+pub(crate) fn clamp_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 

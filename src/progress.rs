@@ -78,6 +78,15 @@ impl Progress {
     /// Cheap to call often: it returns before formatting anything until a paint is due,
     /// so a caller does not have to rate-limit on its own.
     pub fn tick(&self, position: u64, head: u64, matched: usize) {
+        self.paint(|elapsed| line(position, head, matched, elapsed));
+    }
+
+    /// Redraw the line with whatever `text` renders, if a paint is due.
+    ///
+    /// The closure is what keeps [`tick`](Progress::tick) and its siblings cheap to call per
+    /// record: nothing is formatted until a redraw is actually owed. It is handed the elapsed
+    /// time because every line drawn here ends in an estimate extrapolated from it.
+    pub fn paint(&self, text: impl FnOnce(Duration) -> String) {
         if !self.enabled {
             return;
         }
@@ -88,7 +97,7 @@ impl Progress {
         if self.painted.get().is_some_and(|at| at.elapsed() < REDRAW) {
             return;
         }
-        let text = line(position, head, matched, elapsed);
+        let text = text(elapsed);
         // Padded to the widest line drawn so far, because a carriage return moves the
         // cursor and erases nothing. The line does shrink: the estimate loses digits as
         // it counts down and disappears entirely at the tip, so an unpadded redraw would
@@ -123,22 +132,51 @@ impl Progress {
 /// Separate from [`Progress`] so it can be asserted on without a terminal, which is the
 /// same split `cli::use_ansi` makes for the colour decision.
 pub fn line(position: u64, head: u64, matched: usize, elapsed: Duration) -> String {
-    // An empty log is complete rather than a division by zero. A scan over one visits
-    // nothing and this is drawn only if it somehow took long enough to paint.
-    let percent = match head {
-        0 => 100,
-        head => position.min(head) * 100 / head,
-    };
     let mut out = format!(
-        "  scanned {} of {} ({percent}%)  {} matched",
+        "  scanned {} of {} ({}%)  {} matched",
         thousands(position),
         thousands(head),
+        percent(position, head),
         thousands(matched as u64)
     );
     if let Some(left) = remaining(position, head, elapsed) {
         let _ = write!(out, "  {left} left");
     }
     out
+}
+
+/// The line a file copy draws: the same shape as [`line()`] over a different unit.
+///
+/// A scan counts events against the log's tip and a copy counts bytes against what it has to
+/// move, and "scanned 412,880 of 1,203,556 ... matched" describes neither of those.
+///
+/// `file` is the one being copied rather than the number finished, because this is painted
+/// from inside a copy: a count of completed files reads as zero for the whole of the first
+/// one, which on a log of one large segment is the whole of the run.
+pub fn copied(bytes: u64, total: u64, file: usize, files: usize, elapsed: Duration) -> String {
+    let mut out = format!(
+        "  copied {} of {} ({}%)  file {file} of {files}",
+        size(bytes),
+        size(total),
+        percent(bytes, total),
+    );
+    if let Some(left) = remaining(bytes, total, elapsed) {
+        let _ = write!(out, "  {left} left");
+    }
+    out
+}
+
+/// How far through, as a percentage.
+///
+/// Nothing to do is complete rather than a division by zero: an empty log is visited by a
+/// scan that does nothing, and this is drawn at all only if that somehow took long enough to
+/// paint. Clamped, because a bar past one hundred would be a worse way to learn that a caller
+/// counted wrong than a bar that sits at the end.
+fn percent(done: u64, total: u64) -> u64 {
+    match total {
+        0 => 100,
+        total => done.min(total) * 100 / total,
+    }
 }
 
 /// How much longer the scan has, extrapolated from the rate it has managed so far.
@@ -165,6 +203,45 @@ fn short_duration(seconds: f64) -> String {
     } else {
         format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
     }
+}
+
+/// A byte count for a line that is glanced at: one decimal place while the leading figure is
+/// a single digit, whole units above that, and bytes below a kibibyte.
+///
+/// Beside [`thousands`] because it is the same kind of thing, a number being made readable
+/// rather than exact, and the two are used in the same sentences.
+pub fn size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let bytes = u128::from(bytes);
+    let mut scale = 1u128;
+    let mut unit = 0;
+    while unit + 1 < UNITS.len() && bytes >= scale * 1024 {
+        scale *= 1024;
+        unit += 1;
+    }
+    // A value in the top half of a unit rounds to a full 1024 of it, and "1024 KiB" beside
+    // "1.0 MiB" for two sizes a byte apart is exactly the disagreement this is avoiding. So
+    // the carry climbs rather than being printed.
+    if unit + 1 < UNITS.len() && round(bytes, scale) >= 1024 {
+        scale *= 1024;
+        unit += 1;
+    }
+    if unit == 0 {
+        return format!("{bytes} B");
+    }
+    let tenths = round(bytes * 10, scale);
+    if tenths < 100 {
+        return format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit]);
+    }
+    // From the bytes rather than from `tenths`: rounding a number that has already been
+    // rounded to tenths climbs a whole unit for anything in the top half of a tenth, which
+    // reported 10.496 MiB as "11 MiB".
+    format!("{} {}", round(bytes, scale), UNITS[unit])
+}
+
+/// `value / scale`, to the nearest, with the halfway point going up.
+fn round(value: u128, scale: u128) -> u128 {
+    (value + scale / 2) / scale
 }
 
 /// A count with thousands separators.
@@ -196,6 +273,68 @@ mod tests {
         assert_eq!(thousands(1_000), "1,000");
         assert_eq!(thousands(1_203_556), "1,203,556");
         assert_eq!(thousands(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn sizes_read_at_a_glance() {
+        assert_eq!(size(0), "0 B");
+        assert_eq!(size(512), "512 B");
+        assert_eq!(size(2 * 1024), "2.0 KiB");
+        assert_eq!(size(1_153_434), "1.1 MiB");
+        assert_eq!(size(256 * 1024 * 1024), "256 MiB");
+        assert_eq!(size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+        assert_eq!(size(3 * 1024 * 1024 * 1024 * 1024), "3.0 TiB");
+        // Absurd, and the point is that the tenths arithmetic does not overflow on the way to
+        // saying so: a `u64` of bytes is 2^24 tebibytes.
+        assert_eq!(size(u64::MAX), "16777216 TiB");
+    }
+
+    /// A byte apart must not read differently, at either boundary: the one where the precision
+    /// changes, and the one where the unit does. Picking the branch on the truncated whole made
+    /// the lower of the first pair "10.0 GiB"; printing the carry made the lower of the second
+    /// "1024 KiB" beside "1.0 MiB".
+    #[test]
+    fn two_sizes_a_byte_apart_read_the_same() {
+        let (kib, mib, gib) = (1024, 1024 * 1024, 1024 * 1024 * 1024);
+        assert_eq!(size(10 * gib - 1), "10 GiB");
+        assert_eq!(size(10 * gib), "10 GiB");
+        assert_eq!(size(10 * gib + 1), "10 GiB");
+
+        assert_eq!(size(mib - 1), "1.0 MiB");
+        assert_eq!(size(mib), "1.0 MiB");
+        assert_eq!(size(gib - 1), "1.0 GiB");
+        assert_eq!(size(gib), "1.0 GiB");
+        assert_eq!(
+            size(kib - 1),
+            "1023 B",
+            "and the bottom one is exact either side"
+        );
+        assert_eq!(size(kib), "1.0 KiB");
+    }
+
+    /// Rounding a number that has already been rounded to tenths climbs a whole unit for
+    /// anything in the top half of a tenth. 10.496 MiB read as "11 MiB".
+    #[test]
+    fn a_size_is_not_rounded_twice() {
+        assert_eq!(size(11_005_853), "10 MiB");
+        assert_eq!(
+            size(11_534_336),
+            "11 MiB",
+            "and 11.0 exactly still reads 11"
+        );
+    }
+
+    #[test]
+    fn a_copy_line_reports_bytes_over_the_bytes_to_move() {
+        let text = copied(1_153_434, 4_194_304, 2, 3, Duration::from_millis(500));
+        assert_eq!(text, "  copied 1.1 MiB of 4.0 MiB (27%)  file 2 of 3");
+    }
+
+    /// Nothing to copy is a finished copy, which is how a backup of an empty log reads.
+    #[test]
+    fn a_copy_line_over_nothing_is_complete() {
+        let text = copied(0, 0, 0, 0, Duration::from_secs(10));
+        assert!(text.contains("(100%)"), "{text}");
     }
 
     #[test]

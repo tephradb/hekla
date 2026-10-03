@@ -253,12 +253,23 @@ its own history. `hekla verify` checks the properties those rest on, against wha
 deployment actually reached rather than against cases someone thought to write down.
 
 ```sh
-# Verify a stopped instance, or a snapshot of one. A plain `cp -r` of a directory a
-# server has open is not crash-consistent (SQLite WAL, a segment mid-append), so the
-# sweep could report divergence the copy caused, the worst possible false positive
-# for a tool whose whole value is being believed.
+# Verify a stopped instance, or a `hekla backup` of a running one. Take the copy with
+# that rather than with `cp -r`: a hand-copied live directory is not consistent (SQLite
+# WAL, and the key store against the log), so the sweep could report divergence the copy
+# caused, the worst possible false positive for a tool whose whole value is being believed.
 cargo run -- verify . --data-dir data   # non-zero exit on any violation, for CI or a nightly job
 ```
+
+A backup holds no read models, so a sweep over one reports `checked 0 projector(s)`: rebuild
+equivalence needs a live model to compare a rebuild against, and `verify` builds none (it opens the
+directory quiescent, starting no projector and no effect). What it does check is the half a bad copy
+would break: that the log opens, and that every recorded invocation still replays.
+
+**Giving it the other half means running the deployment from the copy, which is not a routine
+check.** A boot resumes the invocations that were in flight when the backup was taken, performing
+their calls for real: webhooks sent again, and an `erase` carried out. Do that only with the
+credentials taken away, which hekla turns into a refusal rather than a surprise, and never against a
+copy whose effects can still reach production.
 
 It checks that every projector rebuilt from position 0 matches the live one row for row, and that
 every recorded effect invocation still replays without performing anything. The replay runs against
@@ -274,6 +285,54 @@ One process at a time: a runtime takes an exclusive lock on the whole data direc
 anything in it. tephra refuses a second writer on the log by itself, but the operational database and
 the read models have no such rule, and by the time a second process reached the log it would already
 have migrated one and started building the others.
+
+## Backing it up
+
+```sh
+cargo run -- backup . /backups/hekla              # while the server is serving
+cargo run -- backup . /backups/hekla              # again: copies only what changed
+cargo run -- verify . --data-dir /backups/hekla   # and the copy replays
+```
+
+The first argument is the deployment, named either by its data directory (`/var/lib/hekla`) or by the
+project that holds one at `<dir>/data`. There is no `--data-dir`: the other subcommands have one
+because they need the code and the data together and only a project can say where the code is, and a
+backup needs no project at all.
+
+The log can be copied from under the writer safely, because a segment is never rewritten and a batch
+counts only if it ends in a commit marker, so any copy is a committed prefix. What an operator
+reaching for `cp`, `rsync` or Borg cannot know is that **the order is forced, and that the order
+alone is not enough.**
+
+The key store has to be at least as new as the log. A missing subject key is indistinguishable from
+an erasure, by design, so a key store copied first makes everything appended in between read as
+though those customers had asked to be forgotten, with nothing in any log to say otherwise. The
+effect journal has the opposite constraint: a restored log carries on at `head + 1`, and an
+invocation is recorded against a position, so a record left above the head makes a *different* event
+look like one that has already been handled, and its effect silently never runs. Both of those live
+in `hekla.db`, so there is no order that satisfies both, and the second is repaired after the copy
+rather than ordered for.
+
+So `hekla backup` copies the log, snapshots the operational database, and then lowers every position
+the copy records to the head of the log it ended up with, telling you what that discarded. It takes
+no lock on the source, loads no project and needs no master key. Read models are left out, because a
+restore rebuilds them from the log.
+
+The target is an ordinary data directory: check it with `hekla verify`, or serve from it. Run the
+command again over the same target to update it in place, which is also what carries an erasure
+across: the state is replaced wholesale, so there is no older key store in it to resurrect a key
+from. A dated copy you keep yourself holds the key store as of its date, which is the one thing a
+backup cannot make right. An erasure driven by an effect re-applies itself on a restore (the request
+is in the log, and `erase` is journaled, so a replay that finds no entry performs it); `hekla erase`
+has to be re-run.
+
+The backup is inert without the master key it was taken under, which the summary and the manifest
+both name. Keep that somewhere else.
+
+A run that dies part way through leaves the target marked `complete: false`, because in that window
+its log has grown past the key store beside it and a restore would read everything in between as
+erased. The next run repairs it, and `serve` and `verify` both say so if they are pointed at one
+first, since a sweep over it would otherwise pass: a key that is absent is a legitimate state.
 
 ## Watching it run
 

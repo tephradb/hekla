@@ -1,6 +1,6 @@
 ---
 name: hekla
-description: Run, operate and debug hekla, the single-app event-sourcing runtime that executes a heklang project. Covers the CLI (check, test, serve, verify, openapi, erase, rotate), project layout and hekla.toml, the generated HTTP surface (/commands, /read, /status, /admin and the console), projector rebuilds, the effect journal and wedged effects, and subject keys, master keys and erasure. Use for anything about running a hekla project, a hekla.toml, an HTTP route a project serves, a stuck effect or projector, HEKLA_MASTER_KEY, or erasing a subject. Writing the `.hk` files themselves is the heklang skill's job.
+description: Run, operate and debug hekla, the single-app event-sourcing runtime that executes a heklang project. Covers the CLI (check, test, serve, verify, backup, openapi, erase, rotate), project layout and hekla.toml, the generated HTTP surface (/commands, /read, /status, /admin and the console), projector rebuilds, the effect journal and wedged effects, and subject keys, master keys and erasure. Use for anything about running a hekla project, a hekla.toml, an HTTP route a project serves, a stuck effect or projector, HEKLA_MASTER_KEY, backing up or restoring a data directory, or erasing a subject. Writing the `.hk` files themselves is the heklang skill's job.
 ---
 
 # hekla
@@ -35,6 +35,7 @@ hekla test  <dir>     # the same, then run every `test` declaration against hekl
 hekla serve <dir>     # the runtime and the HTTP API, on 127.0.0.1:8080 by default
 hekla openapi <dir>   # the generated OpenAPI 3.1 document on stdout, findings on stderr
 hekla verify <dir>    # the offline invariant sweep over a data directory
+hekla backup <source> <target>  # a consistent copy of a deployment a server is still writing
 hekla plan   <dir>    # what deploying this project over a data directory would change
                       #   --replay also re-runs recorded effect invocations against it
 hekla project <file> <dir>  # fold an undeployed projector over the log once and print its rows
@@ -47,7 +48,8 @@ hekla adopt  <dir>   # move keys under the parent their subject now declares, be
 
 Install with `cargo install hekla`, or `nix run git+https://git.tqwewe.com/tephra/hekla` to run it
 without installing anything. From a hekla checkout it is `cargo run -- check <dir>`. Every
-subcommand defaults `<dir>` to `.`.
+subcommand that takes a project `<dir>` defaults it to `.`. `backup` takes two paths instead, and its
+source may be either a data directory or a project holding one at `<dir>/data`.
 
 **Workflow for every change:** edit the `.hk` files, `hekla check`, fix what it names, `hekla test`,
 then run it. `hekla check` is the gate for placement and read-model shape; `hekla test` is the gate
@@ -108,7 +110,8 @@ one under `tests/` does.
 | give a project a webhook url or an API key | `secret NAME` in a `.hk` file, then `HEKLA_SECRET_<NAME>` or a `[secrets]` entry |
 | check a deploy has the credentials it needs | `hekla secrets`, or the `secrets` section of `hekla plan` |
 | rotate a credential | change the source and restart. There is no `_PREVIOUS` list and none is needed |
-| prove a deployment did not diverge | stop it (or copy the data directory) and `hekla verify` |
+| prove a deployment did not diverge | `hekla backup` it (or stop it) and `hekla verify` the copy |
+| back up a running deployment | `hekla backup . <target>` (or name the data directory), again over the same target to update it |
 | pin the API in CI | `hekla openapi . > openapi.json` and diff it |
 | see what the log actually holds | `GET /admin/events`, or open `/admin` in a browser |
 | count or group the log once, without deploying | write a `projector` in a scratch `.hk` and `hekla project <file> <dir>` |

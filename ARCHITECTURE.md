@@ -831,8 +831,38 @@ data/
   hekla.db               # shared operational DB: effect journals, subject keys, declarations
 ```
 
-Backup is "copy the directory". Projector databases are rebuildable from the log regardless, so a
-consistent copy is not required for them.
+Backup is `hekla backup <source> <target>`, and it runs against a directory a server is writing.
+Copying the directory by hand is not, because the ordering invariant is two-sided and only hekla
+knows it. The **key store must be at least as new as the log**: a missing subject key is
+indistinguishable from an erasure, so a key store copied first makes everything appended in between
+read as though those subjects had been forgotten, with nothing reported. The **effect tables must be
+no newer**: a restored log continues at `head + 1` and `begin_invocation` keys on `(effect,
+position)` alone, so a terminal row above the head makes a *different* event report
+`AlreadyTerminal` and skip its effect, also with nothing reported. Both live in `hekla.db`, so no
+ordering of two snapshots satisfies both, and the second is repaired after the copy: the command
+lowers every position the copy records to the head of the log it ended up with, and says what that
+discarded.
+
+The copy itself needs no coordination. A segment is never rewritten or deleted and a batch counts
+only if every record validates by CRC and the run ends in a commit marker, so a file-level copy is a
+committed prefix and a torn tail rolls back on open; the operational database is one `VACUUM INTO`
+through a read-only connection. Projector databases are not copied at all: a read model cannot be
+rewound, because its rows already reflect events above its checkpoint, and it is rebuildable from
+the log by construction, so a restore builds them from scratch.
+
+The source is named either by its data directory or by the project that holds one at `<dir>/data`,
+and there is deliberately no `--data-dir`: the flag exists elsewhere because those commands need the
+code and the data together and only a project can say where the code is, and this one needs no
+project at all.
+
+The target is a data directory, so `hekla verify` runs against it directly and a restore is serving
+from it. Repeat runs update it in place: everything under `events/` is immutable except the segment
+being appended to, and the state is replaced wholesale, which is also what keeps an erasure
+propagating into it. A run that dies between the two leaves the target marked incomplete, because in
+that window its log has grown past its key store, which on a restore is indistinguishable from
+erasing everything in between; `serve` and `verify` both warn when pointed at one, since a sweep
+over it would otherwise pass. What survives in a *dated* copy an operator keeps of their own is the key store
+as of that date, which is the one thing a backup cannot make right: see section 15.
 
 ## 10. HTTP API surface (v1)
 
@@ -976,6 +1006,10 @@ consistent copy is not required for them.
   own harness for those numbers rather than restating them, so a heklang release that moves either
   one fails hekla's suite instead of a downstream project's.
 - `hekla verify <dir>`: the runtime invariant sweep over a data directory. Section 11.2.
+- `hekla backup <source> <target>`: a consistent copy of a deployment a server is still writing. The
+  source is a data directory or a project holding one; there is no `--data-dir`, because a backup
+  needs no project for the flag to be relative to.
+  Section 9.
 - `hekla plan <dir>`: what deploying this project over a data directory would change. It reads the
   `declaration` table rather than the log, so it needs no lock and runs against a live directory. The
   one exception is the history check of section 4: when the diff says an event, record or enum moved,
@@ -1078,7 +1112,7 @@ fold, comparing two Starlark states, so it had nowhere left to stand once the ch
 
 Two entry points over one set of checks. `hekla verify <dir>` sweeps offline and exits non-zero on a
 violation, for CI or a nightly job; it takes the data-directory lock, so the documented shape is to
-verify a copy of the directory, which exercises the backup at the same time. `serve --verify` (or
+verify a `hekla backup` of the directory, which exercises the backup at the same time. `serve --verify` (or
 `[verify] enabled` in `hekla.toml`) runs the per-operation half continuously.
 
 A violation **quarantines the component**: it stops advancing, `/status` names what broke, and the
@@ -1087,7 +1121,13 @@ because what a failed check calls into question is precisely the rows and the po
 read-your-writes wait against a position that moved backwards would resolve on a lie.
 
 Rebuild equivalence is offline only: it costs a full log replay, and against a live projector the
-shadow model would race the one it is comparing to.
+shadow model would race the one it is comparing to. It is also the half a `hekla backup` cannot
+answer at all, because the copy holds no read models and the sweep builds none: it opens the
+directory through `Runtime::open_quiescent`, which spawns no projector and no effect, and skips a
+projector with no model on disk. A sweep over a backup is therefore the replay half in full and zero
+projectors checked. Only serving from the copy gives it models, and that resumes the invocations
+that were in flight when the backup was taken and performs their calls for real, so it is a
+deliberate restore rather than a way to widen a check.
 ## 12. Why heklang (determinism and purity)
 
 umari pins the wall clock and zeroes the monotonic clock to make commands deterministic, and polices
@@ -1360,5 +1400,14 @@ and `order_total` under the shop key, and leaves the ids plaintext.
 - **Effect external sinks are outside the boundary.** Erasure shreds hekla's own store; it cannot
   un-send an email an effect already delivered. The effect journal holds revealed plaintext only
   transiently, until the retention sweeper reclaims the completed invocation.
+- **A dated copy taken before an erasure is outside it as well**, and there is no ledger to put that
+  right: erasure deletes the key row, so an erased subject and one that never existed are the same
+  state on disk and nothing records which it was. A `hekla backup` target is kept current by the next
+  run, which is why the state is replaced wholesale rather than versioned; a copy an operator has
+  dated and filed away holds the key store as of that date. Erasure driven from an effect needs
+  nothing further: the request is an event in the log and `erase` is journaled, so a restore whose
+  journal predates the erase replays the arm, misses the journal and performs it again. `hekla erase`,
+  the operator command, leaves no such trace, so it has to be re-run against anything restored from
+  a copy older than it.
 - **Losing `HEKLA_MASTER_KEY` is total, unrecoverable loss** of every subject-scoped value. Boot fails
   fast with a subject-specific message when a project uses subjects and the key is absent or wrong.
