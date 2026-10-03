@@ -613,6 +613,12 @@ nothing to stop them. `Runtime::open` now takes an exclusive lock (an open `BEGI
 dedicated SQLite file, so it needs no dependency and dies with the process however it dies), which is
 also what keeps `verify` off a directory a server is using.
 
+*(True of the tephra of the time. It has since grown a record lock on its own segment directory, so
+the log now defends itself. This lock stayed, for what that one does not cover: `hekla.db` and the
+read models, which get per-connection concurrency rather than exclusion, and the fact that it is
+taken before any of them is opened, where tephra's refusal would arrive after a migration and a
+half-built read model. See `src/lock.rs`.)*
+
 **Honest scope:**
 
 - **Rebuild equivalence is offline only.** It costs a full log replay, and against a live projector

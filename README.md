@@ -270,8 +270,10 @@ it finishes. A component that breaks an invariant is quarantined (it stops advan
 return 503, and `/status` names what broke) while the rest of the runtime keeps serving. Turn it
 on permanently with `[verify] enabled = true` in `hekla.toml`.
 
-One process at a time: a runtime takes an exclusive lock on its data directory, because tephra does
-not lock the segment directory itself.
+One process at a time: a runtime takes an exclusive lock on the whole data directory, before it opens
+anything in it. tephra refuses a second writer on the log by itself, but the operational database and
+the read models have no such rule, and by the time a second process reached the log it would already
+have migrated one and started building the others.
 
 ## Watching it run
 

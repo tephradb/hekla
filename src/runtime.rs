@@ -310,8 +310,9 @@ impl Runtime {
         // ad-hoc projection compiles against what booted rather than against whatever is
         // on disk when a request arrives. See [`loader::Sources`].
         let sources = Arc::clone(project.sources());
-        // Taken before anything opens the log. tephra does not lock its segment
-        // directory, so a second process here would corrupt it rather than fail.
+        // Taken before anything is opened, which is the whole point of it: tephra refuses a
+        // second writer on `events/`, but by then this boot would have migrated `hekla.db`
+        // and started creating read models. See [`crate::lock`].
         fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
         let lock = DataDirLock::acquire(data_dir)?;
         let events_dir = data_dir.join("events");

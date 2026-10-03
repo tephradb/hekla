@@ -105,10 +105,13 @@ project/
   code: the effect blocking-pool size, the retention window for effect journals, and whether the
   continuous invariant checks run. Defaults are sensible, so a project runs with no config.
 - **One process per data directory.** A runtime takes an exclusive lock on its data directory for
-  its lifetime, because tephra locks nothing itself and two writers on one segment set corrupt the
-  log. The lock is an open `BEGIN EXCLUSIVE` on a dedicated SQLite file, so it needs no dependency
-  and is released by process death however it arrives. It is also what keeps `hekla verify` off a
-  directory a server is using (see section 11.2).
+  its lifetime, and takes it **before it opens anything**. tephra refuses a second writer on the
+  segment set by itself, but the operational database and the read models have no such rule, so two
+  runtimes would both drive projectors and effects and perform every side effect twice, and a second
+  process that got as far as tephra's refusal would already have migrated `hekla.db` and started
+  creating read models. The lock is an open `BEGIN EXCLUSIVE` on a dedicated SQLite file, so it
+  needs no dependency and is released by process death however it arrives. It is also what keeps
+  `hekla verify` off a directory a server is using (see section 11.2).
 
 ## 4. Events and schema
 

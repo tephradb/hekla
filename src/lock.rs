@@ -1,8 +1,18 @@
 //! An exclusive lock on a data directory.
 //!
-//! tephra does not lock its segment directory, so two processes opening one data
-//! directory corrupt the log with nothing to stop them. `serve` and `verify` both
-//! take this lock for their whole run, so the second one fails to start instead.
+//! A data directory is the log, the operational database and one read model per
+//! projector, and only the first of those defends itself: tephra takes a record lock
+//! on its segment directory and refuses a second writer there. SQLite gives the rest
+//! per-connection concurrency rather than exclusion, so two runtimes over one
+//! directory would both drive projectors and effects, performing every side effect
+//! twice (`begin_invocation` treats a `running` row as a crash to replay, not as
+//! somebody else's work), and would find out about the log only once they reached it.
+//!
+//! **This lock is taken before anything is opened**, which is the load-bearing part
+//! rather than the scope: `OpDb::open` migrates, and a projector creates its read
+//! model, so a second process that got as far as tephra's refusal would already have
+//! written to a directory it was never allowed to have. `serve` and `verify` both hold
+//! it for their whole run, so the second one fails to start instead.
 //!
 //! The lock is a dedicated SQLite file holding an open `BEGIN EXCLUSIVE`
 //! transaction. SQLite's own file locking does the cross-process work, which is why
