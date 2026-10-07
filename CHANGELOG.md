@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2](https://git.tqwewe.com/tephra/hekla/compare/v0.7.1...v0.7.2) - 2026-10-03
+
+### Added
+
+- a consistent copy of a deployment a server is still writing
+
+### Other
+
+- tephra locks its segment directory, so the data-directory lock is about the rest
+- a lane belongs to one effect, and writers of one resource belong in one effect
+
 ## [0.7.1](https://git.tqwewe.com/tephra/hekla/compare/v0.7.0...v0.7.1) - 2026-09-21
 
 ### Other
