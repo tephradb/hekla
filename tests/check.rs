@@ -349,6 +349,19 @@ fn a_key_the_read_api_cannot_paginate_by_is_an_error() {
     );
 }
 
+/// heklang takes an entity's key as a sequence, and a read model here is keyed on **one**
+/// column: `create_table_sql`'s `PRIMARY KEY`, `EntityDef::index_columns`' trailing key,
+/// `read_api`'s cursor and the `{key}` segment of `/read/{projector}/{entity}/{key}` all
+/// assume one. Refused rather than collapsed onto the first column, because collapsing
+/// would serve one row under a key that names two and nothing would say so.
+#[test]
+fn a_read_model_keyed_on_two_columns_is_an_error() {
+    entity_error(
+        "    thing_id: Uuid @key,\n    note: String @max(200) @key,",
+        "keyed on one column",
+    );
+}
+
 /// An index over a sealed column could never match: a filter arrives as plaintext and,
 /// without the subject, cannot derive the key to compare against the ciphertext. An
 /// index over a column the entity does not have is heklang's, checked where the index
@@ -1182,4 +1195,62 @@ test "a small owner does nothing" {
         ]),
         ok()
     );
+}
+
+/// A rule 13 key conjunct (`param == value`) says which key an arm writes. It is not a
+/// predicate on the event, has no representation in a `Predicate` and never reaches a
+/// host, so none of the three lints over a slice's filters may count one.
+///
+/// Measured against the ratio deliberately: this event has four fields and the fold pins
+/// two of them, which is half and quiet. Counting the conjunct makes it three of four,
+/// which is exactly `OVER_CONSTRAINT_RATIO`, so the warning would fire for a slice that
+/// constrains half the fields it would be accused of constraining.
+#[test]
+fn a_key_conjunct_is_not_a_constraint_on_the_event() {
+    let dir = write_project(&[
+        (
+            "events/person.hk",
+            r#"
+event @person.signed_up {
+  person_id: Uuid,
+  email: String @max(200),
+  plan: String @max(20),
+  region: String @max(20),
+}
+"#,
+        ),
+        (
+            "lib/folds.hk",
+            r#"
+fold SignedUpOn(person_id: Uuid, plan: String, kind: String) -> Bool = false {
+  on @person.signed_up(person_id, plan, kind == "web") => true
+}
+"#,
+        ),
+        (
+            "commands/sign-up.hk",
+            r#"
+refusal Dup "already signed up"
+
+command SignUp(person_id: Uuid, email: String, plan: String, region: String) {
+  fold seen = SignedUpOn { person_id, plan, kind: "web" }
+
+  if seen {
+    reject Dup
+  }
+
+  emit @person.signed_up { person_id, email, plan, region }
+}
+"#,
+        ),
+    ]);
+    let project = LoadedProject::load(dir.path());
+    let warns = warnings(&project);
+    assert!(
+        !warns
+            .iter()
+            .any(|warn| warn.contains("looks like a copied `emit`")),
+        "two of four fields is not over-constrained, got {warns:?}"
+    );
+    assert!(errors(&project).is_empty(), "must not fail the check");
 }

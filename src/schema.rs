@@ -869,7 +869,16 @@ impl EntityDef {
     /// subject, so the column holding that subject's ids is whichever one has its type.
     /// [`EntityDef::validate`] refuses an entity where there is none.
     pub fn of(def: &ir::EntityDef, defs: Defs<'_>) -> EntityDef {
-        let key = def.key_field().name.clone();
+        // The first `@key` column, and `unservable_key` refuses an entity with more than
+        // one before anything reads this. Empty when the declaration has none, which
+        // `validate` catches as a key that is not a declared field: heklang rejects that
+        // already, so this is the same kind of deliberate non-resolving fallback as
+        // `id_column`'s below.
+        let key = def
+            .key_fields()
+            .next()
+            .map(|field| field.name.clone())
+            .unwrap_or_default();
         // The fallback is a column name that does not resolve, on purpose:
         // [`EntityDef::validate`] refuses the entity before anything reads it, and it does
         // so by *type*, so this never has to be a name nothing could collide with.
@@ -931,6 +940,29 @@ impl EntityDef {
             .map(|def| EntityDef::of(def, defs))
             .collect()
     }
+}
+
+/// Why this deployment cannot serve `def`, or `None`.
+///
+/// Apart from [`EntityDef::validate`], which sees only the table it produced: this is the
+/// one check that needs the declaration, because what it refuses is a shape the conversion
+/// cannot carry. heklang takes an entity's key as a sequence, and a read model here is
+/// keyed on **one** column, from `create_table_sql`'s `PRIMARY KEY` through
+/// `EntityDef::index_columns`' trailing key and `read_api`'s cursor to the `{key}` segment
+/// of `/read/{projector}/{entity}/{key}`.
+///
+/// Refused at load rather than collapsed onto the first column, because collapsing would
+/// serve one row under a key that names several and nothing would say so. A derived fold
+/// table has its own composite key and does not come through here.
+pub fn unservable_key(def: &ir::EntityDef) -> Option<String> {
+    let columns: Vec<&str> = def.key_fields().map(|field| field.name.as_str()).collect();
+    (columns.len() > 1).then(|| {
+        format!(
+            "entity `{}`: its key is ({}), and a read model here is keyed on one column",
+            def.name,
+            columns.join(", ")
+        )
+    })
 }
 
 impl InputSchema {

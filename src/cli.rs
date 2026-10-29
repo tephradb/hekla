@@ -860,12 +860,16 @@ fn check(dir: &Path) -> ExitCode {
     let (errors, warnings) = report_findings(&project);
 
     let modules = project.commands.len() + project.projectors.len() + project.effects.len();
+    // Folds sit beside events rather than inside `modules`: neither is a deployable
+    // module, and both are declarations a deployment records. A named fold is counted
+    // because it is otherwise invisible here, being declared in `lib/` and read by name.
     println!(
-        "\nchecked {modules} module(s): {} command(s), {} projector(s), {} effect(s), {} event(s)",
+        "\nchecked {modules} module(s): {} command(s), {} projector(s), {} effect(s), {} event(s), {} fold(s)",
         project.commands.len(),
         project.projectors.len(),
         project.effects.len(),
         project.events.len(),
+        project.program.folds.len(),
     );
     if errors == 0 {
         println!("ok: no errors, {warnings} warning(s)");

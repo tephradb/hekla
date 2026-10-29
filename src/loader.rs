@@ -292,7 +292,7 @@ pub struct Scratch<'a> {
 ///
 /// An event and an enum are absent because their declarations carry no module at all,
 /// which is why the column this feeds is nullable. A subject does carry one, so it sits
-/// with the five that do.
+/// with the six that do.
 pub fn module_paths(program: &Program) -> HashMap<(Kind, String), String> {
     let mut out = HashMap::new();
     let mut add = |kind: Kind, name: &str, module: &Option<String>| {
@@ -308,6 +308,9 @@ pub fn module_paths(program: &Program) -> HashMap<(Kind, String), String> {
     }
     for def in &program.functions {
         add(Kind::Function, &def.name, &def.module);
+    }
+    for def in &program.folds {
+        add(Kind::Fold, &def.name, &def.module);
     }
     for def in &program.commands {
         add(Kind::Command, &def.name, &def.module);
@@ -512,6 +515,11 @@ impl Sources {
             }
             let entities = EntityDef::all(&program, projector);
             let sources = event_types(projector.handlers.iter().map(|handler| &handler.event));
+            for def in &projector.entities {
+                if let Some(why) = crate::schema::unservable_key(def) {
+                    findings.push(Finding::error(rel.clone(), why));
+                }
+            }
             for entity in &entities {
                 if let Err(err) = entity.validate() {
                     findings.push(Finding::error(rel.clone(), err.to_string()));

@@ -1,0 +1,11 @@
+// The two propositions every ticket command needs. Named rather than written inline in
+// each one, because a fold declares the slice its caller conflicts on: two copies that
+// fall out of step give two commands two different boundaries for one question, and no
+// test can see it. `in_org` and `notified` stay inline, each being written once.
+fold TicketOpened(ticket_id: Uuid) -> Bool = false {
+  on @ticket.opened(ticket_id) => true
+}
+
+fold TicketClosed(ticket_id: Uuid) -> Bool = false {
+  on @ticket.closed(ticket_id) => true
+}

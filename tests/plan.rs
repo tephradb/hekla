@@ -390,11 +390,16 @@ fn a_const_edit_is_one_shared_edit_and_the_const_has_no_row() {
     let project = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let limit = "const BUSY: Int = 17\n";
+    // The fold is named rather than written inline in each command, because two inline
+    // folds written the same way are refused. What this case is about is the `const` both
+    // commands read, and the fold does not read it, so the shared edit is still the two
+    // commands and nothing else.
+    let seen =
+        "fold Seen(shop_id: Int) -> seen: Int = 0 {\n  on @thing.done(shop_id) => seen + 1\n}\n";
     let uses = |name: &str| {
         format!(
             "command {name}(shop_id: Int) {{
-  fold seen: Int = 0
-    on @thing.done(shop_id) => seen + 1
+  fold seen = Seen {{ shop_id }}
 
   if seen >= BUSY {{
     reject ShopNotConnected
@@ -410,6 +415,7 @@ fn a_const_edit_is_one_shared_edit_and_the_const_has_no_row() {
         project.path(),
         &[
             ("lib/limits.hk", limit),
+            ("lib/seen.hk", seen),
             ("commands/a.hk", &a),
             ("commands/b.hk", &b),
         ],
@@ -420,6 +426,7 @@ fn a_const_edit_is_one_shared_edit_and_the_const_has_no_row() {
         project.path(),
         &[
             ("lib/limits.hk", "const BUSY: Int = 42\n"),
+            ("lib/seen.hk", seen),
             ("commands/a.hk", &a),
             ("commands/b.hk", &b),
         ],

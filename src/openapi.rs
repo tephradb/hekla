@@ -331,12 +331,17 @@ const FIXED_SCHEMAS: [&str; 29] = [
 /// A `const`, a `refusal` and a `guard` are absent for a different reason: heklang
 /// inlines all three before a program exists, so their content is already inside every
 /// declaration that names them and they have no entry to record.
-const DECLARATION_KINDS: [&str; 8] = [
+///
+/// A named `fold` is not one of those three. heklang splices a fold into its callers and
+/// still keeps the declaration, because `Interpreter::fold` runs one by name, so a fold
+/// earns an entry and a deployment with one records it.
+const DECLARATION_KINDS: [&str; 9] = [
     "subject",
     "event",
     "enum",
     "record",
     "function",
+    "fold",
     "command",
     "projector",
     "effect",
@@ -4421,19 +4426,41 @@ mod tests {
         // fails here instead of silently making the document describe kinds no row can
         // hold. `Test` is the one kind deliberately left out: `Digest::entries` holds
         // tests back, so a declaration row can never carry it.
+        // Exhaustive on purpose, so a kind added upstream fails to compile here rather
+        // than making the document describe a value no row can hold, or omitting one
+        // every row can. Listing the kinds is not enough for that: a new variant
+        // would simply be missing from a list and nothing would say so.
+        fn recorded(kind: Kind) -> bool {
+            match kind {
+                Kind::Subject
+                | Kind::Event
+                | Kind::Enum
+                | Kind::Record
+                | Kind::Function
+                | Kind::Fold
+                | Kind::Command
+                | Kind::Projector
+                | Kind::Effect => true,
+                Kind::Test => false,
+            }
+        }
+
         let expected: Vec<&str> = [
             Kind::Subject,
             Kind::Event,
             Kind::Enum,
             Kind::Record,
             Kind::Function,
+            Kind::Fold,
             Kind::Command,
             Kind::Projector,
             Kind::Effect,
         ]
         .iter()
+        .inspect(|kind| assert!(recorded(**kind), "{} is not a recorded kind", kind.name()))
         .map(|kind| kind.name())
         .collect();
+        assert!(!recorded(Kind::Test));
         assert_eq!(DECLARATION_KINDS.to_vec(), expected);
         assert!(!DECLARATION_KINDS.contains(&Kind::Test.name()));
 

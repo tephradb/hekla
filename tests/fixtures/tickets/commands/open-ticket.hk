@@ -18,8 +18,7 @@ command OpenTicket(
   labels: Map(String, String),
   meta: Json,
 ) {
-  fold opened: Bool = false
-    on @ticket.opened(ticket_id) => true
+  fold opened = TicketOpened { ticket_id }
 
   fold in_org: Int = 0
     on @ticket.opened(org_id) => in_org + 1

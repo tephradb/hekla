@@ -403,6 +403,16 @@ impl<'a> Shadow<'a> {
                     fields.insert(name.clone(), rendered);
                 }
             }
+            // One part: `schema::unservable_key` refuses an entity declaring more than
+            // one `@key`, so a row here is keyed on one column and the oracle keys on it
+            // the way the read model does.
+            let [key] = key else {
+                return Err(format!(
+                    "entity `{entity}` is keyed on {} columns, which this deployment \
+                     refuses to serve",
+                    key.len()
+                ));
+            };
             out.insert(render_key(&key_as_value(key)), fields);
         }
         Ok(out)
@@ -495,18 +505,18 @@ struct Stamping<'a> {
 }
 
 impl Rows for Stamping<'_> {
-    fn row(&self, entity: &str, key: &Key) -> Result<Option<Row>, Error> {
+    fn row(&self, entity: &str, key: &[Key]) -> Result<Option<Row>, Error> {
         self.store.row(entity, key)
     }
 
-    fn put(&mut self, entity: &Ident, key: Key, mut row: Row) -> Result<(), Error> {
+    fn put(&mut self, entity: &Ident, key: Vec<Key>, mut row: Row) -> Result<(), Error> {
         for value in row.0.values_mut() {
             stamp(value, self.host, self.at);
         }
         self.store.put(entity, key, row)
     }
 
-    fn delete(&mut self, entity: &Ident, key: &Key) -> Result<(), Error> {
+    fn delete(&mut self, entity: &Ident, key: &[Key]) -> Result<(), Error> {
         self.store.delete(entity, key)
     }
 }

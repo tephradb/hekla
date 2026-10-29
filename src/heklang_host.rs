@@ -1561,15 +1561,31 @@ impl RowWriter<'_> {
 
 /// A key as the read model spells it. Every key type is a scalar, so this is the same
 /// text a tag or a path segment carries.
-fn key_text(key: &heklang::Key) -> String {
-    value::text(&heklang::interp::key_as_value(key))
+///
+/// One part, because a read model has one key column. heklang takes a key as a sequence
+/// so that a compound one is not a special case, and [`crate::schema::EntityDef`] still
+/// holds a single column: the loader refuses an entity declaring more than one
+/// `@key`, so a longer key cannot reach here from a project that loaded. This is the
+/// backstop for that refusal rather than the refusal itself.
+///
+/// The refusal is `schema::unservable_key`, called from the loader, and not
+/// `EntityDef::validate`: by the time that runs its subject is an `EntityDef`, which holds
+/// one key column and has already dropped the evidence.
+fn key_text(key: &[heklang::Key]) -> Result<String, Error> {
+    match key {
+        [one] => Ok(value::text(&heklang::interp::key_as_value(one))),
+        _ => Err(host_error(format!(
+            "a read model is keyed on one column, and this key has {}",
+            key.len()
+        ))),
+    }
 }
 
 impl heklang::host::Rows for RowWriter<'_> {
-    fn row(&self, entity: &str, key: &heklang::Key) -> Result<Option<heklang::Row>, Error> {
+    fn row(&self, entity: &str, key: &[heklang::Key]) -> Result<Option<heklang::Row>, Error> {
         let table = self.table(entity)?;
         let declared = self.declared(entity)?;
-        let found = self.model.get(table, &key_text(key)).map_err(host_error)?;
+        let found = self.model.get(table, &key_text(key)?).map_err(host_error)?;
         let Some(stored) = found else { return Ok(None) };
 
         let defs = self.defs();
@@ -1616,7 +1632,7 @@ impl heklang::host::Rows for RowWriter<'_> {
     fn put(
         &mut self,
         entity: &heklang::ir::Ident,
-        key: heklang::Key,
+        key: Vec<heklang::Key>,
         row: heklang::Row,
     ) -> Result<(), Error> {
         let table = self.table(entity)?;
@@ -1746,10 +1762,10 @@ impl heklang::host::Rows for RowWriter<'_> {
         Ok(())
     }
 
-    fn delete(&mut self, entity: &heklang::ir::Ident, key: &heklang::Key) -> Result<(), Error> {
+    fn delete(&mut self, entity: &heklang::ir::Ident, key: &[heklang::Key]) -> Result<(), Error> {
         let table = self.table(entity)?;
         self.model
-            .apply_one(table, crate::schema::EntityOpKind::Delete(key_text(key)))
+            .apply_one(table, crate::schema::EntityOpKind::Delete(key_text(key)?))
             .map_err(host_error)
     }
 }

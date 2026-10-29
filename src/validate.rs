@@ -11,7 +11,7 @@
 //! The rest is advice: a judgement about a design that parses perfectly well and that
 //! hekla has no business refusing, which is why those stay warnings.
 
-use heklang::ir::{Command, Slice, Type};
+use heklang::ir::{Command, Filter, Slice, Type};
 use heklang::{Defs, Program};
 use serde_json::{Value, json};
 
@@ -276,11 +276,14 @@ fn check_boundary(
         };
         let path = event_type(&slice.event);
 
-        if !slice
-            .filters
-            .iter()
-            .any(|filter| is_selective(declared, &filter.field, defs))
-        {
+        // A field filter is the only kind that narrows the event. A rule 13 key conjunct
+        // (`param == value`) says which key an arm writes, has no representation in a
+        // `Predicate` and never reaches a host, so counting one as selective would call a
+        // boundary narrow on the strength of something nothing outside the process sees.
+        if !slice.filters.iter().any(|filter| match filter {
+            Filter::Field { field, .. } => is_selective(declared, field, defs),
+            Filter::Key { .. } => false,
+        }) {
             findings.push(Finding::warning(
                 location,
                 format!(
@@ -301,16 +304,22 @@ fn check_boundary(
         // always been there and carries `@absent` against a future it never needed, and
         // it cannot say so about one added later as `T?`, which has the same defect and
         // no annotation to give it away.
+        //
+        // Field filters only, for the reason above: a key conjunct names no event field, so
+        // it cannot be a filter on one younger than the log.
         let younger: Vec<&str> = slice
             .filters
             .iter()
-            .filter(|filter| {
+            .filter_map(|filter| match filter {
+                Filter::Field { field, .. } => Some(field.as_str()),
+                Filter::Key { .. } => None,
+            })
+            .filter(|name| {
                 declared
                     .fields
                     .iter()
-                    .any(|field| field.name == filter.field && field.absent.is_some())
+                    .any(|field| field.name == *name && field.absent.is_some())
             })
-            .map(|filter| filter.field.as_str())
             .collect();
         // One finding per slice, not per filter: two such filters are one design and one
         // thing to say about it.
@@ -439,5 +448,13 @@ fn over_constrained(declared: &heklang::ir::EventDef, slice: &Slice) -> bool {
     if fields < 4 {
         return false;
     }
-    slice.filters.len() as f64 / fields as f64 >= OVER_CONSTRAINT_RATIO
+    // Field filters only, the way the two checks above count them. A rule 13 key conjunct
+    // constrains no field of the event, so counting one would call a slice a copied `emit`
+    // for narrowing fewer fields than the warning accuses it of.
+    let constrained = slice
+        .filters
+        .iter()
+        .filter(|filter| matches!(filter, Filter::Field { .. }))
+        .count();
+    constrained as f64 / fields as f64 >= OVER_CONSTRAINT_RATIO
 }

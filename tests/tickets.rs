@@ -876,3 +876,58 @@ fn a_subject_written_to_after_an_erasure_gets_a_new_key_and_keeps_the_old_data_s
 
     harness.shutdown();
 }
+
+/// A named fold is a declaration a deployment records, and the two things a reader needs
+/// off that row are its kind and where it is written.
+///
+/// Both were wrong when folds first reached hekla: `/system` served `"kind": "fold"`
+/// against an OpenAPI enum of eight kinds that did not list it, so a strict generated
+/// client rejected the response, and `loader::module_paths` had no arm for a fold, so the
+/// row said `null` where the file is and `hekla plan` could report a changed fold without
+/// naming one.
+#[tokio::test]
+async fn a_named_fold_is_recorded_with_its_kind_and_its_file() {
+    let harness = boot();
+    let (status, schema) = support::get(&harness.app(), "/admin/schema").await;
+    assert_eq!(status, 200);
+
+    let rows: Vec<(&str, &str, Option<&str>)> = schema["declarations"]
+        .as_array()
+        .expect("declarations")
+        .iter()
+        .map(|row| {
+            (
+                row["kind"].as_str().unwrap(),
+                row["name"].as_str().unwrap(),
+                row["module"].as_str(),
+            )
+        })
+        .collect();
+
+    assert!(
+        rows.contains(&("fold", "TicketOpened", Some("lib/folds.hk"))),
+        "a fold is recorded by kind and by the file it is declared in: {rows:?}"
+    );
+    assert!(rows.contains(&("fold", "TicketClosed", Some("lib/folds.hk"))));
+
+    // The document has to admit every kind a row can carry, or a generated client
+    // rejects a response this deployment really serves. Read from the served document
+    // rather than from `DECLARATION_KINDS`, so this is the two halves meeting.
+    let (status, document) = support::get(&harness.app(), "/openapi.json").await;
+    assert_eq!(status, 200);
+    let kinds: Vec<&str> =
+        document["components"]["schemas"]["DeclarationSummary"]["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("the kind enum")
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+    for (kind, name, _) in &rows {
+        assert!(
+            kinds.contains(kind),
+            "`{name}` is recorded as `{kind}`, which the document does not declare: {kinds:?}"
+        );
+    }
+
+    harness.shutdown();
+}

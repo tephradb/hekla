@@ -314,17 +314,17 @@ impl TestRows {
 }
 
 impl Rows for TestRows {
-    fn row(&self, entity: &str, key: &Key) -> Result<Option<Row>, Error> {
+    fn row(&self, entity: &str, key: &[Key]) -> Result<Option<Row>, Error> {
         self.writer(entity)?.row(entity, key)
     }
 
-    fn put(&mut self, entity: &String, key: Key, row: Row) -> Result<(), Error> {
+    fn put(&mut self, entity: &String, key: Vec<Key>, row: Row) -> Result<(), Error> {
         let writer = self.writer(entity)?;
         let mut writer = writer;
         writer.put(entity, key, row)
     }
 
-    fn delete(&mut self, entity: &String, key: &Key) -> Result<(), Error> {
+    fn delete(&mut self, entity: &String, key: &[Key]) -> Result<(), Error> {
         let writer = self.writer(entity)?;
         let mut writer = writer;
         writer.delete(entity, key)
