@@ -197,3 +197,322 @@ fn every_key(table: &TableDef, row: &Recorded) -> Pins {
         parts: vec![None; table.key.len()],
     }
 }
+
+// ---------------------------------------------------------------------------
+// Following the log
+// ---------------------------------------------------------------------------
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use heklang::Digest;
+use tephra::Position;
+
+use crate::context::CommandContext;
+use crate::crypto::KeyStore;
+use crate::heklang_host::{HeklaHost, Stamp};
+use crate::schema::EventDefs;
+use crate::store::Store;
+
+/// How long a caught-up store blocks before re-checking its shutdown flag.
+const IDLE_POLL: Duration = Duration::from_millis(250);
+
+/// The derived store's file inside the data directory.
+pub const FILE_NAME: &str = "tables.db";
+
+/// What the HTTP surface and `/status` can see of the store without touching SQLite.
+///
+/// One of these for the whole store rather than one per table, which is the same reason
+/// there is one checkpoint: every column is at one position, so there is one thing to say.
+pub struct FoldShared {
+    /// The log length every caught-up column has been folded to.
+    head: AtomicU64,
+    /// Columns that are not at it, which is what a read has to refuse to serve.
+    behind: AtomicU64,
+    shutdown: AtomicBool,
+    running: AtomicBool,
+    last_error: Mutex<Option<String>>,
+}
+
+impl FoldShared {
+    pub fn head(&self) -> u64 {
+        self.head.load(Ordering::Acquire)
+    }
+
+    /// How many columns hold their seed rather than their value. Zero is servable.
+    pub fn behind(&self) -> u64 {
+        self.behind.load(Ordering::Acquire)
+    }
+
+    pub fn running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn stop(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn fail(&self, why: &anyhow::Error) {
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(format!("{why:#}"));
+    }
+}
+
+/// The store's thread, held so a shutdown can drain it.
+pub struct FoldThread {
+    shared: Arc<FoldShared>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl FoldThread {
+    /// Signal the thread to stop, then join it.
+    ///
+    /// Called while the write coordinator is still live, as a projector's is, so the
+    /// thread drains to head and commits its final batch before exiting.
+    pub fn shutdown_and_join(mut self) {
+        self.shared.stop();
+        if let Some(join) = self.join.take()
+            && join.join().is_err()
+        {
+            tracing::error!("the derived-table thread panicked");
+        }
+    }
+}
+
+/// Open the derived store, bring its schema to what the program says, and follow the log.
+///
+/// The schema reconcile happens here rather than at the first batch because a column a
+/// deploy added has to exist before anything can fold it, and the backfill that follows is
+/// what turns its seed into its value.
+pub fn start(
+    store: &Store,
+    data_dir: &Path,
+    program: Arc<Program>,
+    events: Arc<EventDefs>,
+    keystore: Option<Arc<KeyStore>>,
+    digest: &Digest,
+) -> anyhow::Result<(Arc<FoldShared>, FoldThread)> {
+    let tables = TableDef::all(&program);
+    // **No tables, no store and no thread.** A project whose folds are all unstorable, or
+    // that declares none, has nothing to keep: creating the file anyway would put a
+    // database in every data directory that nothing ever reads, and leave a thread writing
+    // a checkpoint for it.
+    if tables.is_empty() {
+        return Ok((
+            FoldShared::idle(),
+            FoldThread {
+                shared: FoldShared::idle(),
+                join: None,
+            },
+        ));
+    }
+    let path = data_dir.join(FILE_NAME);
+    let fold_store = FoldStore::open(&path, &tables)?;
+    let changes = fold_store.apply(digest, &tables)?;
+    for change in changes.iter().filter(|change| change.verdict.refills()) {
+        tracing::info!(
+            table = %change.table,
+            column = %change.column,
+            fold = %change.fold,
+            verdict = change.verdict.label(),
+            "derived column needs folding"
+        );
+    }
+
+    let shared = Arc::new(FoldShared {
+        head: AtomicU64::new(fold_store.read_checkpoint()?),
+        behind: AtomicU64::new(fold_store.behind()?.len() as u64),
+        shutdown: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        last_error: Mutex::new(None),
+    });
+
+    // Every event any column folds, which is this store's subscription. One list for the
+    // whole store because one thread serves every table.
+    let sources: Vec<String> = sources_of(&program);
+    let store = store.clone();
+    let handle = Arc::clone(&shared);
+    let join = thread::Builder::new()
+        .name("derived-tables".to_owned())
+        .spawn(move || {
+            let outcome = follow(
+                &handle,
+                &store,
+                &fold_store,
+                &program,
+                &events,
+                keystore,
+                &tables,
+                &sources,
+            );
+            handle.running.store(false, Ordering::Relaxed);
+            if let Err(why) = outcome {
+                tracing::error!("the derived tables stopped: {why:#}");
+                handle.fail(&why);
+            }
+        })
+        .map_err(|err| anyhow::anyhow!("spawning the derived-table thread: {err}"))?;
+
+    Ok((
+        Arc::clone(&shared),
+        FoldThread {
+            shared,
+            join: Some(join),
+        },
+    ))
+}
+
+/// Every event type any column of the program folds, deduplicated.
+///
+/// Spelled the way a subscription spells one, through `schema::event_type`, which is the
+/// segments joined and **no `@` sigil**. `EventPath`'s own `Display` keeps the sigil, and a
+/// query built from that matches nothing: the store then follows the log, folds none of
+/// it, and advances its checkpoint over every batch, which looks exactly like a store that
+/// is caught up.
+fn sources_of(program: &Program) -> Vec<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for table in &heklang::layout(program).tables {
+        for column in &table.columns {
+            for event in &column.events {
+                seen.insert(crate::schema::event_type(event));
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn follow(
+    shared: &FoldShared,
+    store: &Store,
+    fold_store: &FoldStore,
+    program: &Arc<Program>,
+    events: &Arc<EventDefs>,
+    keystore: Option<Arc<KeyStore>>,
+    tables: &[TableDef],
+    sources: &[String],
+) -> anyhow::Result<()> {
+    let layout = heklang::layout(program);
+    // The host reads and never appends, which is why every field an append accumulates is
+    // empty here: a fold has no clock, no network and no `secret`, and `fold_stored` never
+    // reaches `Keys` either, since it is the one read that does not shred.
+    let host = HeklaHost {
+        program: Arc::clone(program),
+        events: Arc::clone(events),
+        store: store.clone(),
+        keystore,
+        ctx: CommandContext::new(uuid::Uuid::nil()),
+        stamp: Stamp::Pinned,
+        idem_tag: None,
+        call: None,
+        appended: None,
+        emitted: Vec::new(),
+        unavailable: None,
+        duplicated: false,
+        retry_after: None,
+        last_transport: None,
+        sealed: false,
+        http: None,
+        secrets: None,
+    };
+    let interpreter = Interpreter::with_host(program.as_ref(), host);
+
+    // A column a deploy left behind holds its seed, so this is what has to happen before
+    // the store serves anything. It blocks, as a projector's rebuild does.
+    let filled = backfill(fold_store, &interpreter, tables)?;
+    if filled.columns > 0 {
+        tracing::info!(columns = filled.columns, "backfilled derived columns");
+    }
+    shared
+        .behind
+        .store(fold_store.behind()?.len() as u64, Ordering::Release);
+
+    let query = crate::heklang_host::query_of_types(sources)
+        .map_err(|err| anyhow::anyhow!("building the derived-table subscription: {err}"))?;
+    // A heklang head and a tephra position are the same number: heklang counts positions
+    // from zero and tephra from one, so a log of N events is head N and position N.
+    let mut sub = store.subscribe(
+        "the derived tables",
+        query,
+        Position::new(fold_store.read_checkpoint()?),
+    )?;
+    loop {
+        let batch = sub
+            .poll_batch()
+            .map_err(|err| anyhow::anyhow!("reading events: {err}"))?;
+        let head = sub.position().get();
+        if !batch.is_empty() {
+            let records: Vec<Record> = batch
+                .iter()
+                .map(|(position, event)| {
+                    crate::heklang_host::record_of(program, *position, event.as_ref())
+                        .map_err(|err| anyhow::anyhow!("decoding a record: {err}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let filled = apply_batch(
+                fold_store,
+                &interpreter,
+                program,
+                &layout,
+                tables,
+                &records,
+                head,
+            )?;
+            crate::metrics::fold_batch(filled.columns);
+            shared.head.store(head, Ordering::Release);
+            continue;
+        }
+
+        // Nothing matched, so every caught-up column is still correct at the watermark and
+        // only the position has to move. Driven through the same pass rather than a
+        // checkpoint write of its own, so the rule about which columns may advance is
+        // stated once.
+        if head > shared.head() {
+            apply_batch(
+                fold_store,
+                &interpreter,
+                program,
+                &layout,
+                tables,
+                &[],
+                head,
+            )?;
+            shared.head.store(head, Ordering::Release);
+        }
+        if shared.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = sub.wait_timeout(IDLE_POLL);
+    }
+    Ok(())
+}
+
+impl FoldShared {
+    /// A store nothing is following, for a read-only follower.
+    ///
+    /// `runtime::follow` opens a data directory without taking its lock and without
+    /// starting a writer's threads, so there is no derived store to report on. Behind by
+    /// nothing rather than behind by zero columns: a follower serves no derived read at
+    /// all, and saying "caught up" would be a claim about a store it never opened.
+    pub fn idle() -> Arc<FoldShared> {
+        Arc::new(FoldShared {
+            head: AtomicU64::new(0),
+            behind: AtomicU64::new(0),
+            shutdown: AtomicBool::new(true),
+            running: AtomicBool::new(false),
+            last_error: Mutex::new(None),
+        })
+    }
+}

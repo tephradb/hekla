@@ -68,6 +68,7 @@ pub async fn serve(
     runtime: Arc<Runtime>,
     coordinator: WriteCoordinator,
     projectors: ProjectorSet,
+    folds: crate::fold_runtime::FoldThread,
     effects: EffectRuntime,
     addr: SocketAddr,
 ) -> anyhow::Result<()> {
@@ -84,9 +85,12 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving http")?;
-    tracing::info!("draining effects, then projectors, then shutting down the writer");
+    tracing::info!(
+        "draining effects, then projectors, then the derived tables, then shutting down the writer"
+    );
     effects.shutdown_and_join();
     projectors.shutdown_and_join();
+    folds.shutdown_and_join();
     coordinator.shutdown();
     Ok(())
 }

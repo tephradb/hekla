@@ -1986,6 +1986,7 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("EmittedEvent".to_owned(), emitted_event_schema(surface));
     out.insert("Status".to_owned(), status_schema());
     out.insert("ProjectorStatus".to_owned(), projector_status_schema());
+    out.insert("TableStatus".to_owned(), table_status_schema());
     out.insert("EffectStatus".to_owned(), effect_status_schema());
     out.insert("LogEvent".to_owned(), log_event_schema());
     out.insert("SubjectState".to_owned(), subject_state_schema());
@@ -2469,6 +2470,7 @@ fn status_schema() -> Value {
                 "additionalProperties": false,
             },
             "projectors": { "type": "array", "items": schema_ref("ProjectorStatus") },
+            "tables": schema_ref("TableStatus"),
             "effects": { "type": "array", "items": schema_ref("EffectStatus") },
             "events": {
                 "type": "integer",
@@ -2478,8 +2480,36 @@ fn status_schema() -> Value {
         },
         "required": [
             "log_head", "uptime_seconds", "verify", "commands",
-            "projectors", "effects", "events",
+            "projectors", "tables", "effects", "events",
         ],
+        "additionalProperties": false,
+    })
+}
+
+/// The derived tables, as one object rather than a list.
+///
+/// Every column of every table is at one log position, recorded once with the store, so
+/// there is one head to report and not one per table. A projector holds its own, which is
+/// why `projectors` is a list and this is not.
+fn table_status_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "head": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "How long the log was when every caught-up column was last folded.",
+            },
+            "behind": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Columns holding their fold's seed rather than its value, which a \
+                                deploy leaves until a backfill answers them. Zero is servable.",
+            },
+            "running": { "type": "boolean" },
+            "last_error": { "type": ["string", "null"] },
+        },
+        "required": ["head", "behind", "running", "last_error"],
         "additionalProperties": false,
     })
 }

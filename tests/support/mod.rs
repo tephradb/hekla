@@ -102,11 +102,12 @@ pub fn fixture_dir(name: &str) -> PathBuf {
 
 // --- the harness ----------------------------------------------------------
 
-/// A live runtime plus the three handles that have to be drained on shutdown.
+/// A live runtime plus the four handles that have to be drained on shutdown.
 pub struct Harness {
     pub rt: Arc<Runtime>,
     pub coord: WriteCoordinator,
     pub projectors: ProjectorSet,
+    pub folds: hekla::fold_runtime::FoldThread,
     pub effects: EffectRuntime,
     data_dir: PathBuf,
     /// Kept alive for the harness's lifetime when the data directory is ours;
@@ -115,11 +116,13 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// Drain effects, then projectors, then the writer. Every test must end with
-    /// this: the order matters, since an effect can still invoke a command.
+    /// Drain effects, then projectors, then the derived tables, then the writer. Every
+    /// test must end with this: the order matters, since an effect can still invoke a
+    /// command, and every reader has to drain before the writer stops.
     pub fn shutdown(self) {
         self.effects.shutdown_and_join();
         self.projectors.shutdown_and_join();
+        self.folds.shutdown_and_join();
         self.coord.shutdown();
     }
 
@@ -204,12 +207,13 @@ impl Boot {
                 (Some(temp), dir)
             }
         };
-        let (rt, coord, projectors, effects) =
+        let (rt, coord, projectors, folds, effects) =
             Runtime::open(project, &data_dir, self.http, self.master)?;
         Ok(Harness {
             rt,
             coord,
             projectors,
+            folds,
             effects,
             data_dir,
             _data: temp,
@@ -516,10 +520,15 @@ pub fn try_quiesce(harness: &Harness) -> bool {
     let mut previous = u64::MAX;
     wait_for(|| {
         let head = rt.log_head();
-        let caught_up = rt
-            .projector_handles()
-            .iter()
-            .all(|handle| handle.position() >= head)
+        // The derived tables settle too, and a test that did not wait for them would race
+        // the thread's own checkpoint write. `behind` as well as the head: a column still
+        // holding its seed is not caught up however far the store has read.
+        let folds = rt.fold_handle();
+        let caught_up = (!folds.running() || (folds.head() >= head && folds.behind() == 0))
+            && rt
+                .projector_handles()
+                .iter()
+                .all(|handle| handle.position() >= head)
             && rt
                 .effect_handles()
                 .iter()

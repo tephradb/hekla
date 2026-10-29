@@ -1515,7 +1515,7 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) 
             return ExitCode::FAILURE;
         }
     };
-    let (rt, coordinator, projectors, effects) =
+    let (rt, coordinator, projectors, folds, effects) =
         match runtime::Runtime::open(project, &data, http, master) {
             Ok(parts) => parts,
             Err(err) => {
@@ -1534,7 +1534,14 @@ fn serve(dir: &Path, addr: Option<&str>, data_dir: Option<&Path>, verify: bool) 
             return ExitCode::FAILURE;
         }
     };
-    match tokio_rt.block_on(server::serve(rt, coordinator, projectors, effects, addr)) {
+    match tokio_rt.block_on(server::serve(
+        rt,
+        coordinator,
+        projectors,
+        folds,
+        effects,
+        addr,
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");

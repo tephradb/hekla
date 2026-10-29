@@ -233,6 +233,9 @@ pub struct Runtime {
     program: Arc<Program>,
     started: Instant,
     projectors: HashMap<String, Arc<ProjectorShared>>,
+    /// The derived tables, for `/status`. One handle because the store holds one
+    /// checkpoint.
+    folds: Arc<crate::fold_runtime::FoldShared>,
     /// The effect handles, for `/status` and the skip endpoint. Set once, right
     /// after the effect threads spawn (they need `Arc<Runtime>` first).
     effects: OnceLock<Vec<Arc<EffectShared>>>,
@@ -297,14 +300,20 @@ impl Runtime {
     /// from an already-loaded, error-free project. `http` is the transport the
     /// journaled `http.*` builtins use (a [`UreqClient`](crate::http::UreqClient)
     /// in production, a stub in tests). Returns the runtime, the write coordinator,
-    /// the projector set, and the effect runtime; the caller keeps the last three
-    /// to drain and join on shutdown.
+    /// the projector set, the derived-table thread, and the effect runtime; the caller
+    /// keeps the last four to drain and join on shutdown.
     pub fn open(
         project: LoadedProject,
         data_dir: &Path,
         http: Arc<dyn HttpClient>,
         master: Option<MasterKeys>,
-    ) -> anyhow::Result<(Arc<Runtime>, WriteCoordinator, ProjectorSet, EffectRuntime)> {
+    ) -> anyhow::Result<(
+        Arc<Runtime>,
+        WriteCoordinator,
+        ProjectorSet,
+        crate::fold_runtime::FoldThread,
+        EffectRuntime,
+    )> {
         refuse_scratch(&project)?;
         // Taken before the project is taken apart below, and kept for the process: an
         // ad-hoc projection compiles against what booted rather than against whatever is
@@ -449,6 +458,19 @@ impl Runtime {
             .map(|handle| (handle.name.clone(), handle))
             .collect();
 
+        // One thread for every derived table, because they share one checkpoint: every
+        // column of every table is at one log position, which a thread per table could
+        // not promise. Started after the projectors so a boot that refuses for a
+        // projector has not already created `tables.db`.
+        let (folds, fold_thread) = crate::fold_runtime::start(
+            &store,
+            data_dir,
+            Arc::clone(&program),
+            Arc::clone(&events),
+            keystore.clone(),
+            &project.digest,
+        )?;
+
         let runtime = Arc::new(Runtime {
             commands,
             store,
@@ -460,6 +482,7 @@ impl Runtime {
             secret_report,
             started: Instant::now(),
             projectors,
+            folds,
             effects: OnceLock::new(),
             openapi_json,
             _lock: Some(lock),
@@ -476,7 +499,13 @@ impl Runtime {
         let effect_runtime = effect::start_all(effect_units, &runtime, http, &project.config)?;
         let _ = runtime.effects.set(effect_runtime.shared_handles());
 
-        Ok((runtime, coordinator, projector_set, effect_runtime))
+        Ok((
+            runtime,
+            coordinator,
+            projector_set,
+            fold_thread,
+            effect_runtime,
+        ))
     }
 
     /// Open the store and operational DB without starting a single thread.
@@ -563,6 +592,7 @@ impl Runtime {
             secret_report,
             started: Instant::now(),
             projectors: HashMap::new(),
+            folds: crate::fold_runtime::FoldShared::idle(),
             effects: OnceLock::new(),
             openapi_json: String::new(),
             config: project.config.clone(),
@@ -636,6 +666,7 @@ impl Runtime {
             secret_report,
             started: Instant::now(),
             projectors: HashMap::new(),
+            folds: crate::fold_runtime::FoldShared::idle(),
             effects: OnceLock::new(),
             openapi_json: String::new(),
             config: project.config.clone(),
@@ -888,9 +919,23 @@ impl Runtime {
             "verify": self.verify,
             "commands": { "public": public, "internal": internal },
             "projectors": projectors,
+            // One object rather than a list, because the derived tables share one
+            // checkpoint: every column is at one log position, so there is one thing to
+            // report. `behind` is the number a read has to refuse to serve on.
+            "tables": {
+                "head": self.folds.head(),
+                "behind": self.folds.behind(),
+                "running": self.folds.running(),
+                "last_error": self.folds.last_error(),
+            },
             "effects": effects,
             "events": self.events.len(),
         })
+    }
+
+    /// The derived tables, for `/status` and for a test waiting on the runtime to settle.
+    pub fn fold_handle(&self) -> &Arc<crate::fold_runtime::FoldShared> {
+        &self.folds
     }
 
     /// The running projector by name, for the read API and the replay endpoint.

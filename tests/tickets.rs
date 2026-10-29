@@ -931,3 +931,50 @@ async fn a_named_fold_is_recorded_with_its_kind_and_its_file() {
 
     harness.shutdown();
 }
+
+/// **The derived tables in a running deployment**, which is what every slice before this
+/// one was building toward: a command appends, the store's thread follows the log, and the
+/// column holds what folding it returns.
+#[tokio::test]
+async fn the_derived_tables_follow_the_log_in_a_running_deployment() {
+    let harness = boot();
+    open(&harness, UUID_A, 1, 10, None);
+    quiesce(&harness);
+
+    // One head for the whole store and nothing behind it, which is what makes it
+    // servable: every column of every table is at one log position.
+    let (status, system) = support::get(&harness.app(), "/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(system["tables"]["behind"], 0, "{}", system["tables"]);
+    assert_eq!(
+        system["tables"]["head"], system["log_head"],
+        "the store has followed the log to its head: {}",
+        system["tables"]
+    );
+    assert_eq!(system["tables"]["running"], true);
+    assert_eq!(system["tables"]["last_error"], serde_json::Value::Null);
+
+    let path = harness.data_dir().join(hekla::fold_runtime::FILE_NAME);
+    let conn = rusqlite::Connection::open(&path).expect("the store exists");
+    let opened: i64 = conn
+        .query_row(
+            "SELECT \"ticket_opened\" FROM \"ticket\" WHERE \"ticket\" = ?1",
+            [UUID_A],
+            |row| row.get(0),
+        )
+        .expect("the row the command's event minted");
+    assert_eq!(opened, 1, "`TicketOpened` folded to true for this ticket");
+    let closed: i64 = conn
+        .query_row(
+            "SELECT \"ticket_closed\" FROM \"ticket\" WHERE \"ticket\" = ?1",
+            [UUID_A],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        closed, 0,
+        "no arm of `TicketClosed` named this key, so the column holds its seed"
+    );
+
+    harness.shutdown();
+}

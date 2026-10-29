@@ -478,6 +478,16 @@ pub fn read_wait(projector: &str, outcome: &'static str) {
     counter!(READ_WAITS, "projector" => projector.to_owned(), "outcome" => outcome).increment(1);
 }
 
+/// One batch of events folded into the derived tables, and the columns it wrote.
+///
+/// One series for the store rather than one per table, which is the same reason it holds
+/// one checkpoint: a batch is applied to every table it touches at one position, so the
+/// unit of work is the batch and not the table.
+pub fn fold_batch(columns: usize) {
+    counter!("hekla_fold_batches_total").increment(1);
+    counter!("hekla_fold_columns_total").increment(columns as u64);
+}
+
 #[cfg(test)]
 mod tests {
     use metrics::with_local_recorder;
