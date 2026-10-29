@@ -56,6 +56,13 @@ enum Command {
         /// The project directory.
         #[arg(default_value = ".")]
         dir: PathBuf,
+        /// Print the derived tables: one per key signature, one column per named fold.
+        ///
+        /// The grouping is `heklang::layout`'s, the same answer `hek check --tables`
+        /// prints, so this adds what that cannot say: the SQLite these tables really
+        /// become, including the side table a collection-typed fold is split into.
+        #[arg(long)]
+        tables: bool,
     },
     /// Run the runtime and HTTP API from a project directory.
     Serve {
@@ -374,7 +381,7 @@ pub fn run() -> ExitCode {
     // Only the two long-running commands log; `openapi` and `plan --json` write
     // machine-readable stdout that a subscriber would interleave with.
     match command {
-        Command::Check { dir } => check(&dir),
+        Command::Check { dir, tables } => check(&dir, tables),
         Command::Serve {
             dir,
             addr,
@@ -855,9 +862,17 @@ fn operational_db(dir: &Path, data_dir: Option<&Path>) -> Result<PathBuf, ExitCo
     }
 }
 
-fn check(dir: &Path) -> ExitCode {
+fn check(dir: &Path, tables: bool) -> ExitCode {
     let project = LoadedProject::load(dir);
     let (errors, warnings) = report_findings(&project);
+
+    // Asked for rather than printed, for the reason `hek check --tables` is: only the
+    // derived part is information, and only when someone is asking. Printed before the
+    // summary and only when the project loaded, because a layout derived from a program
+    // that did not check describes nothing.
+    if tables && errors == 0 {
+        print_tables(&project);
+    }
 
     let modules = project.commands.len() + project.projectors.len() + project.effects.len();
     // Folds sit beside events rather than inside `modules`: neither is a deployable
@@ -1576,6 +1591,50 @@ fn init_tracing(no_color: bool) {
 fn print_findings(findings: &[Finding]) {
     for finding in findings {
         println!("{}", validate::render(finding));
+    }
+}
+
+/// The derived tables, as the DDL they become.
+///
+/// `hek check --tables` prints the layout; this prints what hekla makes of it, which is
+/// the two things heklang cannot say: the SQLite types a column really takes, and the
+/// side table a collection-typed fold is split into. Both come out of the same
+/// `heklang::layout`, so an author reading either is reading what will exist.
+fn print_tables(project: &crate::loader::LoadedProject) {
+    let tables = crate::tables::TableDef::all(&project.program);
+    if tables.is_empty() {
+        println!("\nno derived tables: this project declares no storable named fold");
+        return;
+    }
+    println!();
+    for table in &tables {
+        let key: Vec<&str> = table.key.iter().map(|(name, _)| name.as_str()).collect();
+        let keyed = if key.is_empty() {
+            "one row".to_owned()
+        } else {
+            key.join(", ")
+        };
+        println!(
+            "TABLE {}  ({})  {} column(s)",
+            table.name,
+            keyed,
+            table.columns.len()
+        );
+        for column in &table.columns {
+            let sealed = match &column.meta.sealed_under {
+                Some(seal) => format!("  sealed under {}", seal.subject()),
+                None => String::new(),
+            };
+            println!(
+                "  {:<28} {:<8} <- {}{sealed}",
+                column.name,
+                column.meta.sql_type(),
+                column.fold
+            );
+        }
+        for ix in &table.indexes {
+            println!("  index ({})", ix.columns.join(", "));
+        }
     }
 }
 
