@@ -238,7 +238,7 @@ fn deploy(dir: &std::path::Path, source: &str) -> Vec<hekla::fold_store::Change>
     let digest = Digest::of(&program);
     let tables = TableDef::all(&program);
     let store = FoldStore::open(&dir.join("tables.db"), &tables).expect("the store opens");
-    store.apply(&program, &digest, &tables).expect("applied")
+    store.apply(&digest, &tables).expect("applied")
 }
 
 fn verdicts(changes: &[hekla::fold_store::Change]) -> Vec<(&str, &str)> {
@@ -376,14 +376,12 @@ fn the_store_holds_one_checkpoint_for_every_table() {
     let program = program(SPEND);
     let tables = TableDef::all(&program);
     let store = FoldStore::open(&dir.path().join("tables.db"), &tables).unwrap();
-    assert_eq!(store.read_checkpoint().unwrap().get(), 0);
+    assert_eq!(store.read_checkpoint().unwrap(), 0);
 
     let tx = store.begin().unwrap();
-    store
-        .write_checkpoint(tephra::Position::new(42), &tx)
-        .unwrap();
+    store.write_checkpoint(42, &tx).unwrap();
     tx.commit().unwrap();
-    assert_eq!(store.read_checkpoint().unwrap().get(), 42);
+    assert_eq!(store.read_checkpoint().unwrap(), 42);
 }
 
 /// A refilled column records `built_to = 0`, which is what says it holds its seed and
@@ -396,7 +394,7 @@ fn a_column_that_needs_refolding_records_that_it_holds_nothing_yet() {
     let tables = TableDef::all(&program);
     let path = dir.path().join("tables.db");
     let store = FoldStore::open(&path, &tables).unwrap();
-    store.apply(&program, &digest, &tables).unwrap();
+    store.apply(&digest, &tables).unwrap();
 
     let recorded = store.recorded().unwrap();
     assert_eq!(recorded.len(), 2);
@@ -422,7 +420,8 @@ fn the_reconcile_is_a_function_of_two_catalogs() {
     let before = catalog(
         &Digest::of(&program(SPEND)),
         &TableDef::all(&program(SPEND)),
-    );
+    )
+    .unwrap();
     assert!(
         reconcile(&before, &before)
             .iter()
@@ -443,5 +442,519 @@ fn the_reconcile_is_a_function_of_two_catalogs() {
             .collect::<Vec<_>>(),
         vec![Verdict::Drop, Verdict::Drop],
         "nothing current is every column dropped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Filling the tables
+// ---------------------------------------------------------------------------
+
+use hekla::fold_runtime::{apply_batch, backfill};
+use heklang::EventPath;
+use heklang::value::{Event, Record};
+use heklang::{Interpreter, Value, layout};
+
+/// Append `events` to an interpreter's log and hand back the records a batch would carry.
+///
+/// The envelope is the harness's, and the positions are the ones `fold_stored` will see,
+/// which is what makes the comparison below a comparison and not a coincidence.
+fn appended<'a>(interpreter: &mut Interpreter<'a>, events: Vec<Event>) -> Vec<Record> {
+    let mut records = Vec::new();
+    for (at, event) in events.into_iter().enumerate() {
+        interpreter.append(event.clone());
+        records.push(Record {
+            id: format!("{at}"),
+            position: at as u64,
+            at: 0,
+            event,
+        });
+    }
+    records
+}
+
+fn placed(customer: i64, total: i64) -> Event {
+    Event::new(
+        EventPath::new(["order", "placed"]),
+        [
+            ("customer_id".to_owned(), Value::Int(customer)),
+            ("order_id".to_owned(), Value::Int(1)),
+            ("total".to_owned(), Value::money(total, 2)),
+        ],
+    )
+}
+
+fn cancelled(customer: i64) -> Event {
+    Event::new(
+        EventPath::new(["order", "cancelled"]),
+        [("customer_id".to_owned(), Value::Int(customer))],
+    )
+}
+
+fn cell(conn: &Connection, sql: &str) -> Option<String> {
+    conn.query_row(sql, [], |row| row.get::<_, Option<String>>(0))
+        .unwrap()
+}
+
+/// **The check the whole design rests on: the store and the read cannot disagree, because
+/// one is the other's definition.** A column is filled by `Interpreter::fold_stored` and
+/// served by `Interpreter::fold`, so every stored value is compared here against folding
+/// the same fold for the same key directly.
+#[test]
+fn a_filled_column_holds_what_folding_it_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(SPEND);
+    let digest = Digest::of(&program);
+    let tables = TableDef::all(&program);
+    let layout = layout(&program);
+
+    let mut interpreter = Interpreter::new(&program);
+    let records = appended(
+        &mut interpreter,
+        vec![
+            placed(7, 1_000),
+            placed(7, 500),
+            cancelled(9),
+            placed(9, 250),
+        ],
+    );
+    let head = records.len() as u64;
+
+    let path = dir.path().join("tables.db");
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&digest, &tables).unwrap();
+    let filled = apply_batch(
+        &store,
+        &interpreter,
+        &program,
+        &layout,
+        &tables,
+        &records,
+        head,
+    )
+    .expect("the batch applies");
+
+    assert_eq!(filled.records, 4);
+    // Three, not four: `@order.placed` names `lifetime_spend` for customers 7 and 9, and
+    // `@order.cancelled` names `cancelled` for 9 alone. Customer 7's `cancelled` column is
+    // never touched, and holds the seed its `DEFAULT` gave it when the row came into
+    // being. That is the per-column write and the seed default doing their jobs together.
+    assert_eq!(filled.columns, 3, "{filled:?}");
+    assert_eq!(
+        store.read_checkpoint().unwrap(),
+        head,
+        "the values and the position commit together"
+    );
+
+    let conn = Connection::open(&path).unwrap();
+    for customer in [7, 9] {
+        for (column, fold) in [
+            ("lifetime_spend", "LifetimeSpend"),
+            ("cancelled", "Cancelled"),
+        ] {
+            let stored = cell(
+                &conn,
+                &format!(
+                    "SELECT CAST(\"{column}\" AS TEXT) FROM \"customer\" WHERE \"customer\" = {customer}"
+                ),
+            );
+            let folded = interpreter
+                .fold(fold, [("customer_id".to_owned(), Value::Int(customer))])
+                .expect("folded");
+            let expected = match folded {
+                Value::Bool(flag) => Some((if flag { "1" } else { "0" }).to_owned()),
+                other => Some(other.to_string()),
+            };
+            assert_eq!(
+                stored, expected,
+                "`{column}` of customer {customer} must be what `{fold}` folds to"
+            );
+        }
+    }
+
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT CAST(\"cancelled\" AS TEXT) FROM \"customer\" WHERE \"customer\" = 7"
+        ),
+        Some("0".to_owned()),
+        "a column no arm named holds its seed, which is what folding it would return"
+    );
+}
+
+/// A record names the columns it could have changed, and nothing else is touched. The
+/// other key's row is not rewritten, which is what makes a two-column write a two-column
+/// write rather than a row rewrite.
+#[test]
+fn a_batch_touches_only_the_keys_its_records_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(SPEND);
+    let digest = Digest::of(&program);
+    let tables = TableDef::all(&program);
+    let layout = layout(&program);
+
+    let mut interpreter = Interpreter::new(&program);
+    let first = appended(&mut interpreter, vec![placed(7, 1_000)]);
+    let path = dir.path().join("tables.db");
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&digest, &tables).unwrap();
+    apply_batch(&store, &interpreter, &program, &layout, &tables, &first, 0).unwrap();
+
+    // A second batch about a different customer.
+    let second = vec![Record {
+        id: "1".to_owned(),
+        position: 1,
+        at: 0,
+        event: placed(9, 250),
+    }];
+    interpreter.append(placed(9, 250));
+    let filled = apply_batch(&store, &interpreter, &program, &layout, &tables, &second, 1).unwrap();
+    assert_eq!(
+        filled.columns, 1,
+        "one record, one arm, one key, one column: {filled:?}"
+    );
+}
+
+/// A column a deploy added records `built_to = 0`, and this is the pass that answers it.
+/// Only the column that is behind is folded, which is obligation 3 holding through a
+/// backfill as well as through a deploy.
+#[test]
+fn a_backfill_fills_the_column_that_is_behind_and_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let one_fold = "subject Customer(Int)
+
+event @order.placed { customer_id: Customer, order_id: Int, total: Money(2) }
+event @order.cancelled { customer_id: Customer }
+
+fold Cancelled(customer_id: Customer) -> Bool = false {
+  on @order.cancelled(customer_id) => true
+}
+";
+    let path = dir.path().join("tables.db");
+
+    // Deploy one fold and fill it, so the table has a row.
+    let first_program = program(one_fold);
+    let tables = TableDef::all(&first_program);
+    let layout_one = layout(&first_program);
+    let mut interpreter = Interpreter::new(&first_program);
+    let records = appended(&mut interpreter, vec![cancelled(7)]);
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&Digest::of(&first_program), &tables).unwrap();
+    apply_batch(
+        &store,
+        &interpreter,
+        &first_program,
+        &layout_one,
+        &tables,
+        &records,
+        0,
+    )
+    .unwrap();
+    drop(store);
+
+    // Now deploy a second fold over the same data directory.
+    let grown = program(SPEND);
+    let tables = TableDef::all(&grown);
+    let store = FoldStore::open(&path, &tables).unwrap();
+    let changes = store.apply(&Digest::of(&grown), &tables).unwrap();
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|c| c.verdict != Verdict::UpToDate)
+            .map(|c| (c.column.as_str(), c.verdict.label()))
+            .collect::<Vec<_>>(),
+        vec![("lifetime_spend", "add")]
+    );
+    assert_eq!(
+        store.behind().unwrap().len(),
+        0,
+        "the checkpoint is still 0 here, so nothing is behind it yet"
+    );
+
+    // One event later, the new column is behind and the backfill answers it.
+    let mut interpreter = Interpreter::new(&grown);
+    interpreter.append(cancelled(7));
+    interpreter.append(placed(7, 400));
+    let tx = store.begin().unwrap();
+    // The log is two events long now, so the head is 2. Both columns are behind it, and
+    // honestly so: the first was folded at a head of 1 and the checkpoint moved past it
+    // here by hand. In a running store `apply_batch` moves a caught-up column and the
+    // checkpoint together, so only a column a deploy reset is ever behind.
+    store.write_checkpoint(2, &tx).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        store
+            .behind()
+            .unwrap()
+            .iter()
+            .any(|row| row.column == "lifetime_spend"),
+        "the added column is behind"
+    );
+
+    let filled = backfill(&store, &interpreter, &tables).unwrap();
+    assert_eq!(
+        filled.columns, 2,
+        "one key, and the two columns that are behind it: {filled:?}"
+    );
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT \"lifetime_spend\" FROM \"customer\" WHERE \"customer\" = 7"
+        ),
+        Some("4.00".to_owned())
+    );
+    assert!(
+        store.behind().unwrap().is_empty(),
+        "and nothing is behind now"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What a review found, pinned
+// ---------------------------------------------------------------------------
+
+const LINES: &str = "subject Shop(Int)
+
+event @order.placed { shop_id: Shop, order_id: Int, line: Int }
+
+fold OrderLines(shop_id: Shop, order_id: Int) -> lines: List(Int) = [] {
+  on @order.placed(shop_id, order_id) { line } => lines.push(line)
+}
+
+fold OrderPlaced(shop_id: Shop, order_id: Int) -> Bool = false {
+  on @order.placed(shop_id, order_id) => true
+}
+";
+
+fn ordered(shop: i64, order: i64, line: i64) -> Event {
+    Event::new(
+        EventPath::new(["order", "placed"]),
+        [
+            ("shop_id".to_owned(), Value::Int(shop)),
+            ("order_id".to_owned(), Value::Int(order)),
+            ("line".to_owned(), Value::Int(line)),
+        ],
+    )
+}
+
+/// `layout` reports a collection column under the key signature it belongs to, and
+/// `TableDef::all` puts it in the side table, so a batch that resolved a column by the
+/// layout's table name alone found the scalars-only table and failed outright.
+#[test]
+fn a_batch_fills_a_collection_column_in_its_side_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(LINES);
+    let tables = TableDef::all(&program);
+    let layout = layout(&program);
+    let mut interpreter = Interpreter::new(&program);
+    let records = appended(&mut interpreter, vec![ordered(1, 9001, 5)]);
+
+    let path = dir.path().join("tables.db");
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&Digest::of(&program), &tables).unwrap();
+    let filled = apply_batch(
+        &store,
+        &interpreter,
+        &program,
+        &layout,
+        &tables,
+        &records,
+        1,
+    )
+    .expect("a collection column is filled rather than failing the batch");
+    assert_eq!(
+        filled.columns, 2,
+        "one scalar and one collection: {filled:?}"
+    );
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(&conn, "SELECT \"order_lines\" FROM \"_side_shop__order\""),
+        Some("[5]".to_owned()),
+        "the list stores as the JSON it goes on the wire as"
+    );
+}
+
+/// An arm leaving a key part open is a range over every key carrying the parts it pinned,
+/// and a key this same batch minted is one of them. Reading the range before the pinned
+/// writes missed it, and the column was then marked built holding its `DEFAULT`.
+#[test]
+fn a_range_arm_sees_a_key_the_same_batch_minted() {
+    let source = "subject Shop(Int)
+
+event @shop.rendered { shop_id: Shop, surface: String }
+event @shop.hidden { shop_id: Shop, surface: String }
+event @shop.uninstalled { shop_id: Shop }
+
+fold ShopRendered(shop_id: Shop, surface: String) -> Bool = false {
+  on @shop.rendered(shop_id, surface) => true
+}
+
+// `surface` is pinned by the hidden arm, which is what makes this storable, and the
+// uninstall arm leaves it open. Nothing in the batch below fires the hidden arm, so this
+// column's only touch is the range, and the key it ranges over is one the other column's
+// write mints in the same batch.
+fold ShopGone(shop_id: Shop, surface: String) -> Bool = false {
+  on @shop.hidden(shop_id, surface) => true
+  on @shop.uninstalled(shop_id) => true
+}
+";
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(source);
+    let tables = TableDef::all(&program);
+    let layout = layout(&program);
+    let mut interpreter = Interpreter::new(&program);
+    let records = appended(
+        &mut interpreter,
+        vec![
+            Event::new(
+                EventPath::new(["shop", "rendered"]),
+                [
+                    ("shop_id".to_owned(), Value::Int(1)),
+                    ("surface".to_owned(), Value::str("a")),
+                ],
+            ),
+            Event::new(
+                EventPath::new(["shop", "uninstalled"]),
+                [("shop_id".to_owned(), Value::Int(1))],
+            ),
+        ],
+    );
+
+    let path = dir.path().join("tables.db");
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&Digest::of(&program), &tables).unwrap();
+    apply_batch(
+        &store,
+        &interpreter,
+        &program,
+        &layout,
+        &tables,
+        &records,
+        2,
+    )
+    .unwrap();
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT CAST(\"shop_gone\" AS TEXT) FROM \"shop__surface\" WHERE \"surface\" = 'a'"
+        ),
+        Some("1".to_owned()),
+        "the uninstall arm ranges over the surface the render arm created in this batch"
+    );
+}
+
+/// A column a deploy reset must not be advanced by the next batch. Advancing it made
+/// `behind` empty, left the backfill nothing to do, and stranded the column on its seed
+/// for every key that existed before the deploy.
+#[test]
+fn a_batch_does_not_advance_a_column_that_is_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    let one = "subject Customer(Int)
+
+event @order.placed { customer_id: Customer, order_id: Int, total: Money(2) }
+event @order.cancelled { customer_id: Customer }
+
+fold Cancelled(customer_id: Customer) -> Bool = false {
+  on @order.cancelled(customer_id) => true
+}
+";
+    // Fill one fold over one event, so the table has a key.
+    let first = program(one);
+    let tables = TableDef::all(&first);
+    let mut interpreter = Interpreter::new(&first);
+    let records = appended(&mut interpreter, vec![cancelled(7)]);
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&Digest::of(&first), &tables).unwrap();
+    apply_batch(
+        &store,
+        &interpreter,
+        &first,
+        &layout(&first),
+        &tables,
+        &records,
+        1,
+    )
+    .unwrap();
+    drop(store);
+
+    // Add a second fold, which records `built_to = 0`, then run a batch that touches only
+    // the first fold's column.
+    let grown = program(SPEND);
+    let tables = TableDef::all(&grown);
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&Digest::of(&grown), &tables).unwrap();
+    let mut interpreter = Interpreter::new(&grown);
+    interpreter.append(cancelled(7));
+    let records = vec![Record {
+        id: "1".to_owned(),
+        position: 1,
+        at: 0,
+        event: cancelled(9),
+    }];
+    interpreter.append(cancelled(9));
+    apply_batch(
+        &store,
+        &interpreter,
+        &grown,
+        &layout(&grown),
+        &tables,
+        &records,
+        2,
+    )
+    .unwrap();
+
+    assert!(
+        store
+            .behind()
+            .unwrap()
+            .iter()
+            .any(|row| row.column == "lifetime_spend"),
+        "the added column is still behind, so the backfill still has work"
+    );
+}
+
+/// The seed is in the fold's stage and not in its signature, so changing it moves `hash`
+/// alone. That would have been a refold, the column would have stayed, and SQLite cannot
+/// alter a `DEFAULT`: every row created afterwards would hold the old seed.
+#[test]
+fn changing_only_a_folds_seed_reshapes_its_column() {
+    let dir = tempfile::tempdir().unwrap();
+    deploy(dir.path(), SPEND);
+    let reseeded = deploy(
+        dir.path(),
+        &SPEND.replace("-> Bool = false", "-> Bool = true"),
+    );
+    assert_eq!(verdicts(&reseeded), vec![("cancelled", "reshape")]);
+
+    let conn = Connection::open(dir.path().join("tables.db")).unwrap();
+    let ddl: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'customer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        ddl.contains("\"cancelled\" INTEGER NOT NULL DEFAULT 1"),
+        "the live default is the new seed: {ddl}"
+    );
+}
+
+/// Every named fold earns a digest entry, so a column without one is an invariant
+/// violation. Two empty hashes compare equal, so defaulting it would have read as up to
+/// date on every deploy and never rebuilt the column.
+#[test]
+fn a_column_whose_fold_has_no_digest_entry_is_loud() {
+    let program = program(SPEND);
+    let tables = TableDef::all(&program);
+    let empty = Digest::of(&heklang::Program::default());
+    let why = catalog(&empty, &tables).expect_err("no entry, no identity");
+    assert!(
+        why.to_string().contains("has no digest entry"),
+        "the message names the cause: {why}"
     );
 }
