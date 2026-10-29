@@ -224,3 +224,224 @@ fold ShopRendered(shop_id: Shop, surface: String) -> Bool = false {
          is every surface of one shop"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The store and its column catalog
+// ---------------------------------------------------------------------------
+
+use hekla::fold_store::{FoldStore, Verdict, catalog, reconcile};
+use heklang::Digest;
+
+/// Deploy `source` over `dir` and hand back what it changed.
+fn deploy(dir: &std::path::Path, source: &str) -> Vec<hekla::fold_store::Change> {
+    let program = program(source);
+    let digest = Digest::of(&program);
+    let tables = TableDef::all(&program);
+    let store = FoldStore::open(&dir.join("tables.db"), &tables).expect("the store opens");
+    store.apply(&program, &digest, &tables).expect("applied")
+}
+
+fn verdicts(changes: &[hekla::fold_store::Change]) -> Vec<(&str, &str)> {
+    changes
+        .iter()
+        .filter(|change| change.verdict != Verdict::UpToDate)
+        .map(|change| (change.column.as_str(), change.verdict.label()))
+        .collect()
+}
+
+/// **The headline win over a projector, and the one worth not losing.** A column is keyed
+/// by its fold's digest entry hash, so editing one fold's arm rebuilds one column and
+/// leaves every other column of the same table alone. A projector rebuilds its whole
+/// database for the same edit.
+#[test]
+fn editing_one_fold_rebuilds_one_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = deploy(dir.path(), SPEND);
+    assert_eq!(
+        verdicts(&first),
+        vec![("cancelled", "add"), ("lifetime_spend", "add")],
+        "a first deploy adds every column"
+    );
+
+    assert!(
+        verdicts(&deploy(dir.path(), SPEND)).is_empty(),
+        "the same program again changes nothing"
+    );
+
+    let edited = deploy(
+        dir.path(),
+        &SPEND.replace("=> spend + total", "=> spend + total + total"),
+    );
+    assert_eq!(
+        verdicts(&edited),
+        vec![("lifetime_spend", "refold")],
+        "one fold's arm moved, so one column refolds and the other is untouched"
+    );
+}
+
+/// A moved signature is a column of another shape under the same name, so it goes and
+/// comes back rather than being refolded where it is: its table, its key order or its own
+/// type has changed.
+#[test]
+fn retyping_a_fold_reshapes_its_column_rather_than_refolding_it() {
+    let dir = tempfile::tempdir().unwrap();
+    deploy(dir.path(), SPEND);
+    let retyped = deploy(
+        dir.path(),
+        &SPEND
+            .replace("-> Bool = false", "-> Int = 0")
+            .replace("=> true", "=> 1"),
+    );
+    assert_eq!(verdicts(&retyped), vec![("cancelled", "reshape")]);
+}
+
+/// A fold deleted from the program takes its column with it.
+#[test]
+fn deleting_a_fold_drops_its_column() {
+    let dir = tempfile::tempdir().unwrap();
+    deploy(dir.path(), SPEND);
+    let without = deploy(
+        dir.path(),
+        "subject Customer(Int)
+
+event @order.placed { customer_id: Customer, order_id: Int, total: Money(2) }
+event @order.cancelled { customer_id: Customer }
+
+fold LifetimeSpend(customer_id: Customer) -> spend: Money(2) = 0 {
+  on @order.placed(customer_id) { total } => spend + total
+}
+",
+    );
+    assert_eq!(verdicts(&without), vec![("cancelled", "drop")]);
+}
+
+/// **A column added to a populated table is given the fold's seed, not a placeholder.**
+/// `ALTER TABLE ... ADD COLUMN` needs a default for a `NOT NULL` column, and for a key no
+/// arm of the new fold has fired for, the seed is the answer the column should hold.
+#[test]
+fn a_column_added_to_a_populated_table_defaults_to_its_folds_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let one_fold = "subject Customer(Int)
+
+event @order.placed { customer_id: Customer, total: Money(2) }
+
+fold Placed(customer_id: Customer) -> Bool = false {
+  on @order.placed(customer_id) => true
+}
+";
+    deploy(dir.path(), one_fold);
+
+    // A row the first deploy's column was folded for.
+    let path = dir.path().join("tables.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO \"customer\" (\"customer\", \"placed\") VALUES (7, 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let added = deploy(
+        dir.path(),
+        &format!(
+            "{one_fold}
+fold LifetimeSpend(customer_id: Customer) -> spend: Money(2) = 0 {{
+  on @order.placed(customer_id) {{ total }} => spend + total
+}}
+"
+        ),
+    );
+    assert_eq!(verdicts(&added), vec![("lifetime_spend", "add")]);
+
+    let conn = Connection::open(&path).unwrap();
+    let seeded: String = conn
+        .query_row(
+            "SELECT \"lifetime_spend\" FROM \"customer\" WHERE \"customer\" = 7",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the existing row has the new column");
+    assert_eq!(
+        seeded, "0.00",
+        "a Money(2) seed of `0` is the amount at its scale, not an integer"
+    );
+}
+
+/// Obligation 4: one position for the whole store, so a row is never half updated and a
+/// query reads one position. A projector holds its own, which is why this is a property
+/// of the file rather than of a table.
+#[test]
+fn the_store_holds_one_checkpoint_for_every_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(SPEND);
+    let tables = TableDef::all(&program);
+    let store = FoldStore::open(&dir.path().join("tables.db"), &tables).unwrap();
+    assert_eq!(store.read_checkpoint().unwrap().get(), 0);
+
+    let tx = store.begin().unwrap();
+    store
+        .write_checkpoint(tephra::Position::new(42), &tx)
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(store.read_checkpoint().unwrap().get(), 42);
+}
+
+/// A refilled column records `built_to = 0`, which is what says it holds its seed and
+/// nothing else until whatever follows the log catches it up.
+#[test]
+fn a_column_that_needs_refolding_records_that_it_holds_nothing_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(SPEND);
+    let digest = Digest::of(&program);
+    let tables = TableDef::all(&program);
+    let path = dir.path().join("tables.db");
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&program, &digest, &tables).unwrap();
+
+    let recorded = store.recorded().unwrap();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded.iter().all(|row| row.built_to == 0));
+    assert!(
+        recorded.iter().all(|row| !row.fold_hash.is_empty()),
+        "every named fold earns a digest entry, so every column has an identity"
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|row| row.fold.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Cancelled", "LifetimeSpend"],
+    );
+}
+
+/// The reconcile is pure so that `hekla plan` can forecast a deploy without a second
+/// implementation of the rule, the way `projector::reconcile_from` is reused by
+/// `plan::forecast`.
+#[test]
+fn the_reconcile_is_a_function_of_two_catalogs() {
+    let before = catalog(
+        &Digest::of(&program(SPEND)),
+        &TableDef::all(&program(SPEND)),
+    );
+    assert!(
+        reconcile(&before, &before)
+            .iter()
+            .all(|c| c.verdict == Verdict::UpToDate)
+    );
+    assert_eq!(
+        reconcile(&[], &before)
+            .iter()
+            .map(|c| c.verdict)
+            .collect::<Vec<_>>(),
+        vec![Verdict::Add, Verdict::Add],
+        "nothing recorded is every column added"
+    );
+    assert_eq!(
+        reconcile(&before, &[])
+            .iter()
+            .map(|c| c.verdict)
+            .collect::<Vec<_>>(),
+        vec![Verdict::Drop, Verdict::Drop],
+        "nothing current is every column dropped"
+    );
+}
