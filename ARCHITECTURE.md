@@ -1381,7 +1381,10 @@ and `order_total` under the shop key, and leaves the ids plaintext.
   boundary on a plaintext field beside the sealed one: `examples/orders` keeps a per-shop allocation
   cap, and `ACCOUNT_EVENTS` in the test suite keeps a plaintext `handle` beside a sealed `email`.
   Erasing a subject does not reopen a handle it claimed, which is the property `unique` existed for,
-  and it holds with no key at all.
+  and it holds with no key at all. What a plaintext handle cannot do is make the *personal* value
+  itself unique, which is the case a project owning its own signup meets;
+  [docs/unique-claims-handoff.md](docs/unique-claims-handoff.md) designs that and says why it waits
+  on heklang.
 - **A field appended without a subject cannot be erased** until a segment-rewrite tool exists (out of
   scope): its plaintext is already in the log payload and tag index, and replaying projectors just
   re-reads it. Which fields are personal is a judgement about meaning rather than about a name, so

@@ -3380,6 +3380,16 @@ warranted.
   actually hurt.
 - **Vendoring Scalar for `/docs`**: when hekla has to run somewhere with no outbound network. The
   page loads the reference UI from a CDN today; `/openapi.json` itself needs nothing.
+- **Unique claims over erasable values** (`docs/unique-claims-handoff.md`): when a project owns its own
+  signup, so the identity it must keep unique *is* the personal data. hekla can enforce uniqueness
+  across subjects, or erase a value with one key delete, and today not both on one field:
+  `examples/users` tags a plaintext email that nothing can ever erase, `examples/orders` seals one that
+  nothing can match across accounts. The design splits the value into a token in a `claim` table keyed
+  by a `UNIQUE` constraint and a copy sealed under the holder, so the registry is searchable and
+  deletable while the log copy stays readable and immutable. It needs a `unique` declaration,
+  `@claims`/`@releases`, and a `claim` read in a command, so heklang moves first. Deferred rather than
+  missing because a Shopify-shaped app never meets it: Shopify assigns the identities and the app only
+  carries the personal data hanging off them.
 - **A timer that wakes a command**: when something a deployment cannot solve outside the runtime
   needs one. A window cap elapsing runs no handler today, and the shape proposed for it is an
   effect-arm verb (`schedule Cmd { .. } at <timestamp>`), so it is heklang's decision before it is
