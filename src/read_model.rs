@@ -633,7 +633,7 @@ fn text(value: &str) -> SqlValue {
 /// Reconstruct a JSON value from a stored column per the field's declared kind. A
 /// subject-scoped column returns its stored ciphertext string as-is; the read API
 /// layer decrypts it (and re-types it to the underlying kind) on the way out.
-fn from_sql(meta: &FieldMeta, value: ValueRef) -> anyhow::Result<serde_json::Value> {
+pub(crate) fn from_sql(meta: &FieldMeta, value: ValueRef) -> anyhow::Result<serde_json::Value> {
     use serde_json::Value as J;
     if meta.sealed_under.is_some() {
         return Ok(match value {

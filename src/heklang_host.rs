@@ -757,7 +757,7 @@ impl HeklaHost {
             .map_err(|err| host_error(err.to_string()))
     }
 
-    fn query_of(&self, slices: &[Predicate]) -> Result<tephra::Query, Error> {
+    pub(crate) fn query_of(&self, slices: &[Predicate]) -> Result<tephra::Query, Error> {
         let items = slices
             .iter()
             .map(|slice| self.item_of(slice))
@@ -1995,7 +1995,7 @@ pub(crate) fn timestamp_wire(text: &str) -> Option<serde_json::Value> {
 /// A column's stored form back as rule 8's, which is what `Value::from_json` reads.
 ///
 /// The inverse of [`column_form`], and only a `Timestamp` differs between the two.
-fn wire_form(kind: &FieldKind, stored: serde_json::Value) -> serde_json::Value {
+pub(crate) fn wire_form(kind: &FieldKind, stored: serde_json::Value) -> serde_json::Value {
     match (kind.base(), &stored) {
         (FieldKind::Timestamp, serde_json::Value::String(text)) => {
             timestamp_wire(text).unwrap_or(stored)

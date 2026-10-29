@@ -442,7 +442,7 @@ fn nullable(meta: &FieldMeta) -> bool {
 /// that the `Value::Sealed` carries rather than under the column's. A projector re-seals
 /// because a handler may move content between columns; a fold arm cannot, so there is
 /// nothing to re-seal for.
-fn stored_text(kind: &FieldKind, value: &Value) -> Option<String> {
+pub(crate) fn stored_text(kind: &FieldKind, value: &Value) -> Option<String> {
     match value {
         Value::Sealed { content, .. } => Some(content.to_string()),
         Value::Opt { value: held, .. } => held.as_ref().and_then(|held| stored_text(kind, held)),
@@ -456,65 +456,6 @@ fn stored_text(kind: &FieldKind, value: &Value) -> Option<String> {
 }
 
 impl FoldStore {
-    /// Every key of `table` that `pins` names.
-    ///
-    /// A fully pinned arm names one key, whether or not a row for it exists yet: the write
-    /// that follows creates it, which is what "a row exists once any event matched it"
-    /// means. An arm that left a part open is a **range update** over that part, so the
-    /// keys are whichever rows already carry the parts it did pin. An index over exactly
-    /// that set of parts is what makes it a seek, and `TableDef` derives one.
-    pub fn keys_matching(
-        &self,
-        table: &TableDef,
-        pins: &crate::tables::Pins,
-    ) -> anyhow::Result<Vec<Vec<String>>> {
-        let bound: Vec<Option<String>> = pins
-            .parts
-            .iter()
-            .zip(&table.key)
-            .map(|(part, (_, meta))| {
-                part.as_ref()
-                    .and_then(|value| stored_text(&meta.kind, value))
-            })
-            .collect();
-        if pins.complete() {
-            // Every part pinned, so this is one key and no read is needed to find it.
-            return Ok(vec![
-                bound.into_iter().map(Option::unwrap_or_default).collect(),
-            ]);
-        }
-        let mut wheres = Vec::new();
-        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
-        for ((name, meta), value) in table.key.iter().zip(&bound) {
-            let Some(text) = value else { continue };
-            wheres.push(format!("{} = ?{}", quote_ident(name), binds.len() + 1));
-            binds.push(crate::read_model::coerce_value(&meta.kind, text)?);
-        }
-        let columns: Vec<String> = table
-            .key
-            .iter()
-            .map(|(name, _)| quote_ident(name))
-            .collect();
-        let sql = format!(
-            "SELECT {} FROM {}{}",
-            columns.join(", "),
-            quote_ident(&table.name),
-            if wheres.is_empty() {
-                String::new()
-            } else {
-                format!(" WHERE {}", wheres.join(" AND "))
-            }
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let width = table.key.len();
-        let rows = stmt.query_map(rusqlite::params_from_iter(binds), move |row| {
-            (0..width)
-                .map(|at| row.get::<_, rusqlite::types::Value>(at).map(render))
-                .collect::<Result<Vec<String>, _>>()
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
     /// Write one column of one row, creating the row if no event had matched its key yet.
     ///
     /// Per column rather than per row, because that is the unit a fold is: two folds of
@@ -612,4 +553,114 @@ fn render(value: rusqlite::types::Value) -> String {
         rusqlite::types::Value::Text(text) => text,
         rusqlite::types::Value::Blob(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
     }
+}
+
+impl FoldStore {
+    /// One cell as it stands inside `tx`, including writes this batch has already made.
+    ///
+    /// Read through the transaction rather than the connection so that two arms of one
+    /// event accumulate onto each other: the second has to see what the first wrote.
+    pub fn cell(
+        &self,
+        tx: &Transaction,
+        table: &TableDef,
+        key: &[String],
+        column: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let mut wheres = Vec::new();
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        for ((name, meta), text) in table.key.iter().zip(key) {
+            wheres.push(format!("{} = ?{}", quote_ident(name), binds.len() + 1));
+            binds.push(crate::read_model::coerce_value(&meta.kind, text)?);
+        }
+        if table.key.is_empty() {
+            wheres.push(format!("{} = 0", quote_ident("_one")));
+        }
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {}",
+            quote_ident(column),
+            quote_ident(&table.name),
+            wheres.join(" AND ")
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(binds))?;
+        let Some(row) = rows.next()? else {
+            // No row for this key yet, which is not the same as a column holding NULL: the
+            // arm is about to mint it, and `Columns::value` answering `None` is what says
+            // "use the seed".
+            return Ok(None);
+        };
+        // Through `from_sql`, not off the raw cell: a `Bool` is an INTEGER and a `Money` is
+        // its decimal string, so the typed conversion is what a projector's row read also
+        // goes through. Reading the cell directly gave a number where the fold wanted a
+        // bool.
+        Ok(Some(crate::read_model::from_sql(
+            &meta_of(table, column)?.clone(),
+            row.get_ref(0)?,
+        )?))
+    }
+
+    /// Every key of `table` carrying the parts `parts` names, inside `tx`.
+    ///
+    /// `parts` is one entry per key part in key order: `Some` where a value is pinned,
+    /// `None` where it is the range. Read through the transaction, so a key an earlier
+    /// arm of this record minted is in the range.
+    pub fn keys_pinned(
+        &self,
+        tx: &Transaction,
+        table: &TableDef,
+        parts: &[Option<String>],
+    ) -> anyhow::Result<Vec<Vec<String>>> {
+        let mut wheres = Vec::new();
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        for ((name, meta), value) in table.key.iter().zip(parts) {
+            let Some(text) = value else { continue };
+            wheres.push(format!("{} = ?{}", quote_ident(name), binds.len() + 1));
+            binds.push(crate::read_model::coerce_value(&meta.kind, text)?);
+        }
+        let columns: Vec<String> = table
+            .key
+            .iter()
+            .map(|(name, _)| quote_ident(name))
+            .collect();
+        if columns.is_empty() {
+            // The single-row table: one key, which is the empty one, and it exists.
+            return Ok(vec![Vec::new()]);
+        }
+        let sql = format!(
+            "SELECT {} FROM {}{}",
+            columns.join(", "),
+            quote_ident(&table.name),
+            if wheres.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", wheres.join(" AND "))
+            }
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let width = table.key.len();
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), move |row| {
+            (0..width)
+                .map(|at| row.get::<_, rusqlite::types::Value>(at).map(render))
+                .collect::<Result<Vec<String>, _>>()
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+/// One column's metadata, by name, for a typed read of its cell.
+fn meta_of<'a>(table: &'a TableDef, column: &str) -> anyhow::Result<&'a FieldMeta> {
+    table
+        .key
+        .iter()
+        .find(|(name, _)| name == column)
+        .map(|(_, meta)| meta)
+        .or_else(|| {
+            table
+                .columns
+                .iter()
+                .find(|held| held.name == column)
+                .map(|held| &held.meta)
+        })
+        .with_context(|| format!("no column `{column}` of `{}`", table.name))
 }

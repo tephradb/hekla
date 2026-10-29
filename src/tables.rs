@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 
 use anyhow::Context;
 
+use heklang::ir::Type;
 use heklang::value::Defs;
-use heklang::value::Record;
-use heklang::{ArmMatch, Column, KeyPart, Layout, Program, Table, layout};
+use heklang::{ArmMatch, Column, KeyPart, Program, Table, layout};
 
 use crate::schema::{FieldKind, FieldMeta, IndexDef, Seal};
 
@@ -49,13 +49,12 @@ pub struct ColumnDef {
     /// The fold's declared name. What the column catalog keys this column by, so that
     /// changing one fold rebuilds one column.
     pub fold: String,
-    /// The fold's own parameter name for each part of the table's key, in key order.
+    /// `heklang::Column::args`: the fold's own parameter name for each part of the
+    /// table's key, in key order, which is what `fold_stored` has to be called with.
     ///
-    /// A key part is named for the parameter with one trailing `_id` taken off, or for the
-    /// subject it keys, so the part's name is usually not the parameter's and
-    /// `Interpreter::fold_stored` wants the parameter's. Per column rather than per table
-    /// because two folds sharing a key signature may spell their parameters differently:
-    /// `A(shop_id: Shop)` and `B(shop: Shop)` are one key and two names for it.
+    /// Carried by the layout rather than derived here. hekla did derive it once, by
+    /// matching `part_names` back onto the parameters, and that is a second
+    /// implementation of a rule with one right answer.
     pub args: Vec<String>,
     /// The fold's seed as a SQL literal, for a column that cannot hold `NULL`.
     ///
@@ -66,6 +65,12 @@ pub struct ColumnDef {
     /// come into being holding something. For both, the something is the seed, which is
     /// what folding that column for that key would return.
     pub default: Option<String>,
+    /// The fold's declared return type, which is the column's.
+    ///
+    /// Kept whole beside `meta.kind` because reading a stored cell back as a value needs
+    /// the declared type and not the storage it shares with another: `Value::from_json`
+    /// takes the type, and a `Map(String, Int)` and a `List(Int)` are both `FieldKind::Json`.
+    pub ty: Type,
     pub meta: FieldMeta,
 }
 
@@ -233,8 +238,9 @@ fn column_def(program: &Program, table: &Table, column: &Column, defs: Defs<'_>)
     ColumnDef {
         name: column.name.clone(),
         fold: column.fold.clone(),
-        args: arg_names(program, &column.fold, &table.key),
+        args: column.args.clone(),
         default: seed_literal(program, column, &kind, sealed_under.is_some()),
+        ty: column.ty.clone(),
         meta: FieldMeta {
             kind,
             indexed: false,
@@ -291,74 +297,6 @@ fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// What one record pins, for one column, before the open parts are filled in.
-///
-/// `parts` is one entry per key part in the table's key order: `Some` where the arm fixed
-/// the part, `None` where it left it open and whatever writes the row has to range over
-/// every value of it that already exists.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Pins {
-    pub table: String,
-    pub column: String,
-    pub fold: String,
-    pub parts: Vec<Option<heklang::Value>>,
-}
-
-impl Pins {
-    /// Whether every part is pinned, which makes this one key rather than a range.
-    pub fn complete(&self) -> bool {
-        self.parts.iter().all(Option::is_some)
-    }
-}
-
-/// Every column one record could have changed, with the key parts that record pins.
-///
-/// **This is `layout`'s answer and not a second derivation.** An arm says which key it
-/// writes; `ArmMatch::Field` names the event field the value comes from, which is often
-/// not the parameter's name, `ArmMatch::Fixed` is rule 13's conjunct resolved against an
-/// empty frame, and `ArmMatch::Open` is a range over that part. Conflating the last two
-/// would tell a writer to range over the very part an arm fixed.
-///
-/// **Deliberately an over-approximation.** A `ColumnArm` carries the key parts and not the
-/// arm's field filters, so a record reaching an arm whose filter it fails is still
-/// reported here. That costs a refold of a column that will come back the value it already
-/// held, and it cannot be wrong: `docs/host.md` rule 4's asymmetry, where over-delivering
-/// is a cost and under-delivering is a bug, holds the same way round for this.
-pub fn pinned(program: &Program, layout: &Layout, record: &Record) -> Vec<Pins> {
-    let mut out = Vec::new();
-    for table in &layout.tables {
-        for column in &table.columns {
-            for arm in &column.arms {
-                if arm.event != record.event.path {
-                    continue;
-                }
-                let parts: Vec<Option<heklang::Value>> = arm
-                    .fields
-                    .iter()
-                    .zip(&table.key)
-                    .map(|(field, part)| match field {
-                        ArmMatch::Field(name) => record.event.fields.get(name).cloned(),
-                        // A conjunct resolves once against an empty frame, which is the
-                        // whole of rule 13's guarantee, so a failure here is a program
-                        // that should not have checked rather than a key to guess at.
-                        ArmMatch::Fixed(at) => {
-                            heklang::fixed(program, &column.fold, part, *at).ok()
-                        }
-                        ArmMatch::Open => None,
-                    })
-                    .collect();
-                out.push(Pins {
-                    table: table.name.clone(),
-                    column: column.name.clone(),
-                    fold: column.fold.clone(),
-                    parts,
-                });
-            }
-        }
-    }
-    out
-}
-
 /// One stored key part back as the value a fold takes as its argument.
 ///
 /// The store binds a key part as text, because that is the one rendering every key type
@@ -375,28 +313,6 @@ pub fn key_value(kind: &FieldKind, text: &str) -> anyhow::Result<heklang::Value>
         // An enum key is its variant name, and a `Money` or a `Json` cannot be one.
         _ => Value::str(text),
     })
-}
-
-/// The fold's parameter name for each part of `key`, in key order.
-///
-/// `heklang::tables::part_names` is the same derivation the layout used, read in parameter
-/// order, so matching on it cannot drift from the names the key actually carries. A part
-/// with no parameter is impossible for a program that checked, and falls back to the
-/// part's own name so that the failure is a missing argument naming the fold rather than a
-/// panic here.
-fn arg_names(program: &Program, fold: &str, key: &[KeyPart]) -> Vec<String> {
-    let Some(def) = program.fold(fold) else {
-        return key.iter().map(|part| part.name.clone()).collect();
-    };
-    let parts = heklang::tables::part_names(def.params.iter().map(|p| (&p.name, &p.ty)));
-    key.iter()
-        .map(|part| {
-            parts
-                .iter()
-                .position(|name| *name == part.name)
-                .map_or_else(|| part.name.clone(), |at| def.params[at].name.clone())
-        })
-        .collect()
 }
 
 /// The fold's seed as a SQL literal, or `None` for a column that can hold `NULL`.

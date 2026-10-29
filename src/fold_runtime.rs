@@ -11,39 +11,40 @@
 //! the log rather than updated in place, which is why this is the correct-and-slow shape
 //! the per-record sink is measured against rather than the end state.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::Context;
 use heklang::value::{Record, Value};
-use heklang::{Interpreter, Layout, Program, host::Host};
+use heklang::{Interpreter, Program, Tables, host::Host};
 
+use crate::fold_sink::ColumnWriter;
 use crate::fold_store::{FoldStore, Recorded};
-use crate::tables::{ColumnDef, Pins, TableDef, holding, main_of, pinned};
+use crate::tables::{ColumnDef, TableDef, main_of};
 
 /// What one pass did, for a log line and a test to read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Filled {
-    /// Columns written, counting one per (key, column) pair.
+    /// Cell writes, which is one per arm the batch's records named per key it named it
+    /// for.
+    ///
+    /// Not distinct columns: a record updates the value already there, so two events of
+    /// one batch touching one column are two writes. That is the whole difference between
+    /// this and re-folding a column over the log once per key.
     pub columns: usize,
     /// Records the batch carried, whether or not any arm matched one.
     pub records: usize,
 }
 
-/// One column of one row to fold: where it lives, which key, and which fold.
-type Target = (String, Vec<String>, String);
-
 /// Apply one batch of records, then move the checkpoint, in one transaction.
 ///
-/// `head` is how long the log was, which is the unit `Interpreter::fold_stored` takes and
-/// the only number the seam hands out. Every column is folded at that one head, because
-/// *every column of every table is at one log position* is the property a query reads:
-/// `docs/host.md` is explicit that `head` and `read` are not atomic together, so a bound
-/// taken per column would leave a row half updated.
-pub fn apply_batch<H: Host>(
+/// `head` is how long the log was, which is the unit the store records. **The records are
+/// applied in position order and each one to the value already there**, which is what
+/// makes a batch cost one pass over itself rather than one fold over the log per key it
+/// touches. `Tables::apply` owns everything about which columns a record names, at which
+/// keys, and what each accumulates to; this owns the transaction and the checkpoint.
+pub fn apply_batch(
     store: &FoldStore,
-    interpreter: &Interpreter<'_, H>,
     program: &Program,
-    layout: &Layout,
     tables: &[TableDef],
     records: &[Record],
     head: u64,
@@ -58,42 +59,23 @@ pub fn apply_batch<H: Host>(
         .collect();
 
     let tx = store.begin()?;
-    let mut filled = Filled {
-        columns: 0,
+    let derived = Tables::new(program);
+    let mut writer = ColumnWriter {
+        store,
+        tx: &tx,
+        program,
+        tables,
+        written: 0,
+    };
+    for record in records {
+        derived
+            .apply(record, &mut writer)
+            .with_context(|| format!("applying the record at {}", record.position))?;
+    }
+    let filled = Filled {
+        columns: writer.written,
         records: records.len(),
     };
-
-    // **Fully pinned arms first, and ranges second.** An arm that leaves a key part open
-    // is a range update over every key that carries the parts it did pin, and a key this
-    // same batch has just minted is one of them. Reading the range before the pinned
-    // writes would miss it, and nothing afterwards would correct it: the column would be
-    // marked built at this head holding the seed its `DEFAULT` gave it. Both halves run
-    // inside the transaction and on one connection, so the range sees the writes above it.
-    let mut pins: Vec<Pins> = Vec::new();
-    for record in records {
-        pins.extend(pinned(program, layout, record));
-    }
-
-    let mut done: BTreeSet<Target> = BTreeSet::new();
-    for complete in [true, false] {
-        for pin in pins.iter().filter(|pin| pin.complete() == complete) {
-            let Some((table, column)) = holding(tables, &pin.table, &pin.column) else {
-                continue;
-            };
-            // A side table holds only the keys its column has been written for, so an
-            // open range is read against the main table of the key signature.
-            let over = main_of(tables, &pin.table).unwrap_or(table);
-            for key in store.keys_matching(over, pin)? {
-                let target = (table.name.clone(), key, column.name.clone());
-                if !done.insert(target.clone()) {
-                    continue;
-                }
-                let value = fold_one(interpreter, table, column, &target.1, head)?;
-                store.write(&tx, table, &target.1, column, &value)?;
-                filled.columns += 1;
-            }
-        }
-    }
 
     // **Only a column that was already caught up may advance.** A column a deploy added or
     // refolded carries `built_to = 0` precisely so `behind` finds it, and a column holds
@@ -104,8 +86,7 @@ pub fn apply_batch<H: Host>(
     for table in tables {
         for column in &table.columns {
             let key = (table.name.clone(), column.name.clone());
-            let caught_up = recorded.get(&key).is_some_and(|row| row.built_to >= was);
-            if caught_up {
+            if recorded.get(&key).is_some_and(|row| row.built_to >= was) {
                 store.mark_built(&tx, &table.name, &column.name, head)?;
             }
         }
@@ -177,7 +158,8 @@ pub fn backfill<H: Host>(
         // fold for at all. A column being backfilled cannot mint a key either, because a
         // key exists only because some event matched it.
         let over = main_of(tables, &table.source).unwrap_or(table);
-        for key in store.keys_matching(over, &every_key(over, row))? {
+        let every = vec![None; over.key.len()];
+        for key in store.keys_pinned(&tx, over, &every)? {
             let value = fold_one(interpreter, table, column, &key, head)?;
             store.write(&tx, table, &key, column, &value)?;
             filled.columns += 1;
@@ -186,16 +168,6 @@ pub fn backfill<H: Host>(
     }
     tx.commit()?;
     Ok(filled)
-}
-
-/// Every part open, which reads as every key the table holds.
-fn every_key(table: &TableDef, row: &Recorded) -> Pins {
-    Pins {
-        table: table.source.clone(),
-        column: row.column.clone(),
-        fold: row.fold.clone(),
-        parts: vec![None; table.key.len()],
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -339,9 +311,6 @@ pub fn start(
         last_error: Mutex::new(None),
     });
 
-    // Every event any column folds, which is this store's subscription. One list for the
-    // whole store because one thread serves every table.
-    let sources: Vec<String> = sources_of(&program);
     let store = store.clone();
     let handle = Arc::clone(&shared);
     let join = thread::Builder::new()
@@ -355,7 +324,6 @@ pub fn start(
                 &events,
                 keystore,
                 &tables,
-                &sources,
             );
             handle.running.store(false, Ordering::Relaxed);
             if let Err(why) = outcome {
@@ -374,25 +342,6 @@ pub fn start(
     ))
 }
 
-/// Every event type any column of the program folds, deduplicated.
-///
-/// Spelled the way a subscription spells one, through `schema::event_type`, which is the
-/// segments joined and **no `@` sigil**. `EventPath`'s own `Display` keeps the sigil, and a
-/// query built from that matches nothing: the store then follows the log, folds none of
-/// it, and advances its checkpoint over every batch, which looks exactly like a store that
-/// is caught up.
-fn sources_of(program: &Program) -> Vec<String> {
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for table in &heklang::layout(program).tables {
-        for column in &table.columns {
-            for event in &column.events {
-                seen.insert(crate::schema::event_type(event));
-            }
-        }
-    }
-    seen.into_iter().collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn follow(
     shared: &FoldShared,
@@ -402,9 +351,8 @@ fn follow(
     events: &Arc<EventDefs>,
     keystore: Option<Arc<KeyStore>>,
     tables: &[TableDef],
-    sources: &[String],
 ) -> anyhow::Result<()> {
-    let layout = heklang::layout(program);
+    let derived = Tables::new(program.as_ref());
     // The host reads and never appends, which is why every field an append accumulates is
     // empty here: a fold has no clock, no network and no `secret`, and `fold_stored` never
     // reaches `Keys` either, since it is the one read that does not shred.
@@ -427,6 +375,13 @@ fn follow(
         http: None,
         secrets: None,
     };
+    // **The subscription comes from `Tables::query`**, lowered through the same `query_of`
+    // a command's append condition uses. Spelling the event types here instead is how the
+    // first version of this thread followed the log, folded none of it, and reported
+    // itself caught up.
+    let query = host
+        .query_of(&derived.query().slices)
+        .map_err(|err| anyhow::anyhow!("building the derived-table subscription: {err}"))?;
     let interpreter = Interpreter::with_host(program.as_ref(), host);
 
     // A column a deploy left behind holds its seed, so this is what has to happen before
@@ -439,8 +394,6 @@ fn follow(
         .behind
         .store(fold_store.behind()?.len() as u64, Ordering::Release);
 
-    let query = crate::heklang_host::query_of_types(sources)
-        .map_err(|err| anyhow::anyhow!("building the derived-table subscription: {err}"))?;
     // A heklang head and a tephra position are the same number: heklang counts positions
     // from zero and tephra from one, so a log of N events is head N and position N.
     let mut sub = store.subscribe(
@@ -461,15 +414,7 @@ fn follow(
                         .map_err(|err| anyhow::anyhow!("decoding a record: {err}"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let filled = apply_batch(
-                fold_store,
-                &interpreter,
-                program,
-                &layout,
-                tables,
-                &records,
-                head,
-            )?;
+            let filled = apply_batch(fold_store, program, tables, &records, head)?;
             crate::metrics::fold_batch(filled.columns);
             shared.head.store(head, Ordering::Release);
             continue;
@@ -480,15 +425,7 @@ fn follow(
         // checkpoint write of its own, so the rule about which columns may advance is
         // stated once.
         if head > shared.head() {
-            apply_batch(
-                fold_store,
-                &interpreter,
-                program,
-                &layout,
-                tables,
-                &[],
-                head,
-            )?;
+            apply_batch(fold_store, program, tables, &[], head)?;
             shared.head.store(head, Ordering::Release);
         }
         if shared.shutdown.load(Ordering::Relaxed) {

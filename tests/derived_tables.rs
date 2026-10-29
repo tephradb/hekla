@@ -452,7 +452,7 @@ fn the_reconcile_is_a_function_of_two_catalogs() {
 use hekla::fold_runtime::{apply_batch, backfill};
 use heklang::EventPath;
 use heklang::value::{Event, Record};
-use heklang::{Interpreter, Value, layout};
+use heklang::{Interpreter, Value};
 
 /// Append `events` to an interpreter's log and hand back the records a batch would carry.
 ///
@@ -505,7 +505,6 @@ fn a_filled_column_holds_what_folding_it_returns() {
     let program = program(SPEND);
     let digest = Digest::of(&program);
     let tables = TableDef::all(&program);
-    let layout = layout(&program);
 
     let mut interpreter = Interpreter::new(&program);
     let records = appended(
@@ -522,23 +521,15 @@ fn a_filled_column_holds_what_folding_it_returns() {
     let path = dir.path().join("tables.db");
     let store = FoldStore::open(&path, &tables).unwrap();
     store.apply(&digest, &tables).unwrap();
-    let filled = apply_batch(
-        &store,
-        &interpreter,
-        &program,
-        &layout,
-        &tables,
-        &records,
-        head,
-    )
-    .expect("the batch applies");
+    let filled = apply_batch(&store, &program, &tables, &records, head).expect("the batch applies");
 
     assert_eq!(filled.records, 4);
-    // Three, not four: `@order.placed` names `lifetime_spend` for customers 7 and 9, and
-    // `@order.cancelled` names `cancelled` for 9 alone. Customer 7's `cancelled` column is
-    // never touched, and holds the seed its `DEFAULT` gave it when the row came into
-    // being. That is the per-column write and the seed default doing their jobs together.
-    assert_eq!(filled.columns, 3, "{filled:?}");
+    // Four cell writes, not four columns: `@order.placed` names `lifetime_spend` for
+    // customer 7 twice, once per event, and for 9 once, and `@order.cancelled` names
+    // `cancelled` for 9. Customer 7's `cancelled` column is never touched and holds the
+    // seed its `DEFAULT` gave it when the row came into being, which is the per-column
+    // write and the seed default doing their jobs together.
+    assert_eq!(filled.columns, 4, "{filled:?}");
     assert_eq!(
         store.read_checkpoint().unwrap(),
         head,
@@ -590,14 +581,13 @@ fn a_batch_touches_only_the_keys_its_records_name() {
     let program = program(SPEND);
     let digest = Digest::of(&program);
     let tables = TableDef::all(&program);
-    let layout = layout(&program);
 
     let mut interpreter = Interpreter::new(&program);
     let first = appended(&mut interpreter, vec![placed(7, 1_000)]);
     let path = dir.path().join("tables.db");
     let store = FoldStore::open(&path, &tables).unwrap();
     store.apply(&digest, &tables).unwrap();
-    apply_batch(&store, &interpreter, &program, &layout, &tables, &first, 0).unwrap();
+    apply_batch(&store, &program, &tables, &first, 0).unwrap();
 
     // A second batch about a different customer.
     let second = vec![Record {
@@ -607,7 +597,7 @@ fn a_batch_touches_only_the_keys_its_records_name() {
         event: placed(9, 250),
     }];
     interpreter.append(placed(9, 250));
-    let filled = apply_batch(&store, &interpreter, &program, &layout, &tables, &second, 1).unwrap();
+    let filled = apply_batch(&store, &program, &tables, &second, 1).unwrap();
     assert_eq!(
         filled.columns, 1,
         "one record, one arm, one key, one column: {filled:?}"
@@ -634,21 +624,11 @@ fold Cancelled(customer_id: Customer) -> Bool = false {
     // Deploy one fold and fill it, so the table has a row.
     let first_program = program(one_fold);
     let tables = TableDef::all(&first_program);
-    let layout_one = layout(&first_program);
     let mut interpreter = Interpreter::new(&first_program);
     let records = appended(&mut interpreter, vec![cancelled(7)]);
     let store = FoldStore::open(&path, &tables).unwrap();
     store.apply(&Digest::of(&first_program), &tables).unwrap();
-    apply_batch(
-        &store,
-        &interpreter,
-        &first_program,
-        &layout_one,
-        &tables,
-        &records,
-        0,
-    )
-    .unwrap();
+    apply_batch(&store, &first_program, &tables, &records, 0).unwrap();
     drop(store);
 
     // Now deploy a second fold over the same data directory.
@@ -745,23 +725,14 @@ fn a_batch_fills_a_collection_column_in_its_side_table() {
     let dir = tempfile::tempdir().unwrap();
     let program = program(LINES);
     let tables = TableDef::all(&program);
-    let layout = layout(&program);
     let mut interpreter = Interpreter::new(&program);
     let records = appended(&mut interpreter, vec![ordered(1, 9001, 5)]);
 
     let path = dir.path().join("tables.db");
     let store = FoldStore::open(&path, &tables).unwrap();
     store.apply(&Digest::of(&program), &tables).unwrap();
-    let filled = apply_batch(
-        &store,
-        &interpreter,
-        &program,
-        &layout,
-        &tables,
-        &records,
-        1,
-    )
-    .expect("a collection column is filled rather than failing the batch");
+    let filled = apply_batch(&store, &program, &tables, &records, 1)
+        .expect("a collection column is filled rather than failing the batch");
     assert_eq!(
         filled.columns, 2,
         "one scalar and one collection: {filled:?}"
@@ -802,7 +773,6 @@ fold ShopGone(shop_id: Shop, surface: String) -> Bool = false {
     let dir = tempfile::tempdir().unwrap();
     let program = program(source);
     let tables = TableDef::all(&program);
-    let layout = layout(&program);
     let mut interpreter = Interpreter::new(&program);
     let records = appended(
         &mut interpreter,
@@ -824,16 +794,7 @@ fold ShopGone(shop_id: Shop, surface: String) -> Bool = false {
     let path = dir.path().join("tables.db");
     let store = FoldStore::open(&path, &tables).unwrap();
     store.apply(&Digest::of(&program), &tables).unwrap();
-    apply_batch(
-        &store,
-        &interpreter,
-        &program,
-        &layout,
-        &tables,
-        &records,
-        2,
-    )
-    .unwrap();
+    apply_batch(&store, &program, &tables, &records, 2).unwrap();
 
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
@@ -869,16 +830,7 @@ fold Cancelled(customer_id: Customer) -> Bool = false {
     let records = appended(&mut interpreter, vec![cancelled(7)]);
     let store = FoldStore::open(&path, &tables).unwrap();
     store.apply(&Digest::of(&first), &tables).unwrap();
-    apply_batch(
-        &store,
-        &interpreter,
-        &first,
-        &layout(&first),
-        &tables,
-        &records,
-        1,
-    )
-    .unwrap();
+    apply_batch(&store, &first, &tables, &records, 1).unwrap();
     drop(store);
 
     // Add a second fold, which records `built_to = 0`, then run a batch that touches only
@@ -896,16 +848,7 @@ fold Cancelled(customer_id: Customer) -> Bool = false {
         event: cancelled(9),
     }];
     interpreter.append(cancelled(9));
-    apply_batch(
-        &store,
-        &interpreter,
-        &grown,
-        &layout(&grown),
-        &tables,
-        &records,
-        2,
-    )
-    .unwrap();
+    apply_batch(&store, &grown, &tables, &records, 2).unwrap();
 
     assert!(
         store

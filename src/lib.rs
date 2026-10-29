@@ -5,6 +5,7 @@ pub mod context;
 pub mod crypto;
 pub mod envelope;
 pub mod fold_runtime;
+pub mod fold_sink;
 pub mod fold_store;
 pub mod hash;
 pub mod heklang_host;
