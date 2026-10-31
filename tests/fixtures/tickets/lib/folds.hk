@@ -42,3 +42,13 @@ fold OrgTicketsSince(since: Int, org_id: Org) -> tickets: Int = since {
 fold TicketOpenedAt(ticket_id: Uuid) -> Timestamp? = none {
   on @ticket.opened as e (ticket_id) => e.at
 }
+
+// Query-only too, for another reason: the month is computed from the record rather than
+// carried on it, and a computed key has no form a command's read could ask the log for.
+fold OrgTicketsDue(org_id: Org, month: String) -> tickets: Int = 0 {
+  on @ticket.opened(org_id) { due_at } key month = month_of(due_at) => tickets + 1
+}
+
+fn month_of(at: Timestamp) -> String {
+  return "{at.year()}-{at.month().pad(2)}"
+}

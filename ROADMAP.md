@@ -3470,7 +3470,9 @@ Decisions worth keeping:
   rather than a fold over the whole log on every request, which would make the cheapest-looking
   read the most expensive one, with a cost that grows with the log. That is the only kind: a
   query-only fold is stored like any other, and this route is where it is read, since no command
-  may fold it.
+  may fold it. That includes one with a computed key part (`key month = month_of(at)`),
+  which heklang makes query-only for the same reason it does an envelope binding: a computed key has
+  no form a command's read could ask the log for, while the store computes it per record.
 - **A key no event has named is a 404**, as a row read is, rather than the fold's seed: answering
   the seed would make a mistyped id indistinguishable from a real key at its starting value.
 

@@ -1227,3 +1227,61 @@ fn a_fold_parameter_named_like_the_wait_is_refused() {
         loaded.findings
     );
 }
+
+/// A key part computed from the record: each ticket counts towards the month it is due
+/// in, which no event carries. Read by row, by scan and by name like any other column.
+#[tokio::test]
+async fn a_computed_key_part_buckets_rows_by_what_the_record_holds() {
+    let harness = boot();
+    let mut position = 0;
+    // 2023-11-14, 2023-11-14 and 2023-12-14.
+    for (ticket, due_at) in [
+        (ALICE, 1_700_000_000_000_000i64),
+        (BOB, 1_700_000_000_000_000),
+        (CAROL, 1_702_592_000_000_000),
+    ] {
+        let mut body = open_body(ticket, 1, 10, None);
+        body["due_at"] = due_at.into();
+        let result = harness
+            .rt
+            .execute("OpenTicket", body, &ctx(), None)
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+        position = position.max(result.body["positions"]["last"].as_u64().unwrap());
+    }
+    let app = harness.app();
+
+    let (status, body) =
+        support::get(&app, &format!("/tables/org__month?org=1&after={position}")).await;
+    assert_eq!(status, 200, "{body}");
+    let months: Vec<(String, i64)> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["month"].as_str().unwrap().to_owned(),
+                row["org_tickets_due"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        months,
+        vec![("2023-11".to_owned(), 2), ("2023-12".to_owned(), 1)]
+    );
+
+    let (status, body) = support::get(&app, "/tables/org__month/row?org=1&month=2023-12").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["item"]["org_tickets_due"], 1);
+
+    let (status, body) = support::get(&app, "/folds/OrgTicketsDue?org_id=1&month=2023-11").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["value"], 2);
+    let (status, body) = support::get(&app, "/folds/OrgTicketsDue?org_id=1&month=2024-01").await;
+    assert_eq!(
+        status, 404,
+        "a month no ticket is due in has no row: {body}"
+    );
+
+    harness.shutdown();
+}

@@ -147,7 +147,9 @@ GET /folds/OwnerTickets?org_id=1&owner_id=10
 - `404 not_found` for a key no event has named (the fold holds its seed there), or an undeclared fold.
 - `400 not_stored` for a fold with a parameter no arm matches, naming it: its keys cannot be listed,
   so nothing stores it, though a command can still fold it. A query-only fold (an arm reads the
-  envelope) *is* stored and served here, and this is the only place it can be read.
+  envelope, or computes a key part with `key month = month_of(at)`) *is* stored and served here,
+  and this is the only place it can be read. A computed part is passed like any other argument:
+  `/folds/OrgTicketsDue?org_id=1&month=2023-11`.
 - `after`, `timeout_ms` and the `503`s are the table routes'.
 
 ## Ordering a scan

@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "heklang"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "sha2",
  "uuid",

@@ -171,8 +171,10 @@ position. A filter on a key part that is not a leading one is a `400 unindexed_f
 
 **One fold by name** is `GET /folds/{Fold}?<param>=...`, its arguments named as the fold declares
 its parameters (`/folds/OwnerTickets?org_id=1&owner_id=10`), answering `{value, position}`. A
-query-only fold (one whose arm reads the envelope) is stored and served like any other, and this is
-the only place it can be read, since no command may fold it. A fold with a parameter no arm matches
+query-only fold (one whose arm reads the envelope, or computes a key part from the record with
+`key month = month_of(at)`) is stored and served like any other, and this is the only place it can
+be read, since no command may fold it. A computed key part is a column and a filter like any other,
+so a read model can bucket by something no event carries. A fold with a parameter no arm matches
 is not stored, and is a `400 not_stored` naming that parameter; a command can still fold it.
 
 A command's success body is `{correlation_id, causation_id, positions: {first, last}, events: [...]}`,
