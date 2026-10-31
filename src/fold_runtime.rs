@@ -130,6 +130,7 @@ pub fn backfill<H: Host>(
     }
     let tx = store.begin()?;
     let mut replay = Replay::default();
+    let mut folds = Vec::new();
     for row in &behind {
         let Some(table) = tables.iter().find(|table| table.name == row.table) else {
             continue;
@@ -140,9 +141,15 @@ pub fn backfill<H: Host>(
         store.reset_column(&tx, table, column)?;
         replay.only.insert((row.table.clone(), row.column.clone()));
         replay.sources.insert(table.source.clone());
+        folds.push(column.fold.clone());
     }
 
+    // Only the behind columns and what heklang says they need beside them: the columns of
+    // their tables that mint the keys a range of theirs reaches. Those run too, and the sink
+    // keeps their keys and drops their writes, so a column that is already right is neither
+    // doubled nor reset.
     let derived = Tables::new(program);
+    let rebuild = derived.only(&folds);
     let mut writer = ColumnWriter {
         store,
         tx: &tx,
@@ -163,7 +170,7 @@ pub fn backfill<H: Host>(
             .host()
             .read(&query, &mut |record| {
                 records += 1;
-                derived.apply(record, &mut writer)
+                rebuild.apply(record, &mut writer)
             })
             .map_err(|err| anyhow::anyhow!("replaying the log into the derived tables: {err}"))?;
     }

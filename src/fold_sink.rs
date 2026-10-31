@@ -44,8 +44,10 @@ pub struct ColumnWriter<'a> {
 
 /// What a backfill replays the log under.
 ///
-/// Every arm of every column still runs, because `Tables::apply` applies a record whole,
-/// but only the columns being rebuilt are written: the rest are already at the checkpoint.
+/// The replay runs `Tables::only` over the columns being rebuilt, which also runs the columns
+/// of their tables that mint keys, since a range of theirs reaches only keys something has
+/// minted. Only the columns being rebuilt are written: the rest are already at the
+/// checkpoint, and keeping their writes would fold every record into them a second time.
 /// Those read back as their seed rather than their final value, so their bodies run over
 /// history from where it started rather than from where it ended, which an arithmetic
 /// arm can overflow on.
