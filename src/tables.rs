@@ -50,7 +50,7 @@ pub struct ColumnDef {
     /// changing one fold rebuilds one column.
     pub fold: String,
     /// `heklang::Column::args`: the fold's own parameter name for each part of the
-    /// table's key, in key order, which is what `fold_stored` has to be called with.
+    /// table's key, in key order, which is how the arguments of a by-name read map onto it.
     ///
     /// Carried by the layout rather than derived here. hekla did derive it once, by
     /// matching `part_names` back onto the parameters, and that is a second

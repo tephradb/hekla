@@ -420,8 +420,8 @@ fn follow(
 ) -> anyhow::Result<()> {
     let derived = Tables::new(program.as_ref());
     // The host reads and never appends, which is why every field an append accumulates is
-    // empty here: a fold has no clock, no network and no `secret`, and `fold_stored` never
-    // reaches `Keys` either, since it is the one read that does not shred.
+    // empty here: a fold has no clock, no network and no `secret`, and the sink never reaches
+    // `Keys` either, since it hands a sealed value through rather than shredding it.
     let host = HeklaHost {
         program: Arc::clone(program),
         events: Arc::clone(events),

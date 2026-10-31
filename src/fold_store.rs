@@ -261,7 +261,7 @@ impl FoldStore {
 
     /// How long the log was when every column was last folded.
     ///
-    /// **A head and not a position**, which is what `Interpreter::fold_stored` takes and
+    /// **A head and not a position**, which is what heklang bounds a read with and
     /// the only number the seam hands out: `Log::head` answers it, a head of zero is a log
     /// with nothing in it, and keeping it in that unit means no call site subtracts one.
     pub fn read_checkpoint(&self) -> anyhow::Result<u64> {
@@ -530,7 +530,7 @@ impl SealedCell {
         serde_json::from_str(text).context("a sealed derived cell that is not one")
     }
 
-    /// The cell as the value `fold_stored` handed the store, so an arm reading it back
+    /// The cell as the value the sink handed the store, so an arm reading it back
     /// sees exactly what it wrote.
     pub fn value(self) -> Value {
         Value::Sealed {

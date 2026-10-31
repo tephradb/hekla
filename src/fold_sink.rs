@@ -109,7 +109,7 @@ impl Columns for ColumnWriter<'_> {
             return Ok(None);
         };
         // A sealed cell goes back to the arm as the `Value::Sealed` it was written from,
-        // unopened, which is what `fold_stored` would have handed it: an arm never sees
+        // unopened, which is what the sink handed the store: an arm never sees
         // sealed content as plaintext, so there is nothing to decrypt for.
         if held.meta.sealed_under.is_some() {
             // `NULL` is a cell no arm of this fold has written, since an erased subject
