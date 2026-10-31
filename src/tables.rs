@@ -16,7 +16,7 @@ use anyhow::Context;
 
 use heklang::ir::Type;
 use heklang::value::Defs;
-use heklang::{ArmMatch, Column, KeyPart, Program, Table, layout};
+use heklang::{ArmMatch, Column, Program, Table, layout};
 
 use crate::schema::{FieldKind, FieldMeta, IndexDef, Seal};
 
@@ -214,7 +214,7 @@ fn split(program: &Program, table: &Table, defs: Defs<'_>) -> (Vec<ColumnDef>, V
     let mut scalars = Vec::new();
     let mut collections = Vec::new();
     for column in &table.columns {
-        let def = column_def(program, table, column, defs);
+        let def = column_def(program, column, defs);
         if matches!(def.meta.kind.base(), FieldKind::Json) {
             collections.push(def);
         } else {
@@ -224,15 +224,14 @@ fn split(program: &Program, table: &Table, defs: Defs<'_>) -> (Vec<ColumnDef>, V
     (scalars, collections)
 }
 
-fn column_def(program: &Program, table: &Table, column: &Column, defs: Defs<'_>) -> ColumnDef {
-    // The subject comes off the key rather than being found by type the way an entity's
-    // does: a fold's key says which part keys which subject, so there is nothing to
-    // infer. A seal whose subject is not in the key has no id column to read, which is
-    // what the `None` arm leaves for a store to refuse rather than guess at.
-    let sealed_under = column.ty.subject().and_then(|subject| {
-        id_column(table, subject).map(|id| Seal {
-            chain: vec![(subject.clone(), id)],
-        })
+fn column_def(program: &Program, column: &Column, defs: Defs<'_>) -> ColumnDef {
+    // **Every sealed column is marked, and none names an id column.** A derived cell
+    // carries its own subject id (`fold_store::SealedCell`), because a fold's key need not
+    // hold one: `OrderEmail(order_id, shop_id) -> Sealed(String, Customer)?` is keyed on
+    // an order. Naming the key part only when there is one would leave a reader that looks
+    // the id up in the row working for some columns and silently not for others.
+    let sealed_under = column.ty.subject().map(|subject| Seal {
+        chain: vec![(subject.clone(), String::new())],
     });
     let kind = FieldKind::of(&column.ty, defs);
     ColumnDef {
@@ -248,14 +247,6 @@ fn column_def(program: &Program, table: &Table, column: &Column, defs: Defs<'_>)
             identifies: None,
         },
     }
-}
-
-fn id_column(table: &Table, subject: &str) -> Option<String> {
-    table
-        .key
-        .iter()
-        .find(|part| part.subject.as_deref() == Some(subject))
-        .map(|part: &KeyPart| part.name.clone())
 }
 
 /// One index per distinct set of parts an arm pins while leaving another part open.

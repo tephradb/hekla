@@ -11,11 +11,12 @@
 
 use heklang::host::Columns;
 use heklang::interp::{Error, ErrorKind, key_as_value};
+use heklang::ir::Type;
 use heklang::value::{Defs, Value};
 use heklang::{Key, Program};
 use rusqlite::Transaction;
 
-use crate::fold_store::{FoldStore, stored_text};
+use crate::fold_store::{FoldStore, SealedCell, stored_text};
 use crate::heklang_host::{to_heklang_json, wire_form};
 use crate::tables::{ColumnDef, TableDef, holding, main_of};
 
@@ -55,19 +56,6 @@ impl ColumnWriter<'_> {
 impl Columns for ColumnWriter<'_> {
     fn value(&self, table: &str, key: &[Key], column: &str) -> Result<Option<Value>, Error> {
         let (def, held) = self.cell(table, column)?;
-        // **A sealed column cannot be read back as an accumulator.** The cell holds the
-        // log's own ciphertext, sealed under the *event field's* name, and this does not
-        // record which field that was, so there is nothing to hand an arm that reads it.
-        // No arm in the measured corpus does: a sealed fold replaces rather than
-        // accumulates, because rule 7 makes sealed content cross a signature as its own
-        // type. Loud rather than absent, so the day one does it says so.
-        if held.meta.sealed_under.is_some() {
-            return Err(host_error(format!(
-                "`{table}`.`{column}` holds sealed content, which an arm may write but not \
-                 read back: the cell carries the log's ciphertext and not the field it was \
-                 sealed under"
-            )));
-        }
         let texts = key_texts(def, key)?;
         let found = self
             .store
@@ -76,6 +64,26 @@ impl Columns for ColumnWriter<'_> {
         let Some(stored) = found else {
             return Ok(None);
         };
+        // A sealed cell goes back to the arm as the `Value::Sealed` it was written from,
+        // unopened, which is what `fold_stored` would have handed it: an arm never sees
+        // sealed content as plaintext, so there is nothing to decrypt for.
+        if held.meta.sealed_under.is_some() {
+            // `NULL` is a cell no arm of this fold has written, since an erased subject
+            // still stores its seal, so the seed is the answer.
+            let Some(text) = stored.as_str() else {
+                return Ok(None);
+            };
+            let sealed = SealedCell::parse(text)
+                .map_err(|why| host_error(format!("{why:#}")))?
+                .value();
+            return Ok(Some(match &held.ty {
+                Type::Opt(inner) => Value::Opt {
+                    inner: inner.as_ref().clone(),
+                    value: Some(Box::new(sealed)),
+                },
+                _ => sealed,
+            }));
+        }
         // The same route a projector's row read takes: the stored form back to the wire
         // form, then to the declared type. `column_form` and `wire_form` differ only on a
         // top-level `Timestamp`, and that is exactly the column this would get wrong.

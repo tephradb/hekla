@@ -27,8 +27,9 @@ use anyhow::Context;
 use heklang::value::Value;
 use heklang::{Digest, Json, Kind};
 use rusqlite::{Connection, Transaction};
+use serde::{Deserialize, Serialize};
 
-use crate::heklang_host::{column_form, from_heklang_json};
+use crate::heklang_host::{column_form, from_heklang_json, peeled};
 use crate::read_model::quote_ident;
 use crate::schema::{FieldKind, FieldMeta};
 use crate::tables::{ColumnDef, TableDef};
@@ -238,6 +239,7 @@ impl FoldStore {
         // WAL lets a read run beside the single writer, as a read model's does.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_row| Ok(()))
             .context("enabling WAL")?;
+        reformat(&conn)?;
         conn.execute_batch(INTERNAL_DDL)
             .context("creating the store's internal tables")?;
         let tx = conn.unchecked_transaction()?;
@@ -372,6 +374,46 @@ impl FoldStore {
     }
 }
 
+/// How cells are stored, as `PRAGMA user_version`. Moved whenever a stored cell would read
+/// back differently, which the catalog cannot see: it keys a column by what its fold does,
+/// and a change to how hekla stores the result moves no fold's hash.
+///
+/// 1: a sealed cell is a [`SealedCell`] rather than bare ciphertext.
+const FORMAT: i64 = 1;
+
+/// Empty a store written in another format, so it refolds from the log.
+///
+/// **Rebuilt rather than migrated**, because it can be: a derived store holds nothing the
+/// log does not, which is why a backup leaves it out. Dropping the catalog with the tables
+/// is what makes every column read as `Add`, and the checkpoint coming back at zero is
+/// what makes the follow start from the beginning.
+fn reformat(conn: &Connection) -> anyhow::Result<()> {
+    let at: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if at == FORMAT {
+        return Ok(());
+    }
+    let tables: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !tables.is_empty() {
+        tracing::info!(
+            from = at,
+            to = FORMAT,
+            "the derived tables are stored in another format and will be refolded"
+        );
+    }
+    let tx = conn.unchecked_transaction()?;
+    for table in &tables {
+        tx.execute_batch(&format!("DROP TABLE {}", quote_ident(table)))?;
+    }
+    tx.execute_batch(&format!("PRAGMA user_version = {FORMAT}"))?;
+    tx.commit()
+        .context("emptying a derived store of another format")
+}
+
 /// `ALTER TABLE ... ADD COLUMN`, but only when SQLite does not already have it.
 ///
 /// Idempotent against the real schema rather than against the catalog, because
@@ -432,19 +474,76 @@ fn nullable(meta: &FieldMeta) -> bool {
     meta.is_nullable() || meta.sealed_under.is_some()
 }
 
-/// One value as the column stores it, or `None` for a value the column holds as `NULL`.
+/// A sealed cell at rest: the log's own ciphertext, and what it takes to open it.
 ///
-/// **A sealed column holds the log's own ciphertext, verbatim.** `fold_stored` hands back
-/// the `Value::Sealed` the log sealed at append time, and this keeps it rather than
-/// opening it and re-sealing under the column's name the way a projector's `put` does. So
-/// the column really is the bytes the log holds, an erasure makes it unreadable with no
-/// pass over the store, and the read side has to decrypt under the **event field's** name
-/// that the `Value::Sealed` carries rather than under the column's. A projector re-seals
-/// because a handler may move content between columns; a fold arm cannot, so there is
-/// nothing to re-seal for.
+/// **Not re-sealed under the column's name the way a projector's `put` does**, for two
+/// reasons. A projector re-seals under its row's subject column, and a fold's key need
+/// not have one: `OrderEmail` is keyed on an order and sealed under a customer, so the
+/// id has to ride in the cell or nothing could ever open it. And keeping the log's bytes
+/// means a write never touches a key, so a rebuild after an erasure cannot re-mint the
+/// key it destroyed, and the erasure makes the cell unreadable with no pass over the
+/// store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedCell {
+    pub subject: String,
+    pub id: String,
+    /// The event field the content was sealed under, which the key store binds into the
+    /// ciphertext, so it is the name a read decrypts under rather than the column's.
+    pub field: String,
+    pub sealed: String,
+}
+
+impl SealedCell {
+    /// The stored text of a value bound for a sealed column: `Some(None)` for an absent
+    /// optional, which is `NULL`, and `None` for anything that is not a seal.
+    pub(crate) fn text(value: &Value) -> Option<Option<String>> {
+        // Borrowed, so a write in the hot path serializes straight off the value.
+        #[derive(Serialize)]
+        struct Borrowed<'a> {
+            subject: &'a str,
+            id: &'a str,
+            field: &'a str,
+            sealed: &'a str,
+        }
+        match peeled(value) {
+            Value::Opt { value: None, .. } => Some(None),
+            Value::Sealed {
+                field,
+                subject,
+                id,
+                content,
+            } => Some(Some(
+                serde_json::to_string(&Borrowed {
+                    subject,
+                    id,
+                    field,
+                    sealed: content,
+                })
+                .expect("four strings serialize"),
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn parse(text: &str) -> anyhow::Result<SealedCell> {
+        serde_json::from_str(text).context("a sealed derived cell that is not one")
+    }
+
+    /// The cell as the value `fold_stored` handed the store, so an arm reading it back
+    /// sees exactly what it wrote.
+    pub fn value(self) -> Value {
+        Value::Sealed {
+            field: self.field,
+            subject: self.subject,
+            id: self.id,
+            content: self.sealed.into(),
+        }
+    }
+}
+
+/// One value as the column stores it, or `None` for a value the column holds as `NULL`.
 pub(crate) fn stored_text(kind: &FieldKind, value: &Value) -> Option<String> {
     match value {
-        Value::Sealed { content, .. } => Some(content.to_string()),
         Value::Opt { value: held, .. } => held.as_ref().and_then(|held| stored_text(kind, held)),
         other => match column_form(kind, from_heklang_json(&Json::from_value(other))) {
             serde_json::Value::Null => None,
@@ -485,9 +584,24 @@ impl FoldStore {
             binds.push(rusqlite::types::Value::Integer(0));
         }
         names.push(quote_ident(&column.name));
-        binds.push(match stored_text(&column.meta.kind, value) {
-            Some(text) => crate::read_model::coerce_value(&column.meta.kind, &text)?,
-            None => rusqlite::types::Value::Null,
+        binds.push(if column.meta.sealed_under.is_some() {
+            match SealedCell::text(value) {
+                Some(Some(text)) => rusqlite::types::Value::Text(text),
+                Some(None) => rusqlite::types::Value::Null,
+                // Plaintext in a sealed column would be personal data stored in the clear,
+                // and heklang's parse-time rule is what keeps it from happening, so this is
+                // the backstop rather than a case.
+                None => anyhow::bail!(
+                    "`{}`.`{}` is sealed and was handed plaintext to store",
+                    table.name,
+                    column.name
+                ),
+            }
+        } else {
+            match stored_text(&column.meta.kind, value) {
+                Some(text) => crate::read_model::coerce_value(&column.meta.kind, &text)?,
+                None => rusqlite::types::Value::Null,
+            }
         });
         let holders: Vec<String> = (1..=names.len()).map(|at| format!("?{at}")).collect();
         let conflict: Vec<String> = if table.key.is_empty() {

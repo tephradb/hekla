@@ -3358,6 +3358,78 @@ Honest scope:
   nothing for them. Phase 40's `hekla adopt` does not help either, since it moves a row's *wrapping*
   and not its name. Rewriting a namespace after the fact is a different tool and is not built.
 
+## Phase 42: a named fold is kept as a column, for every key (done)
+
+heklang's `named-folds` work made a named fold a read model by declaration: its parameters are its
+key, folds sharing a key signature share a table, and `heklang::layout` derives the tables. hekla
+kept none of them. This phase is the store that makes the declaration mean something, built to the
+four obligations of `stored-folds-handoff.md` section 5 (beside this repository): one table per key
+signature, one row per key, one column per fold; collection-typed folds in a side table from the
+start; maintenance per fold, so changing one fold rebuilds one column; every column of a table at
+one log position.
+
+- **`src/tables.rs`** is `heklang::Layout` as SQLite, and nothing else derives a table. A key part
+  is a key column under a trailing composite `PRIMARY KEY`, a keyless fold is one row pinned by a
+  `CHECK`, a `FieldKind::Json` column goes to `_side_{table}`, and an arm that leaves a key part
+  `Open` gets the index its range update needs. `hekla check --tables` prints it, and agrees with
+  `hek check --tables` because both come out of `layout`.
+- **`src/fold_store.rs`** is `data/tables.db`: one `_hekla_checkpoint` for the whole file and one
+  `_hekla_column` catalog row per column, keyed by the fold's digest entry hash. Every named fold
+  earns a `Kind::Fold` entry in heklang (`hek-digest 6`), because the digest is the one source of
+  every hash hekla records. The reconcile is a pure function over two catalogs, so `hekla plan`
+  forecasts it without a second copy.
+- **`src/fold_sink.rs` and `src/fold_runtime.rs`** follow the log. heklang's `Tables::apply` applies
+  one record to the value already in a column, through `host::Columns`, so a batch costs one pass
+  over itself rather than one fold over the log per key it touches. A column a deploy added is
+  backfilled through `Interpreter::fold_stored` before the store serves anything.
+
+Decisions worth keeping:
+
+- **The store's checkpoint is a head, a log length, throughout.** `fold_stored` takes one, and the
+  first version passed a last position and silently got seeds. Keeping one unit means no call site
+  subtracts one.
+- **A column's `DEFAULT` is its fold's seed, and the seed is recorded in the catalog.** A key minted
+  by one fold's arm holds every other column's seed, which is what folding them would return. SQLite
+  cannot alter a default, so a seed-only edit is a reshape, not a refold.
+- **Only a column already at the previous checkpoint may advance.** A column a deploy added holds
+  its seed; advancing it because a batch wrote a handful of its keys would hide it from the backfill
+  forever.
+- **The subscription comes from `Tables::query`.** The first thread spelled event types with the
+  `@` sigil, matched nothing, advanced its checkpoint over every batch, and reported itself caught
+  up. Only an end-to-end test asserting a real row caught it.
+- **A sealed cell keeps the log's own ciphertext, wrapped with the subject, the id and the field it
+  was sealed under** (`fold_store::SealedCell`). Re-sealing under the column's name, as a projector
+  does, needs a subject id in the row, and four of the ported application's seven sealed columns
+  are keyed on an order and sealed under a customer. Keeping the log's bytes also means a write
+  never touches a key, so a rebuild after an erasure cannot re-mint the key it destroyed.
+
+Honest scope:
+
+- **The store is invisible from outside** until Phase 43: `/status` reports how far behind it is
+  and nothing reads it.
+- **hekla depends on heklang by path** until heklang `0.12.0` is cut, so this branch cannot pass CI.
+- **`verify` has no fold-store equivalence check**, the counterpart of `rebuild_equivalence`.
+
+## Phase 43: the derived tables are served, and shown (in progress)
+
+What Phase 42 stores, an application can now read and an operator can see.
+
+- **`GET /tables/{table}`** lists rows in key order, filtered by leading key parts and paged by a
+  cursor over the key. **`GET /tables/{table}/{part}/...`** reads one row. Both merge the side
+  table's collection columns into the row, open sealed cells under the key store, and report the
+  position read at. A store with a column still backfilling answers `503`, as an unready projector
+  does.
+- **The namespace is `/tables/` and not `/read/`**, because a derived table belongs to no projector
+  and its name is already unique: `layout` made it so, and it is the name `hekla check --tables` and
+  `/status` print.
+- **Each table is in the OpenAPI document**, with its key parts as path parameters and its columns
+  typed from their folds.
+- **The console gains a Tables view**: every table with its row count and how far behind it is,
+  its rows, and one row with each column named for its fold.
+
+Not in this phase: filtering or sorting on a non-key column, which waits on how a fold declares an
+index (design section 7), and the console's time slider (design section 11).
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

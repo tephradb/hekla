@@ -1395,7 +1395,7 @@ fn plaintext_scalar(value: &Value) -> Option<String> {
 }
 
 /// The value inside an optional, since `Opt` is outermost around a seal.
-fn peeled(value: &Value) -> &Value {
+pub(crate) fn peeled(value: &Value) -> &Value {
     match value {
         Value::Opt {
             value: Some(held), ..

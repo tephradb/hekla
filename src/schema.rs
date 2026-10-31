@@ -204,6 +204,9 @@ impl Seal {
     }
 
     /// The sibling field or column holding this row's id for that subject: `buyer`.
+    ///
+    /// Empty for a derived table's column, whose cell carries its own id
+    /// (`fold_store::SealedCell`) because a fold's key need not hold one.
     pub fn id_field(&self) -> &str {
         &self.chain[0].1
     }

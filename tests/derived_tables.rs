@@ -901,3 +901,150 @@ fn a_column_whose_fold_has_no_digest_entry_is_loud() {
         "the message names the cause: {why}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sealed columns
+// ---------------------------------------------------------------------------
+
+use hekla::fold_store::SealedCell;
+
+/// Keyed on an order and sealed under a customer, which is the shape four of the ported
+/// application's sealed columns have: no column of the row is a customer id.
+const CONTACT: &str = "subject Customer(Int)
+
+event @order.contact.recorded { order_id: Int, customer_id: Customer, email: String? @subject(customer_id) }
+event @order.contact.touched { order_id: Int }
+
+fold OrderEmail(order_id: Int) -> held: Sealed(String, Customer)? = none {
+  on @order.contact.recorded(order_id) { email } => email
+  on @order.contact.touched(order_id) => held
+}
+";
+
+fn contact(order: i64, sealed: Value) -> Event {
+    Event::new(
+        EventPath::new(["order", "contact", "recorded"]),
+        [
+            ("order_id".to_owned(), Value::Int(order)),
+            ("customer_id".to_owned(), Value::Int(42)),
+            ("email".to_owned(), sealed),
+        ],
+    )
+}
+
+fn sealed_email() -> Value {
+    Value::Opt {
+        inner: heklang::ir::Type::String,
+        value: Some(Box::new(Value::Sealed {
+            field: "email".to_owned(),
+            subject: "Customer".to_owned(),
+            id: "42".to_owned(),
+            content: "ciphertext".into(),
+        })),
+    }
+}
+
+/// **A sealed cell carries what opens it.** The row is an order's, so the customer id has
+/// to ride in the cell, and the field it was sealed under has to too, since the key store
+/// binds that name into the ciphertext. Then an arm that reads the column back gets the
+/// same seal it wrote, rather than the refusal it used to.
+#[test]
+fn a_sealed_column_keyed_off_its_subject_keeps_what_opens_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(CONTACT);
+    let digest = Digest::of(&program);
+    let tables = TableDef::all(&program);
+    let path = dir.path().join("tables.db");
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&digest, &tables).unwrap();
+
+    let touched = Event::new(
+        EventPath::new(["order", "contact", "touched"]),
+        [("order_id".to_owned(), Value::Int(1))],
+    );
+    let mut interpreter = Interpreter::new(&program);
+    let records = appended(&mut interpreter, vec![contact(1, sealed_email()), touched]);
+    apply_batch(&store, &program, &tables, &records, 2).expect("a sealed write and its read back");
+
+    let conn = Connection::open(&path).unwrap();
+    let stored = cell(
+        &conn,
+        "SELECT \"order_email\" FROM \"order\" WHERE \"order\" = 1",
+    )
+    .expect("the column holds the seal");
+    assert_eq!(
+        SealedCell::parse(&stored).unwrap(),
+        SealedCell {
+            subject: "Customer".to_owned(),
+            id: "42".to_owned(),
+            field: "email".to_owned(),
+            sealed: "ciphertext".to_owned(),
+        }
+    );
+}
+
+/// Plaintext in a sealed column would be personal data at rest in the clear, and nothing
+/// would ever erase it. heklang seals an arm's value before it reaches a host, so this is
+/// the store's own backstop, written to directly.
+#[test]
+fn a_sealed_column_refuses_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(CONTACT);
+    let tables = TableDef::all(&program);
+    let store = FoldStore::open(&dir.path().join("tables.db"), &tables).unwrap();
+    store.apply(&Digest::of(&program), &tables).unwrap();
+    let table = &tables[0];
+    let column = &table.columns[0];
+
+    let plain = Value::Opt {
+        inner: heklang::ir::Type::String,
+        value: Some(Box::new(Value::str("ann@example.com"))),
+    };
+    let tx = store.begin().unwrap();
+    let why = store
+        .write(&tx, table, &["1".to_owned()], column, &plain)
+        .expect_err("refused");
+    assert!(format!("{why:#}").contains("handed plaintext"), "{why:#}");
+    store
+        .write(&tx, table, &["1".to_owned()], column, &sealed_email())
+        .expect("a seal is what the column holds");
+}
+
+/// A store written before sealed cells were wrapped holds bare ciphertext that reads back
+/// as nothing, and no fold's hash moved to say so. The format version is what does, and
+/// the answer is to refold from the log rather than to read the old cells.
+#[test]
+fn a_store_in_another_format_is_emptied_and_refolded() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(CONTACT);
+    let digest = Digest::of(&program);
+    let tables = TableDef::all(&program);
+    let path = dir.path().join("tables.db");
+    {
+        let store = FoldStore::open(&path, &tables).unwrap();
+        store.apply(&digest, &tables).unwrap();
+        let mut interpreter = Interpreter::new(&program);
+        let records = appended(&mut interpreter, vec![contact(1, sealed_email())]);
+        apply_batch(&store, &program, &tables, &records, 1).unwrap();
+    }
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA user_version = 0").unwrap();
+    drop(conn);
+
+    let store = FoldStore::open(&path, &tables).unwrap();
+    assert_eq!(
+        store.read_checkpoint().unwrap(),
+        0,
+        "it follows from the start"
+    );
+    let changes = store.apply(&digest, &tables).unwrap();
+    assert!(
+        changes.iter().all(|change| change.verdict == Verdict::Add),
+        "every column is new again: {changes:?}"
+    );
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(&conn, "SELECT CAST(COUNT(*) AS TEXT) FROM \"order\""),
+        Some("0".to_owned())
+    );
+}
