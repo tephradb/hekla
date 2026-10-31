@@ -184,6 +184,29 @@ export const api = {
       { signal },
     ),
 
+  tables: (signal) => request('/admin/tables', { signal }),
+
+  table: (name, { counts = false } = {}, signal) =>
+    request(`/admin/tables/${encodeURIComponent(name)}`, {
+      signal,
+      params: [['counts', String(counts)]],
+    }),
+
+  /* Through the public tables API, as `rows` goes through the projector read API. A
+   * filter is a parameter named after a key part, and `hekla check` refuses a key part
+   * named like one of the control parameters, so this cannot shadow one. */
+  tableRows: (name, { filters = [], cursor, limit } = {}, signal) =>
+    request(`/tables/${encodeURIComponent(name)}`, {
+      signal,
+      params: [...filters, ['cursor', cursor], ['limit', limit]],
+    }),
+
+  tableRow: (name, key, signal) =>
+    request(`/tables/${encodeURIComponent(name)}/row`, {
+      signal,
+      params: key.map(([part, value]) => [part, String(value)]),
+    }),
+
   commands: (signal) => request('/admin/commands', { signal }),
   command: (name, signal) => request(`/admin/commands/${encodeURIComponent(name)}`, { signal }),
 

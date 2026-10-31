@@ -100,6 +100,36 @@ not_found` with the message `no such row`. Unknown entity or projector: `404 not
 
 `next_cursor` is `null` on the last page. Pagination is cursor-based over the ordering, never offset.
 
+## `GET /tables/{table}` and `GET /tables/{table}/row`
+
+A named fold is kept as a column of a **derived table**, one row per key, with no projector to write
+it. `hekla check --tables <dir>` prints every table: its name, its key parts, and the fold behind
+each column. `fold OwnerTickets(org_id: Org, owner_id: Owner)` lives in `org__owner`, keyed on `org`
+and `owner` (a parameter's trailing `_id` is dropped).
+
+```
+GET /tables/org__owner/row?org=1&owner=10
+{ "item": { "org": 1, "owner": 10, "owner_tickets": 2 }, "position": 7 }
+
+GET /tables/org__owner?org=1&limit=50
+{ "items": [ ... ], "next_cursor": "eyJ0Ijoi...", "position": 7 }
+```
+
+| Query parameter | Means |
+| --- | --- |
+| `<part>=<value>` | a row read needs **every** key part; a scan takes the **leading** parts of the key, or of an index a range arm derived |
+| `limit`, `cursor` | as on `/read`; the cursor is over the whole key and only valid for its own table |
+| `after`, `timeout_ms` | wait for the derived tables to reach a position, as on `/read` |
+
+- A row is every fold's value for its key, collections included (they are stored in a side table and
+  joined back), sealed columns opened. A NULL or an erased seal is left out, as on `/read`.
+- `404 not_found` on a row read means no event has named that key, so every column would read its
+  fold's seed.
+- `503 rebuilding` while any column a deploy changed is still being folded, or while the store is
+  folding from empty over an existing log. Every table is served or none is: they share one position.
+- A malformed key part, a part that is not a key part, or a cursor from elsewhere is `400
+  invalid_input`; a filter that skips a leading part is `400 unindexed_filter`.
+
 ## Ordering a scan
 
 Index names are generated from their columns, so `index (shop_id, status, month)` is

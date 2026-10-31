@@ -377,3 +377,14 @@ pub fn main_of<'a>(tables: &'a [TableDef], source: &str) -> Option<&'a TableDef>
         .iter()
         .find(|table| table.source == source && table.name == source)
 }
+
+/// The side table of a key signature, which holds its collection columns, if it has any.
+///
+/// The one place that knows how a main table finds its side: the served row, the OpenAPI
+/// document and the console all join the two, and three copies of the rule would be three
+/// chances for them to disagree about which columns a row has.
+pub fn side_of<'a>(tables: &'a [TableDef], main: &TableDef) -> Option<&'a TableDef> {
+    tables
+        .iter()
+        .find(|table| table.source == main.name && table.name != main.name)
+}

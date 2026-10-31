@@ -86,6 +86,7 @@ const EFFECT_PROGRESS: &str = "hekla_effect_last_progress_timestamp_seconds";
 const EFFECT_HTTP: &str = "hekla_effect_http_requests_total";
 const READS: &str = "hekla_reads_total";
 const READ_WAITS: &str = "hekla_read_waits_total";
+const TABLE_READS: &str = "hekla_table_reads_total";
 
 /// Every `CommandOutcome` variant, plus the `error` the 500 paths report. Enumerated so
 /// [`refresh`] can zero them; the recorder takes whichever one happened.
@@ -275,6 +276,10 @@ fn describe() {
     describe_counter!(
         READ_WAITS,
         "Read-your-writes waits, by projector and whether the projector arrived in time."
+    );
+    describe_counter!(
+        TABLE_READS,
+        "Derived-table read requests, by table and outcome."
     );
 }
 
@@ -486,6 +491,12 @@ pub fn read_wait(projector: &str, outcome: &'static str) {
 pub fn fold_batch(columns: usize) {
     counter!("hekla_fold_batches_total").increment(1);
     counter!("hekla_fold_columns_total").increment(columns as u64);
+}
+
+/// One `GET /tables/...` request. The table label is a declared table, never what the URL
+/// carried: a request for a table that does not exist is not counted.
+pub fn table_read(table: &str, outcome: &'static str) {
+    counter!(TABLE_READS, "table" => table.to_owned(), "outcome" => outcome).increment(1);
 }
 
 #[cfg(test)]

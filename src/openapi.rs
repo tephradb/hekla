@@ -31,11 +31,13 @@ use crate::read_api;
 use crate::read_model::key_kind;
 use crate::schema::{EntityDef, EventDef, FieldKind, FieldMeta, InputSchema, ModuleDef};
 use crate::server::{self, READ_WAIT_DEFAULT, READ_WAIT_MAX};
+use crate::tables::{ColumnDef, TableDef};
 use crate::ui;
 
 const COMMANDS_TAG: &str = "commands";
 const OPERATIONS_TAG: &str = "operations";
 const INTROSPECTION_TAG: &str = "introspection";
+const TABLES_TAG: &str = "tables";
 
 // ---------------------------------------------------------------------------
 // The surface
@@ -59,6 +61,9 @@ pub struct Surface<'a> {
     pub projectors: Vec<ProjectorSurface<'a>>,
     pub effects: Vec<EffectSurface<'a>>,
     pub events: Vec<(&'a str, &'a EventDef)>,
+    /// The derived tables a reader can name, each with the side table its collections
+    /// live in, since the served row joins the two.
+    pub tables: Vec<TableSurface>,
 }
 
 pub struct ProjectorSurface<'a> {
@@ -66,6 +71,21 @@ pub struct ProjectorSurface<'a> {
     pub entities: &'a [EntityDef],
     /// The event types it subscribes to.
     pub sources: Vec<&'a str>,
+}
+
+pub struct TableSurface {
+    pub main: TableDef,
+    pub side: Option<TableDef>,
+}
+
+impl TableSurface {
+    /// Every column of a served row, the side table's collections included.
+    fn columns(&self) -> impl Iterator<Item = &ColumnDef> {
+        self.main
+            .columns
+            .iter()
+            .chain(self.side.iter().flat_map(|side| side.columns.iter()))
+    }
 }
 
 pub struct EffectSurface<'a> {
@@ -124,13 +144,27 @@ impl<'a> Surface<'a> {
             .collect();
         events.sort_by_key(|(event_type, _)| *event_type);
 
+        let all = TableDef::all(&project.program);
+        let mut tables: Vec<TableSurface> = crate::table_read::readable(&all)
+            .map(|main| TableSurface {
+                main: main.clone(),
+                side: crate::tables::side_of(&all, main).cloned(),
+            })
+            .collect();
+        tables.sort_by(|one, two| one.main.name.cmp(&two.main.name));
+
         Surface {
             commands,
             all_command_names,
             projectors,
             effects,
             events,
+            tables,
         }
+    }
+
+    fn table_names(&self) -> Vec<&str> {
+        self.tables.iter().map(|t| t.main.name.as_str()).collect()
     }
 
     fn projector_names(&self) -> Vec<&str> {
@@ -209,6 +243,16 @@ pub fn build(surface: &Surface) -> Value {
             );
         }
     }
+    for table in &surface.tables {
+        paths.insert(
+            format!("/tables/{}", table.main.name),
+            table_scan_path(table, &names),
+        );
+        paths.insert(
+            format!("/tables/{}/row", table.main.name),
+            table_row_path(table, &names),
+        );
+    }
     for (path, item) in operation_paths(surface) {
         paths.insert(path, item);
     }
@@ -242,6 +286,7 @@ pub fn build(surface: &Surface) -> Value {
 struct ComponentNames {
     events: HashMap<String, String>,
     entities: HashMap<(String, String), String>,
+    tables: HashMap<String, String>,
 }
 
 impl ComponentNames {
@@ -280,11 +325,24 @@ impl ComponentNames {
                 entities.insert((projector.name.to_owned(), entity.name.clone()), key);
             }
         }
-        ComponentNames { events, entities }
+        let mut tables = HashMap::new();
+        for table in &surface.tables {
+            let key = claim(format!("table.{}", component_name(&table.main.name)));
+            tables.insert(table.main.name.clone(), key);
+        }
+        ComponentNames {
+            events,
+            entities,
+            tables,
+        }
     }
 
     fn event(&self, event_type: &str) -> &str {
         &self.events[event_type]
+    }
+
+    fn table(&self, table: &str) -> &str {
+        &self.tables[table]
     }
 
     fn entity(&self, projector: &str, entity: &str) -> &str {
@@ -293,7 +351,7 @@ impl ComponentNames {
 }
 
 /// The schemas that are always present, whatever the project declares.
-const FIXED_SCHEMAS: [&str; 29] = [
+const FIXED_SCHEMAS: [&str; 30] = [
     "ErrorDetail",
     "Error",
     "CommandError",
@@ -315,6 +373,7 @@ const FIXED_SCHEMAS: [&str; 29] = [
     "EventDetail",
     "EntityDetail",
     "ProjectorDetail",
+    "TableDetail",
     "DeclarationSummary",
     "SystemInfo",
     "SubjectEntry",
@@ -393,6 +452,12 @@ fn tags(surface: &Surface) -> Value {
         out.push(json!({
             "name": read_tag(projector.name),
             "description": projector_tag_description(projector),
+        }));
+    }
+    if !surface.tables.is_empty() {
+        out.push(json!({
+            "name": TABLES_TAG,
+            "description": TABLES_TAG_DESCRIPTION,
         }));
     }
     out.push(json!({
@@ -570,6 +635,239 @@ fn read_unavailable_response() -> Value {
         );
     }
     response
+}
+
+const TABLES_TAG_DESCRIPTION: &str = "\
+The derived tables: every storable named fold, kept for every key. A table is one key \
+signature, a row is one key, and a column is one fold's value for it. No projector \
+writes them; they follow the log on their own, every table at one position, so a row is \
+never half updated and two tables are never read at different points. A column a deploy \
+changed is refolded before any table is served again.";
+
+const TABLE_READ_YOUR_WRITES: &str = "\
+Pass `after` with the `positions.last` a command returned to block until the derived \
+tables have caught up to that position. Without it the read is served immediately and \
+may be behind the log.";
+
+const TABLE_UNAVAILABLE: &str = "\
+the derived tables cannot be served right now. `error.code` says which: `rebuilding` (a \
+column a deploy added or changed is being folded from the log, or the store is folding \
+from an empty start over a log that already has events), `not_caught_up` (an `after` \
+wait timed out), or `not_served` (this process keeps no derived tables, as a read-only \
+follower does not). The first two resolve on their own and carry a `Retry-After`.";
+
+fn table_unavailable_response() -> Value {
+    let mut response = response(TABLE_UNAVAILABLE, schema_ref("Error"));
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "headers".to_owned(),
+            json!({
+                "Retry-After": {
+                    "description": "Seconds to wait before retrying. Absent for `not_served`, \
+                        which no wait resolves.",
+                    "required": false,
+                    "schema": { "type": "integer", "minimum": 0 },
+                },
+            }),
+        );
+    }
+    response
+}
+
+/// The key parts a table's filters and row reads name, as the query parameters they are.
+fn key_params(table: &TableDef, required: bool) -> Vec<Value> {
+    table
+        .key
+        .iter()
+        .map(|(name, meta)| {
+            let mut param = query_param(
+                name,
+                &format!(
+                    "The `{name}` part of the key{}.",
+                    meta.identifies
+                        .as_deref()
+                        .map(|subject| format!(", a `{subject}` id"))
+                        .unwrap_or_default()
+                ),
+                field_schema(&meta.kind),
+            );
+            param["required"] = json!(required);
+            param
+        })
+        .collect()
+}
+
+fn key_list(table: &TableDef) -> String {
+    let parts: Vec<String> = table
+        .key
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect();
+    if parts.is_empty() {
+        "nothing, so it holds one row".to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
+    let name = &table.main.name;
+    let mut parameters = vec![
+        query_param(
+            "limit",
+            &format!(
+                "Page size. Defaults to {}; a larger value is capped at {}.",
+                read_api::DEFAULT_LIMIT,
+                read_api::MAX_LIMIT,
+            ),
+            json!({ "type": "integer", "minimum": 1, "default": read_api::DEFAULT_LIMIT }),
+        ),
+        query_param(
+            "cursor",
+            "An opaque forward cursor from a previous page's `next_cursor`. Pagination is \
+             by key, never by offset.",
+            json!({ "type": "string" }),
+        ),
+    ];
+    parameters.extend(key_params(&table.main, false));
+    parameters.extend(wait_params());
+    let indexes: Vec<String> = table
+        .main
+        .indexes
+        .iter()
+        .map(|index| format!("({})", index.columns.join(", ")))
+        .collect();
+    let page = json!({
+        "type": "object",
+        "properties": {
+            "items": { "type": "array", "items": schema_ref(names.table(name)) },
+            "next_cursor": {
+                "type": ["string", "null"],
+                "description": "Pass as `cursor` for the next page. Null on the last page.",
+            },
+            "position": position_schema("The derived tables' log position, read in the same snapshot as the rows."),
+        },
+        "required": ["items", "next_cursor", "position"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [TABLES_TAG],
+            "operationId": format!("scan_table_{}", identifier(name)),
+            "summary": format!("scan the `{name}` table"),
+            "description": format!(
+                "The rows of `{name}`, keyed on {}, in key order and cursor-paginated. A \
+                 filter is equality on the leading parts of the key{}; anything else would be \
+                 a table scan, so it is a 400 rather than a slow query. {TABLE_READ_YOUR_WRITES}",
+                key_list(&table.main),
+                if indexes.is_empty() {
+                    String::new()
+                } else {
+                    format!(", or of an index a range arm derived: {}", indexes.join(", "))
+                },
+            ),
+            "parameters": parameters,
+            "responses": {
+                "200": response("one page of rows, and the position they were read at", page),
+                "400": response(
+                    "a malformed parameter, or a filter no index can serve",
+                    schema_ref("Error"),
+                ),
+                "404": response("no such table", schema_ref("Error")),
+                "503": table_unavailable_response(),
+                "500": response("internal error", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn table_row_path(table: &TableSurface, names: &ComponentNames) -> Value {
+    let name = &table.main.name;
+    let mut parameters = key_params(&table.main, true);
+    parameters.extend(wait_params());
+    let item = json!({
+        "type": "object",
+        "properties": {
+            "item": schema_ref(names.table(name)),
+            "position": position_schema("The derived tables' log position, read in the same snapshot as the row."),
+        },
+        "required": ["item", "position"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [TABLES_TAG],
+            "operationId": format!("read_table_{}", identifier(name)),
+            "summary": format!("read one `{name}` row by its key"),
+            "description": format!(
+                "The row whose key is {}, every part given. {TABLE_READ_YOUR_WRITES}",
+                key_list(&table.main),
+            ),
+            "parameters": parameters,
+            "responses": {
+                "200": response("the row, and the position it was read at", item),
+                "400": response(
+                    "a key part is missing or malformed",
+                    schema_ref("Error"),
+                ),
+                "404": response(
+                    "no such table, or no event has named this key, so every column would \
+                     hold its fold's seed",
+                    schema_ref("Error"),
+                ),
+                "503": table_unavailable_response(),
+                "500": response("internal error", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+/// A served row of a derived table: its key parts, then one property per fold.
+fn table_schema(table: &TableSurface) -> Value {
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    for (name, meta) in &table.main.key {
+        let mut schema = field_schema(&meta.kind);
+        schema["description"] = json!("A part of the row's key.");
+        if let Some(subject) = &meta.identifies {
+            schema["x-hekla-identifies"] = json!(subject);
+        }
+        properties.insert(name.clone(), schema);
+        required.push(json!(name));
+    }
+    for column in table.columns() {
+        let mut schema = field_schema(&column.meta.kind);
+        let mut notes = vec![format!(
+            "The value of the `{}` fold for this key.",
+            column.fold
+        )];
+        if let Some(subject) = column.meta.subject() {
+            notes.push(format!(
+                "Sealed under `{subject}`: absent once that subject is erased."
+            ));
+            schema["x-hekla-subject"] = json!(subject);
+        }
+        schema["description"] = json!(notes.join(" "));
+        schema["x-hekla-fold"] = json!(column.fold);
+        properties.insert(column.name.clone(), schema);
+        // A NULL column is left out of a row, and so is a sealed one whose subject is
+        // gone, so neither can be required.
+        if !column.meta.kind.is_nullable() && column.meta.sealed_under.is_none() {
+            required.push(json!(column.name));
+        }
+    }
+    json!({
+        "type": "object",
+        "title": table.main.name,
+        "description": format!(
+            "A row of the derived table `{}`, keyed on {}.",
+            table.main.name,
+            key_list(&table.main)
+        ),
+        "properties": Value::Object(properties),
+        "required": required,
+        "additionalProperties": false,
+    })
 }
 
 fn get_one_path(projector: &ProjectorSurface, entity: &EntityDef, names: &ComponentNames) -> Value {
@@ -1116,6 +1414,11 @@ fn introspection_paths(surface: &Surface) -> Vec<(String, Value)> {
         (
             server::ADMIN_PROJECTOR_ROUTE.to_owned(),
             projector_path(&projectors),
+        ),
+        (server::ADMIN_TABLES_ROUTE.to_owned(), tables_path()),
+        (
+            server::ADMIN_TABLE_ROUTE.to_owned(),
+            table_path(&surface.table_names()),
         ),
         (server::ADMIN_COMMANDS_ROUTE.to_owned(), commands_path()),
         (
@@ -1738,6 +2041,127 @@ fn projector_path(projectors: &[&str]) -> Value {
     })
 }
 
+fn tables_path() -> Value {
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "tables": { "type": "array", "items": schema_ref("TableDetail") },
+            "head": position_schema("The one position every column of every table is folded to."),
+            "log_head": position_schema("The log's head position."),
+            "behind": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Columns a deploy added or changed that are still being \
+                    folded from the log.",
+            },
+            "serving": {
+                "type": "boolean",
+                "description": "Whether `/tables` answers. False while a column is behind, \
+                    while the store is folding from an empty start over a log that already \
+                    has events, and on a process that keeps no derived tables.",
+            },
+            "running": { "type": "boolean" },
+            "last_error": { "type": ["string", "null"] },
+        },
+        "required": ["tables", "head", "log_head", "behind", "serving", "running", "last_error"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "list_tables",
+            "summary": "every derived table and the store's one position",
+            "description": "Reads no table, so each table's `rows` is null here. Ask for one \
+                table to count it.",
+            "responses": { "200": response("every derived table", body) },
+        }
+    })
+}
+
+fn table_path(tables: &[&str]) -> Value {
+    json!({
+        "get": {
+            "tags": [INTROSPECTION_TAG],
+            "operationId": "get_table",
+            "summary": "one derived table, its key and the fold behind every column",
+            "parameters": [
+                path_param("name", "The table.", name_schema(tables)),
+                query_param(
+                    "counts",
+                    "Include the row count (default `false`). Opt-in because a count is a \
+                     scan of the whole table.",
+                    json!({ "type": "boolean", "default": false }),
+                ),
+            ],
+            "responses": {
+                "200": response("the table", schema_ref("TableDetail")),
+                "400": response("a malformed `counts`", schema_ref("Error")),
+                "404": response("no such table", schema_ref("Error")),
+                "500": response("the store could not be read", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn table_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "A derived table: one key signature, one row per key, one column \
+            per fold.",
+        "properties": {
+            "name": { "type": "string" },
+            "key": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "kind": { "type": "string" },
+                        "identifies": { "type": ["string", "null"] },
+                    },
+                    "required": ["name", "kind", "identifies"],
+                    "additionalProperties": false,
+                },
+            },
+            "columns": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "fold": { "type": "string" },
+                        "kind": { "type": "string" },
+                        "optional": { "type": "boolean" },
+                        "subject": { "type": ["string", "null"] },
+                        "collection": {
+                            "type": "boolean",
+                            "description": "Stored in the table's side table, and joined \
+                                back into every row served.",
+                        },
+                    },
+                    "required": ["name", "fold", "kind", "optional", "subject", "collection"],
+                    "additionalProperties": false,
+                },
+            },
+            "indexes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "columns": { "type": "array", "items": { "type": "string" } },
+                    },
+                    "required": ["name", "columns"],
+                    "additionalProperties": false,
+                },
+            },
+            "rows": { "type": ["integer", "null"], "minimum": 0 },
+        },
+        "required": ["name", "key", "columns", "indexes", "rows"],
+        "additionalProperties": false,
+    })
+}
+
 fn commands_path() -> Value {
     let body = json!({
         "type": "object",
@@ -1987,6 +2411,12 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("Status".to_owned(), status_schema());
     out.insert("ProjectorStatus".to_owned(), projector_status_schema());
     out.insert("TableStatus".to_owned(), table_status_schema());
+    for table in &surface.tables {
+        out.insert(
+            names.table(&table.main.name).to_owned(),
+            table_schema(table),
+        );
+    }
     out.insert("EffectStatus".to_owned(), effect_status_schema());
     out.insert("LogEvent".to_owned(), log_event_schema());
     out.insert("SubjectState".to_owned(), subject_state_schema());
@@ -2003,6 +2433,7 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("EventDetail".to_owned(), event_detail_schema());
     out.insert("EntityDetail".to_owned(), entity_detail_schema());
     out.insert("ProjectorDetail".to_owned(), projector_detail_schema());
+    out.insert("TableDetail".to_owned(), table_detail_schema());
     out.insert(
         "DeclarationSummary".to_owned(),
         declaration_summary_schema(),
@@ -2504,12 +2935,17 @@ fn table_status_schema() -> Value {
                 "type": "integer",
                 "minimum": 0,
                 "description": "Columns holding their fold's seed rather than its value, which a \
-                                deploy leaves until a backfill answers them. Zero is servable.",
+                                deploy leaves until a backfill answers them.",
+            },
+            "serving": {
+                "type": "boolean",
+                "description": "Whether `/tables` answers: no column behind, not folding from an \
+                                empty start, and a store this process keeps.",
             },
             "running": { "type": "boolean" },
             "last_error": { "type": ["string", "null"] },
         },
-        "required": ["head", "behind", "running", "last_error"],
+        "required": ["head", "behind", "serving", "running", "last_error"],
         "additionalProperties": false,
     })
 }
@@ -3837,6 +4273,7 @@ mod tests {
                 .iter()
                 .map(|(event_type, def)| (event_type.as_str(), def))
                 .collect(),
+            tables: Vec::new(),
         }
     }
 

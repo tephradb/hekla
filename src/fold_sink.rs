@@ -9,6 +9,8 @@
 //! the only way to do better was to apply the record to the value already there, which is
 //! interpreting heklang. So the interpreter does it and this holds the cells.
 
+use std::collections::BTreeSet;
+
 use heklang::host::Columns;
 use heklang::interp::{Error, ErrorKind, key_as_value};
 use heklang::ir::Type;
@@ -33,14 +35,17 @@ pub struct ColumnWriter<'a> {
     pub tables: &'a [TableDef],
     /// Columns written, which is what a log line and a metric report.
     pub written: usize,
+    /// Main-table keys this batch has already made sure of, so a list pushed onto ten
+    /// thousand times in one batch costs one insert for its key and not ten thousand.
+    pub ensured: BTreeSet<(String, Vec<String>)>,
 }
 
-impl ColumnWriter<'_> {
+impl<'a> ColumnWriter<'a> {
     /// The table that holds `column` of the layout table `source`, and the column itself.
     ///
     /// `Tables::apply` names a layout table, and a collection-typed column of it lives in
     /// the side table, so neither name alone answers where a cell is.
-    fn cell(&self, source: &str, column: &str) -> Result<(&TableDef, &ColumnDef), Error> {
+    fn cell(&self, source: &str, column: &str) -> Result<(&'a TableDef, &'a ColumnDef), Error> {
         holding(self.tables, source, column).ok_or_else(|| {
             host_error(format!(
                 "no derived column `{column}` of `{source}`, which the layout implies"
@@ -96,6 +101,17 @@ impl Columns for ColumnWriter<'_> {
     fn set(&mut self, table: &str, key: Vec<Key>, column: &str, value: Value) -> Result<(), Error> {
         let (def, held) = self.cell(table, column)?;
         let texts = key_texts(def, &key)?;
+        // **A key exists in its main table whichever of the two a write lands in.** Every
+        // reader of "the keys this signature has" reads the main table (a range arm, a
+        // backfill, a scan), so a key whose only writes so far are collections would
+        // otherwise be one none of them could see.
+        if def.name != def.source && self.ensured.insert((def.source.clone(), texts.clone())) {
+            let main = main_of(self.tables, &def.source)
+                .ok_or_else(|| host_error(format!("no derived table `{}`", def.source)))?;
+            self.store
+                .ensure_row(self.tx, main, &texts)
+                .map_err(|why| host_error(format!("{why:#}")))?;
+        }
         self.store
             .write(self.tx, def, &texts, held, &value)
             .map_err(|why| host_error(format!("{why:#}")))?;

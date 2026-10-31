@@ -27,6 +27,10 @@ export const ROUTES = [
     path: '/admin/effects/{name}/invocations/{position}',
     title: 'Effects',
   },
+  /* Above the projectors, as the read model a program gets by declaring a fold: these
+   * are kept with no projector to write them. */
+  { id: 'tables', path: '/admin/tables', title: 'Tables' },
+  { id: 'tables', path: '/admin/tables/{name}', title: 'Tables' },
   { id: 'projectors', path: '/admin/projectors', title: 'Projectors' },
   { id: 'projectors', path: '/admin/projectors/{name}', title: 'Projectors' },
   /* Directly under the deployed folds, because the two read as a contrast rather than

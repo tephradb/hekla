@@ -9,3 +9,24 @@ fold TicketOpened(ticket_id: Uuid) -> Bool = false {
 fold TicketClosed(ticket_id: Uuid) -> Bool = false {
   on @ticket.closed(ticket_id) => true
 }
+
+// Read models, served from the derived tables rather than a projector. The three sealed
+// ones are the owner's personal data kept in a row keyed on the ticket, so no column of
+// the row is the owner's id and each cell has to carry it. Between them they are a
+// scalar, the one kind whose column form differs from its payload, and a record.
+fold TicketContact(ticket_id: Uuid) -> Sealed(String, Owner)? = none {
+  on @ticket.opened(ticket_id) { contact } => contact
+}
+
+fold TicketContactedAt(ticket_id: Uuid) -> Sealed(Timestamp, Owner)? = none {
+  on @ticket.opened(ticket_id) { contacted_at } => contacted_at
+}
+
+fold TicketReporter(ticket_id: Uuid) -> Sealed(Reporter, Owner)? = none {
+  on @ticket.opened(ticket_id) { reporter } => reporter
+}
+
+// Keyed on two subjects, so a read can filter on a leading part of the key.
+fold OwnerTickets(org_id: Org, owner_id: Owner) -> tickets: Int = 0 {
+  on @ticket.opened(org_id, owner_id) => tickets + 1
+}

@@ -204,6 +204,11 @@ pub const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../ui/view-projectors.js"),
     },
     Asset {
+        name: "view-tables.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-tables.js"),
+    },
+    Asset {
         name: "view-schema.js",
         content_type: JS,
         bytes: include_bytes!("../ui/view-schema.js"),

@@ -11,7 +11,7 @@
 //! the log rather than updated in place, which is why this is the correct-and-slow shape
 //! the per-record sink is measured against rather than the end state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use heklang::value::{Record, Value};
@@ -66,6 +66,7 @@ pub fn apply_batch(
         program,
         tables,
         written: 0,
+        ensured: BTreeSet::new(),
     };
     for record in records {
         derived
@@ -174,7 +175,7 @@ pub fn backfill<H: Host>(
 // Following the log
 // ---------------------------------------------------------------------------
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -204,9 +205,18 @@ pub struct FoldShared {
     head: AtomicU64,
     /// Columns that are not at it, which is what a read has to refuse to serve.
     behind: AtomicU64,
+    /// The head a store that started empty has to reach before it serves. A store folded
+    /// from nothing over a log that already has events holds none of them yet, and every
+    /// read would answer short: a 404 for a key that exists, a page with rows missing.
+    /// Zero once it has, and for a store that started where it left off.
+    filling_to: AtomicU64,
     shutdown: AtomicBool,
     running: AtomicBool,
     last_error: Mutex<Option<String>>,
+    /// What a reader may ask for, and where it lives. Empty and `None` for a store nothing
+    /// keeps, which is a project with no storable fold or a read-only follower.
+    tables: Vec<TableDef>,
+    path: Option<PathBuf>,
 }
 
 impl FoldShared {
@@ -217,6 +227,20 @@ impl FoldShared {
     /// How many columns hold their seed rather than their value. Zero is servable.
     pub fn behind(&self) -> u64 {
         self.behind.load(Ordering::Acquire)
+    }
+
+    /// Whether every column is folded far enough to serve: none behind, and not still
+    /// filling from an empty start.
+    pub fn servable(&self) -> bool {
+        self.behind() == 0 && self.head() >= self.filling_to.load(Ordering::Acquire)
+    }
+
+    pub fn tables(&self) -> &[TableDef] {
+        &self.tables
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     pub fn running(&self) -> bool {
@@ -283,9 +307,9 @@ pub fn start(
     // a checkpoint for it.
     if tables.is_empty() {
         return Ok((
-            FoldShared::idle(),
+            FoldShared::idle(Vec::new()),
             FoldThread {
-                shared: FoldShared::idle(),
+                shared: FoldShared::idle(Vec::new()),
                 join: None,
             },
         ));
@@ -306,9 +330,16 @@ pub fn start(
     let shared = Arc::new(FoldShared {
         head: AtomicU64::new(fold_store.read_checkpoint()?),
         behind: AtomicU64::new(fold_store.behind()?.len() as u64),
+        filling_to: AtomicU64::new(if fold_store.read_checkpoint()? == 0 {
+            store.head().get()
+        } else {
+            0
+        }),
         shutdown: AtomicBool::new(false),
         running: AtomicBool::new(true),
         last_error: Mutex::new(None),
+        tables: tables.clone(),
+        path: Some(path.clone()),
     });
 
     let store = store.clone();
@@ -443,13 +474,19 @@ impl FoldShared {
     /// starting a writer's threads, so there is no derived store to report on. Behind by
     /// nothing rather than behind by zero columns: a follower serves no derived read at
     /// all, and saying "caught up" would be a claim about a store it never opened.
-    pub fn idle() -> Arc<FoldShared> {
+    ///
+    /// `tables` is what the program declares, with no file behind it, so a read of one is
+    /// told this node does not serve it rather than that it does not exist.
+    pub fn idle(tables: Vec<TableDef>) -> Arc<FoldShared> {
         Arc::new(FoldShared {
             head: AtomicU64::new(0),
             behind: AtomicU64::new(0),
+            filling_to: AtomicU64::new(0),
             shutdown: AtomicBool::new(true),
             running: AtomicBool::new(false),
             last_error: Mutex::new(None),
+            tables,
+            path: None,
         })
     }
 }

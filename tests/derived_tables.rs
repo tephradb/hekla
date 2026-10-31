@@ -1048,3 +1048,100 @@ fn a_store_in_another_format_is_emptied_and_refolded() {
         Some("0".to_owned())
     );
 }
+
+/// A key whose only write so far is a collection is still a key of its table. Every reader
+/// of a signature's keys reads the main table, so a row only in the side table would be
+/// invisible to a scan, a range arm and a backfill alike.
+#[test]
+fn a_key_only_a_collection_was_written_for_is_in_the_main_table() {
+    let source = "subject Shop(Int)
+
+event @order.lined { shop_id: Shop, order_id: Int, line: Int }
+event @order.flagged { shop_id: Shop, order_id: Int }
+
+fold OrderLines(shop_id: Shop, order_id: Int) -> lines: List(Int) = [] {
+  on @order.lined(shop_id, order_id) { line } => lines.push(line)
+}
+
+fold OrderFlagged(shop_id: Shop, order_id: Int) -> Bool = false {
+  on @order.flagged(shop_id, order_id) => true
+}
+";
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(source);
+    let tables = TableDef::all(&program);
+    let lined = Event::new(
+        EventPath::new(["order", "lined"]),
+        [
+            ("shop_id".to_owned(), Value::Int(1)),
+            ("order_id".to_owned(), Value::Int(9001)),
+            ("line".to_owned(), Value::Int(5)),
+        ],
+    );
+    let mut interpreter = Interpreter::new(&program);
+    let records = appended(&mut interpreter, vec![lined]);
+    let path = dir.path().join("tables.db");
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&Digest::of(&program), &tables).unwrap();
+    apply_batch(&store, &program, &tables, &records, 1).unwrap();
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT CAST(\"order_flagged\" AS TEXT) FROM \"shop__order\" \
+             WHERE \"shop\" = 1 AND \"order\" = 9001"
+        ),
+        Some("0".to_owned()),
+        "the main row exists, holding the other column's seed"
+    );
+}
+
+/// A row whose collection no event has written serves that collection's seed, as a main
+/// column holding its `DEFAULT` does: there is no side row to join, and the fold's answer
+/// for the key is still `[]`, not nothing.
+#[test]
+fn a_served_row_holds_the_seed_of_a_collection_never_written() {
+    let source = "subject Shop(Int)
+
+event @order.lined { shop_id: Shop, order_id: Int, line: Int }
+event @order.flagged { shop_id: Shop, order_id: Int }
+
+fold OrderLines(shop_id: Shop, order_id: Int) -> lines: List(Int) = [] {
+  on @order.lined(shop_id, order_id) { line } => lines.push(line)
+}
+
+fold OrderFlagged(shop_id: Shop, order_id: Int) -> Bool = false {
+  on @order.flagged(shop_id, order_id) => true
+}
+";
+    let dir = tempfile::tempdir().unwrap();
+    let program = program(source);
+    let tables = TableDef::all(&program);
+    let flagged = Event::new(
+        EventPath::new(["order", "flagged"]),
+        [
+            ("shop_id".to_owned(), Value::Int(1)),
+            ("order_id".to_owned(), Value::Int(9001)),
+        ],
+    );
+    let mut interpreter = Interpreter::new(&program);
+    let records = appended(&mut interpreter, vec![flagged]);
+    let path = dir.path().join("tables.db");
+    let store = FoldStore::open(&path, &tables).unwrap();
+    store.apply(&Digest::of(&program), &tables).unwrap();
+    apply_batch(&store, &program, &tables, &records, 1).unwrap();
+
+    let main = hekla::table_read::find(&tables, "shop__order").unwrap();
+    let (row, _) = hekla::table_read::get_one(
+        &path,
+        &tables,
+        main,
+        &["1".to_owned(), "9001".to_owned()],
+        None,
+    )
+    .unwrap();
+    let row = row.expect("the key an event named");
+    assert_eq!(row["order_flagged"], true);
+    assert_eq!(row["order_lines"], serde_json::json!([]), "{row}");
+}

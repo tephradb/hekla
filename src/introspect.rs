@@ -44,6 +44,7 @@ use crate::schema::EventDefs;
 use crate::schema::{EntityDef, EventDef, FieldMeta, ModuleDef, scalar_to_string};
 use crate::secrets::Resolution;
 use crate::store::Store;
+use crate::tables::TableDef;
 use crate::tags;
 use crate::tags::RESERVED_TAG_PREFIX;
 
@@ -562,6 +563,55 @@ fn self_entity(entity: &EntityDef, count: Option<&u64>) -> Value {
         })).collect::<Vec<_>>(),
         "filterable": filterable,
         "rows": count,
+    })
+}
+
+/// One derived table as a reader sees it: its key, every fold kept in it, the indexes a
+/// filter may lead with, and its row count when one was taken.
+///
+/// One table, not two: a collection column lives in the side table and is listed here
+/// with `collection: true`, because the served row joins them and the split is storage.
+pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> Value {
+    let side = crate::tables::side_of(tables, main);
+    let columns: Vec<Value> = main
+        .columns
+        .iter()
+        .map(|column| (column, false))
+        .chain(
+            side.into_iter()
+                .flat_map(|side| side.columns.iter().map(|column| (column, true))),
+        )
+        .map(|(column, collection)| {
+            json!({
+                "name": column.name,
+                "fold": column.fold,
+                "kind": column.meta.kind.describe(),
+                "optional": column.meta.kind.is_nullable(),
+                "subject": column.meta.subject(),
+                "collection": collection,
+            })
+        })
+        .collect();
+    let key: Vec<Value> = main
+        .key
+        .iter()
+        .map(|(name, meta)| {
+            json!({
+                "name": name,
+                "kind": meta.kind.describe(),
+                "identifies": meta.identifies,
+            })
+        })
+        .collect();
+    json!({
+        "name": main.name,
+        "key": key,
+        "columns": columns,
+        "indexes": main.indexes.iter().map(|index| json!({
+            "name": index.name,
+            "columns": index.columns,
+        })).collect::<Vec<_>>(),
+        "rows": rows,
     })
 }
 

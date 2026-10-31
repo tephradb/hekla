@@ -114,6 +114,10 @@ fn the_document_describes_the_projects_real_modules() {
     ] {
         assert!(paths.contains_key(path), "missing read path {path}");
     }
+    // The derived table the named folds imply, both operations.
+    for path in ["/tables/user", "/tables/user/row"] {
+        assert!(paths.contains_key(path), "missing table path {path}");
+    }
 
     // One tag per projector, in the declared render order.
     let tags: Vec<&str> = doc["tags"]
@@ -128,6 +132,7 @@ fn the_document_describes_the_projects_real_modules() {
             "commands",
             "read: UserStats",
             "read: Users",
+            "tables",
             "operations",
             "introspection",
         ],

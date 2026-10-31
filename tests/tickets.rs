@@ -946,6 +946,7 @@ async fn the_derived_tables_follow_the_log_in_a_running_deployment() {
     let (status, system) = support::get(&harness.app(), "/status").await;
     assert_eq!(status, 200);
     assert_eq!(system["tables"]["behind"], 0, "{}", system["tables"]);
+    assert_eq!(system["tables"]["serving"], true, "{}", system["tables"]);
     assert_eq!(
         system["tables"]["head"], system["log_head"],
         "the store has followed the log to its head: {}",
@@ -977,4 +978,161 @@ async fn the_derived_tables_follow_the_log_in_a_running_deployment() {
     );
 
     harness.shutdown();
+}
+
+/// The derived tables over HTTP: one row by its whole key, its collections and sealed
+/// columns included and opened, and the position it was read at.
+///
+/// The three sealed columns are the owner's and the row is the ticket's, so this is the
+/// case a cell has to carry its own subject id for. Erasing the owner then makes them read
+/// absent, with no pass over the store.
+#[tokio::test]
+async fn a_derived_row_is_served_with_its_sealed_columns_opened() {
+    let harness = boot();
+    let position = open(&harness, UUID_A, 1, 10, Some("ada@example.com"));
+    let app = harness.app();
+
+    let (status, body) = support::get(
+        &app,
+        &format!("/tables/ticket/row?ticket={UUID_A}&after={position}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let row = &body["item"];
+    assert_eq!(row["ticket"], UUID_A);
+    assert_eq!(row["ticket_opened"], true);
+    assert_eq!(row["ticket_closed"], false);
+    assert_eq!(row["ticket_contact"], "ada@example.com");
+    // RFC 3339 in a column, as a projector serves it, though the log holds micros.
+    assert_eq!(row["ticket_contacted_at"], "2023-11-15T09:20:00Z");
+    // From the side table, joined back into the one row.
+    assert_eq!(row["ticket_reporter"], reporter());
+    assert!(body["position"].as_u64().unwrap() >= position);
+
+    harness.rt.keystore().unwrap().erase("Owner", "10").unwrap();
+    let (status, body) = support::get(&app, &format!("/tables/ticket/row?ticket={UUID_A}")).await;
+    assert_eq!(status, 200, "{body}");
+    for gone in ["ticket_contact", "ticket_contacted_at", "ticket_reporter"] {
+        absent(&body["item"], gone);
+    }
+    assert_eq!(
+        body["item"]["ticket_opened"], true,
+        "the rest of the row stands"
+    );
+
+    harness.shutdown();
+}
+
+/// A scan filters on what an index serves and pages over the whole key; a key no event
+/// named is a 404, and a filter no index serves is a 400 rather than a table scan.
+#[tokio::test]
+async fn a_derived_table_is_scanned_by_the_leading_parts_of_its_key() {
+    let harness = boot();
+    let mut position = 0;
+    for (ticket, org, owner) in [(ALICE, 1, 10), (BOB, 1, 11), (CAROL, 2, 10)] {
+        position = position.max(open(&harness, ticket, org, owner, None));
+    }
+    let app = harness.app();
+
+    let (status, body) =
+        support::get(&app, &format!("/tables/org__owner?org=1&after={position}")).await;
+    assert_eq!(status, 200, "{body}");
+    let owners: Vec<i64> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["owner"].as_i64().unwrap())
+        .collect();
+    assert_eq!(owners, vec![10, 11], "org 1's rows, in key order");
+
+    // A page of one, then the rest from its cursor.
+    let (_, first) = support::get(&app, "/tables/org__owner?limit=1").await;
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    let cursor = first["next_cursor"].as_str().expect("another page follows");
+    let (_, rest) = support::get(
+        &app,
+        &format!("/tables/org__owner?limit=10&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(rest["items"].as_array().unwrap().len(), 2);
+    assert_eq!(rest["next_cursor"], Value::Null);
+    assert_eq!(first["items"][0]["owner_tickets"], 1);
+
+    let (status, body) = support::get(&app, "/tables/org__owner?owner=10").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "unindexed_filter");
+
+    let (status, body) = support::get(&app, "/tables/org__owner/row?org=9&owner=9").await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = support::get(&app, "/tables/org__owner/row?org=1").await;
+    assert_eq!(status, 400, "{body}");
+    let (status, _) = support::get(&app, "/tables/_side_ticket").await;
+    assert_eq!(status, 404, "a side table is storage, not a route");
+
+    harness.shutdown();
+}
+
+/// A request a derived table cannot answer is a 400 that says why, never a 500 and never
+/// a row that silently is not there.
+#[tokio::test]
+async fn a_malformed_derived_read_is_refused_with_its_reason() {
+    let harness = boot();
+    let position = open(&harness, UUID_A, 1, 10, None);
+    let app = harness.app();
+    let (status, _) = support::get(&app, &format!("/tables/ticket?after={position}")).await;
+    assert_eq!(status, 200);
+
+    for (uri, why) in [
+        (
+            "/tables/ticket/row?ticket=not-a-uuid",
+            "a malformed key part",
+        ),
+        ("/tables/org__owner?org=one", "a key part of the wrong type"),
+        (
+            "/tables/org__owner?cursor=bm90IGEgY3Vyc29y",
+            "a cursor this server did not issue",
+        ),
+        (
+            "/tables/ticket/row?ticket=x&limit=1",
+            "a parameter a row read does not take",
+        ),
+    ] {
+        let (status, body) = support::get(&app, uri).await;
+        assert_eq!(status, 400, "{why}: {body}");
+        assert_eq!(body["error"]["code"], "invalid_input", "{why}: {body}");
+    }
+
+    // An edited cursor: right table, right length, a value of the wrong type.
+    let cursor = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        br#"{"t":"org__owner","k":["x","y"]}"#,
+    );
+    let (status, body) = support::get(&app, &format!("/tables/org__owner?cursor={cursor}")).await;
+    assert_eq!(status, 400, "{body}");
+
+    harness.shutdown();
+}
+
+/// A key part is a query parameter of its table's routes, so one named like a control
+/// parameter could never be filtered on. `hekla check` says so rather than the first read.
+#[test]
+fn a_key_part_named_like_a_control_parameter_is_refused() {
+    let project = support::write_project(&[
+        ("hekla.toml", ""),
+        ("events/page.hk", "event @page.viewed { limit_id: Int }\n"),
+        (
+            "lib/folds.hk",
+            "fold Views(limit_id: Int) -> views: Int = 0 {\n  on @page.viewed(limit_id) => views + 1\n}\n",
+        ),
+    ]);
+    let loaded = hekla::loader::LoadedProject::load(project.path());
+    assert!(loaded.has_errors(), "{:?}", loaded.findings);
+    assert!(
+        loaded
+            .findings
+            .iter()
+            .any(|finding| format!("{finding:?}").contains("control parameter")),
+        "{:?}",
+        loaded.findings
+    );
 }

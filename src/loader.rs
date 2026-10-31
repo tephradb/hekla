@@ -22,6 +22,7 @@ use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::schema::{self, EntityDef, EventDef, EventDefs, InputSchema, ModuleDef, ModuleKind};
+use crate::tables::TableDef;
 
 /// How severe a [`Finding`] is. Only errors fail `hek check`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,6 +537,45 @@ impl Sources {
                 entities,
                 sources,
             });
+        }
+
+        // A derived table's key parts are query parameters of `/tables/{table}`, so one
+        // named like a control parameter could never be filtered on or named in a row read.
+        // Refused here, as an entity column of the same name is, rather than at the first
+        // read that cannot reach it.
+        let derived = TableDef::all(&program);
+        for table in crate::table_read::readable(&derived) {
+            for (part, _) in &table.key {
+                if crate::table_read::RESERVED.contains(&part.as_str()) {
+                    // Any fold of the table will do, side table included: a table whose
+                    // folds are all collections has no column of its own.
+                    let fold = table
+                        .columns
+                        .iter()
+                        .chain(
+                            crate::tables::side_of(&derived, table)
+                                .into_iter()
+                                .flat_map(|side| side.columns.iter()),
+                        )
+                        .next()
+                        .map(|column| column.fold.as_str());
+                    let rel = fold
+                        .and_then(|name| program.fold(name))
+                        .and_then(|def| def.module.clone())
+                        .unwrap_or_default();
+                    findings.push(Finding::error(
+                        rel,
+                        format!(
+                            "derived table `{}` has a key part `{part}`, which `/tables/{}` \
+                             reads as a control parameter ({}); rename the fold parameter it \
+                             comes from",
+                            table.name,
+                            table.name,
+                            crate::table_read::RESERVED.join(", ")
+                        ),
+                    ));
+                }
+            }
         }
 
         let mut effects = Vec::new();

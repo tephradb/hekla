@@ -1,0 +1,12 @@
+// A named fold is a read model by declaration. Each one is kept as a column of a derived
+// table, one row per user, and served at `GET /tables/user` with no projector to write.
+// The key is the parameter: `user_id: Uuid` becomes the table `user` keyed on `user`.
+
+fold UserName(user_id: Uuid) -> String = "" {
+  on @user.registered(user_id) { name } => name
+  on @user.renamed(user_id) { name } => name
+}
+
+fold UserWelcomed(user_id: Uuid) -> Bool = false {
+  on @user.welcomed(user_id) => true
+}

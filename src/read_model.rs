@@ -530,7 +530,7 @@ pub(crate) fn quote_ident(name: &str) -> String {
 /// model whose shape predates a field addition from a loud error into silently wrong
 /// data, and would hide exactly the mismatch [`crate::projector::Readiness`] exists
 /// to detect. With DQS off, an unknown quoted identifier is `no such column` again.
-fn reject_double_quoted_strings(conn: &Connection) -> anyhow::Result<()> {
+pub(crate) fn reject_double_quoted_strings(conn: &Connection) -> anyhow::Result<()> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)
         .context("disabling double-quoted string literals in DML")?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)

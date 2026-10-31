@@ -20,6 +20,7 @@ which needs `[admin] projections = true` and answers `403` otherwise.
 | `/admin/effects/{name}/invocations` | invocations, newest first |
 | `/admin/effects/{name}/invocations/{position}` | one invocation and every call it journaled |
 | `/admin/projectors`, `/admin/projectors/{name}` | readiness, entity shapes, definition hash |
+| `/admin/tables`, `/admin/tables/{name}` | the derived tables: the store's one position, each table's key and the fold behind every column |
 | `/admin/commands`, `/admin/commands/{name}` | every command and its parameters, internal ones included |
 | `/admin/schema` | the loaded project: every declaration with its hash and signature hash |
 | `/admin/system` | version, uptime, data directory, op-DB schema version, keystore, effective config |
@@ -348,6 +349,17 @@ subject columns decrypted. The selection lives in the query string, so a row is 
 - Rows do not refresh on the 3s poll (a scan is not a `/status` read); the header carries a `⟳`.
 - A projector that is rebuilding, stale or quarantined cannot serve rows at its current definition.
   The section reports the server's own message, which names the fix, rather than an error.
+
+### Browsing a derived table
+
+`/admin/tables` lists every derived table with the store's one position; `/admin/tables/{name}`
+shows its key, the fold behind each column (and which are stored in the side table), and its rows,
+fetched through the public `/tables` routes. A filter takes the key parts left to right, so a part
+is offered only once the ones before it have a value. The selection lives in the query string:
+
+```
+/admin/tables/org__owner?k.org=1&cursor=<c>&row=[1,10]
+```
 
 ### Writing a projection
 

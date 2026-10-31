@@ -379,7 +379,8 @@ impl FoldStore {
 /// and a change to how hekla stores the result moves no fold's hash.
 ///
 /// 1: a sealed cell is a [`SealedCell`] rather than bare ciphertext.
-const FORMAT: i64 = 1;
+/// 2: a key a collection column was written for is in its main table too.
+const FORMAT: i64 = 2;
 
 /// Empty a store written in another format, so it refolds from the log.
 ///
@@ -555,6 +556,28 @@ pub(crate) fn stored_text(kind: &FieldKind, value: &Value) -> Option<String> {
 }
 
 impl FoldStore {
+    /// Make sure `table` has a row for `key`, holding every column's seed if it is new.
+    pub fn ensure_row(
+        &self,
+        tx: &Transaction,
+        table: &TableDef,
+        key: &[String],
+    ) -> anyhow::Result<()> {
+        let (names, binds) = key_binds(table, key)?;
+        let holders: Vec<String> = (1..=names.len()).map(|at| format!("?{at}")).collect();
+        tx.execute(
+            &format!(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
+                quote_ident(&table.name),
+                names.join(", "),
+                holders.join(", ")
+            ),
+            rusqlite::params_from_iter(binds),
+        )
+        .with_context(|| format!("recording a key of `{}`", table.name))?;
+        Ok(())
+    }
+
     /// Write one column of one row, creating the row if no event had matched its key yet.
     ///
     /// Per column rather than per row, because that is the unit a fold is: two folds of
@@ -570,19 +593,7 @@ impl FoldStore {
         column: &ColumnDef,
         value: &Value,
     ) -> anyhow::Result<()> {
-        let mut names: Vec<String> = table
-            .key
-            .iter()
-            .map(|(name, _)| quote_ident(name))
-            .collect();
-        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
-        for ((_, meta), text) in table.key.iter().zip(key) {
-            binds.push(crate::read_model::coerce_value(&meta.kind, text)?);
-        }
-        if table.key.is_empty() {
-            names.push(quote_ident("_one"));
-            binds.push(rusqlite::types::Value::Integer(0));
-        }
+        let (mut names, mut binds) = key_binds(table, key)?;
         names.push(quote_ident(&column.name));
         binds.push(if column.meta.sealed_under.is_some() {
             match SealedCell::text(value) {
@@ -760,6 +771,25 @@ impl FoldStore {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+/// A key's columns and values as an insert binds them: each part typed to its column, or
+/// the guard column alone for the one-row table.
+fn key_binds(
+    table: &TableDef,
+    key: &[String],
+) -> anyhow::Result<(Vec<String>, Vec<rusqlite::types::Value>)> {
+    let mut names = Vec::new();
+    let mut binds = Vec::new();
+    for ((name, meta), text) in table.key.iter().zip(key) {
+        names.push(quote_ident(name));
+        binds.push(crate::read_model::coerce_value(&meta.kind, text)?);
+    }
+    if table.key.is_empty() {
+        names.push(quote_ident("_one"));
+        binds.push(rusqlite::types::Value::Integer(0));
+    }
+    Ok((names, binds))
 }
 
 /// One column's metadata, by name, for a typed read of its cell.

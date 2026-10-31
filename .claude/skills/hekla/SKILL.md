@@ -149,6 +149,8 @@ defaults to `127.0.0.1`.
 | `POST /commands/{Name}` | 200 committed, 400 `invalid`, 422 `reject`, 409 conflict, 404 unknown or internal |
 | `GET /read/{Projector}/{Entity}/{key}` | `{item, position}`, or 404 |
 | `GET /read/{Projector}/{Entity}?<field>=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}` |
+| `GET /tables/{table}/row?<part>=...` | one derived row by its whole key: `{item, position}`, or 404 for a key no event named |
+| `GET /tables/{table}?<part>=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}`, filtered on the leading parts of the key |
 | `POST /projectors/{Name}/replay` | 202, schedules a rebuild-and-swap |
 | `POST /effects/{Name}/skip/{position}` | 202, records an operator skip request |
 | `GET /status` | per-module position, lag, readiness, effect state, failure count, last error |
@@ -157,6 +159,13 @@ defaults to `127.0.0.1`.
 | `GET /openapi.json`, `GET /docs` | the generated document, and a reference over it |
 | `GET /admin/...` | read-only introspection, or the console when `Accept: text/html` |
 | `POST /admin/projections` | folds an ad-hoc `projector` (body: the source) over the log. Needs `[admin] projections = true`, else 403 |
+
+**A named fold is served as a column of a derived table** with no projector to write it.
+`fold OwnerTickets(org_id: Org, owner_id: Owner)` lands in a table `org__owner` keyed on `org` and
+`owner` (a parameter's trailing `_id` is dropped), with one column per fold of that key signature;
+`hekla check --tables <dir>` prints every table, column and derived index. A row is every fold's
+value for its key, collections and sealed columns included, and every table is read at one log
+position. A filter on a key part that is not a leading one is a `400 unindexed_filter`.
 
 A command's success body is `{correlation_id, causation_id, positions: {first, last}, events: [...]}`,
 and every error body is `{correlation_id, causation_id, error: {code, message}}` (the two ids are

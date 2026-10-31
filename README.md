@@ -65,8 +65,10 @@ command PlaceOrder(order_id: Uuid, customer_id: Customer, shop_id: Shop, email: 
 ```
 
 `POST /commands/PlaceOrder` runs that: the route is the declared name, not the file. Add a projector
-and `GET /read/{Projector}/{Entity}/{key}` serves what it built. Both routes are generated from the
-declarations, with an OpenAPI document and a reference UI at `/docs`.
+and `GET /read/{Projector}/{Entity}/{key}` serves what it built. Declare a named fold, such as
+`fold OrderTotal(order_id: Int) -> Money(2)`, and `GET /tables/order/row?order=42` serves its value
+with no projector at all, kept for every key as the log grows. All of these routes are generated
+from the declarations, with an OpenAPI document and a reference UI at `/docs`.
 
 ## Install
 

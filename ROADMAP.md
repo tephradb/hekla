@@ -3405,27 +3405,51 @@ Decisions worth keeping:
 
 Honest scope:
 
-- **The store is invisible from outside** until Phase 43: `/status` reports how far behind it is
-  and nothing reads it.
+- **The store was invisible from outside** until Phase 43: `/status` reported how far behind it was
+  and nothing read it.
 - **hekla depends on heklang by path** until heklang `0.12.0` is cut, so this branch cannot pass CI.
 - **`verify` has no fold-store equivalence check**, the counterpart of `rebuild_equivalence`.
 
-## Phase 43: the derived tables are served, and shown (in progress)
+## Phase 43: the derived tables are served, and shown (done)
 
 What Phase 42 stores, an application can now read and an operator can see.
 
-- **`GET /tables/{table}`** lists rows in key order, filtered by leading key parts and paged by a
-  cursor over the key. **`GET /tables/{table}/{part}/...`** reads one row. Both merge the side
-  table's collection columns into the row, open sealed cells under the key store, and report the
-  position read at. A store with a column still backfilling answers `503`, as an unready projector
-  does.
+- **`GET /tables/{table}?<part>=&limit=&cursor=`** lists rows in key order, filtered for equality
+  on the leading parts of the key, or of an index a range arm derived, and paged by a cursor over
+  the whole key. **`GET /tables/{table}/row?<part>=...`** reads one row named by every part of its
+  key. Both join the side table's collections into the row, open sealed cells, report the position
+  read at, and take `after` for read-your-writes. `src/table_read.rs` is the read; the handlers are
+  beside `/read`'s in `src/server.rs`.
+- **`/admin/tables`** and **`/admin/tables/{name}`** describe the store and each table, and the
+  console's **Tables** view browses them through the public routes above, as its projectors view
+  browses through `/read`.
+- **Each table is in the OpenAPI document**, its row a component typed column by column from the
+  folds, and `examples/users` declares two named folds so the document and its drift test have a
+  table to describe.
+
+Decisions worth keeping:
+
 - **The namespace is `/tables/` and not `/read/`**, because a derived table belongs to no projector
   and its name is already unique: `layout` made it so, and it is the name `hekla check --tables` and
   `/status` print.
-- **Each table is in the OpenAPI document**, with its key parts as path parameters and its columns
-  typed from their folds.
-- **The console gains a Tables view**: every table with its row count and how far behind it is,
-  its rows, and one row with each column named for its fold.
+- **A key goes in the query string, not the path.** A table's key has as many parts as its folds
+  have parameters, and the route table and the OpenAPI drift test both work in fixed segment
+  counts. One route per arity would be one route per table in all but name.
+- **A key part named `limit`, `cursor`, `after` or `timeout_ms` is refused at `hekla check`**, as an
+  entity column of those names is: it could never be filtered on or named in a row read.
+- **Every table is served or none is.** A column a deploy added holds its seed until the backfill
+  reaches it, and a store folded from empty over a populated log (a first deploy, or a store whose
+  format moved) holds no key at all until it catches up. Both answer `503 rebuilding` rather than a
+  404 for a key that exists. One gate for the store, because there is one checkpoint.
+- **A row serves what folding returns.** A collection never written for a key reads as its seed
+  through the join rather than going missing, as a main column reads its `DEFAULT`. A NULL or an
+  erased seal is left out of the row, as `/read` leaves it out, so `none` and erased look the same.
+- **A key part is checked against its type, and a timestamp is respelled the way the store holds
+  it**, so a malformed value is a 400 and `...:00.000Z` still finds `...:00Z`. A UUID is checked
+  and kept as spelled, because heklang keeps it the way the event carried it.
+- **A side-table write records its key in the main table**, so a key whose only writes so far are
+  collections is still seen by a scan, a range arm and a backfill. That moved the store to format
+  2, so a store written before it is refolded.
 
 Not in this phase: filtering or sorting on a non-key column, which waits on how a fold declares an
 index (design section 7), and the console's time slider (design section 11).

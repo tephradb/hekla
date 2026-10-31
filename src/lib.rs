@@ -20,6 +20,7 @@ pub mod read_model;
 pub mod schema;
 pub mod secrets;
 pub mod store;
+pub mod table_read;
 pub mod tables;
 pub mod tags;
 pub mod ui;

@@ -1,5 +1,6 @@
 //! The HTTP surface: `POST /commands/{name}`, the generated read API
-//! (`GET /read/{projector}/{entity}[/{key}]`), `POST /projectors/{name}/replay`,
+//! (`GET /read/{projector}/{entity}[/{key}]`), the derived tables
+//! (`GET /tables/{table}[/row]`), `POST /projectors/{name}/replay`,
 //! `POST /effects/{name}/skip/{position}`, `GET /status`, `GET /health`, the Prometheus
 //! scrape at `GET /metrics`, the generated `GET /openapi.json`, a Scalar reference UI
 //! over it at `GET /docs`, and the read-only introspection surface under `GET /admin`.
@@ -45,6 +46,7 @@ use uuid::Uuid;
 use crate::context::CommandContext;
 use crate::crypto::MasterKeys;
 use crate::effect::EffectRuntime;
+use crate::fold_runtime::FoldShared;
 use crate::introspect;
 use crate::loader::{self, LoadedProject};
 use crate::metrics;
@@ -54,6 +56,7 @@ use crate::read_api;
 use crate::runtime::{self, Runtime, error_body};
 use crate::schema::{EntityDef, EventDef};
 use crate::store::Store;
+use crate::table_read;
 use crate::ui;
 use crate::validate;
 
@@ -101,6 +104,8 @@ pub async fn serve(
 pub const COMMAND_ROUTE: &str = "/commands/{name}";
 pub const READ_ONE_ROUTE: &str = "/read/{projector}/{entity}/{key}";
 pub const READ_SCAN_ROUTE: &str = "/read/{projector}/{entity}";
+pub const TABLE_SCAN_ROUTE: &str = "/tables/{table}";
+pub const TABLE_ROW_ROUTE: &str = "/tables/{table}/row";
 pub const REPLAY_ROUTE: &str = "/projectors/{name}/replay";
 pub const SKIP_ROUTE: &str = "/effects/{name}/skip/{position}";
 pub const STATUS_ROUTE: &str = "/status";
@@ -121,6 +126,8 @@ pub const ADMIN_INVOCATIONS_ROUTE: &str = "/admin/effects/{name}/invocations";
 pub const ADMIN_INVOCATION_ROUTE: &str = "/admin/effects/{name}/invocations/{position}";
 pub const ADMIN_PROJECTORS_ROUTE: &str = "/admin/projectors";
 pub const ADMIN_PROJECTOR_ROUTE: &str = "/admin/projectors/{name}";
+pub const ADMIN_TABLES_ROUTE: &str = "/admin/tables";
+pub const ADMIN_TABLE_ROUTE: &str = "/admin/tables/{name}";
 pub const ADMIN_COMMANDS_ROUTE: &str = "/admin/commands";
 pub const ADMIN_COMMAND_ROUTE: &str = "/admin/commands/{name}";
 pub const ADMIN_SCHEMA_ROUTE: &str = "/admin/schema";
@@ -196,6 +203,8 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (COMMAND_ROUTE, post(execute)),
         (READ_ONE_ROUTE, get(read_one)),
         (READ_SCAN_ROUTE, get(read_scan)),
+        (TABLE_SCAN_ROUTE, get(table_scan)),
+        (TABLE_ROW_ROUTE, get(table_row)),
         (REPLAY_ROUTE, post(replay)),
         (SKIP_ROUTE, post(skip)),
         (STATUS_ROUTE, get(status)),
@@ -213,6 +222,8 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (ADMIN_INVOCATION_ROUTE, get(admin_invocation)),
         (ADMIN_PROJECTORS_ROUTE, get(admin_projectors)),
         (ADMIN_PROJECTOR_ROUTE, get(admin_projector)),
+        (ADMIN_TABLES_ROUTE, get(admin_tables)),
+        (ADMIN_TABLE_ROUTE, get(admin_table)),
         (ADMIN_COMMANDS_ROUTE, get(admin_commands)),
         (ADMIN_COMMAND_ROUTE, get(admin_command)),
         (ADMIN_SCHEMA_ROUTE, get(admin_schema)),
@@ -973,22 +984,26 @@ async fn honor_wait(
 ) -> Option<Response> {
     let wait = wait?;
     // Reached only past `resolve_entity`, so `projector` names a declaration.
-    if await_position(shared, wait.after, wait.timeout).await {
+    if await_position(|| shared.position(), wait.after, wait.timeout).await {
         metrics::read_wait(projector, "served");
         None
     } else {
         metrics::read_wait(projector, "timeout");
-        Some(not_caught_up(projector, wait.after, wait.timeout))
+        Some(not_caught_up(
+            &format!("projector `{projector}`"),
+            wait.after,
+            wait.timeout,
+        ))
     }
 }
 
-/// Wait until the projector's committed position reaches `after`, or `timeout`
-/// elapses; returns whether it was reached. The projector publishes its in-memory
-/// position only after committing its batch and checkpoint, so a satisfied wait
-/// means a fresh snapshot read sees the data.
-async fn await_position(shared: &ProjectorShared, after: u64, timeout: Duration) -> bool {
+/// Wait until a committed position reaches `after`, or `timeout` elapses; returns
+/// whether it was reached. A projector and the derived store each publish their position
+/// only after committing the batch and checkpoint behind it, so a satisfied wait means a
+/// fresh snapshot read sees the data.
+async fn await_position(position: impl Fn() -> u64, after: u64, timeout: Duration) -> bool {
     tokio::time::timeout(timeout, async {
-        while shared.position() < after {
+        while position() < after {
             tokio::time::sleep(READ_WAIT_TICK).await;
         }
     })
@@ -996,13 +1011,14 @@ async fn await_position(shared: &ProjectorShared, after: u64, timeout: Duration)
     .is_ok()
 }
 
-/// A 503 for a read-your-writes wait that timed out, with a `Retry-After` so a
-/// client backs off rather than hammering a lagging projector.
-fn not_caught_up(projector: &str, after: u64, timeout: Duration) -> Response {
+/// A 503 for a read-your-writes wait that timed out, with a `Retry-After` so a client
+/// backs off rather than hammering a lagging reader. `who` is what was waited on, as a
+/// reader would name it: a projector, or the derived tables.
+fn not_caught_up(who: &str, after: u64, timeout: Duration) -> Response {
     let body = read_error(
         "not_caught_up",
         &format!(
-            "projector `{projector}` did not reach position {after} within {}ms",
+            "{who} did not reach position {after} within {}ms",
             timeout.as_millis()
         ),
     );
@@ -1011,6 +1027,201 @@ fn not_caught_up(projector: &str, after: u64, timeout: Duration) -> Response {
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     response
+}
+
+/// The derived store, if it declares `table`: 404 otherwise.
+fn find_table(runtime: &Runtime, table: &str) -> Result<Arc<FoldShared>, Box<Response>> {
+    let shared = runtime.fold_handle();
+    if table_read::find(shared.tables(), table).is_none() {
+        return Err(Box::new(not_found(&format!("no derived table `{table}`"))));
+    }
+    Ok(Arc::clone(shared))
+}
+
+/// A 503 when the store cannot serve right now, or `None` when it can.
+///
+/// Asked after the request has been parsed, so a malformed one is a 400 whatever the
+/// store is doing rather than a 503 a client would retry forever. One gate for the whole
+/// store rather than per table, because there is one checkpoint and every row of every
+/// table is read at it: a column behind it holds its seed for every key, and a store
+/// filling from an empty start holds no key at all, which are wrong answers that look
+/// like right ones.
+fn table_unready(shared: &FoldShared, table: &str) -> Option<Response> {
+    if shared.path().is_none() {
+        metrics::table_read(table, "not_ready");
+        return Some(json_response(
+            503,
+            read_error(
+                "not_served",
+                "this process keeps no derived tables: a read-only follower serves none, so \
+                 read them from the process that owns the data directory",
+            ),
+        ));
+    }
+    if shared.servable() {
+        return None;
+    }
+    metrics::table_read(table, "not_ready");
+    let why = if shared.behind() > 0 {
+        format!(
+            "{} derived column(s) are being folded from the log; every table is served once \
+             they catch up",
+            shared.behind()
+        )
+    } else {
+        format!(
+            "the derived tables are being folded from the start of the log, at position {}; \
+             every table is served once they catch up",
+            shared.head()
+        )
+    };
+    let mut response = json_response(503, read_error("rebuilding", &why));
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    Some(response)
+}
+
+/// A read-your-writes wait against the derived store: `?after=<pos>` holds the read until
+/// the store has folded that far. The store's checkpoint is a head, and a head of N is a
+/// log that holds position N, so the comparison is the projector's.
+async fn table_wait(
+    shared: &FoldShared,
+    table: &str,
+    params: &[(String, String)],
+) -> Option<Response> {
+    let map: HashMap<String, String> = params.iter().cloned().collect();
+    let wait = match parse_wait(&map) {
+        Ok(wait) => wait?,
+        Err(response) => {
+            metrics::table_read(table, "invalid_input");
+            return Some(*response);
+        }
+    };
+    if await_position(|| shared.head(), wait.after, wait.timeout).await {
+        return None;
+    }
+    metrics::table_read(table, "not_caught_up");
+    Some(not_caught_up(
+        "the derived tables",
+        wait.after,
+        wait.timeout,
+    ))
+}
+
+fn table_refused(table: &str, refusal: table_read::Refusal) -> Response {
+    metrics::table_read(table, "invalid_input");
+    json_response(400, read_error(refusal.code, &refusal.message))
+}
+
+/// `GET /tables/{table}?<part>=<value>&limit=&cursor=`: a derived table's rows in key
+/// order, filtered for equality on the leading parts of its key, or of an index a range
+/// arm derived. Anything else is a 400, never a table scan. A row is every fold kept for
+/// its key, collections included, with sealed columns opened. An optional `?after=<pos>`
+/// first waits for the store to reach that position, for read-your-writes.
+async fn table_scan(
+    State(runtime): State<Shared>,
+    Path(table): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let shared = match find_table(&runtime, &table) {
+        Ok(shared) => shared,
+        Err(response) => return *response,
+    };
+    let def = table_read::find(shared.tables(), &table).expect("found above");
+    let scan = match table_read::parse_scan(def, &params) {
+        Ok(scan) => scan,
+        Err(refusal) => return table_refused(&table, refusal),
+    };
+    if let Some(response) = table_unready(&shared, &table) {
+        return response;
+    }
+    if let Some(response) = table_wait(&shared, &table, &params).await {
+        return response;
+    }
+    let keystore = runtime.keystore_shared().cloned();
+    let name = table.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let def = table_read::find(shared.tables(), &name).expect("found above");
+        let path = shared.path().context("the derived store has no file")?;
+        table_read::scan(path, shared.tables(), def, &scan, keystore.as_deref())
+    });
+    match task.await {
+        Ok(Ok(page)) => {
+            metrics::table_read(&table, "ok");
+            json_response(
+                200,
+                json!({
+                    "items": page.items,
+                    "next_cursor": page.next_cursor,
+                    "position": page.position,
+                }),
+            )
+        }
+        Ok(Err(err)) => {
+            metrics::table_read(&table, "error");
+            read_failed(err)
+        }
+        Err(err) => {
+            metrics::table_read(&table, "error");
+            task_panicked(err)
+        }
+    }
+}
+
+/// `GET /tables/{table}/row?<part>=<value>...`: one row, named by every part of its key.
+/// 404 for a key no event has named, whose every column would read its fold's seed.
+async fn table_row(
+    State(runtime): State<Shared>,
+    Path(table): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let shared = match find_table(&runtime, &table) {
+        Ok(shared) => shared,
+        Err(response) => return *response,
+    };
+    let def = table_read::find(shared.tables(), &table).expect("found above");
+    let key = match table_read::parse_key(def, &params) {
+        Ok(key) => key,
+        Err(refusal) => return table_refused(&table, refusal),
+    };
+    if let Some(response) = table_unready(&shared, &table) {
+        return response;
+    }
+    if let Some(response) = table_wait(&shared, &table, &params).await {
+        return response;
+    }
+    let keystore = runtime.keystore_shared().cloned();
+    let name = table.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let def = table_read::find(shared.tables(), &name).expect("found above");
+        let path = shared.path().context("the derived store has no file")?;
+        table_read::get_one(path, shared.tables(), def, &key, keystore.as_deref())
+    });
+    match task.await {
+        Ok(Ok((Some(item), position))) => {
+            metrics::table_read(&table, "ok");
+            json_response(200, json!({ "item": item, "position": position }))
+        }
+        Ok(Ok((None, _))) => {
+            metrics::table_read(&table, "not_found");
+            json_response(
+                404,
+                read_error(
+                    "not_found",
+                    "no event has named this key, so every column holds its fold's seed",
+                ),
+            )
+        }
+        Ok(Err(err)) => {
+            metrics::table_read(&table, "error");
+            read_failed(err)
+        }
+        Err(err) => {
+            metrics::table_read(&table, "error");
+            task_panicked(err)
+        }
+    }
 }
 
 /// The request's correlation id: the `x-correlation-id` header when it is a valid
@@ -1198,6 +1409,8 @@ async fn admin_index() -> Json<Value> {
             { "path": ADMIN_INVOCATION_ROUTE, "description": "one invocation and every call it journaled" },
             { "path": ADMIN_PROJECTORS_ROUTE, "description": "every projector and its readiness" },
             { "path": ADMIN_PROJECTOR_ROUTE, "description": "one projector, its entities and their shapes" },
+            { "path": ADMIN_TABLES_ROUTE, "description": "every derived table and the store's one position" },
+            { "path": ADMIN_TABLE_ROUTE, "description": "one derived table, its key and the fold behind every column" },
             { "path": ADMIN_COMMANDS_ROUTE, "description": "every command and its parameters, internal ones included" },
             { "path": ADMIN_COMMAND_ROUTE, "description": "one command" },
             { "path": ADMIN_SCHEMA_ROUTE, "description": "the loaded project: events, commands, projectors, effects" },
@@ -1550,6 +1763,55 @@ async fn admin_projector(
             definition_hash,
             counts.as_deref(),
         ))
+    })
+    .await
+}
+
+/// `GET /admin/tables`: every derived table, and the store's one position.
+///
+/// The position is reported once rather than per table, because there is only one: every
+/// column of every table is folded to the same head.
+async fn admin_tables(State(runtime): State<Shared>) -> Response {
+    let shared = runtime.fold_handle();
+    let tables: Vec<Value> = table_read::readable(shared.tables())
+        .map(|table| introspect::table_detail(shared.tables(), table, None))
+        .collect();
+    json_response(
+        200,
+        json!({
+            "tables": tables,
+            "head": shared.head(),
+            "log_head": runtime.log_head(),
+            "behind": shared.behind(),
+            "serving": shared.path().is_some() && shared.servable(),
+            "running": shared.running(),
+            "last_error": shared.last_error(),
+        }),
+    )
+}
+
+/// `GET /admin/tables/{name}`: one derived table, and on `?counts=true` its row count.
+/// Opt-in, as a projector's is, because a count is a scan of the whole table.
+async fn admin_table(
+    State(runtime): State<Shared>,
+    Path(name): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let shared = Arc::clone(runtime.fold_handle());
+    if table_read::find(shared.tables(), &name).is_none() {
+        return not_found(&format!("no derived table `{name}`"));
+    }
+    let counts = match parse_flag(&params, "counts", false) {
+        Ok(counts) => counts,
+        Err(response) => return *response,
+    };
+    blocking_json(move || {
+        let table = table_read::find(shared.tables(), &name).expect("checked above");
+        let rows = match (counts, shared.path()) {
+            (true, Some(path)) => Some(table_read::count(path, table)?),
+            _ => None,
+        };
+        Ok(introspect::table_detail(shared.tables(), table, rows))
     })
     .await
 }
