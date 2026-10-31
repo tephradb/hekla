@@ -1451,3 +1451,159 @@ fn ticked(n: i64) -> Event {
         [("n".to_owned(), Value::Int(n))],
     )
 }
+
+// ---------------------------------------------------------------------------
+// A fold keyed through another fold
+// ---------------------------------------------------------------------------
+
+const GAMES: &str = "event @game.added { game_id: Int, genre: String }
+event @game.regenred { game_id: Int, genre: String }
+event @game.purchased { game_id: Int, receipt_id: Int }
+event @game.refunded { receipt_id: Int }
+
+fold GameGenre(game_id: Int) -> String = \"unknown\" {
+  on @game.added(game_id) { genre } => genre
+  on @game.regenred(game_id) { genre } => genre
+}
+
+fold ReceiptGame(receipt_id: Int) -> Int = 0 {
+  on @game.purchased(receipt_id) { game_id } => game_id
+}
+";
+
+const GENRE_UNITS: &str = "
+fold GenreUnits(genre: String) -> n: Int = 0 {
+  on @game.purchased() { game_id } key genre = GameGenre { game_id } => n + 1
+  on @game.refunded() { receipt_id }
+    key genre = GameGenre { game_id: ReceiptGame { receipt_id } } => n - 1
+}
+";
+
+fn games() -> Vec<Event> {
+    let event = |path: [&str; 2], fields: Vec<(&str, Value)>| {
+        Event::new(
+            EventPath::new(path),
+            fields
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value)),
+        )
+    };
+    let added = |game: i64, genre: &str, path: &str| {
+        event(
+            ["game", path],
+            vec![("game_id", Value::Int(game)), ("genre", Value::str(genre))],
+        )
+    };
+    let purchased = |game: i64, receipt: i64| {
+        event(
+            ["game", "purchased"],
+            vec![
+                ("game_id", Value::Int(game)),
+                ("receipt_id", Value::Int(receipt)),
+            ],
+        )
+    };
+    vec![
+        added(1, "rpg", "added"),
+        added(2, "sim", "added"),
+        purchased(1, 10),
+        purchased(2, 11),
+        // Game 1 moves genre, so the next sale of it counts towards the new one.
+        added(1, "sim", "regenred"),
+        purchased(1, 12),
+        // And the refund of its first sale subtracts where the game is now, which is the
+        // as-of rule applied to the refund rather than to the sale.
+        event(["game", "refunded"], vec![("receipt_id", Value::Int(10))]),
+    ]
+}
+
+fn genre_units(path: &std::path::Path) -> Vec<(String, String)> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT \"genre\", CAST(\"genre_units\" AS TEXT) FROM \"genre\" ORDER BY \"genre\"",
+        )
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// **A lookup reads the looked-up fold as of each record, followed or replayed.** Added
+/// after the log, the column is rebuilt by a replay that has to carry `GameGenre` and
+/// `ReceiptGame` beside it at their values back then, since what the store holds for them
+/// now is where they ended, and every sale would count towards a game's final genre.
+#[test]
+fn a_fold_keyed_through_another_is_replayed_as_of_each_record() {
+    let all = format!("{GAMES}{GENRE_UNITS}");
+    let events = games();
+
+    let live = tempfile::tempdir().unwrap();
+    deployed_and_filled(&live.path().join("tables.db"), &all, &events);
+    let followed = genre_units(&live.path().join("tables.db"));
+    assert_eq!(
+        followed,
+        vec![
+            ("rpg".to_owned(), "1".to_owned()),
+            ("sim".to_owned(), "1".to_owned())
+        ]
+    );
+
+    let late = tempfile::tempdir().unwrap();
+    let path = late.path().join("tables.db");
+    deployed_and_filled(&path, GAMES, &events);
+    redeployed(&path, &all, &events);
+    assert_eq!(genre_units(&path), followed, "replayed");
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT \"game_genre\" FROM \"game\" WHERE \"game\" = 1"
+        ),
+        Some("sim".to_owned()),
+        "and the folds it looked up are where they ended, not where the replay left them"
+    );
+}
+
+/// An edit to a looked-up fold refolds what keys through it, in place: its values move,
+/// its table and type do not.
+#[test]
+fn editing_a_looked_up_fold_refolds_what_keys_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let all = format!("{GAMES}{GENRE_UNITS}");
+    deploy(dir.path(), &all);
+    let edited = deploy(
+        dir.path(),
+        &all.replace(
+            "on @game.regenred(game_id) { genre } => genre",
+            "on @game.regenred(game_id) { genre } => \"retired\"",
+        ),
+    );
+    assert_eq!(
+        verdicts(&edited),
+        vec![("game_genre", "refold"), ("genre_units", "refold")]
+    );
+
+    // Both behind at once, so `GenreUnits` reads `GameGenre` out of the store while the
+    // same replay rebuilds it, and has to agree with a store that followed the edited
+    // program from the start.
+    let retired = all.replace(
+        "on @game.regenred(game_id) { genre } => genre",
+        "on @game.regenred(game_id) { genre } => \"retired\"",
+    );
+    let events = games();
+    let live = tempfile::tempdir().unwrap();
+    deployed_and_filled(&live.path().join("tables.db"), &retired, &events);
+    let followed = genre_units(&live.path().join("tables.db"));
+    assert!(
+        followed.contains(&("retired".to_owned(), "0".to_owned())),
+        "the edit is visible: {followed:?}"
+    );
+    let refolded = tempfile::tempdir().unwrap();
+    let path = refolded.path().join("tables.db");
+    deployed_and_filled(&path, &all, &events);
+    redeployed(&path, &retired, &events);
+    assert_eq!(genre_units(&path), followed);
+}

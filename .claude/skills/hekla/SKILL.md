@@ -174,8 +174,12 @@ its parameters (`/folds/OwnerTickets?org_id=1&owner_id=10`), answering `{value, 
 query-only fold (one whose arm reads the envelope, or computes a key part from the record with
 `key month = month_of(at)`) is stored and served like any other, and this is the only place it can
 be read, since no command may fold it. A computed key part is a column and a filter like any other,
-so a read model can bucket by something no event carries. A fold with a parameter no arm matches
-is not stored, and is a `400 not_stored` naming that parameter; a command can still fold it.
+so a read model can bucket by something no event carries. A key part may also be read out of
+another fold (`key genre = GameGenre { game_id }`), as that fold stood just before the record: a
+sale counts towards the genre its game had when it sold. Editing the looked-up fold refolds the
+folds keyed through it, and adding one to a deployment with history replays the log for it. A
+fold with a parameter no arm matches is not stored, and is a `400 not_stored` naming that
+parameter; a command can still fold it.
 
 A command's success body is `{correlation_id, causation_id, positions: {first, last}, events: [...]}`,
 and every error body is `{correlation_id, causation_id, error: {code, message}}` (the two ids are

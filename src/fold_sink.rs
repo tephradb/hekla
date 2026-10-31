@@ -44,13 +44,13 @@ pub struct ColumnWriter<'a> {
 
 /// What a backfill replays the log under.
 ///
-/// The replay runs `Tables::only` over the columns being rebuilt, which also runs the columns
-/// of their tables that mint keys, since a range of theirs reaches only keys something has
-/// minted. Only the columns being rebuilt are written: the rest are already at the
-/// checkpoint, and keeping their writes would fold every record into them a second time.
-/// Those read back as their seed rather than their final value, so their bodies run over
-/// history from where it started rather than from where it ended, which an arithmetic
-/// arm can overflow on.
+/// The replay runs `Tables::only` over the columns being rebuilt, which also runs their
+/// closure: the columns of their tables that mint keys, since a range of theirs reaches
+/// only keys something has minted, and the folds they look up, since a lookup reads one as
+/// of each record. Only the columns being rebuilt reach the store. The closure's own values
+/// are kept in [`Replay::overlay`] for the length of the replay and thrown away after it:
+/// they are already right at the checkpoint, and writing a replay into them would fold
+/// every record into them a second time.
 ///
 /// "As followed live" here means followed from the start of the log with the program as
 /// it is now, not with the deploys it actually went through: a key a fold since removed
@@ -59,17 +59,17 @@ pub struct ColumnWriter<'a> {
 pub struct Replay {
     /// The columns being rebuilt, as the holding table and the column name.
     pub only: BTreeSet<(String, String)>,
-    /// The main tables holding one of them. Keys are tracked for these alone, and a range
-    /// over any other table reaches nothing, since nothing it writes is kept.
-    pub sources: BTreeSet<String>,
-    /// Every key some arm has written so far in the replay, per main table, whether or not
-    /// the write was kept.
+    /// Every key some arm has written so far in the replay, per main table.
     ///
     /// **A range arm sees these, not the store's rows.** Followed live, a range at position
     /// `p` reaches only the keys minted before `p`; the store at the checkpoint also holds
     /// every key minted after it, and ranging over those would apply a record to a key that
     /// did not exist yet when it was appended.
     pub minted: BTreeMap<String, BTreeSet<Vec<String>>>,
+    /// The closure's values as of the record being replayed, per holding table and column,
+    /// then key. A lookup reads these, which is why they cannot be the final values the
+    /// store holds. Memory grows with the keys the closure writes over the whole log.
+    pub overlay: BTreeMap<(String, String), BTreeMap<Vec<String>, Value>>,
 }
 
 impl<'a> ColumnWriter<'a> {
@@ -93,14 +93,17 @@ impl<'a> ColumnWriter<'a> {
 impl Columns for ColumnWriter<'_> {
     fn value(&self, table: &str, key: &[Key], column: &str) -> Result<Option<Value>, Error> {
         let (def, held) = self.cell(table, column)?;
-        if self
-            .replay
-            .as_ref()
-            .is_some_and(|replay| !replay.only.contains(&(def.name.clone(), held.name.clone())))
-        {
-            return Ok(None);
-        }
         let texts = key_texts(def, key)?;
+        if let Some(replay) = &self.replay {
+            let at = (def.name.clone(), held.name.clone());
+            if !replay.only.contains(&at) {
+                return Ok(replay
+                    .overlay
+                    .get(&at)
+                    .and_then(|cells| cells.get(&texts))
+                    .cloned());
+            }
+        }
         let found = self
             .store
             .cell(self.tx, def, &texts, &held.name)
@@ -141,14 +144,14 @@ impl Columns for ColumnWriter<'_> {
         let (def, held) = self.cell(table, column)?;
         let texts = key_texts(def, &key)?;
         if let Some(replay) = &mut self.replay {
-            if replay.sources.contains(&def.source) {
-                replay
-                    .minted
-                    .entry(def.source.clone())
-                    .or_default()
-                    .insert(texts.clone());
-            }
-            if !replay.only.contains(&(def.name.clone(), held.name.clone())) {
+            replay
+                .minted
+                .entry(def.source.clone())
+                .or_default()
+                .insert(texts.clone());
+            let at = (def.name.clone(), held.name.clone());
+            if !replay.only.contains(&at) {
+                replay.overlay.entry(at).or_default().insert(texts, value);
                 return Ok(());
             }
         }

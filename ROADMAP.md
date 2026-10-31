@@ -3473,6 +3473,10 @@ Decisions worth keeping:
   may fold it. That includes one with a computed key part (`key month = month_of(at)`),
   which heklang makes query-only for the same reason it does an envelope binding: a computed key has
   no form a command's read could ask the log for, while the store computes it per record.
+  So does a key part read out of another fold (`key genre = GameGenre { game_id }`), as of
+  the record: a backfill replays the looked-up folds beside the column (in memory, unless the
+  same deploy rebuilds them too), since what the store holds for them is where they ended,
+  not where they stood at each record.
 - **A key no event has named is a 404**, as a row read is, rather than the fold's seed: answering
   the seed would make a mistyped id indistinguishable from a real key at its starting value.
 

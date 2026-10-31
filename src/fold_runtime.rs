@@ -140,14 +140,13 @@ pub fn backfill<H: Host>(
         };
         store.reset_column(&tx, table, column)?;
         replay.only.insert((row.table.clone(), row.column.clone()));
-        replay.sources.insert(table.source.clone());
         folds.push(column.fold.clone());
     }
 
-    // Only the behind columns and what heklang says they need beside them: the columns of
-    // their tables that mint the keys a range of theirs reaches. Those run too, and the sink
-    // keeps their keys and drops their writes, so a column that is already right is neither
-    // doubled nor reset.
+    // Only the behind columns and what heklang says they need beside them: the columns that
+    // mint the keys a range of theirs reaches, and the folds they look up. Those run into
+    // the sink's overlay and never reach the store, so a column that is already right is
+    // neither doubled nor reset.
     let derived = Tables::new(program);
     let rebuild = derived.only(&folds);
     let mut writer = ColumnWriter {
