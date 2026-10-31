@@ -30,6 +30,9 @@ const PAGE = 50
  * identifier. */
 const FILTER = 'k.'
 
+/* A fold lookup's arguments ride as `a.<param>`, named as the fold declares them. */
+const ARG = 'a.'
+
 export function TablesView({ params, search }) {
   if (params?.name) {
     return html`<${TableDetail} key=${params.name} name=${params.name} search=${search} />`
@@ -126,25 +129,42 @@ function TableList() {
 /** The key-part filters and the rest of the browse state, read off the query string. */
 function browsing(search) {
   const filters = []
+  const args = []
   for (const [name, value] of search ?? []) {
     if (name.startsWith(FILTER)) filters.push([name.slice(FILTER.length), value])
+    if (name.startsWith(ARG)) args.push([name.slice(ARG.length), value])
   }
   return {
     filters,
     cursor: search?.get('cursor') ?? null,
     row: search?.get('row') ?? null,
+    fold: search?.get('fold') ?? null,
+    args,
   }
 }
 
 /**
  * Replace the browse query wholesale, for the projectors page's reason: a new filter
  * invalidates the cursor, and a new page invalidates the open row.
+ *
+ * The fold lookup is the exception, since nothing about the rows invalidates it: left
+ * `undefined` it carries over from the current URL, so paging or opening a row keeps it
+ * open, and `null` is what closes it.
  */
-function browse({ filters = [], cursor, row } = {}) {
+function browse({ filters = [], cursor, row, fold, args } = {}) {
+  let keptFold = fold
+  let keptArgs = args ?? []
+  if (fold === undefined) {
+    const current = browsing(new URLSearchParams(window.location.search))
+    keptFold = current.fold
+    keptArgs = current.args
+  }
   setQuery([
     ...filters.map(([name, value]) => [`${FILTER}${name}`, value]),
     ['cursor', cursor],
     ['row', row],
+    ['fold', keptFold],
+    ...(keptFold ? keptArgs : []).map(([name, value]) => [`${ARG}${name}`, value]),
   ])
 }
 
@@ -152,7 +172,8 @@ function TableDetail({ name, search }) {
   const { status } = useStatus()
   const [counts, setCounts] = useState(false)
   const state = useResource((signal) => api.table(name, { counts }, signal), [name, counts])
-  const { filters, cursor, row } = browsing(search)
+  const { filters, cursor, row, fold, args } = browsing(search)
+  const lookUp = (name, given = []) => browse({ filters, cursor, row, fold: name, args: given })
 
   return html`
     <${Resource} state=${state}>
@@ -210,8 +231,19 @@ function TableDetail({ name, search }) {
               html`<${StoreState} data=${{ ...status.tables, log_head: status.log_head }} />`}
             </dl>
           </div>
-          <${Columns} table=${table} />
+          <${Columns} table=${table} onFold=${lookUp} />
         </section>
+
+        ${fold !== null &&
+        html`
+          <${FoldLookup}
+            key=${`${fold}:${JSON.stringify(args)}`}
+            table=${table}
+            fold=${fold}
+            args=${args}
+            onClose=${() => browse({ filters, cursor, row, fold: null })}
+          />
+        `}
 
         <div class=${row === null ? undefined : 'with-detail'}>
           <${Rows} table=${table} filters=${filters} cursor=${cursor} openRow=${row} />
@@ -222,6 +254,7 @@ function TableDetail({ name, search }) {
               table=${table}
               keyText=${row}
               onClose=${() => browse({ filters, cursor })}
+              onFold=${lookUp}
             />
           `}
         </div>
@@ -230,7 +263,7 @@ function TableDetail({ name, search }) {
   `
 }
 
-function Columns({ table }) {
+function Columns({ table, onFold }) {
   return html`
     <table class="data">
       <thead>
@@ -247,7 +280,18 @@ function Columns({ table }) {
           (column) => html`
             <tr key=${column.name}>
               <td><code>${column.name}</code></td>
-              <td><code class="tiny">${column.fold}</code></td>
+              <td>
+                <a
+                  href=${foldHref(column.fold)}
+                  onClick=${(clicked) => {
+                    clicked.preventDefault()
+                    onFold(column.fold)
+                  }}
+                  title="Look this fold up for one key"
+                >
+                  <code class="tiny">${column.fold}</code>
+                </a>
+              </td>
               <td><span class="mono tiny dim">${column.kind}</span></td>
               <td>
                 ${column.subject
@@ -478,7 +522,7 @@ function Rows({ table, filters, cursor, openRow }) {
   `
 }
 
-function RowDetail({ table, keyText, onClose }) {
+function RowDetail({ table, keyText, onClose, onFold }) {
   let values = []
   try {
     values = JSON.parse(keyText)
@@ -516,7 +560,25 @@ function RowDetail({ table, keyText, onClose }) {
                 <dt key=${column.name}>${column.name}</dt>
                 <dd>
                   <${Value} column=${column} row=${found.item} />
-                  <span class="note">${column.fold}</span>
+                  <a
+                    class="note"
+                    href=${foldHref(column.fold)}
+                    onClick=${(clicked) => {
+                      clicked.preventDefault()
+                      onFold(
+                        column.fold,
+                        /* Only a whole key starts the lookup filled in: a part the row
+                         * text did not carry would be sent as the word `undefined`. */
+                        values.length === column.args.length &&
+                        values.every((value) => value !== null && value !== undefined)
+                          ? column.args.map((arg, index) => [arg, String(values[index])])
+                          : [],
+                      )
+                    }}
+                    title="Look this fold up for this row's key"
+                  >
+                    ${column.fold}
+                  </a>
                   ${column.subject && html`<span class="note">sealed under ${column.subject}</span>`}
                 </dd>
               `,
@@ -534,5 +596,127 @@ function RowDetail({ table, keyText, onClose }) {
         `}
       <//>
     <//>
+  `
+}
+
+/* --- one fold -------------------------------------------------------------- */
+
+/** This page with a fold's lookup open, as a real link so it can open in a new tab. */
+function foldHref(fold) {
+  return `${window.location.pathname}?fold=${encodeURIComponent(fold)}`
+}
+
+/**
+ * One named fold for one key, through `GET /folds/{fold}`: what an application calling a
+ * fold by name gets, with its arguments named as the fold declares its parameters rather
+ * than as the table spells its key parts. Opened from a row, it starts with that row's key.
+ */
+function FoldLookup({ table, fold, args, onClose }) {
+  const column = table.columns.find((candidate) => candidate.fold === fold)
+  const [draft, setDraft] = useState(() => Object.fromEntries(args))
+  const complete =
+    column !== undefined && column.args.every((arg) => (draft[arg] ?? '').trim() !== '')
+  /* What was last asked for, so the result belongs to the arguments that produced it
+   * rather than to whatever the inputs say now. */
+  const [asked, setAsked] = useState(() =>
+    complete ? column.args.map((arg) => [arg, draft[arg].trim()]) : null,
+  )
+  const state = useResource(
+    (signal) => (asked ? api.fold(fold, asked, signal) : Promise.resolve(null)),
+    [fold, JSON.stringify(asked)],
+  )
+
+  if (column === undefined) {
+    return html`
+      <section class="card">
+        <header>Fold <code>${fold}</code></header>
+        <${Empty} title="Not in this table">
+          <code>${fold}</code> is kept in another table, or not stored at all.
+        <//>
+      </section>
+    `
+  }
+
+  const read = () => {
+    if (complete) setAsked(column.args.map((arg) => [arg, draft[arg].trim()]))
+  }
+  const query = new URLSearchParams(asked ?? [])
+  const route = `/folds/${encodeURIComponent(fold)}`
+  const path = asked && asked.length ? `${route}?${query}` : route
+
+  return html`
+    <section class="card">
+      <header>
+        Fold
+        <code style=${{ textTransform: 'none', letterSpacing: 0 }}>${fold}</code>
+        <span class="tiny faint" style=${{ textTransform: 'none', letterSpacing: 0 }}>
+          ${column.kind}, kept as <code>${column.name}</code>
+        </span>
+        <div style=${{ flex: 1 }}></div>
+        <button type="button" class="btn icon" onClick=${onClose} title="Close" aria-label="Close">
+          ✕
+        </button>
+      </header>
+      <div class="filters">
+        ${column.args.map(
+          (arg, index) => html`
+            <div class="filter-input" key=${arg}>
+              <span class="chip-kind">${arg}</span>
+              <input
+                value=${draft[arg] ?? ''}
+                placeholder=${table.key[index]?.kind ?? ''}
+                onInput=${(typed) => setDraft({ ...draft, [arg]: typed.target.value })}
+                onKeyDown=${(pressed) => {
+                  if (pressed.key === 'Enter') {
+                    pressed.preventDefault()
+                    read()
+                  }
+                }}
+                aria-label=${`The ${arg} argument`}
+                spellcheck="false"
+                autocomplete="off"
+              />
+            </div>
+          `,
+        )}
+        <button type="button" class="btn" onClick=${read} disabled=${!complete}>read</button>
+      </div>
+      <div class="body">
+        ${asked === null
+          ? html`<p class="tiny faint">
+              ${column.args.length
+                ? 'Give every argument to read the fold for that key.'
+                : 'This fold takes no arguments.'}
+            </p>`
+          : state.error?.notFound
+            ? html`<${Empty} title="No such key">
+                No event has named this key, so <code>${fold}</code> holds its seed.
+              <//>`
+            : state.error?.unavailable
+              ? html`<${Empty} title=${state.error.code}>${state.error.message}<//>`
+              : html`
+                  <${Resource} state=${state}>
+                    ${(found) => html`
+                      <dl class="kv">
+                        <dt>value</dt>
+                        <dd>
+                          ${found.value === null
+                            ? html`<${Absent} column=${column} />`
+                            : baseKind(column.kind) === 'Json'
+                              ? html`<${JsonTree} value=${found.value} />`
+                              : html`<span class="mono">${String(found.value)}</span>`}
+                        </dd>
+                        <dt>position</dt>
+                        <dd>${count(found.position)}</dd>
+                      </dl>
+                    `}
+                  <//>
+                `}
+        <div class="row wrap" style=${{ marginTop: '8px' }}>
+          <a href=${path} target="_blank" rel="noreferrer"><code>GET ${path}</code></a>
+          <${Copy} value=${path} />
+        </div>
+      </div>
+    </section>
   `
 }

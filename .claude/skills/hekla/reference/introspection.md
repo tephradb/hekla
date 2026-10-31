@@ -355,11 +355,16 @@ subject columns decrypted. The selection lives in the query string, so a row is 
 `/admin/tables` lists every derived table with the store's one position; `/admin/tables/{name}`
 shows its key, the fold behind each column (and which are stored in the side table), and its rows,
 fetched through the public `/tables` routes. A filter takes the key parts left to right, so a part
-is offered only once the ones before it have a value. The selection lives in the query string:
+is offered once the ones before it have a value, or when it leads a derived index. The selection
+lives in the query string:
 
 ```
 /admin/tables/org__owner?k.org=1&cursor=<c>&row=[1,10]
 ```
+
+A fold's name, in the column list or beside a value in a row's panel, opens a lookup card that
+reads it through `GET /folds/{Fold}`, with one input per parameter, named as the fold declares
+them; from a row it starts with that row's key. That is `?fold=<Fold>&a.<param>=<value>`.
 
 ### Writing a projection
 

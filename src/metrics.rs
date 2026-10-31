@@ -87,6 +87,7 @@ const EFFECT_HTTP: &str = "hekla_effect_http_requests_total";
 const READS: &str = "hekla_reads_total";
 const READ_WAITS: &str = "hekla_read_waits_total";
 const TABLE_READS: &str = "hekla_table_reads_total";
+const FOLD_READS: &str = "hekla_fold_reads_total";
 
 /// Every `CommandOutcome` variant, plus the `error` the 500 paths report. Enumerated so
 /// [`refresh`] can zero them; the recorder takes whichever one happened.
@@ -280,6 +281,10 @@ fn describe() {
     describe_counter!(
         TABLE_READS,
         "Derived-table read requests, by table and outcome."
+    );
+    describe_counter!(
+        FOLD_READS,
+        "Single-fold read requests, by fold and outcome."
     );
 }
 
@@ -497,6 +502,11 @@ pub fn fold_batch(columns: usize) {
 /// carried: a request for a table that does not exist is not counted.
 pub fn table_read(table: &str, outcome: &'static str) {
     counter!(TABLE_READS, "table" => table.to_owned(), "outcome" => outcome).increment(1);
+}
+
+/// One `GET /folds/...` request, labelled by a declared fold only.
+pub fn fold_read(fold: &str, outcome: &'static str) {
+    counter!(FOLD_READS, "fold" => fold.to_owned(), "outcome" => outcome).increment(1);
 }
 
 #[cfg(test)]

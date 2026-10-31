@@ -1,6 +1,7 @@
 //! The HTTP surface: `POST /commands/{name}`, the generated read API
 //! (`GET /read/{projector}/{entity}[/{key}]`), the derived tables
-//! (`GET /tables/{table}[/row]`), `POST /projectors/{name}/replay`,
+//! (`GET /tables/{table}[/row]`) and their folds one at a time (`GET /folds/{fold}`),
+//! `POST /projectors/{name}/replay`,
 //! `POST /effects/{name}/skip/{position}`, `GET /status`, `GET /health`, the Prometheus
 //! scrape at `GET /metrics`, the generated `GET /openapi.json`, a Scalar reference UI
 //! over it at `GET /docs`, and the read-only introspection surface under `GET /admin`.
@@ -106,6 +107,7 @@ pub const READ_ONE_ROUTE: &str = "/read/{projector}/{entity}/{key}";
 pub const READ_SCAN_ROUTE: &str = "/read/{projector}/{entity}";
 pub const TABLE_SCAN_ROUTE: &str = "/tables/{table}";
 pub const TABLE_ROW_ROUTE: &str = "/tables/{table}/row";
+pub const FOLD_ROUTE: &str = "/folds/{fold}";
 pub const REPLAY_ROUTE: &str = "/projectors/{name}/replay";
 pub const SKIP_ROUTE: &str = "/effects/{name}/skip/{position}";
 pub const STATUS_ROUTE: &str = "/status";
@@ -205,6 +207,7 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (READ_SCAN_ROUTE, get(read_scan)),
         (TABLE_SCAN_ROUTE, get(table_scan)),
         (TABLE_ROW_ROUTE, get(table_row)),
+        (FOLD_ROUTE, get(fold_read)),
         (REPLAY_ROUTE, post(replay)),
         (SKIP_ROUTE, post(skip)),
         (STATUS_ROUTE, get(status)),
@@ -1038,7 +1041,8 @@ fn find_table(runtime: &Runtime, table: &str) -> Result<Arc<FoldShared>, Box<Res
     Ok(Arc::clone(shared))
 }
 
-/// A 503 when the store cannot serve right now, or `None` when it can.
+/// A 503 when the store cannot serve right now, or `None` when it can. `count` records the
+/// outcome against whatever the request named, a table or a fold.
 ///
 /// Asked after the request has been parsed, so a malformed one is a 400 whatever the
 /// store is doing rather than a 503 a client would retry forever. One gate for the whole
@@ -1046,9 +1050,9 @@ fn find_table(runtime: &Runtime, table: &str) -> Result<Arc<FoldShared>, Box<Res
 /// table is read at it: a column behind it holds its seed for every key, and a store
 /// filling from an empty start holds no key at all, which are wrong answers that look
 /// like right ones.
-fn table_unready(shared: &FoldShared, table: &str) -> Option<Response> {
+fn table_unready(shared: &FoldShared, count: &(dyn Fn(&'static str) + Sync)) -> Option<Response> {
     if shared.path().is_none() {
-        metrics::table_read(table, "not_ready");
+        count("not_ready");
         return Some(json_response(
             503,
             read_error(
@@ -1061,7 +1065,7 @@ fn table_unready(shared: &FoldShared, table: &str) -> Option<Response> {
     if shared.servable() {
         return None;
     }
-    metrics::table_read(table, "not_ready");
+    count("not_ready");
     let why = if shared.behind() > 0 {
         format!(
             "{} derived column(s) are being folded from the log; every table is served once \
@@ -1087,21 +1091,21 @@ fn table_unready(shared: &FoldShared, table: &str) -> Option<Response> {
 /// log that holds position N, so the comparison is the projector's.
 async fn table_wait(
     shared: &FoldShared,
-    table: &str,
+    count: &(dyn Fn(&'static str) + Sync),
     params: &[(String, String)],
 ) -> Option<Response> {
     let map: HashMap<String, String> = params.iter().cloned().collect();
     let wait = match parse_wait(&map) {
         Ok(wait) => wait?,
         Err(response) => {
-            metrics::table_read(table, "invalid_input");
+            count("invalid_input");
             return Some(*response);
         }
     };
     if await_position(|| shared.head(), wait.after, wait.timeout).await {
         return None;
     }
-    metrics::table_read(table, "not_caught_up");
+    count("not_caught_up");
     Some(not_caught_up(
         "the derived tables",
         wait.after,
@@ -1133,10 +1137,11 @@ async fn table_scan(
         Ok(scan) => scan,
         Err(refusal) => return table_refused(&table, refusal),
     };
-    if let Some(response) = table_unready(&shared, &table) {
+    let count = |outcome| metrics::table_read(&table, outcome);
+    if let Some(response) = table_unready(&shared, &count) {
         return response;
     }
-    if let Some(response) = table_wait(&shared, &table, &params).await {
+    if let Some(response) = table_wait(&shared, &count, &params).await {
         return response;
     }
     let keystore = runtime.keystore_shared().cloned();
@@ -1169,6 +1174,95 @@ async fn table_scan(
     }
 }
 
+/// Why a declared fold has no stored value to read. `layout` stores every named fold whose
+/// key some event supplies, query-only ones included (they are read nowhere else, since a
+/// command may not fold one), so the one kind it leaves out is a fold with a parameter no
+/// arm matches, and the store names those parameters.
+fn not_stored(shared: &FoldShared, fold: &str) -> String {
+    let unmatched = shared
+        .unstored(fold)
+        .filter(|params| !params.is_empty())
+        .map_or_else(
+            || "a parameter".to_owned(),
+            |params| {
+                params
+                    .iter()
+                    .map(|param| format!("`{param}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+    format!(
+        "`{fold}` is not stored: no arm matches {unmatched}, so the keys it has cannot be listed. \
+         A command can still fold it"
+    )
+}
+/// `GET /folds/{fold}?<param>=<value>...`: one named fold's value for one key, its
+/// arguments named as the fold declares its parameters.
+///
+/// The same cell `/tables/{table}/row` serves inside a row, addressed the way a caller
+/// already thinks of it. 404 for a key no event has named, 400 for a declared fold nothing
+/// stores, which is a fold this API would have to fold over the whole log on every request
+/// to answer.
+async fn fold_read(
+    State(runtime): State<Shared>,
+    Path(fold): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let shared = Arc::clone(runtime.fold_handle());
+    let Some(at) = table_read::find_fold(shared.tables(), &fold) else {
+        return match runtime.program().fold(&fold) {
+            Some(_) => json_response(400, read_error("not_stored", &not_stored(&shared, &fold))),
+            None => not_found(&format!("no named fold `{fold}`")),
+        };
+    };
+    let key = match table_read::parse_args(at, &params) {
+        Ok(key) => key,
+        Err(refusal) => {
+            metrics::fold_read(&fold, "invalid_input");
+            return json_response(400, read_error(refusal.code, &refusal.message));
+        }
+    };
+    let count = |outcome| metrics::fold_read(&fold, outcome);
+    if let Some(response) = table_unready(&shared, &count) {
+        return response;
+    }
+    if let Some(response) = table_wait(&shared, &count, &params).await {
+        return response;
+    }
+    let keystore = runtime.keystore_shared().cloned();
+    let name = fold.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let at = table_read::find_fold(shared.tables(), &name).expect("found above");
+        let path = shared.path().context("the derived store has no file")?;
+        table_read::get_fold(path, shared.tables(), at, &key, keystore.as_deref())
+    });
+    match task.await {
+        Ok(Ok((Some(value), position))) => {
+            metrics::fold_read(&fold, "ok");
+            json_response(200, json!({ "value": value, "position": position }))
+        }
+        Ok(Ok((None, _))) => {
+            metrics::fold_read(&fold, "not_found");
+            json_response(
+                404,
+                read_error(
+                    "not_found",
+                    &format!("no event has named this key, so `{fold}` holds its seed"),
+                ),
+            )
+        }
+        Ok(Err(err)) => {
+            metrics::fold_read(&fold, "error");
+            read_failed(err)
+        }
+        Err(err) => {
+            metrics::fold_read(&fold, "error");
+            task_panicked(err)
+        }
+    }
+}
+
 /// `GET /tables/{table}/row?<part>=<value>...`: one row, named by every part of its key.
 /// 404 for a key no event has named, whose every column would read its fold's seed.
 async fn table_row(
@@ -1185,10 +1279,11 @@ async fn table_row(
         Ok(key) => key,
         Err(refusal) => return table_refused(&table, refusal),
     };
-    if let Some(response) = table_unready(&shared, &table) {
+    let count = |outcome| metrics::table_read(&table, outcome);
+    if let Some(response) = table_unready(&shared, &count) {
         return response;
     }
-    if let Some(response) = table_wait(&shared, &table, &params).await {
+    if let Some(response) = table_wait(&shared, &count, &params).await {
         return response;
     }
     let keystore = runtime.keystore_shared().cloned();

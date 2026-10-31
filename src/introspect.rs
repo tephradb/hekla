@@ -585,6 +585,7 @@ pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> 
             json!({
                 "name": column.name,
                 "fold": column.fold,
+                "args": column.args,
                 "kind": column.meta.kind.describe(),
                 "optional": column.meta.kind.is_nullable(),
                 "subject": column.meta.subject(),

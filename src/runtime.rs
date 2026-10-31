@@ -592,9 +592,7 @@ impl Runtime {
             secret_report,
             started: Instant::now(),
             projectors: HashMap::new(),
-            folds: crate::fold_runtime::FoldShared::idle(crate::tables::TableDef::all(
-                &project.program,
-            )),
+            folds: crate::fold_runtime::FoldShared::idle(&project.program),
             effects: OnceLock::new(),
             openapi_json: String::new(),
             config: project.config.clone(),
@@ -668,9 +666,7 @@ impl Runtime {
             secret_report,
             started: Instant::now(),
             projectors: HashMap::new(),
-            folds: crate::fold_runtime::FoldShared::idle(crate::tables::TableDef::all(
-                &project.program,
-            )),
+            folds: crate::fold_runtime::FoldShared::idle(&project.program),
             effects: OnceLock::new(),
             openapi_json: String::new(),
             config: project.config.clone(),

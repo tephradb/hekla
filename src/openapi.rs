@@ -252,6 +252,9 @@ pub fn build(surface: &Surface) -> Value {
             format!("/tables/{}/row", table.main.name),
             table_row_path(table, &names),
         );
+        for column in table.columns() {
+            paths.insert(format!("/folds/{}", column.fold), fold_path(table, column));
+        }
     }
     for (path, item) in operation_paths(surface) {
         paths.insert(path, item);
@@ -774,6 +777,78 @@ fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
                     schema_ref("Error"),
                 ),
                 "404": response("no such table", schema_ref("Error")),
+                "503": table_unavailable_response(),
+                "500": response("internal error", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+/// `/folds/{Name}`: one stored fold's value for one key, its parameters named as the fold
+/// declares them rather than as the table spells its key parts.
+fn fold_path(table: &TableSurface, column: &ColumnDef) -> Value {
+    let mut parameters: Vec<Value> = column
+        .args
+        .iter()
+        .zip(&table.main.key)
+        .map(|(arg, (_, meta))| {
+            let mut param = query_param(
+                arg,
+                &format!(
+                    "The fold's `{arg}` parameter{}.",
+                    meta.identifies
+                        .as_deref()
+                        .map(|subject| format!(", a `{subject}` id"))
+                        .unwrap_or_default()
+                ),
+                field_schema(&meta.kind),
+            );
+            param["required"] = json!(true);
+            param
+        })
+        .collect();
+    parameters.extend(wait_params());
+    let mut value = field_schema(&column.meta.kind);
+    let mut notes = vec![format!(
+        "What `{}` folds to for this key. Null when the fold answers `none`.",
+        column.fold
+    )];
+    if let Some(subject) = column.meta.subject() {
+        notes.push(format!(
+            "Sealed under `{subject}`, and null once that subject is erased."
+        ));
+    }
+    value["description"] = json!(notes.join(" "));
+    let body = json!({
+        "type": "object",
+        "properties": {
+            "value": value,
+            "position": position_schema("The derived tables' log position, read in the same snapshot as the value."),
+        },
+        "required": ["value", "position"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [TABLES_TAG],
+            "operationId": format!("read_fold_{}", identifier(&column.fold)),
+            "summary": format!("read `{}` for one key", column.fold),
+            "description": format!(
+                "The value of the named fold `{}`, kept as the `{}` column of the derived table \
+                 `{}`. Every parameter is required. {TABLE_READ_YOUR_WRITES}",
+                column.fold, column.name, table.main.name,
+            ),
+            "parameters": parameters,
+            "responses": {
+                "200": response("the fold's value, and the position it was read at", body),
+                "400": response(
+                    "a parameter is missing, unknown or malformed",
+                    schema_ref("Error"),
+                ),
+                "404": response(
+                    "no event has named this key, so the fold holds its seed",
+                    schema_ref("Error"),
+                ),
                 "503": table_unavailable_response(),
                 "500": response("internal error", schema_ref("Error")),
             },
@@ -2130,6 +2205,12 @@ fn table_detail_schema() -> Value {
                     "properties": {
                         "name": { "type": "string" },
                         "fold": { "type": "string" },
+                        "args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "The fold's parameter names in key order: what \
+                                `/folds/{fold}` takes, where the table names its key parts.",
+                        },
                         "kind": { "type": "string" },
                         "optional": { "type": "boolean" },
                         "subject": { "type": ["string", "null"] },
@@ -2139,7 +2220,7 @@ fn table_detail_schema() -> Value {
                                 back into every row served.",
                         },
                     },
-                    "required": ["name", "fold", "kind", "optional", "subject", "collection"],
+                    "required": ["name", "fold", "args", "kind", "optional", "subject", "collection"],
                     "additionalProperties": false,
                 },
             },

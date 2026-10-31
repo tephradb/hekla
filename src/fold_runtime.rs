@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use heklang::value::{Record, Value};
-use heklang::{Interpreter, Program, Tables, host::Host};
+use heklang::{Interpreter, Program, Tables, Unstored, host::Host};
 
 use crate::fold_sink::ColumnWriter;
 use crate::fold_store::{FoldStore, Recorded};
@@ -216,6 +216,9 @@ pub struct FoldShared {
     /// What a reader may ask for, and where it lives. Empty and `None` for a store nothing
     /// keeps, which is a project with no storable fold or a read-only follower.
     tables: Vec<TableDef>,
+    /// The named folds `layout` keeps no column for, and which parameters no arm matches,
+    /// so a by-name read can say why without laying the program out again.
+    unstored: Vec<Unstored>,
     path: Option<PathBuf>,
 }
 
@@ -233,6 +236,15 @@ impl FoldShared {
     /// filling from an empty start.
     pub fn servable(&self) -> bool {
         self.behind() == 0 && self.head() >= self.filling_to.load(Ordering::Acquire)
+    }
+
+    /// The parameters no arm of `fold` matches, if it is a named fold `layout` keeps no
+    /// column for.
+    pub fn unstored(&self, fold: &str) -> Option<&[String]> {
+        self.unstored
+            .iter()
+            .find(|unstored| unstored.fold == fold)
+            .map(|unstored| unstored.unmatched.as_slice())
     }
 
     pub fn tables(&self) -> &[TableDef] {
@@ -307,9 +319,9 @@ pub fn start(
     // a checkpoint for it.
     if tables.is_empty() {
         return Ok((
-            FoldShared::idle(Vec::new()),
+            FoldShared::idle(&program),
             FoldThread {
-                shared: FoldShared::idle(Vec::new()),
+                shared: FoldShared::idle(&program),
                 join: None,
             },
         ));
@@ -339,6 +351,7 @@ pub fn start(
         running: AtomicBool::new(true),
         last_error: Mutex::new(None),
         tables: tables.clone(),
+        unstored: heklang::layout(&program).unstored,
         path: Some(path.clone()),
     });
 
@@ -475,17 +488,18 @@ impl FoldShared {
     /// nothing rather than behind by zero columns: a follower serves no derived read at
     /// all, and saying "caught up" would be a claim about a store it never opened.
     ///
-    /// `tables` is what the program declares, with no file behind it, so a read of one is
+    /// The tables are what the program declares, with no file behind them, so a read of one is
     /// told this node does not serve it rather than that it does not exist.
-    pub fn idle(tables: Vec<TableDef>) -> Arc<FoldShared> {
+    pub fn idle(program: &Program) -> Arc<FoldShared> {
         Arc::new(FoldShared {
+            tables: TableDef::all(program),
+            unstored: heklang::layout(program).unstored,
             head: AtomicU64::new(0),
             behind: AtomicU64::new(0),
             filling_to: AtomicU64::new(0),
             shutdown: AtomicBool::new(true),
             running: AtomicBool::new(false),
             last_error: Mutex::new(None),
-            tables,
             path: None,
         })
     }

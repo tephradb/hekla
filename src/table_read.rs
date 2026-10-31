@@ -29,7 +29,7 @@ use crate::fold_store::SealedCell;
 use crate::heklang_host::{column_form, unsealed_json};
 use crate::read_model::{coerce_value, from_sql, quote_ident, reject_double_quoted_strings};
 use crate::schema::{FieldKind, FieldMeta};
-use crate::tables::{TableDef, side_of};
+use crate::tables::{ColumnDef, TableDef, main_of, side_of};
 
 /// Query parameters that are not a key part.
 pub const RESERVED: [&str; 4] = ["limit", "cursor", "after", "timeout_ms"];
@@ -120,7 +120,7 @@ fn decode_cursor(table: &TableDef, raw: &str) -> Result<Vec<String>, Refusal> {
 
 /// The parameters an `after` wait reads, which a scan and a row read both pass through
 /// to the server rather than reading as key parts.
-const WAIT: [&str; 2] = ["after", "timeout_ms"];
+pub const WAIT: [&str; 2] = ["after", "timeout_ms"];
 
 /// Read a scan off the query string, or say why it is not one.
 pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan, Refusal> {
@@ -171,40 +171,53 @@ pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan,
 
 /// Read a whole key off the query string: every key part, once, and nothing else.
 pub fn parse_key(table: &TableDef, params: &[(String, String)]) -> Result<Vec<String>, Refusal> {
-    let mut given: Vec<(&str, String)> = Vec::new();
+    let parts: Vec<&str> = table.key.iter().map(|(part, _)| part.as_str()).collect();
+    parse_whole(table, &parts, &format!("a row of `{}`", table.name), params)
+}
+
+/// Read a whole key under the names a caller gives it: `names[i]` is what the query string
+/// calls `table.key[i]`, which is the part's own name for a row read and the fold's
+/// parameter name for a fold read. `owner` is what the names belong to, for a message.
+fn parse_whole(
+    table: &TableDef,
+    names: &[&str],
+    owner: &str,
+    params: &[(String, String)],
+) -> Result<Vec<String>, Refusal> {
+    let mut given: Vec<Option<String>> = vec![None; names.len()];
     for (name, value) in params {
         if WAIT.contains(&name.as_str()) {
             continue;
         }
-        if !table.key.iter().any(|(part, _)| part == name) {
+        let Some(index) = names.iter().position(|known| known == name) else {
             return Err(Refusal::invalid(format!(
-                "`{name}` is not a key part of `{}`; a row is named by its key ({}) and \
-                 nothing else",
-                table.name,
-                key_names(table)
+                "`{name}` is not one of {owner}'s ({}), which is all it is named by",
+                names.join(", ")
             )));
-        }
-        if given.iter().any(|(part, _)| part == name) {
+        };
+        if given[index].is_some() {
             return Err(Refusal::invalid(format!("`{name}` is given twice")));
         }
-        given.push((name, bound(table, name, value)?));
+        let (part, _) = &table.key[index];
+        let text = bound(table, part, value).map_err(|refusal| Refusal {
+            // The part's name means nothing to a caller who named the parameter.
+            message: refusal
+                .message
+                .replace(&format!("`{part}`"), &format!("`{name}`")),
+            ..refusal
+        })?;
+        given[index] = Some(text);
     }
-    table
-        .key
-        .iter()
-        .map(|(part, _)| {
-            given
-                .iter()
-                .find(|(name, _)| name == part)
-                .map(|(_, value)| value.clone())
-                .ok_or_else(|| {
-                    Refusal::invalid(format!(
-                        "a row of `{}` is named by every part of its key ({}), and `{part}` is \
-                         missing",
-                        table.name,
-                        key_names(table)
-                    ))
-                })
+    given
+        .into_iter()
+        .zip(names)
+        .map(|(value, name)| {
+            value.ok_or_else(|| {
+                Refusal::invalid(format!(
+                    "{owner} is named by all of ({}), and `{name}` is missing",
+                    names.join(", ")
+                ))
+            })
         })
         .collect()
 }
@@ -285,6 +298,59 @@ fn key_names(table: &TableDef) -> String {
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Where a named fold is kept: the main table of its key signature, which is what its key
+/// is read against, and its own column, which may be in the side table.
+#[derive(Debug, Clone, Copy)]
+pub struct FoldAt<'a> {
+    pub main: &'a TableDef,
+    pub column: &'a ColumnDef,
+}
+
+/// The stored fold named `fold`, or `None` for one nothing keeps: undeclared, or with a
+/// parameter no arm matches. Telling those apart is the caller's, since it needs the program
+/// and this needs only the tables.
+pub fn find_fold<'a>(tables: &'a [TableDef], fold: &str) -> Option<FoldAt<'a>> {
+    let (table, column) = tables.iter().find_map(|table| {
+        table
+            .columns
+            .iter()
+            .find(|column| column.fold == fold)
+            .map(|column| (table, column))
+    })?;
+    Some(FoldAt {
+        main: main_of(tables, &table.source)?,
+        column,
+    })
+}
+
+/// Read a fold's arguments off the query string, as the key texts the store binds.
+///
+/// **Named as the fold declares its parameters**, `customer_id` and not the key part
+/// `customer` the table spells it as: a caller asking for a fold by name has its signature
+/// in front of them and nothing else. `ColumnDef::args` is that mapping, in key order.
+pub fn parse_args(at: FoldAt, params: &[(String, String)]) -> Result<Vec<String>, Refusal> {
+    let args: Vec<&str> = at.column.args.iter().map(String::as_str).collect();
+    parse_whole(at.main, &args, &format!("`{}`", at.column.fold), params)
+}
+
+/// One fold's value for one key, plus the store's position, in one read snapshot.
+///
+/// `None` for a key no event has named, whose value would be the fold's seed. `Some(Null)`
+/// for a fold answering `none`, or a sealed one whose subject is gone.
+pub fn get_fold(
+    path: &Path,
+    tables: &[TableDef],
+    at: FoldAt,
+    key: &[String],
+    keystore: Option<&KeyStore>,
+) -> anyhow::Result<(Option<Value>, u64)> {
+    let (row, position) = get_one(path, tables, at.main, key, keystore)?;
+    Ok((
+        row.map(|row| row.get(&at.column.name).cloned().unwrap_or(Value::Null)),
+        position,
+    ))
 }
 
 /// One page of a table, plus the position every row of it was read at.

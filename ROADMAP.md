@@ -3454,6 +3454,26 @@ Decisions worth keeping:
 Not in this phase: filtering or sorting on a non-key column, which waits on how a fold declares an
 index (design section 7), and the console's time slider (design section 11).
 
+## Phase 44: one fold is read by its name (done)
+
+`GET /folds/{Fold}?<param>=...` answers one named fold's value for one key, `{value, position}`:
+the cell a row read serves, addressed the way an application already thinks of it. The console's
+table page opens the same read from a fold's name, as a lookup card, pre-filled from a row.
+
+Decisions worth keeping:
+
+- **Arguments are query parameters named as the fold declares them**, `?customer_id=7`, and not
+  path segments or the table's part names. A fold's arguments are named in its signature, which is
+  the one thing a caller asking for it by name has in front of them; a path would make them
+  positional, and one route per arity. `ColumnDef::args` is the mapping onto the key.
+- **A declared fold nothing stores is a 400 that says why**, naming the parameter no arm matches,
+  rather than a fold over the whole log on every request, which would make the cheapest-looking
+  read the most expensive one, with a cost that grows with the log. That is the only kind: a
+  query-only fold is stored like any other, and this route is where it is read, since no command
+  may fold it.
+- **A key no event has named is a 404**, as a row read is, rather than the fold's seed: answering
+  the seed would make a mistyped id indistinguishable from a real key at its starting value.
+
 ## Deferred, with triggers
 
 Each item is placed with the condition that would pull it forward, so nothing is built before it is

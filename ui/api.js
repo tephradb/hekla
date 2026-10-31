@@ -207,6 +207,10 @@ export const api = {
       params: key.map(([part, value]) => [part, String(value)]),
     }),
 
+  /* One named fold, its arguments named as the fold declares its parameters. */
+  fold: (name, args, signal) =>
+    request(`/folds/${encodeURIComponent(name)}`, { signal, params: args }),
+
   commands: (signal) => request('/admin/commands', { signal }),
   command: (name, signal) => request(`/admin/commands/${encodeURIComponent(name)}`, { signal }),
 

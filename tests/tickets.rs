@@ -1136,3 +1136,94 @@ fn a_key_part_named_like_a_control_parameter_is_refused() {
         loaded.findings
     );
 }
+
+/// One fold by name: its arguments named as the fold declares them, its value alone, and
+/// the reasons it has none.
+#[tokio::test]
+async fn a_fold_is_read_by_name_with_its_own_parameter_names() {
+    let harness = boot();
+    let mut position = open(&harness, UUID_A, 1, 10, Some("ada@example.com"));
+    position = position.max(open(&harness, BOB, 1, 10, None));
+    let app = harness.app();
+
+    let (status, body) = support::get(
+        &app,
+        &format!("/folds/OwnerTickets?org_id=1&owner_id=10&after={position}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["value"], 2);
+    assert!(body["position"].as_u64().unwrap() >= position);
+
+    // Sealed, keyed on the ticket, and opened on the way out.
+    let (status, body) =
+        support::get(&app, &format!("/folds/TicketContact?ticket_id={UUID_A}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["value"], "ada@example.com");
+    // Query-only, so no command may fold it, and this is where it is read.
+    let (status, body) =
+        support::get(&app, &format!("/folds/TicketOpenedAt?ticket_id={UUID_A}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["value"].as_str().is_some_and(|at| at.ends_with('Z')),
+        "{body}"
+    );
+    // A fold answering `none` is a value, and it is null.
+    let (_, body) = support::get(&app, &format!("/folds/TicketContact?ticket_id={BOB}")).await;
+    assert_eq!(body["value"], Value::Null, "{body}");
+
+    for (uri, status, code) in [
+        // The table's part name is not the fold's parameter name.
+        ("/folds/OwnerTickets?org=1&owner=10", 400, "invalid_input"),
+        ("/folds/OwnerTickets?org_id=1", 400, "invalid_input"),
+        (
+            "/folds/OwnerTickets?org_id=1&owner_id=ten",
+            400,
+            "invalid_input",
+        ),
+        ("/folds/OwnerTickets?org_id=9&owner_id=9", 404, "not_found"),
+        ("/folds/NoSuchFold", 404, "not_found"),
+        ("/folds/OrgTicketsSince?since=0&org_id=1", 400, "not_stored"),
+    ] {
+        let (got, body) = support::get(&app, uri).await;
+        assert_eq!(got, status, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], code, "{uri}: {body}");
+    }
+    let (_, body) = support::get(&app, "/folds/OrgTicketsSince?since=0&org_id=1").await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`since`"),
+        "the refusal names the parameter no arm matches: {body}"
+    );
+
+    harness.shutdown();
+}
+
+/// `/folds/{Fold}` reads `after` and `timeout_ms` as its wait, so a fold parameter of either
+/// name could never be passed. Its key part may be named otherwise (`after: Org` is the
+/// part `org`), so the table check alone would let it through.
+#[test]
+fn a_fold_parameter_named_like_the_wait_is_refused() {
+    let project = support::write_project(&[
+        ("hekla.toml", ""),
+        (
+            "events/page.hk",
+            "subject Org(Int)\nevent @page.viewed { after: Org }\n",
+        ),
+        (
+            "lib/folds.hk",
+            "fold Views(after: Org) -> views: Int = 0 {\n  on @page.viewed(after) => views + 1\n}\n",
+        ),
+    ]);
+    let loaded = hekla::loader::LoadedProject::load(project.path());
+    assert!(
+        loaded
+            .findings
+            .iter()
+            .any(|finding| format!("{finding:?}").contains("read-your-writes wait")),
+        "{:?}",
+        loaded.findings
+    );
+}

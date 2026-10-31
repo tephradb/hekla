@@ -105,7 +105,8 @@ not_found` with the message `no such row`. Unknown entity or projector: `404 not
 A named fold is kept as a column of a **derived table**, one row per key, with no projector to write
 it. `hekla check --tables <dir>` prints every table: its name, its key parts, and the fold behind
 each column. `fold OwnerTickets(org_id: Org, owner_id: Owner)` lives in `org__owner`, keyed on `org`
-and `owner` (a parameter's trailing `_id` is dropped).
+and `owner`: a key part is named for its subject when it has one, and otherwise for the parameter
+with one `_id` off.
 
 ```
 GET /tables/org__owner/row?org=1&owner=10
@@ -129,6 +130,25 @@ GET /tables/org__owner?org=1&limit=50
   folding from empty over an existing log. Every table is served or none is: they share one position.
 - A malformed key part, a part that is not a key part, or a cursor from elsewhere is `400
   invalid_input`; a filter that skips a leading part is `400 unindexed_filter`.
+
+## `GET /folds/{Fold}`
+
+One named fold for one key: the same cell a row read serves, addressed by the fold's name, with its
+arguments named as the fold declares its parameters rather than as the table spells its key parts.
+
+```
+GET /folds/OwnerTickets?org_id=1&owner_id=10
+{ "value": 2, "position": 7 }
+```
+
+- Every parameter is required. A missing, unknown or malformed one is `400 invalid_input`; passing the
+  table's part name (`org`) instead of the parameter's (`org_id`) is one of those.
+- `value` is `null` when the fold answers `none`, or when it is sealed and its subject is erased.
+- `404 not_found` for a key no event has named (the fold holds its seed there), or an undeclared fold.
+- `400 not_stored` for a fold with a parameter no arm matches, naming it: its keys cannot be listed,
+  so nothing stores it, though a command can still fold it. A query-only fold (an arm reads the
+  envelope) *is* stored and served here, and this is the only place it can be read.
+- `after`, `timeout_ms` and the `503`s are the table routes'.
 
 ## Ordering a scan
 

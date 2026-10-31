@@ -30,3 +30,15 @@ fold TicketReporter(ticket_id: Uuid) -> Sealed(Reporter, Owner)? = none {
 fold OwnerTickets(org_id: Org, owner_id: Owner) -> tickets: Int = 0 {
   on @ticket.opened(org_id, owner_id) => tickets + 1
 }
+
+// Not stored: `since` is matched by no arm, so the keys it would have cannot be listed.
+// A command can still fold it; `/folds/OrgTicketsSince` says why it has nothing to serve.
+fold OrgTicketsSince(since: Int, org_id: Org) -> tickets: Int = since {
+  on @ticket.opened(org_id) => tickets + 1
+}
+
+// Query-only: the arm reads the envelope, so no command may fold it, and it is stored all
+// the same. Reading it by name is what it is for.
+fold TicketOpenedAt(ticket_id: Uuid) -> Timestamp? = none {
+  on @ticket.opened as e (ticket_id) => e.at
+}

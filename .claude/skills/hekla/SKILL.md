@@ -151,6 +151,7 @@ defaults to `127.0.0.1`.
 | `GET /read/{Projector}/{Entity}?<field>=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}` |
 | `GET /tables/{table}/row?<part>=...` | one derived row by its whole key: `{item, position}`, or 404 for a key no event named |
 | `GET /tables/{table}?<part>=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}`, filtered on the leading parts of the key |
+| `GET /folds/{Fold}?<param>=...` | one named fold's `{value, position}`, its arguments named as the fold declares them |
 | `POST /projectors/{Name}/replay` | 202, schedules a rebuild-and-swap |
 | `POST /effects/{Name}/skip/{position}` | 202, records an operator skip request |
 | `GET /status` | per-module position, lag, readiness, effect state, failure count, last error |
@@ -162,10 +163,17 @@ defaults to `127.0.0.1`.
 
 **A named fold is served as a column of a derived table** with no projector to write it.
 `fold OwnerTickets(org_id: Org, owner_id: Owner)` lands in a table `org__owner` keyed on `org` and
-`owner` (a parameter's trailing `_id` is dropped), with one column per fold of that key signature;
+`owner`, with one column per fold of that key signature. A key part is named for its subject when
+it has one, and otherwise for the parameter with one `_id` off; don't guess, because
 `hekla check --tables <dir>` prints every table, column and derived index. A row is every fold's
 value for its key, collections and sealed columns included, and every table is read at one log
 position. A filter on a key part that is not a leading one is a `400 unindexed_filter`.
+
+**One fold by name** is `GET /folds/{Fold}?<param>=...`, its arguments named as the fold declares
+its parameters (`/folds/OwnerTickets?org_id=1&owner_id=10`), answering `{value, position}`. A
+query-only fold (one whose arm reads the envelope) is stored and served like any other, and this is
+the only place it can be read, since no command may fold it. A fold with a parameter no arm matches
+is not stored, and is a `400 not_stored` naming that parameter; a command can still fold it.
 
 A command's success body is `{correlation_id, causation_id, positions: {first, last}, events: [...]}`,
 and every error body is `{correlation_id, causation_id, error: {code, message}}` (the two ids are

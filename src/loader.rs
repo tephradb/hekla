@@ -577,6 +577,31 @@ impl Sources {
                 }
             }
         }
+        // The same for a stored fold's own parameters, which `/folds/{Fold}` takes by the
+        // name the fold declares and which can differ from the part's (`after: Org` is a
+        // part named `org`), so the check above does not cover them.
+        for table in &derived {
+            for column in &table.columns {
+                for arg in &column.args {
+                    if crate::table_read::WAIT.contains(&arg.as_str()) {
+                        let rel = program
+                            .fold(&column.fold)
+                            .and_then(|def| def.module.clone())
+                            .unwrap_or_default();
+                        findings.push(Finding::error(
+                            rel,
+                            format!(
+                                "fold `{}` has a parameter `{arg}`, which `/folds/{}` reads as \
+                                 its read-your-writes wait ({}); rename the parameter",
+                                column.fold,
+                                column.fold,
+                                crate::table_read::WAIT.join(", ")
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
 
         let mut effects = Vec::new();
         for effect in &program.effects {
