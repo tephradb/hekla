@@ -640,6 +640,28 @@ impl FoldStore {
         Ok(())
     }
 
+    /// Put a column back to its fold's seed for every key, which is where a replay of the
+    /// log starts it from. A refolded column still holds its old fold's values, and a
+    /// replay applies each record to the value already there.
+    pub fn reset_column(
+        &self,
+        tx: &Transaction,
+        table: &TableDef,
+        column: &ColumnDef,
+    ) -> anyhow::Result<()> {
+        tx.execute(
+            &format!(
+                "UPDATE {} SET {} = {}",
+                quote_ident(&table.name),
+                quote_ident(&column.name),
+                column.default.as_deref().unwrap_or("NULL")
+            ),
+            [],
+        )
+        .with_context(|| format!("resetting `{}`.`{}`", table.name, column.name))?;
+        Ok(())
+    }
+
     /// Record that a column has been folded to `position`.
     pub fn mark_built(
         &self,

@@ -670,10 +670,10 @@ fold Cancelled(customer_id: Customer) -> Bool = false {
         "the added column is behind"
     );
 
-    let filled = backfill(&store, &interpreter, &tables).unwrap();
+    let filled = backfill(&store, &grown, &interpreter, &tables).unwrap();
     assert_eq!(
         filled.columns, 2,
-        "one key, and the two columns that are behind it: {filled:?}"
+        "two records replayed, each written to the one behind column it names: {filled:?}"
     );
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
@@ -1144,4 +1144,310 @@ fold OrderFlagged(shop_id: Shop, order_id: Int) -> Bool = false {
     let row = row.expect("the key an event named");
     assert_eq!(row["order_flagged"], true);
     assert_eq!(row["order_lines"], serde_json::json!([]), "{row}");
+}
+
+// ---------------------------------------------------------------------------
+// A backfill replays the log
+// ---------------------------------------------------------------------------
+
+/// Deploy `source` over `path`, then fill it from `events` with the checkpoint at the end
+/// of them, the way a running store would have.
+fn deployed_and_filled(path: &std::path::Path, source: &str, events: &[Event]) -> u64 {
+    let program = program(source);
+    let tables = TableDef::all(&program);
+    let mut interpreter = Interpreter::new(&program);
+    let records = appended(&mut interpreter, events.to_vec());
+    let store = FoldStore::open(path, &tables).unwrap();
+    store.apply(&Digest::of(&program), &tables).unwrap();
+    let head = records.len() as u64;
+    apply_batch(&store, &program, &tables, &records, head).unwrap();
+    head
+}
+
+/// Redeploy `source` over a store already filled from `events`, and backfill what it left
+/// behind from the same log.
+fn redeployed(path: &std::path::Path, source: &str, events: &[Event]) -> FoldStore {
+    let program = program(source);
+    let tables = TableDef::all(&program);
+    let store = FoldStore::open(path, &tables).unwrap();
+    store.apply(&Digest::of(&program), &tables).unwrap();
+    let mut interpreter = Interpreter::new(&program);
+    for event in events {
+        interpreter.append(event.clone());
+    }
+    backfill(&store, &program, &interpreter, &tables).unwrap();
+    assert!(
+        store.behind().unwrap().is_empty(),
+        "nothing is behind after it"
+    );
+    store
+}
+
+/// **A fold added in a table of its own is filled from the history before it.** Its keys
+/// are ones no row holds yet, so a backfill that refolded the rows already there filled
+/// nothing, marked the column built, and served an empty table.
+#[test]
+fn a_fold_added_in_a_new_table_is_filled_from_the_history_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    let events = [placed(7, 400), placed(8, 100), placed(7, 50)];
+    deployed_and_filled(&path, SPEND, &events);
+
+    let grown = format!(
+        "{SPEND}
+fold CustomerOrders(customer_id: Customer) -> n: Int = 0 {{
+  on @order.placed(customer_id) => n + 1
+}}
+
+fold OrdersNumbered(order_id: Int) -> n: Int = 0 {{
+  on @order.placed(order_id) => n + 1
+}}
+"
+    );
+    redeployed(&path, &grown, &events);
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT CAST(\"orders_numbered\" AS TEXT) FROM \"order\" WHERE \"order\" = 1"
+        ),
+        Some("3".to_owned()),
+        "a table that did not exist before the deploy"
+    );
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT CAST(\"customer_orders\" AS TEXT) FROM \"customer\" WHERE \"customer\" = 7"
+        ),
+        Some("2".to_owned()),
+        "a column added to a table that did"
+    );
+}
+
+/// **A range arm in a replay reaches only the keys that existed at its record**, as it did
+/// when the log was followed. The store at the checkpoint holds keys minted after that
+/// record too, and a range over those would count a bump towards a surface rendered later.
+#[test]
+fn a_replayed_range_reaches_only_the_keys_minted_before_its_record() {
+    let seen = "subject Shop(Int)
+
+event @shop.rendered { shop_id: Shop, surface: String }
+event @shop.bumped { shop_id: Shop }
+
+fold SurfaceSeen(shop_id: Shop, surface: String) -> Bool = false {
+  on @shop.rendered(shop_id, surface) => true
+}
+";
+    let counted = format!(
+        "{seen}
+fold SurfaceCount(shop_id: Shop, surface: String) -> n: Int = 0 {{
+  on @shop.rendered(shop_id, surface) => n + 1
+  on @shop.bumped(shop_id) => n + 10
+}}
+"
+    );
+    let events = [bumped(1), rendered(1, "a"), bumped(1), rendered(1, "b")];
+
+    // The answer, from a store that followed the log with the fold already deployed.
+    let live = tempfile::tempdir().unwrap();
+    deployed_and_filled(&live.path().join("tables.db"), &counted, &events);
+
+    // The same fold deployed after the log, so both surfaces' rows exist before the replay.
+    let late = tempfile::tempdir().unwrap();
+    let path = late.path().join("tables.db");
+    deployed_and_filled(&path, seen, &events);
+    redeployed(&path, &counted, &events);
+
+    let sql = "SELECT CAST(\"surface_count\" AS TEXT) FROM \"shop__surface\" WHERE \"surface\" = ";
+    for (surface, want) in [("a", "11"), ("b", "1")] {
+        let query = format!("{sql}'{surface}'");
+        let followed = cell(
+            &Connection::open(live.path().join("tables.db")).unwrap(),
+            &query,
+        );
+        assert_eq!(followed.as_deref(), Some(want), "followed live: {surface}");
+        assert_eq!(
+            cell(&Connection::open(&path).unwrap(), &query),
+            followed,
+            "replayed, surface {surface}"
+        );
+    }
+}
+
+/// A refolded column starts its replay from the seed, not from what the old fold left in
+/// it, which would count every record twice.
+#[test]
+fn a_refolded_column_is_replayed_from_its_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    let events = [placed(7, 400), placed(7, 100)];
+    deployed_and_filled(&path, SPEND, &events);
+    redeployed(
+        &path,
+        &SPEND.replace("=> spend + total", "=> spend + total + total"),
+        &events,
+    );
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT \"lifetime_spend\" FROM \"customer\" WHERE \"customer\" = 7"
+        ),
+        Some("10.00".to_owned())
+    );
+}
+
+fn rendered(shop: i64, surface: &str) -> Event {
+    Event::new(
+        EventPath::new(["shop", "rendered"]),
+        [
+            ("shop_id".to_owned(), Value::Int(shop)),
+            ("surface".to_owned(), Value::str(surface)),
+        ],
+    )
+}
+
+fn bumped(shop: i64) -> Event {
+    Event::new(
+        EventPath::new(["shop", "bumped"]),
+        [("shop_id".to_owned(), Value::Int(shop))],
+    )
+}
+
+/// A collection column added later is replayed into the side table, and its key is made
+/// to exist in the main table too, where every reader of the keys looks.
+#[test]
+fn a_collection_column_added_later_is_replayed_into_its_side_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    let placed_only = LINES.replace(
+        "fold OrderLines(shop_id: Shop, order_id: Int) -> lines: List(Int) = [] {
+  on @order.placed(shop_id, order_id) { line } => lines.push(line)
+}
+",
+        "",
+    );
+    let events = [line(1, 9, 3), line(1, 9, 4), line(2, 5, 7)];
+    deployed_and_filled(&path, &placed_only, &events);
+    redeployed(&path, LINES, &events);
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT \"order_lines\" FROM \"_side_shop__order\" WHERE \"shop\" = 1 AND \"order\" = 9"
+        ),
+        Some("[3,4]".to_owned())
+    );
+    assert_eq!(
+        cell(
+            &conn,
+            "SELECT \"order_lines\" FROM \"_side_shop__order\" WHERE \"shop\" = 2 AND \"order\" = 5"
+        ),
+        Some("[7]".to_owned())
+    );
+}
+
+/// One record that mints a key with a pinned arm and ranges over the same key with
+/// another reaches it in a replay as it did live: pinned arms go first within a record.
+#[test]
+fn a_replayed_record_ranges_over_the_key_it_just_minted() {
+    let seen = "subject Shop(Int)
+
+event @shop.rendered { shop_id: Shop, surface: String }
+event @shop.bumped { shop_id: Shop }
+event @shop.named { shop_id: Shop, surface: String }
+
+fold SurfaceSeen(shop_id: Shop, surface: String) -> Bool = false {
+  on @shop.rendered(shop_id, surface) => true
+}
+";
+    let ranged = format!(
+        "{seen}
+fold SurfaceTouched(shop_id: Shop, surface: String) -> n: Int = 0 {{
+  on @shop.named(shop_id, surface) => n
+  on @shop.rendered(shop_id) => n + 1
+}}
+"
+    );
+    let events = [rendered(1, "a"), rendered(1, "b")];
+
+    let live = tempfile::tempdir().unwrap();
+    deployed_and_filled(&live.path().join("tables.db"), &ranged, &events);
+    let late = tempfile::tempdir().unwrap();
+    let path = late.path().join("tables.db");
+    deployed_and_filled(&path, seen, &events);
+    redeployed(&path, &ranged, &events);
+
+    let sql =
+        "SELECT CAST(\"surface_touched\" AS TEXT) FROM \"shop__surface\" WHERE \"surface\" = ";
+    for (surface, want) in [("a", "2"), ("b", "1")] {
+        let query = format!("{sql}'{surface}'");
+        let followed = cell(
+            &Connection::open(live.path().join("tables.db")).unwrap(),
+            &query,
+        );
+        assert_eq!(followed.as_deref(), Some(want), "followed live: {surface}");
+        assert_eq!(
+            cell(&Connection::open(&path).unwrap(), &query),
+            followed,
+            "replayed, surface {surface}"
+        );
+    }
+}
+
+/// **A column that is not being rebuilt runs over history from its seed, not its final
+/// value.** Its writes are dropped either way, but its body still runs, and doubling a
+/// value the log already doubled sixty-two times overflows: the backfill would fail on a
+/// column that was right all along, on every boot.
+#[test]
+fn a_column_left_alone_does_not_replay_from_its_final_value() {
+    let doubled = "event @clock.ticked { n: Int }
+
+fold Doubled() -> n: Int = 1 {
+  on @clock.ticked() => n * 2
+}
+";
+    let counted = format!(
+        "{doubled}
+fold Ticks() -> n: Int = 0 {{
+  on @clock.ticked() => n + 1
+}}
+"
+    );
+    let events: Vec<Event> = (0..62).map(ticked).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    deployed_and_filled(&path, doubled, &events);
+    redeployed(&path, &counted, &events);
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        cell(&conn, "SELECT CAST(\"ticks\" AS TEXT) FROM \"global\""),
+        Some("62".to_owned())
+    );
+    assert_eq!(
+        cell(&conn, "SELECT CAST(\"doubled\" AS TEXT) FROM \"global\""),
+        Some((1i64 << 62).to_string()),
+        "and the column left alone is as it was"
+    );
+}
+
+fn line(shop: i64, order: i64, line: i64) -> Event {
+    Event::new(
+        EventPath::new(["order", "placed"]),
+        [
+            ("shop_id".to_owned(), Value::Int(shop)),
+            ("order_id".to_owned(), Value::Int(order)),
+            ("line".to_owned(), Value::Int(line)),
+        ],
+    )
+}
+
+fn ticked(n: i64) -> Event {
+    Event::new(
+        EventPath::new(["clock", "ticked"]),
+        [("n".to_owned(), Value::Int(n))],
+    )
 }

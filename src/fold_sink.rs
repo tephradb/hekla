@@ -9,7 +9,7 @@
 //! the only way to do better was to apply the record to the value already there, which is
 //! interpreting heklang. So the interpreter does it and this holds the cells.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use heklang::host::Columns;
 use heklang::interp::{Error, ErrorKind, key_as_value};
@@ -38,6 +38,36 @@ pub struct ColumnWriter<'a> {
     /// Main-table keys this batch has already made sure of, so a list pushed onto ten
     /// thousand times in one batch costs one insert for its key and not ten thousand.
     pub ensured: BTreeSet<(String, Vec<String>)>,
+    /// Set while a backfill replays the log, and `None` while following it.
+    pub replay: Option<Replay>,
+}
+
+/// What a backfill replays the log under.
+///
+/// Every arm of every column still runs, because `Tables::apply` applies a record whole,
+/// but only the columns being rebuilt are written: the rest are already at the checkpoint.
+/// Those read back as their seed rather than their final value, so their bodies run over
+/// history from where it started rather than from where it ended, which an arithmetic
+/// arm can overflow on.
+///
+/// "As followed live" here means followed from the start of the log with the program as
+/// it is now, not with the deploys it actually went through: a key a fold since removed
+/// had minted is not one the replay ranges over.
+#[derive(Default)]
+pub struct Replay {
+    /// The columns being rebuilt, as the holding table and the column name.
+    pub only: BTreeSet<(String, String)>,
+    /// The main tables holding one of them. Keys are tracked for these alone, and a range
+    /// over any other table reaches nothing, since nothing it writes is kept.
+    pub sources: BTreeSet<String>,
+    /// Every key some arm has written so far in the replay, per main table, whether or not
+    /// the write was kept.
+    ///
+    /// **A range arm sees these, not the store's rows.** Followed live, a range at position
+    /// `p` reaches only the keys minted before `p`; the store at the checkpoint also holds
+    /// every key minted after it, and ranging over those would apply a record to a key that
+    /// did not exist yet when it was appended.
+    pub minted: BTreeMap<String, BTreeSet<Vec<String>>>,
 }
 
 impl<'a> ColumnWriter<'a> {
@@ -61,6 +91,13 @@ impl<'a> ColumnWriter<'a> {
 impl Columns for ColumnWriter<'_> {
     fn value(&self, table: &str, key: &[Key], column: &str) -> Result<Option<Value>, Error> {
         let (def, held) = self.cell(table, column)?;
+        if self
+            .replay
+            .as_ref()
+            .is_some_and(|replay| !replay.only.contains(&(def.name.clone(), held.name.clone())))
+        {
+            return Ok(None);
+        }
         let texts = key_texts(def, key)?;
         let found = self
             .store
@@ -101,6 +138,18 @@ impl Columns for ColumnWriter<'_> {
     fn set(&mut self, table: &str, key: Vec<Key>, column: &str, value: Value) -> Result<(), Error> {
         let (def, held) = self.cell(table, column)?;
         let texts = key_texts(def, &key)?;
+        if let Some(replay) = &mut self.replay {
+            if replay.sources.contains(&def.source) {
+                replay
+                    .minted
+                    .entry(def.source.clone())
+                    .or_default()
+                    .insert(texts.clone());
+            }
+            if !replay.only.contains(&(def.name.clone(), held.name.clone())) {
+                return Ok(());
+            }
+        }
         // **A key exists in its main table whichever of the two a write lands in.** Every
         // reader of "the keys this signature has" reads the main table (a range arm, a
         // backfill, a scan), so a key whose only writes so far are collections would
@@ -134,10 +183,17 @@ impl Columns for ColumnWriter<'_> {
                 .ok_or_else(|| host_error(format!("`{table}` has no key part {at}")))?;
             parts[*at] = stored_text(&meta.kind, &key_as_value(key));
         }
-        let rows = self
-            .store
-            .keys_pinned(self.tx, over, &parts)
-            .map_err(|why| host_error(format!("{why:#}")))?;
+        let rows: Vec<Vec<String>> = match &self.replay {
+            Some(replay) => replay
+                .minted
+                .get(&over.name)
+                .map(|minted| minted_matching(minted, &parts))
+                .unwrap_or_default(),
+            None => self
+                .store
+                .keys_pinned(self.tx, over, &parts)
+                .map_err(|why| host_error(format!("{why:#}")))?,
+        };
         rows.iter()
             .map(|row| {
                 row.iter()
@@ -153,6 +209,29 @@ impl Columns for ColumnWriter<'_> {
             })
             .collect()
     }
+}
+
+/// The minted keys carrying every pinned part.
+///
+/// A range arm usually pins a leading run of the key, and the set is ordered by key, so
+/// that run bounds a seek; only a range pinning a later part alone scans the table's keys.
+fn minted_matching(minted: &BTreeSet<Vec<String>>, parts: &[Option<String>]) -> Vec<Vec<String>> {
+    let prefix: Vec<String> = parts.iter().map_while(Clone::clone).collect();
+    let matches = |row: &&Vec<String>| {
+        parts
+            .iter()
+            .zip(row.iter())
+            .all(|(part, text)| part.as_ref().is_none_or(|part| part == text))
+    };
+    if prefix.is_empty() {
+        return minted.iter().filter(matches).cloned().collect();
+    }
+    minted
+        .range(prefix.clone()..)
+        .take_while(|row| row.starts_with(&prefix))
+        .filter(matches)
+        .cloned()
+        .collect()
 }
 
 /// One key as the texts the store binds, in the table's key order.

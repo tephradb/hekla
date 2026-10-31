@@ -1,25 +1,25 @@
 //! Filling the derived tables, and following the log to keep them filled.
 //!
 //! [`crate::tables`] says what the tables are, [`crate::fold_store`] keeps them, and this
-//! is what puts values in them. One sequential pass, mirroring `crate::projector`: a batch
-//! of records names the columns it could have changed, each of those is folded at the
-//! batch's own head, and the values and the checkpoint commit together.
+//! is what puts values in them. One sequential pass, mirroring `crate::projector`: each record
+//! of a batch is applied to the values already there, and the values and the checkpoint
+//! commit together.
 //!
-//! **The read is `Interpreter::fold_stored` and nothing else.** Working out a column's new
-//! value from the record in hand would be a second implementation of what an arm means,
-//! and the arm's own interpreter is right here. The cost is that a column is folded over
-//! the log rather than updated in place, which is why this is the correct-and-slow shape
-//! the per-record sink is measured against rather than the end state.
+//! **What an arm means is heklang's `Tables::apply` and nothing else**, both following the
+//! log and replaying it into a column a deploy left behind. Working out a column's new value
+//! here would be a second implementation of the arm, and the arm's own interpreter is right
+//! there.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use heklang::value::{Record, Value};
-use heklang::{Interpreter, Program, Tables, Unstored, host::Host};
+use heklang::host::{Host, Query};
+use heklang::value::Record;
+use heklang::{Interpreter, Program, Tables, Unstored};
 
-use crate::fold_sink::ColumnWriter;
+use crate::fold_sink::{ColumnWriter, Replay};
 use crate::fold_store::{FoldStore, Recorded};
-use crate::tables::{ColumnDef, TableDef, main_of};
+use crate::tables::TableDef;
 
 /// What one pass did, for a log line and a test to read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,6 +67,7 @@ pub fn apply_batch(
         tables,
         written: 0,
         ensured: BTreeSet::new(),
+        replay: None,
     };
     for record in records {
         derived
@@ -97,45 +98,28 @@ pub fn apply_batch(
     Ok(filled)
 }
 
-/// Fold one column for one key, at the batch's head.
-///
-/// The arguments are named the way the **fold** declares them, which is usually not the
-/// way the table spells the key part: `ColumnDef::args` is that mapping, derived once from
-/// the same `part_names` the layout used.
-fn fold_one<H: Host>(
-    interpreter: &Interpreter<'_, H>,
-    table: &TableDef,
-    column: &ColumnDef,
-    key: &[String],
-    head: u64,
-) -> anyhow::Result<Value> {
-    let typed: Vec<(String, Value)> = column
-        .args
-        .iter()
-        .zip(key)
-        .zip(&table.key)
-        .map(|((name, text), (_, meta))| {
-            crate::tables::key_value(&meta.kind, text).map(|value| (name.clone(), value))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    interpreter
-        .fold_stored(&column.fold, typed, head)
-        .with_context(|| format!("folding `{}`", column.fold))
-}
-
 /// Bring every column that is behind the checkpoint up to it, with nothing else running.
 ///
 /// A column added or refolded by a deploy records `built_to = 0`, which says it holds its
 /// seed and nothing else. This is the pass that answers that, and it blocks rather than
 /// interleaving: a projector rebuild does the same, and the alternative is a column
 /// chasing a head that keeps moving. Obligation 3 is intact either way, because only the
-/// columns that are behind are folded, not the whole store.
+/// columns that are behind are written, not the whole store.
+///
+/// **A replay of the log, not a fold per key.** The keys a column holds are the ones its
+/// arms named, and a column that is behind may name keys no row has yet: a fold added in
+/// a table of its own has no rows at all. Refolding the rows already there filled nothing
+/// for it, marked it built, and served it empty. So the behind columns go back to their
+/// seed and the log is applied to them again through the same `Tables::apply` that
+/// follows it, which is also what keeps a range arm to the keys that existed at its
+/// record (see [`Replay::minted`]).
 ///
 /// **The target is the store's own checkpoint and not a head the caller chose.** Every
 /// column of every table is at one log position, so a column brought to anywhere else
 /// would hold values the one `_hekla_checkpoint` does not admit to.
 pub fn backfill<H: Host>(
     store: &FoldStore,
+    program: &Program,
     interpreter: &Interpreter<'_, H>,
     tables: &[TableDef],
 ) -> anyhow::Result<Filled> {
@@ -145,7 +129,7 @@ pub fn backfill<H: Host>(
         return Ok(Filled::default());
     }
     let tx = store.begin()?;
-    let mut filled = Filled::default();
+    let mut replay = Replay::default();
     for row in &behind {
         let Some(table) = tables.iter().find(|table| table.name == row.table) else {
             continue;
@@ -153,19 +137,50 @@ pub fn backfill<H: Host>(
         let Some(column) = table.columns.iter().find(|c| c.name == row.column) else {
             continue;
         };
-        // Every key the key signature holds, read off its **main** table: a side table
-        // carries only the keys its own columns have been written for, so ranging over one
-        // would leave a collection column added to a populated deployment with no key to
-        // fold for at all. A column being backfilled cannot mint a key either, because a
-        // key exists only because some event matched it.
-        let over = main_of(tables, &table.source).unwrap_or(table);
-        let every = vec![None; over.key.len()];
-        for key in store.keys_pinned(&tx, over, &every)? {
-            let value = fold_one(interpreter, table, column, &key, head)?;
-            store.write(&tx, table, &key, column, &value)?;
-            filled.columns += 1;
-        }
-        store.mark_built(&tx, &row.table, &row.column, head)?;
+        store.reset_column(&tx, table, column)?;
+        replay.only.insert((row.table.clone(), row.column.clone()));
+        replay.sources.insert(table.source.clone());
+    }
+
+    let derived = Tables::new(program);
+    let mut writer = ColumnWriter {
+        store,
+        tx: &tx,
+        program,
+        tables,
+        written: 0,
+        ensured: BTreeSet::new(),
+        replay: Some(replay),
+    };
+    let mut records = 0;
+    if head > 0 {
+        let query = Query {
+            slices: derived.query().slices,
+            from: 0,
+            upto: Some(head - 1),
+        };
+        interpreter
+            .host()
+            .read(&query, &mut |record| {
+                records += 1;
+                derived.apply(record, &mut writer)
+            })
+            .map_err(|err| anyhow::anyhow!("replaying the log into the derived tables: {err}"))?;
+    }
+    let filled = Filled {
+        columns: writer.written,
+        records,
+    };
+    // Only what was reset and replayed: a behind row naming a column no table has was
+    // never folded, so it is not built either.
+    let rebuilt = writer
+        .replay
+        .take()
+        .map(|replay| replay.only)
+        .unwrap_or_default();
+
+    for (table, column) in &rebuilt {
+        store.mark_built(&tx, table, column, head)?;
     }
     tx.commit()?;
     Ok(filled)
@@ -430,7 +445,7 @@ fn follow(
 
     // A column a deploy left behind holds its seed, so this is what has to happen before
     // the store serves anything. It blocks, as a projector's rebuild does.
-    let filled = backfill(fold_store, &interpreter, tables)?;
+    let filled = backfill(fold_store, program, &interpreter, tables)?;
     if filled.columns > 0 {
         tracing::info!(columns = filled.columns, "backfilled derived columns");
     }
