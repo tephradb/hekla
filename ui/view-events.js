@@ -8,9 +8,10 @@
  * line should mean. The list needs no plaintext anyway: `subjects[].state` still comes
  * back, so the row can still say a field is there and encrypted. */
 
-import { html, useState } from './vendor-preact.js'
+import { html, useEffect, useRef, useState } from './vendor-preact.js'
 import { api } from './api.js'
 import { go, setQuery } from './router.js'
+import { isLive, useStatus } from './store.js'
 import { Resource, useResource, Empty } from './ui-states.js'
 import { DataTable, Pager } from './ui-table.js'
 import { Chips } from './ui-chips.js'
@@ -22,11 +23,37 @@ import { railClass, tint } from './correlation.js'
 import { ago, clock, count, shortId, stamp } from './format.js'
 
 const PAGE = 50
+/* How many held-back events the "new" pill counts before it says "many". */
+const HELD = 100
+
+/**
+ * Whether the scroller holding `root` is at its top.
+ *
+ * `.content` is the shell's scroller, not the window, so a view finds it from its own
+ * root rather than listening on `window`.
+ */
+function useAtTop(root) {
+  const [top, setTop] = useState(true)
+  useEffect(() => {
+    const scroller = root.current?.closest('.content')
+    if (!scroller) return
+    const onScroll = () => setTop(scroller.scrollTop <= 4)
+    onScroll()
+    scroller.addEventListener('scroll', onScroll, { passive: true })
+    return () => scroller.removeEventListener('scroll', onScroll)
+  }, [])
+  return top
+}
 
 export function EventsView({ params, search }) {
   const types = search.getAll('type')
   const tags = search.getAll('tag')
   const cursor = search.get('cursor')
+  const open = params?.position
+  const root = useRef(null)
+  const top = useAtTop(root)
+  const { status } = useStatus()
+  const head = status?.log_head
   /* Where we came from, so "newer" can walk back. The API's cursor is one-directional
    * per request, so the console keeps its own trail rather than pretending otherwise. */
   const [trail, setTrail] = useState([])
@@ -39,6 +66,38 @@ export function EventsView({ params, search }) {
     (signal) => api.events({ types, tags, cursor, limit: PAGE }, signal),
     [types.join('|'), tags.join('|'), cursor],
   )
+
+  /* The newest page follows the head the way a log tail does, but only while nobody is
+   * reading it: scrolled down, or with an event open, rows shifting under the pointer
+   * would move what someone is looking at. Then what lands is held back and counted,
+   * and scrolling back to the top (or the pill) shows it. */
+  const seen = page.data?.log_head
+  const atHead = !cursor
+  const following = atHead && top && !open
+  const behind = atHead && head !== undefined && seen !== undefined && head > seen
+
+  useEffect(() => {
+    if (following && behind && !page.loading) page.reload()
+  }, [following, head])
+
+  const held = useResource(
+    (signal) =>
+      behind && !following
+        ? api.events({ types, tags, cursor: seen, limit: HELD, direction: 'forward' }, signal)
+        : Promise.resolve(null),
+    [behind && !following, head, seen],
+  )
+  const waiting = behind && !following ? (held.data?.events.length ?? 0) : 0
+
+  const latest = () => {
+    root.current?.closest('.content')?.scrollTo({ top: 0 })
+    page.reload()
+  }
+
+  const jump = () => {
+    setTrail([])
+    setQuery([...types.map((type) => ['type', type]), ...tags.map((tag) => ['tag', tag])])
+  }
 
   const setFilters = ({ types: nextTypes, tags: nextTags }) => {
     setTrail([])
@@ -150,19 +209,36 @@ export function EventsView({ params, search }) {
     },
   ]
 
-  const open = params?.position
-
   return html`
-    <div class=${open ? 'with-detail' : ''}>
-      <section class="card">
+    <div class=${open ? 'with-detail' : ''} ref=${root}>
+      <section class="card timeline">
         <header>
           Events
+          ${atHead && isLive() &&
+          html`<span
+            class=${`pill ${following ? 'ok' : 'mute'}`}
+            title=${following
+              ? 'new events appear as they are recorded'
+              : 'paused while you read: scroll to the top or close the event to follow again'}
+          >
+            ${following ? 'live' : 'paused'}
+          </span>`}
           <div style=${{ flex: 1 }}></div>
           <span class="tiny faint" style=${{ textTransform: 'none', letterSpacing: 0 }}>
             ${page.data ? `${count(page.data.log_head)} in log` : ''}
           </span>
         </header>
         <${Chips} types=${types} tags=${tags} onChange=${setFilters} />
+        ${waiting > 0 &&
+        html`<div class="timeline-bar">
+          <button type="button" class="fresh" onClick=${latest}>
+            ↑ ${waiting >= HELD ? `${HELD}+` : waiting} new ${waiting === 1 ? 'event' : 'events'}
+          </button>
+        </div>`}
+        ${!atHead &&
+        html`<div class="timeline-bar">
+          <button type="button" class="fresh" onClick=${jump}>Jump to latest</button>
+        </div>`}
         <${Resource}
           state=${page}
           empty=${(data) =>
