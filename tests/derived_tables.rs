@@ -1607,3 +1607,73 @@ fn editing_a_looked_up_fold_refolds_what_keys_through_it() {
     redeployed(&path, &retired, &events);
     assert_eq!(genre_units(&path), followed);
 }
+
+/// A value read out of another fold, as of the record: a request counts unless the order it
+/// names was a test order when it was made. Replayed into a column added after the log, the
+/// read has to see `TestOrder` as it stood then, not where it ended.
+#[test]
+fn a_fold_whose_value_reads_another_is_replayed_as_of_each_record() {
+    let orders = "event @order.placed { order_id: Int, test_order: Bool }
+event @order.flagged { order_id: Int }
+event @edit.requested { order_id: Int }
+
+fold TestOrder(order_id: Int) -> Bool = false {
+  on @order.placed(order_id) { test_order } => test_order
+  on @order.flagged(order_id) => true
+}
+";
+    let counted = format!(
+        "{orders}
+fold EditsRequested() -> n: Int = 0 {{
+  on @edit.requested() {{ order_id }} => if (TestOrder {{ order_id }}) {{ n }} else {{ n + 1 }}
+}}
+"
+    );
+    let event = |path: [&str; 2], fields: Vec<(&str, Value)>| {
+        Event::new(
+            EventPath::new(path),
+            fields
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value)),
+        )
+    };
+    let placed = |order: i64, test: bool| {
+        event(
+            ["order", "placed"],
+            vec![
+                ("order_id", Value::Int(order)),
+                ("test_order", Value::Bool(test)),
+            ],
+        )
+    };
+    let requested =
+        |order: i64| event(["edit", "requested"], vec![("order_id", Value::Int(order))]);
+    let events = vec![
+        placed(1, false),
+        placed(2, true),
+        requested(1),
+        requested(2),
+        // Flagged after its first request, so that request still counted and the next does not.
+        event(["order", "flagged"], vec![("order_id", Value::Int(1))]),
+        requested(1),
+    ];
+
+    let sql = "SELECT CAST(\"edits_requested\" AS TEXT) FROM \"global\"";
+    let live = tempfile::tempdir().unwrap();
+    deployed_and_filled(&live.path().join("tables.db"), &counted, &events);
+    let followed = cell(
+        &Connection::open(live.path().join("tables.db")).unwrap(),
+        sql,
+    );
+    assert_eq!(followed.as_deref(), Some("1"));
+
+    let late = tempfile::tempdir().unwrap();
+    let path = late.path().join("tables.db");
+    deployed_and_filled(&path, orders, &events);
+    redeployed(&path, &counted, &events);
+    assert_eq!(
+        cell(&Connection::open(&path).unwrap(), sql),
+        followed,
+        "replayed"
+    );
+}
