@@ -93,8 +93,10 @@ hekla listening on http://127.0.0.1:8080
 
 Boot fails, before binding, when:
 
-- the project uses `@subject` anywhere and `HEKLA_MASTER_KEY` is unset:
-  `error: this project declares a subject (`+"`"+`subject Customer(Int)`+"`"+`), so HEKLA_MASTER_KEY must be set`
+- an event field seals (`@subject(...)`), or the data directory holds subject keys from data sealed
+  before, and `HEKLA_MASTER_KEY` is unset. The error names the reason:
+  ``error: this project seals `email` of `@order.placed` under the subject `Customer`, so HEKLA_MASTER_KEY must be set``.
+  A `subject` used only as a typed id seals nothing and needs no key.
 - another process holds the data directory:
   `error: the data directory at <path> is in use by another hekla process (database is locked); stop it, or run against a copy of the directory`
 
@@ -120,9 +122,8 @@ ok: no violations
 ```
 
 Exit is 1 on any violation, on a missing data directory (`error: no data directory at <path>`), and
-on a directory another process holds. A project that declares a `subject` is refused without a key, the
-same way `serve` is: `error: this project declares a subject (...), so HEKLA_MASTER_KEY must be set
-to verify it`. Run it with the key the server used.
+on a directory another process holds. A project that seals data is refused without a key, the same
+way `serve` is: `error: this project seals ... , so HEKLA_MASTER_KEY must be set to verify it`. Run it with the key the server used.
 
 An invocation is **skipped**, not checked, when the effect's source hash has changed since the run
 was recorded, when its event cannot be read, when a `reveal` it makes needs a subject key that has

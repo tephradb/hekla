@@ -51,7 +51,7 @@ use crate::opdb::{
 };
 use crate::openapi;
 use crate::projector::{self, ProjectorSet, ProjectorShared};
-use crate::schema::{EmittedEvent, EventDef, EventDefs};
+use crate::schema::{EmittedEvent, EventDef, EventDefs, identified_subject};
 use crate::secrets::{self, Resolution, SecretStore};
 use crate::store::Store;
 use crate::tags;
@@ -400,13 +400,10 @@ impl Runtime {
         // Event field metadata, shared with the projector and effect runtimes so a
         // fold or a `handle` sees subject fields as opaque handles.
         let events = Arc::clone(&project.events);
-        // The declarations rather than the sealed fields: a project that declares a
-        // subject and seals nothing today will seal something tomorrow, and finding out
-        // at the first write is worse than finding out at boot.
-        if !project.program.subjects.is_empty() && master.is_none() {
-            anyhow::bail!(
-                "this project declares a subject (`subject Customer(Int)`), so HEKLA_MASTER_KEY must be set"
-            );
+        if master.is_none()
+            && let Some(reason) = master_key_reason(&project.program, &opdb)?
+        {
+            anyhow::bail!("this project {reason}, so HEKLA_MASTER_KEY must be set");
         }
         let effect_units: Vec<Arc<EffectUnit>> =
             project.effects.into_iter().map(Arc::new).collect();
@@ -535,16 +532,6 @@ impl Runtime {
         let store = Store::writing(store);
 
         let events = Arc::clone(&project.events);
-        // The same guard `open` applies. Without it a sweep of a subject-using project
-        // with no master key runs every check against a keystore-less runtime, where
-        // `reveal` fails before the host can mark the failure terminal, so the replay
-        // check reports a divergence for every invocation. A healthy directory would
-        // exit non-zero naming corruption that is not there.
-        if !project.program.subjects.is_empty() && master.is_none() {
-            anyhow::bail!(
-                "this project declares a subject (`subject Customer(Int)`), so HEKLA_MASTER_KEY must be set to verify it"
-            );
-        }
         // And the same reasoning again for rule 16's credentials. A sweep whose effects
         // read a credential this environment has not set wedges every replayed
         // invocation on `MissingSecret` and reports a divergence for each, which is the
@@ -556,6 +543,19 @@ impl Runtime {
         }
         let secrets = Arc::new(secrets);
         let opdb = Arc::new(Mutex::new(OpDb::open(&data_dir.join("hekla.db"))?));
+        // The same guard `open` applies. Without it a sweep of a project that seals data
+        // with no master key runs every check against a keystore-less runtime, where
+        // `reveal` fails before the host can mark the failure terminal, so the replay
+        // check reports a divergence for every invocation. A healthy directory would
+        // exit non-zero naming corruption that is not there.
+        if master.is_none()
+            && let Some(reason) = master_key_reason(
+                &project.program,
+                &opdb.lock().unwrap_or_else(PoisonError::into_inner),
+            )?
+        {
+            anyhow::bail!("this project {reason}, so HEKLA_MASTER_KEY must be set to verify it");
+        }
         // And once more, after the operational DB the history check reads from. A sweep
         // replays every projector and every effect against the log, so a program that
         // cannot read it reports a rebuild failure and a divergence per invocation,
@@ -1593,6 +1593,42 @@ pub fn resolve_data_dir(project_dir: &Path, data_dir: Option<&Path>) -> PathBuf 
         Some(dir) => dir.to_path_buf(),
         None => project_dir.join("data"),
     }
+}
+
+/// Why a project needs `HEKLA_MASTER_KEY`, or `None` when nothing it holds is sealed.
+///
+/// **A field that seals, not a `subject` declaration.** A subject is also a typed id, and a
+/// project that only uses it as one has nothing to encrypt. Sealing a field later is an edit
+/// and so a deploy, and this check runs at that boot too, so waiting for the first sealed
+/// field loses nothing. Keys already stored count as well: a field that stopped sealing
+/// leaves the events it sealed in the log, and they still need the master to read.
+fn master_key_reason(program: &Program, opdb: &OpDb) -> anyhow::Result<Option<String>> {
+    for event in &program.events {
+        if let Some((field, id)) = event
+            .fields
+            .iter()
+            .find_map(|field| field.subject.as_ref().map(|id| (&field.name, id)))
+        {
+            // `@subject(customer_id)` names the sibling holding the id, and that field's
+            // type names the subject.
+            let subject = event
+                .fields
+                .iter()
+                .find(|field| &field.name == id)
+                .and_then(|field| identified_subject(&field.ty))
+                .unwrap_or(id);
+            return Ok(Some(format!(
+                "seals `{field}` of `{}` under the subject `{subject}`",
+                event.path
+            )));
+        }
+    }
+    if let Some((subject, _)) = opdb.subject_key_counts()?.into_iter().next() {
+        return Ok(Some(format!(
+            "holds keys for the subject `{subject}` from data it sealed before"
+        )));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

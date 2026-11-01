@@ -71,8 +71,55 @@ fn boot_without_a_master_key_fails_when_a_project_uses_subjects() {
     };
     let message = format!("{err:#}");
     assert!(
-        message.contains("HEKLA_MASTER_KEY"),
-        "expected a master-key boot error, got: {message}"
+        message.contains("HEKLA_MASTER_KEY")
+            && message.contains("`email` of `@order.placed` under the subject `Customer`"),
+        "expected a master-key boot error naming the sealed field, got: {message}"
+    );
+}
+
+/// A subject used only as a typed id seals nothing, so it asks for no key.
+#[test]
+fn a_project_whose_subjects_seal_nothing_boots_without_a_key() {
+    let dir = write_project(&[(
+        "events/order.hk",
+        "subject Customer(Int)\n\nevent @order.placed { order_id: Uuid, customer_id: Customer }\n",
+    )]);
+    let harness = Boot::new(dir.path())
+        .http_status(200)
+        .try_start()
+        .expect("boots without a master key");
+    harness.shutdown();
+}
+
+/// A field that stopped sealing leaves what it sealed in the log, and the keys that open
+/// it in the data directory, so the key is still required.
+#[test]
+fn keys_sealed_before_still_need_the_master_after_the_field_stops_sealing() {
+    let dir = orders_project();
+    let data = tempfile::tempdir().unwrap();
+    let harness = Boot::new(dir.path())
+        .data_dir(data.path())
+        .http_status(200)
+        .with_master_key()
+        .start();
+    place_order(&harness.rt, ORDER, 7, "ada@example.com");
+    harness.shutdown();
+
+    let events = dir.path().join("events/order.hk");
+    let source = std::fs::read_to_string(&events).unwrap();
+    std::fs::write(&events, source.replace(" @subject(customer_id)", "")).unwrap();
+    let err = match Boot::new(dir.path())
+        .data_dir(data.path())
+        .http_status(200)
+        .try_start()
+    {
+        Ok(_) => panic!("expected boot to fail without a master key"),
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("holds keys for the subject `Customer`"),
+        "{message}"
     );
 }
 
