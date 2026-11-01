@@ -175,7 +175,7 @@ fn a_fold_with_no_parameters_is_one_row() {
         "event @thing.happened { n: Int }
 
 fold Things() -> n: Int = 0 {
-  on @thing.happened() => n + 1
+  on @thing.happened => n + 1
 }
 ",
     );
@@ -1406,13 +1406,13 @@ fn a_column_left_alone_does_not_replay_from_its_final_value() {
     let doubled = "event @clock.ticked { n: Int }
 
 fold Doubled() -> n: Int = 1 {
-  on @clock.ticked() => n * 2
+  on @clock.ticked => n * 2
 }
 ";
     let counted = format!(
         "{doubled}
 fold Ticks() -> n: Int = 0 {{
-  on @clock.ticked() => n + 1
+  on @clock.ticked => n + 1
 }}
 "
     );
@@ -1473,8 +1473,8 @@ fold ReceiptGame(receipt_id: Int) -> Int = 0 {
 
 const GENRE_UNITS: &str = "
 fold GenreUnits(genre: String) -> n: Int = 0 {
-  on @game.purchased() { game_id } key genre = GameGenre { game_id } => n + 1
-  on @game.refunded() { receipt_id }
+  on @game.purchased { game_id } key genre = GameGenre { game_id } => n + 1
+  on @game.refunded { receipt_id }
     key genre = GameGenre { game_id: ReceiptGame { receipt_id } } => n - 1
 }
 ";
@@ -1625,7 +1625,7 @@ fold TestOrder(order_id: Int) -> Bool = false {
     let counted = format!(
         "{orders}
 fold EditsRequested() -> n: Int = 0 {{
-  on @edit.requested() {{ order_id }} => if (TestOrder {{ order_id }}) {{ n }} else {{ n + 1 }}
+  on @edit.requested {{ order_id }} => if (TestOrder {{ order_id }}) {{ n }} else {{ n + 1 }}
 }}
 "
     );
