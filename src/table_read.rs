@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::crypto::KeyStore;
 use crate::fold_store::SealedCell;
 use crate::heklang_host::{column_form, unsealed_json};
+use crate::read_api::{RANGE_OPERATORS, Range};
 use crate::read_model::{coerce_value, from_sql, quote_ident, reject_double_quoted_strings};
 use crate::schema::{FieldKind, FieldMeta};
 use crate::tables::{ColumnDef, TableDef, main_of, side_of};
@@ -71,6 +72,9 @@ pub fn readable(tables: &[TableDef]) -> impl Iterator<Item = &TableDef> {
 pub struct Scan {
     /// Key parts pinned to a value, as the texts the store binds.
     pub equals: Vec<(String, String)>,
+    /// At most one key part bounded at either end or both: the part right after the
+    /// pinned ones, in the key or in an index, which is what keeps it a seek.
+    pub range: Option<(String, Range)>,
     /// The key of the last row of the previous page.
     pub after: Option<Vec<String>>,
     pub limit: usize,
@@ -140,6 +144,7 @@ pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan,
             }
             "cursor" => scan.after = Some(decode_cursor(table, value)?),
             wait if WAIT.contains(&wait) => {}
+            ranged if ranged.contains('.') => ranged_bound(table, &mut scan, ranged, value)?,
             part => {
                 if scan.equals.iter().any(|(given, _)| given == part) {
                     return Err(Refusal::invalid(format!("`{part}` is given twice")));
@@ -160,13 +165,72 @@ pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan,
             }
         }
     }
-    if !servable(table, &scan.equals) {
+    let ranged = scan.range.as_ref().map(|(part, _)| part.as_str());
+    if ranged.is_some_and(|part| scan.equals.iter().any(|(given, _)| given == part)) {
+        return Err(Refusal::invalid(format!(
+            "`{}` is pinned and bounded at once; filter it one way",
+            ranged.unwrap_or_default()
+        )));
+    }
+    if !servable(table, &scan.equals, ranged) {
         return Err(Refusal {
             code: "unindexed_filter",
-            message: unindexed(table, &scan.equals),
+            message: unindexed(table, &scan.equals, ranged),
         });
     }
     Ok(scan)
+}
+
+/// One end of a range, `part.gte=` and its siblings, onto the scan's one ranged part.
+fn ranged_bound(table: &TableDef, scan: &mut Scan, name: &str, value: &str) -> Result<(), Refusal> {
+    let (part, op) = name.rsplit_once('.').expect("checked to hold a dot");
+    let Some(&(_, lower, bound_kind)) = RANGE_OPERATORS.iter().find(|(word, ..)| *word == op)
+    else {
+        let words: Vec<&str> = RANGE_OPERATORS.iter().map(|(word, ..)| *word).collect();
+        return Err(Refusal::invalid(format!(
+            "`{name}` is not a filter: a range is `{part}.` followed by one of {}",
+            words.join(", ")
+        )));
+    };
+    let Some((_, meta)) = table.key.iter().find(|(known, _)| known == part) else {
+        return Err(Refusal {
+            code: "unindexed_filter",
+            message: format!(
+                "`{part}` is not a key part of `{}`; its key is ({}), and a derived table \
+                 filters on its key",
+                table.name,
+                key_names(table)
+            ),
+        });
+    };
+    if !meta.kind.base().is_comparable() {
+        return Err(Refusal::invalid(format!(
+            "`{part}` is {}, which has no order a range could use; filter it for equality \
+             instead",
+            meta.kind.describe()
+        )));
+    }
+    let (given, range) = scan
+        .range
+        .get_or_insert_with(|| (part.to_owned(), Range::default()));
+    if given != part {
+        return Err(Refusal::invalid(format!(
+            "a scan bounds one key part, and `{given}` is already bounded"
+        )));
+    }
+    let end = if lower {
+        &mut range.lower
+    } else {
+        &mut range.upper
+    };
+    if end.is_some() {
+        return Err(Refusal::invalid(format!(
+            "`{part}` has two {} bounds",
+            if lower { "lower" } else { "upper" }
+        )));
+    }
+    *end = Some((bound_kind, bound(table, part, value)?));
+    Ok(())
 }
 
 /// Read a whole key off the query string: every key part, once, and nothing else.
@@ -261,10 +325,14 @@ fn bound(table: &TableDef, part: &str, value: &str) -> Result<String, Refusal> {
     }
 }
 
-fn servable(table: &TableDef, equals: &[(String, String)]) -> bool {
+/// Whether the key or an index serves the filter: the pinned parts are a leading run of
+/// it, and a ranged part, if any, is the column right after them.
+fn servable(table: &TableDef, equals: &[(String, String)], ranged: Option<&str>) -> bool {
     let asked: Vec<&str> = equals.iter().map(|(name, _)| name.as_str()).collect();
     let leading = |columns: Vec<&str>| {
-        asked.len() <= columns.len() && columns[..asked.len()].iter().all(|c| asked.contains(c))
+        asked.len() <= columns.len()
+            && columns[..asked.len()].iter().all(|c| asked.contains(c))
+            && ranged.is_none_or(|part| columns.get(asked.len()) == Some(&part))
     };
     leading(table.key.iter().map(|(name, _)| name.as_str()).collect())
         || table
@@ -273,8 +341,24 @@ fn servable(table: &TableDef, equals: &[(String, String)]) -> bool {
             .any(|index| leading(index.columns.iter().map(String::as_str).collect()))
 }
 
-fn unindexed(table: &TableDef, equals: &[(String, String)]) -> String {
+fn unindexed(table: &TableDef, equals: &[(String, String)], ranged: Option<&str>) -> String {
     let asked: Vec<&str> = equals.iter().map(|(name, _)| name.as_str()).collect();
+    if let Some(part) = ranged {
+        let mut ways = vec![format!("the key ({})", key_names(table))];
+        ways.extend(
+            table
+                .indexes
+                .iter()
+                .map(|index| format!("index ({})", index.columns.join(", "))),
+        );
+        return format!(
+            "a range on `{part}` after ({}) is not served by any index of `{}`: {}. Pin a \
+             leading run of one of them and range the column right after it.",
+            asked.join(", "),
+            table.name,
+            ways.join(", ")
+        );
+    }
     let mut ways = vec![format!("the key ({})", key_names(table))];
     ways.extend(
         table
@@ -380,8 +464,8 @@ pub fn get_one(
         .collect();
     let scan = Scan {
         equals,
-        after: None,
         limit: 1,
+        ..Scan::default()
     };
     let mut rows = select(&tx, tables, table, &scan, keystore)?;
     Ok((rows.pop().map(|(row, _)| row), position))
@@ -554,6 +638,24 @@ fn select(
             .with_context(|| format!("no key part `{name}`"))?;
         binds.push(coerce_value(&meta.kind, text)?);
         wheres.push(format!("m.{} = ?{}", quote_ident(name), binds.len()));
+    }
+    if let Some((name, range)) = &scan.range {
+        let (_, meta) = table
+            .key
+            .iter()
+            .find(|(part, _)| part == name)
+            .with_context(|| format!("no key part `{name}`"))?;
+        for (lower, end) in [(true, &range.lower), (false, &range.upper)] {
+            if let Some((bound, text)) = end {
+                binds.push(coerce_value(&meta.kind, text)?);
+                wheres.push(format!(
+                    "m.{} {} ?{}",
+                    quote_ident(name),
+                    bound.operator(lower),
+                    binds.len()
+                ));
+            }
+        }
     }
     if let Some(after) = &scan.after {
         // A row value comparison, so a page resumes after a whole key in key order rather

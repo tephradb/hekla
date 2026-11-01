@@ -130,6 +130,10 @@ GET /tables/org__owner?org=1&limit=50
   folding from empty over an existing log. Every table is served or none is: they share one position.
 - A malformed key part, a part that is not a key part, or a cursor from elsewhere is `400
   invalid_input`; a filter that skips a leading part is `400 unindexed_filter`.
+- A range (`part.gte=`, `.gt`, `.lte`, `.lt`, either end or both) goes on one key part, the one
+  right after the pinned ones in the key or in a derived index: `?org=1&month.gte=2023-11`. A range
+  anywhere else is `400 unindexed_filter`; an unknown operator, two bounds at one end, a part both
+  pinned and ranged, or ranges on two parts are `400 invalid_input`.
 
 ## `GET /folds/{Fold}`
 

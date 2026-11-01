@@ -167,7 +167,9 @@ defaults to `127.0.0.1`.
 it has one, and otherwise for the parameter with one `_id` off; don't guess, because
 `hekla check --tables <dir>` prints every table, column and derived index. A row is every fold's
 value for its key, collections and sealed columns included, and every table is read at one log
-position. A filter on a key part that is not a leading one is a `400 unindexed_filter`.
+position. A filter on a key part that is not a leading one is a `400 unindexed_filter`. The part
+right after the pinned ones may also take a range (`?org=1&month.gte=2023-11&month.lt=2024-01`, with
+`.gte`, `.gt`, `.lte`, `.lt`), one part per request.
 
 **One fold by name** is `GET /folds/{Fold}?<param>=...`, its arguments named as the fold declares
 its parameters (`/folds/OwnerTickets?org_id=1&owner_id=10`), answering `{value, position}`. A

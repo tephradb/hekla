@@ -700,6 +700,34 @@ fn key_params(table: &TableDef, required: bool) -> Vec<Value> {
         .collect()
 }
 
+/// The range bounds a scan takes on each key part with an order, for the reason
+/// [`range_params`] gives a projector's columns.
+fn key_range_params(table: &TableDef) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (name, meta) in &table.key {
+        if !meta.kind.base().is_comparable() {
+            continue;
+        }
+        for (operator, lower, bound) in read_api::RANGE_OPERATORS {
+            let end = if lower { "at or above" } else { "at or below" };
+            let end = match bound {
+                read_api::Bound::Inclusive => end.to_owned(),
+                read_api::Bound::Exclusive => end.replace("at or ", ""),
+            };
+            out.push(query_param(
+                &format!("{name}.{operator}"),
+                &format!(
+                    "Match rows whose `{name}` is {end} this. One key part per request may \
+                     carry a range, and it must be the part right after the pinned ones, in \
+                     the key or in an index. Both ends may be given together.",
+                ),
+                field_schema(&meta.kind),
+            ));
+        }
+    }
+    out
+}
+
 fn key_list(table: &TableDef) -> String {
     let parts: Vec<String> = table
         .key
@@ -733,6 +761,7 @@ fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
         ),
     ];
     parameters.extend(key_params(&table.main, false));
+    parameters.extend(key_range_params(&table.main));
     parameters.extend(wait_params());
     let indexes: Vec<String> = table
         .main
@@ -760,8 +789,9 @@ fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
             "summary": format!("scan the `{name}` table"),
             "description": format!(
                 "The rows of `{name}`, keyed on {}, in key order and cursor-paginated. A \
-                 filter is equality on the leading parts of the key{}; anything else would be \
-                 a table scan, so it is a 400 rather than a slow query. {TABLE_READ_YOUR_WRITES}",
+                 filter is equality on the leading parts of the key{}, plus an optional range \
+                 on the part right after them; anything else would be a table scan, so it is \
+                 a 400 rather than a slow query. {TABLE_READ_YOUR_WRITES}",
                 key_list(&table.main),
                 if indexes.is_empty() {
                     String::new()

@@ -356,6 +356,44 @@ function Value({ column, row }) {
   return html`<span class="mono">${String(value)}</span>`
 }
 
+/* A filter input takes a value, or bounds written `>=a <b`, which become the scan's
+ * `part.gte` and `part.lt`. Longest operator first, so `>=` is not read as `>` of `=a`. */
+const BOUNDS = [
+  ['>=', 'gte'],
+  ['<=', 'lte'],
+  ['>', 'gt'],
+  ['<', 'lt'],
+]
+
+function parsed(part, value) {
+  const words = value.split(/\s+/)
+  const bounds = words.map((word) => {
+    const found = BOUNDS.find(([sign]) => word.startsWith(sign))
+    return found && word.length > found[0].length
+      ? [`${part}.${found[1]}`, word.slice(found[0].length)]
+      : null
+  })
+  return bounds.every(Boolean) ? bounds : [[part, value]]
+}
+
+/* The inputs' text back from the query string, so a reload shows what was asked. */
+function draftOf(filters) {
+  const draft = {}
+  for (const [name, value] of filters) {
+    const [part, op] = name.split('.')
+    const sign = BOUNDS.find(([, word]) => word === op)?.[0]
+    const text = sign ? `${sign}${value}` : value
+    draft[part] = draft[part] ? `${draft[part]} ${text}` : text
+  }
+  return draft
+}
+
+function spelled([name, value]) {
+  const [part, op] = name.split('.')
+  const sign = BOUNDS.find(([, word]) => word === op)?.[0]
+  return sign ? `${part} ${sign} ${value}` : `${part} = ${value}`
+}
+
 function Rows({ table, filters, cursor, openRow }) {
   /* Not on the shared tick, for the projectors page's reason: rows shifting under
    * someone reading them is worse than rows a few seconds old. ⟳ refreshes. */
@@ -364,7 +402,7 @@ function Rows({ table, filters, cursor, openRow }) {
     [table.name, JSON.stringify(filters), cursor],
   )
   const [trail, setTrail] = useState([])
-  const [draft, setDraft] = useState(() => Object.fromEntries(filters))
+  const [draft, setDraft] = useState(() => draftOf(filters))
 
   /* A filter is a leading run of the key, or of an index a range arm derived, so a part
    * is offered once every key part before it has a value, or when it leads an index: the
@@ -379,7 +417,7 @@ function Rows({ table, filters, cursor, openRow }) {
     const chosen = []
     for (const [index, part] of table.key.entries()) {
       const value = (draft[part.name] ?? '').trim()
-      if (value && offered(index)) chosen.push([part.name, value])
+      if (value && offered(index)) chosen.push(...parsed(part.name, value))
     }
     browse({ filters: chosen })
   }
@@ -453,7 +491,7 @@ function Rows({ table, filters, cursor, openRow }) {
                 <span class="chip-kind">${part.name}</span>
                 <input
                   value=${draft[part.name] ?? ''}
-                  placeholder=${offered(index) ? part.kind : `set ${table.key[index - 1].name} first`}
+                  placeholder=${offered(index) ? `${part.kind}, or >=a <b` : `set ${table.key[index - 1].name} first`}
                   disabled=${!offered(index)}
                   onInput=${(typed) => setDraft({ ...draft, [part.name]: typed.target.value })}
                   onKeyDown=${(pressed) => {
@@ -474,7 +512,7 @@ function Rows({ table, filters, cursor, openRow }) {
           html`
             <span class="chip">
               <span class="chip-kind">where</span>
-              <code>${filters.map(([name, value]) => `${name} = ${value}`).join(', ')}</code>
+              <code>${filters.map(spelled).join(', ')}</code>
               <button type="button" onClick=${clear} aria-label="Remove the filter">✕</button>
             </span>
           `}

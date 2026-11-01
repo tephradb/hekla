@@ -1285,3 +1285,91 @@ async fn a_computed_key_part_buckets_rows_by_what_the_record_holds() {
 
     harness.shutdown();
 }
+
+/// A range on the key part after the pinned ones, the way a month of a tenant's history is
+/// read: `org=1&month.gte=..&month.lt=..`. A range anywhere an index would not seek to is a
+/// 400, as an unindexed equality is.
+#[tokio::test]
+async fn a_derived_table_is_ranged_on_the_part_after_its_pinned_ones() {
+    let harness = boot();
+    let mut position = 0;
+    // Due in 2023-11, 2023-11 and 2023-12, all in org 1.
+    for (ticket, due_at) in [
+        (ALICE, 1_700_000_000_000_000i64),
+        (BOB, 1_700_000_000_000_000),
+        (CAROL, 1_702_592_000_000_000),
+    ] {
+        let mut body = open_body(ticket, 1, 10, None);
+        body["due_at"] = due_at.into();
+        let result = harness
+            .rt
+            .execute("OpenTicket", body, &ctx(), None)
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+        position = position.max(result.body["positions"]["last"].as_u64().unwrap());
+    }
+    let app = harness.app();
+    let months = |body: &Value| -> Vec<String> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["month"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let (status, body) = support::get(
+        &app,
+        &format!("/tables/org__month?org=1&month.gte=2023-12&after={position}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(months(&body), vec!["2023-12"]);
+
+    let (_, body) = support::get(
+        &app,
+        "/tables/org__month?org=1&month.gte=2023-11&month.lt=2023-12",
+    )
+    .await;
+    assert_eq!(
+        months(&body),
+        vec!["2023-11"],
+        "both ends, the upper exclusive"
+    );
+
+    let (status, body) = support::get(&app, "/tables/org__month?org.gte=1").await;
+    assert_eq!(
+        status, 200,
+        "the first part needs nothing pinned before it: {body}"
+    );
+    assert_eq!(months(&body), vec!["2023-11", "2023-12"]);
+
+    let (status, body) = support::get(&app, "/tables/org__month?month.gte=2023-11").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "unindexed_filter");
+
+    for (uri, why) in [
+        (
+            "/tables/org__month?org=1&month.after=2023-11",
+            "not an operator",
+        ),
+        (
+            "/tables/org__month?org=1&month.gte=2023-11&month.gt=2023-10",
+            "two lower bounds",
+        ),
+        (
+            "/tables/org__month?org=1&org.gte=1",
+            "pinned and bounded at once",
+        ),
+        (
+            "/tables/org__month?org.gte=1&month.gte=2023-11",
+            "two parts bounded",
+        ),
+    ] {
+        let (status, body) = support::get(&app, uri).await;
+        assert_eq!(status, 400, "{why}: {body}");
+        assert_eq!(body["error"]["code"], "invalid_input", "{why}: {body}");
+    }
+
+    harness.shutdown();
+}
