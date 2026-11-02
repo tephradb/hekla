@@ -1641,6 +1641,13 @@ async fn a_derived_row_and_a_fold_have_a_history() {
         assert_eq!(status, 400, "{uri}: {body}");
         assert_eq!(body["error"]["code"], code, "{uri}: {body}");
     }
+    let (_, body) = support::get(&app, "/folds/TicketsByOrgCloses/history?closes=0").await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("through `OwnerOrgCloses`")),
+        "the refusal names the fold that ranges: {body}"
+    );
     // A table's default leaves out the column with no history rather than refusing.
     let (status, body) = support::get(&app, "/tables/org__owner/history?org=1&owner=10").await;
     assert_eq!(status, 200, "{body}");

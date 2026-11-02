@@ -16,7 +16,7 @@ use anyhow::Context;
 
 use heklang::ir::Type;
 use heklang::value::Defs;
-use heklang::{ArmMatch, Column, Program, Table, layout};
+use heklang::{ArmMatch, Column, Layout, Program, Table, layout};
 
 use crate::schema::{FieldKind, FieldMeta, IndexDef, Seal};
 
@@ -87,10 +87,18 @@ pub struct ColumnDef {
     /// takes the type, and a `Map(String, Int)` and a `List(Int)` are both `FieldKind::Json`.
     pub ty: Type,
     pub meta: FieldMeta,
-    /// Whether a history can be read for it: false for a fold with a range arm, whose
-    /// by-key history would report steps the stored column never took (`heklang`'s
-    /// `Column::ranges`, and `docs/folds.md` section 11).
-    pub history: bool,
+    /// The fold that keeps this column from having a history, if one does: a fold with a
+    /// range arm, this one or one it reads, whose by-key read would report steps the stored
+    /// column never took (`heklang`'s `Layout::ranged_through`, and `docs/folds.md`
+    /// section 11). `None` is a column whose history is exact.
+    pub ranged_through: Option<String>,
+}
+
+impl ColumnDef {
+    /// Whether `/folds/{fold}/history` serves this column.
+    pub fn history(&self) -> bool {
+        self.ranged_through.is_none()
+    }
 }
 
 /// The guard column a keyless table carries, so `global` really holds one row.
@@ -106,8 +114,9 @@ impl TableDef {
     pub fn all(program: &Program) -> Vec<TableDef> {
         let defs = Defs::of(program);
         let mut out = Vec::new();
-        for table in &layout(program).tables {
-            let (scalars, collections) = split(program, table, defs);
+        let laid = layout(program);
+        for table in &laid.tables {
+            let (scalars, collections) = split(program, &laid, table, defs);
             let sorted = sort_indexes(table, &scalars);
             out.push(TableDef {
                 name: table.name.clone(),
@@ -235,11 +244,16 @@ fn key_columns(table: &Table, defs: Defs<'_>) -> Vec<(String, FieldMeta)> {
 ///
 /// A record, a list and a map all store as the JSON rule 8 already puts them on the wire,
 /// so `FieldKind::Json` is exactly the set that belongs in the side table.
-fn split(program: &Program, table: &Table, defs: Defs<'_>) -> (Vec<ColumnDef>, Vec<ColumnDef>) {
+fn split(
+    program: &Program,
+    laid: &Layout,
+    table: &Table,
+    defs: Defs<'_>,
+) -> (Vec<ColumnDef>, Vec<ColumnDef>) {
     let mut scalars = Vec::new();
     let mut collections = Vec::new();
     for column in &table.columns {
-        let def = column_def(program, column, defs);
+        let def = column_def(program, laid, column, defs);
         if matches!(def.meta.kind.base(), FieldKind::Json) {
             collections.push(def);
         } else {
@@ -249,7 +263,7 @@ fn split(program: &Program, table: &Table, defs: Defs<'_>) -> (Vec<ColumnDef>, V
     (scalars, collections)
 }
 
-fn column_def(program: &Program, column: &Column, defs: Defs<'_>) -> ColumnDef {
+fn column_def(program: &Program, laid: &Layout, column: &Column, defs: Defs<'_>) -> ColumnDef {
     // **Every sealed column is marked, and none names an id column.** A derived cell
     // carries its own subject id (`fold_store::SealedCell`), because a fold's key need not
     // hold one: `OrderEmail(order_id, shop_id) -> Sealed(String, Customer)?` is keyed on
@@ -264,7 +278,7 @@ fn column_def(program: &Program, column: &Column, defs: Defs<'_>) -> ColumnDef {
         fold: column.fold.clone(),
         args: column.args.clone(),
         default: seed_literal(program, column, &kind, sealed_under.is_some()),
-        history: !column.ranges(),
+        ranged_through: laid.ranged_through(&column.fold).cloned(),
         ty: column.ty.clone(),
         meta: FieldMeta {
             kind,

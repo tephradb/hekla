@@ -137,7 +137,7 @@ pub fn chosen<'a>(
         });
     }
     let Some(asked) = asked else {
-        let kept: Vec<&ColumnDef> = columns.iter().copied().filter(|c| c.history).collect();
+        let kept: Vec<&ColumnDef> = columns.iter().copied().filter(|c| c.history()).collect();
         if kept.is_empty() {
             return Err(no_history(table, columns));
         }
@@ -153,7 +153,7 @@ pub fn chosen<'a>(
                     code: "invalid_input",
                     message: format!("`{name}` is not a column of `{table}`"),
                 })?;
-            if !column.history {
+            if !column.history() {
                 return Err(no_history(table, slice::from_ref(column)));
             }
             Ok(*column)
@@ -162,13 +162,20 @@ pub fn chosen<'a>(
 }
 
 fn no_history(table: &str, columns: &[&ColumnDef]) -> Refusal {
-    let names: Vec<&str> = columns.iter().map(|column| column.name.as_str()).collect();
+    let names: Vec<String> = columns
+        .iter()
+        .map(|column| match column.ranged_through.as_deref() {
+            Some(ranged) if ranged == column.fold => format!("`{}`", column.name),
+            Some(ranged) => format!("`{}` (through `{ranged}`)", column.name),
+            None => format!("`{}`", column.name),
+        })
+        .collect();
     Refusal {
         code: "no_history",
         message: format!(
-            "{} of `{table}` has no history: its fold has an arm that leaves a key part open, \
-             so a key made after such a record never saw it, and a history read off the log \
-             would report a change the stored column never took",
+            "{} of `{table}` has no history: a fold it depends on has an arm that leaves a key \
+             part open, so a key made after such a record never saw it, and a history read off \
+             the log would report a change the stored column never took",
             names.join(", ")
         ),
     }
@@ -287,7 +294,7 @@ pub fn read(
             .fold_steps(&column.fold, args, head, &mut visit)
             .map_err(|err| match &err.kind {
                 ErrorKind::Host(why) if why == TOO_LONG => anyhow::Error::new(TooLong),
-                ErrorKind::NoHistory(_) => anyhow::anyhow!("`{}` has no history", column.fold),
+                ErrorKind::NoHistory { .. } => anyhow::anyhow!("`{}` has no history", column.fold),
                 _ => anyhow::anyhow!("reading the history of `{}`: {err}", column.fold),
             })?;
     }

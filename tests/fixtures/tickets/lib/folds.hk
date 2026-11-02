@@ -77,3 +77,15 @@ fold OwnerAnyClosed(org_id: Org, owner_id: Owner) -> Bool = false {
 fold OrgPlan(org_id: Org) -> String? = "free" {
   on @ticket.opened(org_id) => "free"
 }
+
+// Ranged: a close reaches every owner of the org.
+fold OwnerOrgCloses(org_id: Org, owner_id: Owner) -> n: Int = 0 {
+  on @ticket.opened(org_id, owner_id) => n
+  on @ticket.closed(org_id) => n + 1
+}
+
+// Every arm pins its whole key, but the key is read through a ranged fold, so this has no
+// history either: a by-key read would file a ticket under a count the store never held.
+fold TicketsByOrgCloses(closes: Int) -> n: Int = 0 {
+  on @ticket.opened { org_id, owner_id } key closes = OwnerOrgCloses { org_id, owner_id } => n + 1
+}

@@ -252,7 +252,7 @@ pub fn build(surface: &Surface) -> Value {
             format!("/tables/{}/row", table.main.name),
             table_row_path(table, &names),
         );
-        if table.columns().any(|column| column.history) {
+        if table.columns().any(|column| column.history()) {
             paths.insert(
                 format!("/tables/{}/history", table.main.name),
                 table_history_path(table),
@@ -260,7 +260,7 @@ pub fn build(surface: &Surface) -> Value {
         }
         for column in table.columns() {
             paths.insert(format!("/folds/{}", column.fold), fold_path(table, column));
-            if column.history {
+            if column.history() {
                 paths.insert(
                     format!("/folds/{}/history", column.fold),
                     fold_history_path(table, column),
@@ -984,7 +984,7 @@ fn table_history_path(table: &TableSurface) -> Value {
     let mut parameters = key_params(&table.main, true);
     let columns: Vec<&str> = table
         .columns()
-        .filter(|column| column.history)
+        .filter(|column| column.history())
         .map(|column| column.name.as_str())
         .collect();
     parameters.push(query_param(

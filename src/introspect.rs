@@ -590,7 +590,7 @@ pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> 
                 "optional": column.meta.kind.is_nullable(),
                 "subject": column.meta.subject(),
                 "collection": collection,
-                "history": column.history,
+                "history": column.history(),
             })
         })
         .collect();
