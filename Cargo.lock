@@ -1933,9 +1933,9 @@ dependencies = [
 
 [[package]]
 name = "tephra"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afb3e454eb1f6e1d9c184b6d70c854e1ae153a961d986f43798343a4442af33c"
+checksum = "b5afd86e56d68e727c452470187cb58674e1d29cf33b1e7d08bd3a9e99cf0baf"
 dependencies = [
  "crc32fast",
  "dashmap",
