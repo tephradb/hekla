@@ -577,6 +577,36 @@ impl Sources {
                 }
             }
         }
+        // An `@index` heklang accepts on any type that orders, and the store orders by what it
+        // holds: a `Money` is its decimal string, so `@index` on one would sort `"10.00"`
+        // under `"9.00"`. The range filters' rule, applied where the declaration is written.
+        for table in &derived {
+            for sort in &table.sorts {
+                let Some(column) = table
+                    .columns
+                    .iter()
+                    .find(|column| column.name == sort.column)
+                else {
+                    continue;
+                };
+                if !column.meta.kind.base().is_comparable() {
+                    let rel = program
+                        .fold(&column.fold)
+                        .and_then(|def| def.module.clone())
+                        .unwrap_or_default();
+                    findings.push(Finding::error(
+                        rel,
+                        format!(
+                            "fold `{}` declares `@index`, but its column is {}, which the \
+                             store does not hold in an order a sort could use; index an \
+                             `Int`, `String`, `Uuid` or `Timestamp` fold instead",
+                            column.fold,
+                            column.meta.kind.describe()
+                        ),
+                    ));
+                }
+            }
+        }
         // The same for a stored fold's own parameters, which `/folds/{Fold}` takes by the
         // name the fold declares and which can differ from the part's (`after: Org` is a
         // part named `org`), so the check above does not cover them.

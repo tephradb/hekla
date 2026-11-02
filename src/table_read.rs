@@ -30,10 +30,10 @@ use crate::heklang_host::{column_form, unsealed_json};
 use crate::read_api::{RANGE_OPERATORS, Range};
 use crate::read_model::{coerce_value, from_sql, quote_ident, reject_double_quoted_strings};
 use crate::schema::{FieldKind, FieldMeta};
-use crate::tables::{ColumnDef, TableDef, main_of, side_of};
+use crate::tables::{ColumnDef, SortDef, TableDef, main_of, side_of};
 
 /// Query parameters that are not a key part.
-pub const RESERVED: [&str; 4] = ["limit", "cursor", "after", "timeout_ms"];
+pub const RESERVED: [&str; 5] = ["limit", "cursor", "after", "timeout_ms", "order_by"];
 
 /// How long a read waits on the single writer's lock before failing.
 const BUSY: Duration = Duration::from_secs(5);
@@ -75,30 +75,61 @@ pub struct Scan {
     /// At most one key part bounded at either end or both: the part right after the
     /// pinned ones, in the key or in an index, which is what keeps it a seek.
     pub range: Option<(String, Range)>,
-    /// The key of the last row of the previous page.
-    pub after: Option<Vec<String>>,
+    /// A column a fold's `@index` declares, to order by instead of the key.
+    pub order: Option<Order>,
+    /// Where the previous page ended.
+    pub after: Option<After>,
     pub limit: usize,
 }
 
+/// An ordering by a declared sort column, ascending or descending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Order {
+    pub column: String,
+    pub descending: bool,
+}
+
+impl Order {
+    /// The `order_by` spelling, which a cursor records so it is not read under another.
+    fn token(&self) -> String {
+        format!("{}{}", if self.descending { "-" } else { "" }, self.column)
+    }
+}
+
+/// The last row of the previous page: its key, and its sort value when the scan is
+/// ordered by one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct After {
+    pub value: Option<String>,
+    pub key: Vec<String>,
+}
+
 /// A page cursor. Carries its table so one taken over another table, whose key compares
-/// different columns, is refused rather than read as a position in this one.
+/// different columns, is refused rather than read as a position in this one, and the
+/// ordering it was taken under for the same reason.
 #[derive(Debug, Serialize, Deserialize)]
 struct Cursor {
     #[serde(rename = "t")]
     table: String,
     #[serde(rename = "k")]
     key: Vec<String>,
+    #[serde(rename = "o", default, skip_serializing_if = "Option::is_none")]
+    order: Option<String>,
+    #[serde(rename = "v", default, skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
 }
 
-fn encode_cursor(table: &str, key: Vec<String>) -> String {
+fn encode_cursor(table: &str, order: Option<&Order>, after: After) -> String {
     let cursor = Cursor {
         table: table.to_owned(),
-        key,
+        key: after.key,
+        order: order.map(Order::token),
+        value: after.value,
     };
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).expect("a cursor serializes"))
 }
 
-fn decode_cursor(table: &TableDef, raw: &str) -> Result<Vec<String>, Refusal> {
+fn decode_cursor(table: &TableDef, raw: &str, order: Option<&Order>) -> Result<After, Refusal> {
     let bad = || Refusal::invalid("cursor is not valid".to_owned());
     // A one-row table never hands out a cursor, so one for it was not this server's.
     if table.key.is_empty() {
@@ -112,14 +143,45 @@ fn decode_cursor(table: &TableDef, raw: &str) -> Result<Vec<String>, Refusal> {
             table.name
         )));
     }
+    let asked = order.map(Order::token);
+    if cursor.order != asked {
+        return Err(Refusal::invalid(format!(
+            "this cursor was taken {} and this request asks for {}",
+            cursor
+                .order
+                .as_deref()
+                .map_or("in key order".to_owned(), |token| format!(
+                    "under `order_by={token}`"
+                )),
+            asked
+                .as_deref()
+                .map_or("key order".to_owned(), |token| format!(
+                    "`order_by={token}`"
+                ))
+        )));
+    }
     // Each part through the same check a filter takes, so a cursor somebody edited is a
     // 400 here rather than a bind that fails as a 500.
-    table
+    let key = table
         .key
         .iter()
         .zip(&cursor.key)
         .map(|((part, _), value)| bound(table, part, value).map_err(|_| bad()))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let value = match (order, cursor.value) {
+        (None, None) => None,
+        (Some(order), Some(value)) => {
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.name == order.column)
+                .ok_or_else(bad)?;
+            coerce_value(&column.meta.kind, &value).map_err(|_| bad())?;
+            Some(value)
+        }
+        _ => return Err(bad()),
+    };
+    Ok(After { value, key })
 }
 
 /// The parameters an `after` wait reads, which a scan and a row read both pass through
@@ -132,6 +194,8 @@ pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan,
         limit: crate::read_api::DEFAULT_LIMIT,
         ..Scan::default()
     };
+    let mut cursor = None;
+    let mut order_by = None;
     for (name, value) in params {
         match name.as_str() {
             "limit" => {
@@ -142,7 +206,8 @@ pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan,
                     .ok_or_else(|| Refusal::invalid("limit must be a positive integer".into()))?
                     .min(crate::read_api::MAX_LIMIT);
             }
-            "cursor" => scan.after = Some(decode_cursor(table, value)?),
+            "cursor" => cursor = Some(value.as_str()),
+            "order_by" => order_by = Some(value.as_str()),
             wait if WAIT.contains(&wait) => {}
             ranged if ranged.contains('.') => ranged_bound(table, &mut scan, ranged, value)?,
             part => {
@@ -178,7 +243,80 @@ pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan,
             message: unindexed(table, &scan.equals, ranged),
         });
     }
+    if let Some(raw) = order_by {
+        scan.order = Some(ordered(table, &scan, raw)?);
+    }
+    if let Some(raw) = cursor {
+        scan.after = Some(decode_cursor(table, raw, scan.order.as_ref())?);
+    }
     Ok(scan)
+}
+
+/// An `order_by` against what the table declares: a column an `@index` names, `-` before
+/// it to reverse, with exactly the key parts that lead that index pinned. Anything else
+/// would be a sort over the rows the filter matched rather than a walk of one index.
+fn ordered(table: &TableDef, scan: &Scan, raw: &str) -> Result<Order, Refusal> {
+    let (descending, column) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    let declared: Vec<&SortDef> = table
+        .sorts
+        .iter()
+        .filter(|sort| sort.column == column)
+        .collect();
+    if declared.is_empty() {
+        let known: Vec<String> = table.sorts.iter().map(spelled_sort).collect();
+        return Err(Refusal::invalid(if known.is_empty() {
+            format!(
+                "`{column}` is not an ordering of `{}`, which declares none; a fold orders \
+                 its table with `@index`",
+                table.name
+            )
+        } else {
+            format!(
+                "`{column}` is not an ordering of `{}`; it orders by {}, each optionally \
+                 prefixed with `-` to reverse it",
+                table.name,
+                known.join(", ")
+            )
+        }));
+    }
+    let pinned: Vec<&str> = scan.equals.iter().map(|(part, _)| part.as_str()).collect();
+    let fits = |sort: &&SortDef| {
+        sort.lead.len() == pinned.len()
+            && sort.lead.iter().all(|part| pinned.contains(&part.as_str()))
+    };
+    if scan.range.is_some() || !declared.iter().any(fits) {
+        let ways: Vec<String> = declared.iter().map(|sort| spelled_sort(sort)).collect();
+        return Err(Refusal {
+            code: "unindexed_filter",
+            message: format!(
+                "ordering `{}` by `{column}` with ({}) pinned{} is not one index walk: {}. Pin \
+                 exactly the parts before the column, and no range.",
+                table.name,
+                pinned.join(", "),
+                if scan.range.is_some() {
+                    " and a range"
+                } else {
+                    ""
+                },
+                ways.join(", ")
+            ),
+        });
+    }
+    Ok(Order {
+        column: column.to_owned(),
+        descending,
+    })
+}
+
+fn spelled_sort(sort: &SortDef) -> String {
+    if sort.lead.is_empty() {
+        format!("`{}`", sort.column)
+    } else {
+        format!("`{}` with ({}) pinned", sort.column, sort.lead.join(", "))
+    }
 }
 
 /// One end of a range, `part.gte=` and its siblings, onto the scan's one ranged part.
@@ -491,7 +629,7 @@ pub fn scan(
     let next_cursor = if rows.len() > scan.limit {
         rows.truncate(scan.limit);
         rows.last()
-            .map(|(_, key)| encode_cursor(&table.name, key.clone()))
+            .map(|(_, after)| encode_cursor(&table.name, scan.order.as_ref(), after.clone()))
     } else {
         None
     };
@@ -554,7 +692,7 @@ fn select(
     table: &TableDef,
     scan: &Scan,
     keystore: Option<&KeyStore>,
-) -> anyhow::Result<Vec<(Value, Vec<String>)>> {
+) -> anyhow::Result<Vec<(Value, After)>> {
     let side = side_of(tables, table);
     let mut outs: Vec<Out> = table
         .key
@@ -657,29 +795,58 @@ fn select(
             }
         }
     }
+    // An ordering by a declared column: its absent rows are left out, since a row-value
+    // comparison against NULL matches nothing and a page boundary would drop them, and
+    // the key breaks ties so every row has one place in the order.
+    let sorted = match &scan.order {
+        Some(order) => {
+            let meta = &table
+                .columns
+                .iter()
+                .find(|column| column.name == order.column)
+                .with_context(|| format!("no column `{}`", order.column))?
+                .meta;
+            wheres.push(format!("m.{} IS NOT NULL", quote_ident(&order.column)));
+            Some((order, meta))
+        }
+        None => None,
+    };
     if let Some(after) = &scan.after {
         // A row value comparison, so a page resumes after a whole key in key order rather
         // than after its first part.
         let mut holders = Vec::new();
-        for ((_, meta), text) in table.key.iter().zip(after) {
+        let mut columns = Vec::new();
+        if let (Some((order, meta)), Some(value)) = (sorted, &after.value) {
+            binds.push(coerce_value(&meta.kind, value)?);
+            holders.push(format!("?{}", binds.len()));
+            columns.push(format!("m.{}", quote_ident(&order.column)));
+        }
+        for ((name, meta), text) in table.key.iter().zip(&after.key) {
             binds.push(coerce_value(&meta.kind, text)?);
             holders.push(format!("?{}", binds.len()));
+            columns.push(format!("m.{}", quote_ident(name)));
         }
-        let columns: Vec<String> = table
-            .key
-            .iter()
-            .map(|(name, _)| format!("m.{}", quote_ident(name)))
-            .collect();
+        let descending = sorted.is_some_and(|(order, _)| order.descending);
         wheres.push(format!(
-            "({}) > ({})",
+            "({}) {} ({})",
             columns.join(", "),
+            if descending { "<" } else { ">" },
             holders.join(", ")
         ));
     }
     if !wheres.is_empty() {
         sql.push_str(&format!(" WHERE {}", wheres.join(" AND ")));
     }
-    let order: Vec<String> = joined.iter().map(|column| format!("m.{column}")).collect();
+    let direction = if sorted.is_some_and(|(order, _)| order.descending) {
+        " DESC"
+    } else {
+        ""
+    };
+    let mut order: Vec<String> = Vec::new();
+    if let Some((sort, _)) = sorted {
+        order.push(format!("m.{}{direction}", quote_ident(&sort.column)));
+    }
+    order.extend(joined.iter().map(|column| format!("m.{column}{direction}")));
     sql.push_str(&format!(
         " ORDER BY {} LIMIT {}",
         order.join(", "),
@@ -691,11 +858,16 @@ fn select(
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         let mut item = Map::new();
-        let mut key = Vec::new();
+        let mut after = After {
+            value: None,
+            key: Vec::new(),
+        };
         for (at, column) in outs.iter().enumerate() {
             let raw = row.get_ref(at)?;
             if column.key {
-                key.push(key_text(raw));
+                after.key.push(key_text(raw));
+            } else if sorted.is_some_and(|(sort, _)| sort.column == column.name) {
+                after.value = Some(key_text(raw));
             }
             let value = rendered(column.meta, raw, keystore)
                 .with_context(|| format!("reading `{}`.`{}`", table.name, column.name))?;
@@ -705,7 +877,7 @@ fn select(
                 item.insert(column.name.to_owned(), value);
             }
         }
-        out.push((Value::Object(item), key));
+        out.push((Value::Object(item), after));
     }
     Ok(out)
 }

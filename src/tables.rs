@@ -39,7 +39,22 @@ pub struct TableDef {
     pub key: Vec<(String, FieldMeta)>,
     /// One column per fold, alphabetical, as `layout` orders them.
     pub columns: Vec<ColumnDef>,
+    /// Every index the table carries: the ones a ranged arm derives and the ones a fold's
+    /// `@index` declares, which [`TableDef::sorts`] names by the column they order.
     pub indexes: Vec<IndexDef>,
+    /// The orderings a scan may ask for, one per `@index` a fold of this table declares.
+    pub sorts: Vec<SortDef>,
+}
+
+/// An ordering a fold's `@index` declares: its column, after the key parts that lead it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortDef {
+    /// The column it orders by.
+    pub column: String,
+    /// The key parts a scan pins to use it, in key order. Empty for a whole-table order.
+    pub lead: Vec<String>,
+    /// The index that serves it, in [`TableDef::indexes`].
+    pub index: String,
 }
 
 /// One column, and the fold it is kept for.
@@ -89,12 +104,17 @@ impl TableDef {
         let mut out = Vec::new();
         for table in &layout(program).tables {
             let (scalars, collections) = split(program, table, defs);
+            let sorted = sort_indexes(table, &scalars);
             out.push(TableDef {
                 name: table.name.clone(),
                 source: table.name.clone(),
                 key: key_columns(table, defs),
+                indexes: ranged_indexes(table)
+                    .into_iter()
+                    .chain(sorted.iter().map(|(_, index)| index.clone()))
+                    .collect(),
+                sorts: sorted.into_iter().map(|(sort, _)| sort).collect(),
                 columns: scalars,
-                indexes: ranged_indexes(table),
             });
             // **From the start, not when it shows up.** The widest row in the ported
             // application is 87 columns of which 5 are collections, and 40 of the 46
@@ -109,6 +129,7 @@ impl TableDef {
                     key: key_columns(table, defs),
                     columns: collections,
                     indexes: Vec::new(),
+                    sorts: Vec::new(),
                 });
             }
         }
@@ -324,7 +345,7 @@ fn seed_literal(
     // An empty frame, which is what a seed resolves in: a seed that reads a parameter
     // makes the fold unstorable, so no column reaches here with one.
     let value = heklang::interp::eval_pure(program, &def.exprs, def.frame, seed.init).ok()?;
-    let stored = crate::heklang_host::column_form(
+    let stored = crate::heklang_host::stored_form(
         kind,
         crate::heklang_host::from_heklang_json(&heklang::Json::from_value(&value)),
     );
@@ -387,4 +408,48 @@ pub fn side_of<'a>(tables: &'a [TableDef], main: &TableDef) -> Option<&'a TableD
     tables
         .iter()
         .find(|table| table.source == main.name && table.name != main.name)
+}
+
+/// One ordering and its index per `@index` a fold of `table` declares.
+///
+/// The index is the parts that lead it, then the column, then the rest of the key, so the
+/// key that breaks a tie between equal values is in the index too and a page of an
+/// ordering is one walk with no sort. Only a column of the main table can be one: heklang
+/// refuses `@index` on a collection, which is what a side table holds.
+fn sort_indexes(table: &Table, scalars: &[ColumnDef]) -> Vec<(SortDef, IndexDef)> {
+    let mut out = Vec::new();
+    for column in &table.columns {
+        if !scalars.iter().any(|kept| kept.name == column.name) {
+            continue;
+        }
+        for lead in &column.indexes {
+            let lead: Vec<String> = lead.iter().map(|&at| table.key[at].name.clone()).collect();
+            let mut columns = lead.clone();
+            columns.push(column.name.clone());
+            columns.extend(
+                table
+                    .key
+                    .iter()
+                    .filter(|part| !lead.contains(&part.name))
+                    .map(|part| part.name.clone()),
+            );
+            // `__` between the parts, which a column cannot contain: a fold name has no `_`,
+            // so its snake case never doubles one, and `sorts_score_by_game` could otherwise
+            // be `ScoreByGame` or `Score` led by `game`.
+            let name = if lead.is_empty() {
+                format!("sorts__{}", column.name)
+            } else {
+                format!("sorts__{}__{}", column.name, lead.join("__"))
+            };
+            out.push((
+                SortDef {
+                    column: column.name.clone(),
+                    lead,
+                    index: name.clone(),
+                },
+                IndexDef { name, columns },
+            ));
+        }
+    }
+    out
 }

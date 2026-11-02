@@ -27,7 +27,7 @@ fold TicketReporter(ticket_id: Uuid) -> Sealed(Reporter, Owner)? = none {
 }
 
 // Keyed on two subjects, so a read can filter on a leading part of the key.
-fold OwnerTickets(org_id: Org, owner_id: Owner) -> tickets: Int = 0 {
+fold OwnerTickets(org_id: Org, owner_id: Owner) -> tickets: Int @index(org_id) = 0 {
   on @ticket.opened(org_id, owner_id) => tickets + 1
 }
 
@@ -51,4 +51,10 @@ fold OrgTicketsDue(org_id: Org, month: String) -> tickets: Int = 0 {
 
 fn month_of(at: Timestamp) -> String {
   return "{at.year()}-{at.month().pad(2)}"
+}
+
+// Sortable across the whole table, and absent for a ticket still open, which a sort by it
+// leaves out.
+fold TicketClosedAt(ticket_id: Uuid) -> Timestamp? @index = none {
+  on @ticket.closed as e (ticket_id) => e.at
 }

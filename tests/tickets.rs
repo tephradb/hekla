@@ -1373,3 +1373,144 @@ async fn a_derived_table_is_ranged_on_the_part_after_its_pinned_ones() {
 
     harness.shutdown();
 }
+
+/// A fold's `@index` orders its table: `order_by=-owner_tickets` with the part before it
+/// pinned, or a whole-table order. A row without a value is left out, pages follow the
+/// order, and an ordering nothing declares is a 400 rather than a sort.
+#[tokio::test]
+async fn a_derived_table_is_ordered_by_a_column_its_fold_indexes() {
+    let harness = boot();
+    // Owner 10 opens three tickets in org 1, owner 11 one, owner 12 two.
+    let mut position = 0;
+    for (ticket, owner) in [
+        (ALICE, 10),
+        (BOB, 10),
+        (CAROL, 10),
+        (UUID_A, 11),
+        (support::UUID_B, 12),
+        (support::UUID_C, 12),
+    ] {
+        position = position.max(open(&harness, ticket, 1, owner, None));
+    }
+    // Two tickets closed, BOB first; the rest stay open and have no `ticket_closed_at`.
+    for ticket in [BOB, ALICE] {
+        let result = harness
+            .rt
+            .execute(
+                "CloseTicket",
+                json!({ "ticket_id": ticket, "org_id": 1 }),
+                &ctx(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+        position = position.max(result.body["positions"]["last"].as_u64().unwrap());
+    }
+    let app = harness.app();
+    let column = |body: &Value, name: &str| -> Vec<Value> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row[name].clone())
+            .collect()
+    };
+
+    let (status, body) = support::get(
+        &app,
+        &format!("/tables/org__owner?org=1&order_by=-owner_tickets&after={position}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        column(&body, "owner"),
+        vec![json!(10), json!(12), json!(11)]
+    );
+
+    // A page at a time, the cursor carrying the order.
+    let (_, first) = support::get(
+        &app,
+        "/tables/org__owner?org=1&order_by=owner_tickets&limit=2",
+    )
+    .await;
+    assert_eq!(column(&first, "owner"), vec![json!(11), json!(12)]);
+    let cursor = first["next_cursor"].as_str().expect("another page follows");
+    let (status, rest) = support::get(
+        &app,
+        &format!("/tables/org__owner?org=1&order_by=owner_tickets&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{rest}");
+    assert_eq!(column(&rest, "owner"), vec![json!(10)]);
+    assert_eq!(rest["next_cursor"], Value::Null);
+    let (status, body) = support::get(
+        &app,
+        &format!("/tables/org__owner?org=1&order_by=-owner_tickets&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(status, 400, "a cursor read under another order: {body}");
+
+    // The whole table, the open tickets left out.
+    let (status, body) = support::get(&app, "/tables/ticket?order_by=-ticket_closed_at").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        column(&body, "ticket"),
+        vec![json!(ALICE), json!(BOB)],
+        "closed last first, and no row for a ticket still open"
+    );
+
+    for (uri, code, why) in [
+        (
+            "/tables/org__owner?org=1&order_by=owner",
+            "invalid_input",
+            "not a declared ordering",
+        ),
+        (
+            "/tables/org__owner?order_by=owner_tickets",
+            "unindexed_filter",
+            "the leading part not pinned",
+        ),
+        (
+            "/tables/org__owner?org=1&owner=10&order_by=owner_tickets",
+            "unindexed_filter",
+            "more pinned than lead the index",
+        ),
+        (
+            "/tables/org__owner?org=1&owner.gte=10&order_by=owner_tickets",
+            "unindexed_filter",
+            "a range beside an order",
+        ),
+    ] {
+        let (status, body) = support::get(&app, uri).await;
+        assert_eq!(status, 400, "{why}: {body}");
+        assert_eq!(body["error"]["code"], code, "{why}: {body}");
+    }
+
+    harness.shutdown();
+}
+
+/// The store holds a `Money` as its decimal string, so an `@index` on one would sort
+/// `"10.00"` under `"9.00"`. `hekla check` says so where it is declared.
+#[test]
+fn an_index_on_a_column_the_store_cannot_order_is_refused() {
+    let project = support::write_project(&[
+        ("hekla.toml", ""),
+        (
+            "events/order.hk",
+            "event @order.placed { order_id: Int, total: Money(2) }\n",
+        ),
+        (
+            "lib/folds.hk",
+            "fold OrderTotal(order_id: Int) -> Money(2) @index = 0 {\n  on @order.placed(order_id) { total } => total\n}\n",
+        ),
+    ]);
+    let loaded = hekla::loader::LoadedProject::load(project.path());
+    assert!(
+        loaded
+            .findings
+            .iter()
+            .any(|finding| format!("{finding:?}").contains("does not hold in an order")),
+        "{:?}",
+        loaded.findings
+    );
+}

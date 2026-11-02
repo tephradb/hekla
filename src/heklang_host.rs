@@ -1741,7 +1741,7 @@ impl heklang::host::Rows for RowWriter<'_> {
                     }
                 }
                 _ => {
-                    stored.insert(name.clone(), column_form(&meta.kind, json));
+                    stored.insert(name.clone(), stored_form(&meta.kind, json));
                 }
             }
         }
@@ -1971,6 +1971,51 @@ pub(crate) fn column_form(kind: &FieldKind, json: serde_json::Value) -> serde_js
     }
 }
 
+/// What a column holds in SQLite: [`column_form`], except a `Timestamp` is spelled at one
+/// fixed width.
+///
+/// **Because SQLite compares it as text.** RFC 3339 as `time` writes it drops a zero
+/// fraction and trailing zeros, so `12:00:05Z` sorts after `12:00:05.5Z` (`Z` is above
+/// `.`) and `.1Z` after `.15Z`. A range or an `order_by` over a timestamp column would
+/// then answer in an order that is not time's. Six digits, always, in UTC, makes byte
+/// order the instant's order. A reader never sees this spelling: [`from_sql`] serves the
+/// short one, and `coerce_value` binds any spelling a caller sends as this one.
+///
+/// [`from_sql`]: crate::read_model::from_sql
+pub(crate) fn stored_form(kind: &FieldKind, json: serde_json::Value) -> serde_json::Value {
+    let micros = match (kind.base(), &json) {
+        (FieldKind::Timestamp, serde_json::Value::Number(micros)) => micros.as_i64(),
+        (FieldKind::Timestamp, serde_json::Value::String(text)) => heklang::value::timestamp(text),
+        _ => return column_form(kind, json),
+    };
+    micros
+        .and_then(stored_timestamp)
+        .map_or(json, serde_json::Value::String)
+}
+
+/// Epoch microseconds as fixed-width RFC 3339 in UTC, which [`stored_form`] stores.
+pub(crate) fn stored_timestamp(micros: i64) -> Option<String> {
+    let at = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1_000).ok()?;
+    if !(0..=9999).contains(&at.year()) {
+        return None;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.microsecond()
+    ))
+}
+
+/// A stored timestamp back in the spelling a reader is served, which is [`column_form`]'s.
+pub(crate) fn served_timestamp(text: &str) -> Option<String> {
+    heklang::value::timestamp(text).and_then(rfc3339)
+}
+
 /// Epoch microseconds as RFC 3339, which is what an envelope and a timestamp column
 /// both hold.
 fn rfc3339(micros: i64) -> Option<String> {
@@ -2148,6 +2193,33 @@ mod tests {
             Type::Opt(inner) => Type::opt(Type::sealed((**inner).clone(), "owner_id")),
             other => Type::sealed(other.clone(), "owner_id"),
         }
+    }
+
+    proptest! {
+        /// **A stored timestamp's text order is its time order**, which is what a range or
+        /// an `order_by` over one compares, and it reads back as the instant it stored.
+        /// RFC 3339 as `time` writes it is neither: `12:00:05Z` sorts after `12:00:05.5Z`.
+        #[test]
+        fn a_stored_timestamp_sorts_as_its_instant_does(
+            a in 0i64..crate::propgen::MAX_MICROS,
+            b in 0i64..crate::propgen::MAX_MICROS,
+        ) {
+            let (left, right) = (stored_timestamp(a).unwrap(), stored_timestamp(b).unwrap());
+            prop_assert_eq!(left.cmp(&right), a.cmp(&b), "{} against {}", left, right);
+            prop_assert_eq!(heklang::value::timestamp(&left), Some(a));
+            prop_assert_eq!(served_timestamp(&left), rfc3339(a));
+        }
+    }
+
+    /// The case that started it: a whole second and a fraction of it.
+    #[test]
+    fn a_whole_second_sorts_before_its_fractions() {
+        let whole = stored_timestamp(1_700_000_005_000_000).unwrap();
+        let half = stored_timestamp(1_700_000_005_500_000).unwrap();
+        let tenth = stored_timestamp(1_700_000_005_100_000).unwrap();
+        let more = stored_timestamp(1_700_000_005_150_000).unwrap();
+        assert_eq!(whole, "2023-11-14T22:13:25.000000Z");
+        assert!(whole < tenth && tenth < more && more < half);
     }
 
     proptest! {

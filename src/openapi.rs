@@ -762,6 +762,33 @@ fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
     ];
     parameters.extend(key_params(&table.main, false));
     parameters.extend(key_range_params(&table.main));
+    if !table.main.sorts.is_empty() {
+        let mut orderings: Vec<String> = Vec::new();
+        let mut ways: Vec<String> = Vec::new();
+        for sort in &table.main.sorts {
+            for sign in ["", "-"] {
+                let token = format!("{sign}{}", sort.column);
+                if !orderings.contains(&token) {
+                    orderings.push(token);
+                }
+            }
+            ways.push(if sort.lead.is_empty() {
+                format!("`{}`", sort.column)
+            } else {
+                format!("`{}` with ({}) pinned", sort.column, sort.lead.join(", "))
+            });
+        }
+        parameters.push(query_param(
+            "order_by",
+            &format!(
+                "Order by a column a fold's `@index` declares instead of the key, `-` first to \
+                 reverse it: {}. Pin exactly the key parts that lead that index, and no range. \
+                 Rows whose column is absent are left out, and the key breaks ties.",
+                ways.join(", ")
+            ),
+            json!({ "type": "string", "enum": orderings }),
+        ));
+    }
     parameters.extend(wait_params());
     let indexes: Vec<String> = table
         .main
@@ -2266,9 +2293,22 @@ fn table_detail_schema() -> Value {
                     "additionalProperties": false,
                 },
             },
+            "sorts": {
+                "type": "array",
+                "description": "The orderings a scan may ask for with `order_by`: a column a fold's `@index` declares, after the key parts that must be pinned to use it.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "column": { "type": "string" },
+                        "lead": { "type": "array", "items": { "type": "string" } },
+                    },
+                    "required": ["column", "lead"],
+                    "additionalProperties": false,
+                },
+            },
             "rows": { "type": ["integer", "null"], "minimum": 0 },
         },
-        "required": ["name", "key", "columns", "indexes", "rows"],
+        "required": ["name", "key", "columns", "indexes", "sorts", "rows"],
         "additionalProperties": false,
     })
 }

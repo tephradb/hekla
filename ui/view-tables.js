@@ -223,9 +223,15 @@ function TableDetail({ name, search }) {
                 ${table.indexes.length === 0
                   ? html`<span class="faint">the key only</span>`
                   : table.indexes.map(
-                      (index) => html`<code>(${index.columns.join(', ')})</code> `,
+                      (index) => html`
+                        <code>(${index.columns.join(', ')})</code>
+                        <span class="note">
+                          ${index.name.startsWith('sorts__')
+                            ? 'an @index orders by it'
+                            : 'a range arm reaches keys through it'}
+                        </span>
+                      `,
                     )}
-                <span class="note">derived from arms that leave a key part open</span>
               </dd>
               ${status?.tables &&
               html`<${StoreState} data=${{ ...status.tables, log_head: status.log_head }} />`}
@@ -356,6 +362,9 @@ function Value({ column, row }) {
   return html`<span class="mono">${String(value)}</span>`
 }
 
+/* An ordering rides with the filters, as the scan's own `order_by`. */
+const ORDER = 'order_by'
+
 /* A filter input takes a value, or bounds written `>=a <b`, which become the scan's
  * `part.gte` and `part.lt`. Longest operator first, so `>=` is not read as `>` of `=a`. */
 const BOUNDS = [
@@ -389,6 +398,7 @@ function draftOf(filters) {
 }
 
 function spelled([name, value]) {
+  if (name === ORDER) return value.startsWith('-') ? `by ${value.slice(1)} ↓` : `by ${value} ↑`
   const [part, op] = name.split('.')
   const sign = BOUNDS.find(([, word]) => word === op)?.[0]
   return sign ? `${part} ${sign} ${value}` : `${part} = ${value}`
@@ -419,7 +429,8 @@ function Rows({ table, filters, cursor, openRow }) {
       const value = (draft[part.name] ?? '').trim()
       if (value && offered(index)) chosen.push(...parsed(part.name, value))
     }
-    browse({ filters: chosen })
+    const order = filters.find(([name]) => name === ORDER)
+    browse({ filters: order ? [...chosen, order] : chosen })
   }
 
   const clear = () => {
@@ -439,6 +450,13 @@ function Rows({ table, filters, cursor, openRow }) {
     const previous = trail[trail.length - 1]
     setTrail((current) => current.slice(0, -1))
     browse({ filters, cursor: previous || null })
+  }
+
+  const ordering = filters.find(([name]) => name === ORDER)?.[1] ?? ''
+  const reorder = (value) => {
+    setTrail([])
+    const rest = filters.filter(([name]) => name !== ORDER)
+    browse({ filters: value ? [...rest, [ORDER, value]] : rest })
   }
 
   const keyColumns = table.key.map((part) => ({
@@ -462,7 +480,7 @@ function Rows({ table, filters, cursor, openRow }) {
       <header>
         Rows
         <span class="tiny faint" style=${{ textTransform: 'none', letterSpacing: 0 }}>
-          in key order
+          ${ordering ? spelled([ORDER, ordering]) : 'in key order'}
         </span>
         <div style=${{ flex: 1 }}></div>
         ${state.data &&
@@ -508,6 +526,22 @@ function Rows({ table, filters, cursor, openRow }) {
             `,
           )}
           <button type="button" class="btn" onClick=${apply}>apply</button>
+          ${table.sorts?.length > 0 &&
+          html`
+            <select
+              class="btn"
+              value=${ordering}
+              onChange=${(changed) => reorder(changed.target.value)}
+              aria-label="Order rows by"
+              title="Order by a column a fold's @index declares; pin the parts before it first"
+            >
+              <option value="">key order</option>
+              ${table.sorts.flatMap((sort) => [
+                html`<option value=${sort.column}>${sort.column} ↑</option>`,
+                html`<option value=${`-${sort.column}`}>${sort.column} ↓</option>`,
+              ])}
+            </select>
+          `}
           ${filters.length > 0 &&
           html`
             <span class="chip">

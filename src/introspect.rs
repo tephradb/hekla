@@ -612,6 +612,10 @@ pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> 
             "name": index.name,
             "columns": index.columns,
         })).collect::<Vec<_>>(),
+        "sorts": main.sorts.iter().map(|sort| json!({
+            "column": sort.column,
+            "lead": sort.lead,
+        })).collect::<Vec<_>>(),
         "rows": rows,
     })
 }

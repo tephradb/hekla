@@ -29,7 +29,7 @@ use heklang::{Digest, Json, Kind};
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
-use crate::heklang_host::{column_form, from_heklang_json, peeled};
+use crate::heklang_host::{from_heklang_json, peeled, stored_form};
 use crate::read_model::quote_ident;
 use crate::schema::{FieldKind, FieldMeta};
 use crate::tables::{ColumnDef, TableDef};
@@ -234,6 +234,10 @@ impl FoldStore {
     /// `CREATE TABLE IF NOT EXISTS` will not add a column to a table that already exists,
     /// which is the whole reason the catalog and [`FoldStore::apply`] exist: a table's
     /// shape moves one column at a time.
+    ///
+    /// Indexes are not made here but in [`FoldStore::apply`], after it has added the columns
+    /// they name: an index on a fold a deploy just added names a column the table does not
+    /// have until then.
     pub fn open(path: &Path, tables: &[TableDef]) -> anyhow::Result<FoldStore> {
         let conn = Connection::open(path).context("opening the derived-table database")?;
         // WAL lets a read run beside the single writer, as a read model's does.
@@ -246,10 +250,6 @@ impl FoldStore {
         for table in tables {
             tx.execute_batch(&table.create_table_sql())
                 .with_context(|| format!("creating derived table `{}`", table.name))?;
-            for sql in table.create_index_sql() {
-                tx.execute_batch(&sql)
-                    .with_context(|| format!("indexing derived table `{}`", table.name))?;
-            }
         }
         tx.commit()?;
         Ok(FoldStore { conn })
@@ -323,6 +323,17 @@ impl FoldStore {
             .collect();
 
         let tx = self.begin()?;
+        // SQLite will not drop a column an index names, so those indexes go first; the
+        // sync below puts back whichever are still wanted.
+        for change in &changes {
+            if matches!(change.verdict, Verdict::Drop | Verdict::Reshape) {
+                for (name, columns) in indexes_on(&tx, &change.table)? {
+                    if columns.contains(&change.column) {
+                        drop_index(&tx, &name)?;
+                    }
+                }
+            }
+        }
         for change in &changes {
             let key = (change.table.as_str(), change.column.as_str());
             match change.verdict {
@@ -369,6 +380,7 @@ impl FoldStore {
                 }
             }
         }
+        sync_indexes(&tx, tables)?;
         tx.commit()?;
         Ok(changes)
     }
@@ -380,7 +392,8 @@ impl FoldStore {
 ///
 /// 1: a sealed cell is a [`SealedCell`] rather than bare ciphertext.
 /// 2: a key a collection column was written for is in its main table too.
-const FORMAT: i64 = 2;
+/// 3: a `Timestamp` is stored at one fixed width, so its text order is its time order.
+const FORMAT: i64 = 3;
 
 /// Empty a store written in another format, so it refolds from the log.
 ///
@@ -546,7 +559,7 @@ impl SealedCell {
 pub(crate) fn stored_text(kind: &FieldKind, value: &Value) -> Option<String> {
     match value {
         Value::Opt { value: held, .. } => held.as_ref().and_then(|held| stored_text(kind, held)),
-        other => match column_form(kind, from_heklang_json(&Json::from_value(other))) {
+        other => match stored_form(kind, from_heklang_json(&Json::from_value(other))) {
             serde_json::Value::Null => None,
             serde_json::Value::Bool(flag) => Some((if flag { "1" } else { "0" }).to_owned()),
             serde_json::Value::String(text) => Some(text),
@@ -829,4 +842,68 @@ fn meta_of<'a>(table: &'a TableDef, column: &str) -> anyhow::Result<&'a FieldMet
                 .map(|held| &held.meta)
         })
         .with_context(|| format!("no column `{column}` of `{}`", table.name))
+}
+
+/// Make each derived table carry exactly the indexes its definition asks for.
+///
+/// An index's name spells its columns, so one whose declaration moved is a new name: the
+/// old goes and the new is built. One already there is left alone, which is what keeps an
+/// ordinary boot from rebuilding every index of a large store.
+fn sync_indexes(tx: &Transaction, tables: &[TableDef]) -> anyhow::Result<()> {
+    for table in tables {
+        let wanted: Vec<(String, String)> = table
+            .indexes
+            .iter()
+            .map(|index| format!("{}_{}", table.name, index.name))
+            .zip(table.create_index_sql())
+            .collect();
+        for (name, _) in indexes_on(tx, &table.name)? {
+            if owned(&table.name, &name) && !wanted.iter().any(|(want, _)| *want == name) {
+                drop_index(tx, &name)?;
+            }
+        }
+        for (_, sql) in &wanted {
+            tx.execute_batch(sql)
+                .with_context(|| format!("indexing derived table `{}`", table.name))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether hekla named this index: a ranged arm's `by_..` or an `@index`'s `sorts__..`. One
+/// an operator made by hand on a derived table is theirs, and a sync leaves it alone.
+fn owned(table: &str, index: &str) -> bool {
+    index
+        .strip_prefix(table)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(|rest| rest.starts_with("by_") || rest.starts_with("sorts__"))
+}
+
+/// The indexes hekla made on `table`, with the columns each one names. The one SQLite
+/// makes for a primary key is not among them.
+fn indexes_on(tx: &Transaction, table: &str) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+    let names: Vec<String> = tx
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 \
+             AND sql IS NOT NULL",
+        )?
+        .query_map([table], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut out = Vec::new();
+    for name in names {
+        // An expression column has no name, so it is `NULL` here, and it names no column
+        // a drop could be blocked by.
+        let columns: Vec<String> = tx
+            .prepare(&format!("PRAGMA index_info({})", quote_ident(&name)))?
+            .query_map([], |row| row.get::<_, Option<String>>(2))?
+            .filter_map(Result::transpose)
+            .collect::<Result<_, _>>()?;
+        out.push((name, columns));
+    }
+    Ok(out)
+}
+
+fn drop_index(tx: &Transaction, name: &str) -> anyhow::Result<()> {
+    tx.execute_batch(&format!("DROP INDEX IF EXISTS {}", quote_ident(name)))
+        .with_context(|| format!("dropping index `{name}`"))
 }

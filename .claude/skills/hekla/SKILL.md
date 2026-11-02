@@ -150,7 +150,7 @@ defaults to `127.0.0.1`.
 | `GET /read/{Projector}/{Entity}/{key}` | `{item, position}`, or 404 |
 | `GET /read/{Projector}/{Entity}?<field>=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}` |
 | `GET /tables/{table}/row?<part>=...` | one derived row by its whole key: `{item, position}`, or 404 for a key no event named |
-| `GET /tables/{table}?<part>=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}`, filtered on the leading parts of the key |
+| `GET /tables/{table}?<part>=&order_by=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}`, filtered on the leading parts of the key, optionally ordered by an `@index` column |
 | `GET /folds/{Fold}?<param>=...` | one named fold's `{value, position}`, its arguments named as the fold declares them |
 | `POST /projectors/{Name}/replay` | 202, schedules a rebuild-and-swap |
 | `POST /effects/{Name}/skip/{position}` | 202, records an operator skip request |
@@ -169,7 +169,12 @@ it has one, and otherwise for the parameter with one `_id` off; don't guess, bec
 value for its key, collections and sealed columns included, and every table is read at one log
 position. A filter on a key part that is not a leading one is a `400 unindexed_filter`. The part
 right after the pinned ones may also take a range (`?org=1&month.gte=2023-11&month.lt=2024-01`, with
-`.gte`, `.gt`, `.lte`, `.lt`), one part per request.
+`.gte`, `.gt`, `.lte`, `.lt`), one part per request. A fold declared `-> n: Int @index = 0` (or
+`@index(game_id)`, naming the key parameters that lead it) lets a scan order by its column:
+`?order_by=-game_units&limit=10` for a top ten, `?game=g1&order_by=-review_helpful` within one
+game. Pin exactly the parts the index names first, and no range; rows whose column is absent are left
+out. An ordering nothing declares is a `400`, never a sort, and `@index` on a `Money` or `Decimal`
+fold is refused at `hekla check`, since the store holds those as text.
 
 **One fold by name** is `GET /folds/{Fold}?<param>=...`, its arguments named as the fold declares
 its parameters (`/folds/OwnerTickets?org_id=1&owner_id=10`), answering `{value, position}`. A

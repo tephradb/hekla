@@ -134,6 +134,12 @@ GET /tables/org__owner?org=1&limit=50
   right after the pinned ones in the key or in a derived index: `?org=1&month.gte=2023-11`. A range
   anywhere else is `400 unindexed_filter`; an unknown operator, two bounds at one end, a part both
   pinned and ranged, or ranges on two parts are `400 invalid_input`.
+- `order_by=<column>` (or `-<column>` descending) orders by a column a fold's `@index` declares,
+  served by the index `(lead parts, column, rest of the key)`. Pin exactly the parts `@index(..)`
+  names, and no range, or it is `400 unindexed_filter`; a column nothing indexes is `400
+  invalid_input` naming the orderings the table has. Rows whose column is absent (an optional fold
+  answering `none`) are left out of an ordered scan. The cursor records its ordering, so one taken
+  under another `order_by` is a 400. `GET /admin/tables/{table}` lists them as `sorts`.
 
 ## `GET /folds/{Fold}`
 

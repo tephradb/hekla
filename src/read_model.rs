@@ -39,6 +39,46 @@ CREATE TABLE IF NOT EXISTS _hekla_definition (
 );
 INSERT OR IGNORE INTO _hekla_definition (id, definition_hash) VALUES (0, NULL);";
 
+/// How a read model stores its cells, as `PRAGMA user_version`. Moved whenever a stored
+/// cell would read back or compare differently, which a projector's definition hash cannot
+/// see: it covers what the projector does, not how hekla stores what it wrote.
+///
+/// 1: a `Timestamp` is stored at one fixed width, so its text order is its time order.
+const FORMAT: i64 = 1;
+
+/// Empty a read model written in another format, so it replays from the log.
+///
+/// Rebuilt rather than migrated, as a derived store is: a read model holds nothing the log
+/// does not. Dropping the internal tables with the rest is what brings the checkpoint back
+/// to zero and the recorded definition back to none, which the projector reads as a fresh
+/// model and replays from the start.
+fn reformat(conn: &Connection) -> anyhow::Result<()> {
+    let at: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if at == FORMAT {
+        return Ok(());
+    }
+    let tables: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !tables.is_empty() {
+        tracing::info!(
+            from = at,
+            to = FORMAT,
+            "a read model is stored in another format and will be replayed"
+        );
+    }
+    let tx = conn.unchecked_transaction()?;
+    for table in &tables {
+        tx.execute_batch(&format!("DROP TABLE {}", quote_ident(table)))?;
+    }
+    tx.execute_batch(&format!("PRAGMA user_version = {FORMAT}"))?;
+    tx.commit()
+        .context("emptying a read model of another format")
+}
+
 /// A projector's materialised read model: one SQLite table per entity.
 pub struct ReadModel {
     conn: Connection,
@@ -54,6 +94,7 @@ impl ReadModel {
         // WAL lets the read API read concurrently with this single writer.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_row| Ok(()))
             .context("enabling WAL")?;
+        reformat(&conn)?;
         conn.execute_batch(INTERNAL_DDL)
             .context("creating the projector's internal tables")?;
         // One transaction for the whole schema, because a reshaped index is a drop and a
@@ -613,6 +654,13 @@ pub(crate) fn coerce_value(kind: &FieldKind, raw: &str) -> anyhow::Result<SqlVal
             _ => anyhow::bail!("expected a boolean (`true` or `false`)"),
         },
         FieldKind::I64 => SqlValue::Integer(raw.parse::<i64>().context("expected an integer")?),
+        // The stored spelling, whatever spelling the caller sent: one instant has many
+        // RFC 3339 spellings and a text comparison finds only the one the column holds.
+        FieldKind::Timestamp => SqlValue::Text(
+            heklang::value::timestamp(raw)
+                .and_then(crate::heklang_host::stored_timestamp)
+                .context("expected an RFC 3339 timestamp with an offset")?,
+        ),
         // Money and the text-shaped kinds bind as their string form.
         _ => SqlValue::Text(raw.to_owned()),
     })
@@ -664,6 +712,11 @@ pub(crate) fn from_sql(meta: &FieldMeta, value: ValueRef) -> anyhow::Result<serd
                 FieldKind::Json => {
                     serde_json::from_str(text).unwrap_or_else(|_| J::String(text.to_owned()))
                 }
+                // Stored at a fixed width so it sorts, served in the short spelling a
+                // reader is given everywhere else.
+                FieldKind::Timestamp => J::String(
+                    crate::heklang_host::served_timestamp(text).unwrap_or_else(|| text.to_owned()),
+                ),
                 _ => J::String(text.to_owned()),
             }
         }
@@ -946,6 +999,29 @@ mod tests {
     }
 
     #[test]
+    fn a_read_model_of_another_format_is_emptied_to_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let entity = users_entity();
+        {
+            let model = ReadModel::open(&path, slice::from_ref(&entity)).unwrap();
+            put(&model, &entity, "u0", "old@x");
+            model.conn.execute_batch("PRAGMA user_version = 0").unwrap();
+        }
+        let model = ReadModel::open(&path, slice::from_ref(&entity)).unwrap();
+        assert!(
+            model.rows(&entity).unwrap().is_empty(),
+            "replayed from nothing"
+        );
+        assert_eq!(model.read_checkpoint().unwrap().get(), 0);
+        let at: i64 = model
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(at, FORMAT);
+    }
+
+    #[test]
     fn a_read_model_created_with_unquoted_ddl_still_reads_and_writes() {
         // Quoting is a parsing change, not a schema change: SQLite resolves `"group"`
         // and `group` to the same column. A model built by the pre-quoting generator
@@ -959,11 +1035,13 @@ mod tests {
         });
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
+            // At the current storage format, since what is under test is the quoting.
+            conn.execute_batch(&format!(
                 "CREATE TABLE users (user_id TEXT PRIMARY KEY NOT NULL, email TEXT NOT NULL);
                  CREATE INDEX users_by_email ON users (email);
-                 INSERT INTO users (user_id, email) VALUES ('u0', 'old@x');",
-            )
+                 INSERT INTO users (user_id, email) VALUES ('u0', 'old@x');
+                 PRAGMA user_version = {FORMAT};"
+            ))
             .unwrap();
         }
 

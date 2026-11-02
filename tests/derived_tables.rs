@@ -1677,3 +1677,120 @@ fold EditsRequested() -> n: Int = 0 {{
         "replayed"
     );
 }
+
+fn index_names(path: &std::path::Path) -> Vec<String> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
+        )
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// An `@index` follows the declaration across deploys: added to a populated table it is
+/// built, taken off it is dropped, and a fold deleted with its index still on takes both,
+/// which SQLite refuses to do the other way round.
+#[test]
+fn an_index_follows_its_declaration_across_deploys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    let events = [placed(7, 400), placed(8, 100)];
+    deployed_and_filled(&path, SPEND, &events);
+    assert!(index_names(&path).is_empty());
+    // One an operator made by hand, which no deploy is to touch.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE INDEX mine ON customer (lifetime_spend)")
+        .unwrap();
+
+    let indexed = format!(
+        "{SPEND}
+fold Orders(customer_id: Customer) -> n: Int @index = 0 {{
+  on @order.placed(customer_id) => n + 1
+}}
+"
+    );
+    redeployed(&path, &indexed, &events);
+    assert_eq!(index_names(&path), vec!["customer_sorts__orders", "mine"]);
+
+    let unindexed = indexed.replace("-> n: Int @index = 0", "-> n: Int = 0");
+    redeployed(&path, &unindexed, &events);
+    assert_eq!(
+        index_names(&path),
+        vec!["mine"],
+        "taking `@index` off drops it, and only it"
+    );
+
+    redeployed(&path, &indexed, &events);
+    redeployed(&path, SPEND, &events);
+    assert_eq!(
+        index_names(&path),
+        vec!["mine"],
+        "the fold and its index went together, and the hand-made one stayed"
+    );
+}
+
+/// Instants within one second come back in time order, which they did not while a
+/// timestamp was stored as `time` writes RFC 3339: `05Z` sorted after `05.5Z`. Served in
+/// the short spelling all the same.
+#[test]
+fn a_timestamp_ordering_is_time_order_within_a_second() {
+    let source = "event @thing.seen { id: Int, at: Timestamp }
+
+fold ThingSeenAt(id: Int) -> Timestamp? @index = none {
+  on @thing.seen(id) { at } => at
+}
+";
+    let seen = |id: i64, at: i64| {
+        Event::new(
+            EventPath::new(["thing", "seen"]),
+            [
+                ("id".to_owned(), Value::Int(id)),
+                ("at".to_owned(), Value::Timestamp(at)),
+            ],
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    deployed_and_filled(
+        &path,
+        source,
+        &[
+            seen(1, 1_700_000_005_500_000),
+            seen(2, 1_700_000_005_000_000),
+            seen(3, 1_700_000_005_150_000),
+            seen(4, 1_700_000_005_100_000),
+        ],
+    );
+    let tables = TableDef::all(&program(source));
+    let table = &tables[0];
+    let scan = hekla::table_read::parse_scan(
+        table,
+        &[("order_by".to_owned(), "thing_seen_at".to_owned())],
+    )
+    .unwrap();
+    let page = hekla::table_read::scan(&path, &tables, table, &scan, None).unwrap();
+    let order: Vec<(i64, String)> = page
+        .items
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_i64().unwrap(),
+                row["thing_seen_at"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            (2, "2023-11-14T22:13:25Z".to_owned()),
+            (4, "2023-11-14T22:13:25.1Z".to_owned()),
+            (3, "2023-11-14T22:13:25.15Z".to_owned()),
+            (1, "2023-11-14T22:13:25.5Z".to_owned()),
+        ]
+    );
+}
