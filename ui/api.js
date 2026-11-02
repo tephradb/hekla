@@ -211,6 +211,19 @@ export const api = {
   fold: (name, args, signal) =>
     request(`/folds/${encodeURIComponent(name)}`, { signal, params: args }),
 
+  /* What changed a row's columns, or one fold's, newest first, a page before `before`. */
+  tableHistory: (name, key, { before } = {}, signal) =>
+    request(`/tables/${encodeURIComponent(name)}/history`, {
+      signal,
+      params: [...key.map(([part, value]) => [part, String(value)]), ['before', before]],
+    }),
+
+  foldHistory: (name, args, { before } = {}, signal) =>
+    request(`/folds/${encodeURIComponent(name)}/history`, {
+      signal,
+      params: [...args, ['before', before]],
+    }),
+
   commands: (signal) => request('/admin/commands', { signal }),
   command: (name, signal) => request(`/admin/commands/${encodeURIComponent(name)}`, { signal }),
 

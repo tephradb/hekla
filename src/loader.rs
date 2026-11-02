@@ -629,6 +629,22 @@ impl Sources {
                             ),
                         ));
                     }
+                    if crate::history::CONTROL.contains(&arg.as_str()) {
+                        let rel = program
+                            .fold(&column.fold)
+                            .and_then(|def| def.module.clone())
+                            .unwrap_or_default();
+                        findings.push(Finding::error(
+                            rel,
+                            format!(
+                                "fold `{}` has a parameter `{arg}`, which `/folds/{}/history` \
+                                 reads as its own ({}); rename the parameter",
+                                column.fold,
+                                column.fold,
+                                crate::history::CONTROL.join(", ")
+                            ),
+                        ));
+                    }
                 }
             }
         }

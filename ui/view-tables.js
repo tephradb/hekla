@@ -665,9 +665,101 @@ function RowDetail({ table, keyText, onClose, onFold }) {
           <p class="tiny faint">
             read at position ${count(found.position)}, in the same snapshot as the row
           </p>
+          ${table.columns.some((column) => column.history) &&
+          html`<${History}
+            load=${(before, signal) => api.tableHistory(table.name, key, { before }, signal)}
+            deps=${[table.name, keyText]}
+          />`}
         `}
       <//>
     <//>
+  `
+}
+
+/**
+ * What changed a row's columns or a fold, newest first: each record that moved one, the
+ * value before and after, and a link to the event. `load(before, signal)` reads a page.
+ */
+function History({ load, deps }) {
+  const [before, setBefore] = useState(null)
+  const [trail, setTrail] = useState([])
+  const state = useResource((signal) => load(before ?? undefined, signal), [...deps, before])
+  const shown = (value) =>
+    value === null || value === undefined
+      ? html`<span class="faint">absent</span>`
+      : typeof value === 'object'
+        ? html`<code class="tiny">${truncate(JSON.stringify(value), 60)}</code>`
+        : html`<span class="mono">${String(value)}</span>`
+  return html`
+    <h3 class="section-title">History <span class="note">newest first</span></h3>
+    ${state.error?.code === 'no_history'
+      ? html`<p class="tiny faint">${state.error.message}</p>`
+      : html`
+          <${Resource}
+            state=${state}
+            empty=${(data) =>
+              data.items.length === 0
+                ? html`<p class="tiny faint">Nothing has changed it yet.</p>`
+                : null}
+          >
+            ${(data) => html`
+              <ol class="history">
+                ${data.items.map(
+                  (item) => html`
+                    <li key=${item.position}>
+                      <div class="row" style=${{ gap: '8px' }}>
+                        <a
+                          class="mono tiny"
+                          href=${`/admin/events/${item.position}`}
+                          onClick=${(clicked) => {
+                            clicked.preventDefault()
+                            go(`/admin/events/${item.position}`)
+                          }}
+                          title="The event that made this change"
+                        >
+                          #${item.position}
+                        </a>
+                        <code class="tiny">${item.event?.type}</code>
+                      </div>
+                      <dl class="kv">
+                        ${Object.entries(item.changed).map(
+                          ([name, { before: was, after }]) => html`
+                            <dt key=${name}>${name}</dt>
+                            <dd>${shown(was)} <span class="faint">→</span> ${shown(after)}</dd>
+                          `,
+                        )}
+                      </dl>
+                    </li>
+                  `,
+                )}
+              </ol>
+              <div class="row" style=${{ gap: '8px' }}>
+                <button
+                  type="button"
+                  class="btn"
+                  disabled=${trail.length === 0}
+                  onClick=${() => {
+                    setBefore(trail[trail.length - 1] ?? null)
+                    setTrail(trail.slice(0, -1))
+                  }}
+                >
+                  ← newer
+                </button>
+                <button
+                  type="button"
+                  class="btn"
+                  disabled=${data.next_before === null}
+                  onClick=${() => {
+                    setTrail([...trail, before])
+                    setBefore(data.next_before)
+                  }}
+                >
+                  older →
+                </button>
+              </div>
+            `}
+          </>
+        `}
   `
 }
 
@@ -781,6 +873,12 @@ function FoldLookup({ table, fold, args, onClose }) {
                         <dt>position</dt>
                         <dd>${count(found.position)}</dd>
                       </dl>
+                      ${column.history &&
+                      html`<${History}
+                        key=${JSON.stringify(asked)}
+                        load=${(before, signal) => api.foldHistory(fold, asked, { before }, signal)}
+                        deps=${[fold, JSON.stringify(asked)]}
+                      />`}
                     `}
                   <//>
                 `}

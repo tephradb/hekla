@@ -608,25 +608,7 @@ impl FoldStore {
     ) -> anyhow::Result<()> {
         let (mut names, mut binds) = key_binds(table, key)?;
         names.push(quote_ident(&column.name));
-        binds.push(if column.meta.sealed_under.is_some() {
-            match SealedCell::text(value) {
-                Some(Some(text)) => rusqlite::types::Value::Text(text),
-                Some(None) => rusqlite::types::Value::Null,
-                // Plaintext in a sealed column would be personal data stored in the clear,
-                // and heklang's parse-time rule is what keeps it from happening, so this is
-                // the backstop rather than a case.
-                None => anyhow::bail!(
-                    "`{}`.`{}` is sealed and was handed plaintext to store",
-                    table.name,
-                    column.name
-                ),
-            }
-        } else {
-            match stored_text(&column.meta.kind, value) {
-                Some(text) => crate::read_model::coerce_value(&column.meta.kind, &text)?,
-                None => rusqlite::types::Value::Null,
-            }
-        });
+        binds.push(cell_of(&table.name, column, value)?);
         let holders: Vec<String> = (1..=names.len()).map(|at| format!("?{at}")).collect();
         let conflict: Vec<String> = if table.key.is_empty() {
             vec![quote_ident("_one")]
@@ -906,4 +888,31 @@ fn indexes_on(tx: &Transaction, table: &str) -> anyhow::Result<Vec<(String, Vec<
 fn drop_index(tx: &Transaction, name: &str) -> anyhow::Result<()> {
     tx.execute_batch(&format!("DROP INDEX IF EXISTS {}", quote_ident(name)))
         .with_context(|| format!("dropping index `{name}`"))
+}
+
+/// A fold's value as the SQL value its column holds, which is what a write binds and what a
+/// history renders through the same read a stored cell takes.
+pub(crate) fn cell_of(
+    table: &str,
+    column: &ColumnDef,
+    value: &Value,
+) -> anyhow::Result<rusqlite::types::Value> {
+    Ok(if column.meta.sealed_under.is_some() {
+        match SealedCell::text(value) {
+            Some(Some(text)) => rusqlite::types::Value::Text(text),
+            Some(None) => rusqlite::types::Value::Null,
+            // Plaintext in a sealed column would be personal data stored in the clear,
+            // and heklang's parse-time rule is what keeps it from happening, so this is
+            // the backstop rather than a case.
+            None => anyhow::bail!(
+                "`{table}`.`{}` is sealed and was handed plaintext to store",
+                column.name
+            ),
+        }
+    } else {
+        match stored_text(&column.meta.kind, value) {
+            Some(text) => crate::read_model::coerce_value(&column.meta.kind, &text)?,
+            None => rusqlite::types::Value::Null,
+        }
+    })
 }

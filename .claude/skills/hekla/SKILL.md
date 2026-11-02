@@ -175,6 +175,10 @@ right after the pinned ones may also take a range (`?org=1&month.gte=2023-11&mon
 game. Pin exactly the parts the index names first, and no range; rows whose column is absent are left
 out. An ordering nothing declares is a `400`, never a sort, and `@index` on a `Money` or `Decimal`
 fold is refused at `hekla check`, since the store holds those as text.
+Every row and every fold also has a **history** (`/tables/{table}/history?<key>`,
+`/folds/{Fold}/history?<params>`): each record that changed it, newest first, with the value before
+and after. Prefer it to a list fold that pushes an entry per event just to keep a ledger; that list
+is rewritten whole on every write. A fold with a range arm has none (`400 no_history`).
 
 **One fold by name** is `GET /folds/{Fold}?<param>=...`, its arguments named as the fold declares
 its parameters (`/folds/OwnerTickets?org_id=1&owner_id=10`), answering `{value, position}`. A

@@ -1729,3 +1729,23 @@ textarea:focus {
 .fresh:hover {
   filter: brightness(1.08);
 }
+
+/* A history: one entry per record that changed something, newest first. */
+ol.history {
+  list-style: none;
+  margin: 0 0 var(--s3);
+  padding: 0;
+}
+
+ol.history > li {
+  padding: var(--s2) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+ol.history > li:last-child {
+  border-bottom: none;
+}
+
+ol.history .kv {
+  margin-top: var(--s1);
+}

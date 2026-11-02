@@ -87,6 +87,10 @@ pub struct ColumnDef {
     /// takes the type, and a `Map(String, Int)` and a `List(Int)` are both `FieldKind::Json`.
     pub ty: Type,
     pub meta: FieldMeta,
+    /// Whether a history can be read for it: false for a fold with a range arm, whose
+    /// by-key history would report steps the stored column never took (`heklang`'s
+    /// `Column::ranges`, and `docs/folds.md` section 11).
+    pub history: bool,
 }
 
 /// The guard column a keyless table carries, so `global` really holds one row.
@@ -260,6 +264,7 @@ fn column_def(program: &Program, column: &Column, defs: Defs<'_>) -> ColumnDef {
         fold: column.fold.clone(),
         args: column.args.clone(),
         default: seed_literal(program, column, &kind, sealed_under.is_some()),
+        history: !column.ranges(),
         ty: column.ty.clone(),
         meta: FieldMeta {
             kind,

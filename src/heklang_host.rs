@@ -268,6 +268,38 @@ pub struct HeklaHost {
 }
 
 impl HeklaHost {
+    /// A host that reads the log and never appends, for a fold read outside any command.
+    ///
+    /// Every field an append accumulates is empty: a fold has no clock, no network and no
+    /// `secret`, and a fold read hands a sealed value through rather than shredding it, so
+    /// the key store is here only for a caller that opens one afterwards.
+    pub(crate) fn reader(
+        program: Arc<Program>,
+        events: Arc<EventDefs>,
+        store: Store,
+        keystore: Option<Arc<KeyStore>>,
+    ) -> HeklaHost {
+        HeklaHost {
+            program,
+            events,
+            store,
+            keystore,
+            ctx: CommandContext::new(uuid::Uuid::nil()),
+            stamp: Stamp::Pinned,
+            idem_tag: None,
+            call: None,
+            appended: None,
+            emitted: Vec::new(),
+            unavailable: None,
+            duplicated: false,
+            retry_after: None,
+            last_transport: None,
+            sealed: false,
+            http: None,
+            secrets: None,
+        }
+    }
+
     /// One stored event as heklang reads it.
     fn record_of(&self, position: Position, event: tephra::EventRef<'_>) -> Result<Record, Error> {
         record_of(&self.program, position, event)
@@ -2014,6 +2046,11 @@ pub(crate) fn stored_timestamp(micros: i64) -> Option<String> {
 /// A stored timestamp back in the spelling a reader is served, which is [`column_form`]'s.
 pub(crate) fn served_timestamp(text: &str) -> Option<String> {
     heklang::value::timestamp(text).and_then(rfc3339)
+}
+
+/// An instant as a reader is served it.
+pub(crate) fn served_micros(micros: i64) -> Option<String> {
+    rfc3339(micros)
 }
 
 /// Epoch microseconds as RFC 3339, which is what an envelope and a timestamp column

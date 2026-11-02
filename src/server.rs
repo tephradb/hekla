@@ -48,6 +48,7 @@ use crate::context::CommandContext;
 use crate::crypto::MasterKeys;
 use crate::effect::EffectRuntime;
 use crate::fold_runtime::FoldShared;
+use crate::history;
 use crate::introspect;
 use crate::loader::{self, LoadedProject};
 use crate::metrics;
@@ -58,6 +59,7 @@ use crate::runtime::{self, Runtime, error_body};
 use crate::schema::{EntityDef, EventDef};
 use crate::store::Store;
 use crate::table_read;
+use crate::tables::{ColumnDef, side_of};
 use crate::ui;
 use crate::validate;
 
@@ -107,7 +109,9 @@ pub const READ_ONE_ROUTE: &str = "/read/{projector}/{entity}/{key}";
 pub const READ_SCAN_ROUTE: &str = "/read/{projector}/{entity}";
 pub const TABLE_SCAN_ROUTE: &str = "/tables/{table}";
 pub const TABLE_ROW_ROUTE: &str = "/tables/{table}/row";
+pub const TABLE_HISTORY_ROUTE: &str = "/tables/{table}/history";
 pub const FOLD_ROUTE: &str = "/folds/{fold}";
+pub const FOLD_HISTORY_ROUTE: &str = "/folds/{fold}/history";
 pub const REPLAY_ROUTE: &str = "/projectors/{name}/replay";
 pub const SKIP_ROUTE: &str = "/effects/{name}/skip/{position}";
 pub const STATUS_ROUTE: &str = "/status";
@@ -208,6 +212,8 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (TABLE_SCAN_ROUTE, get(table_scan)),
         (TABLE_ROW_ROUTE, get(table_row)),
         (FOLD_ROUTE, get(fold_read)),
+        (TABLE_HISTORY_ROUTE, get(table_history)),
+        (FOLD_HISTORY_ROUTE, get(fold_history)),
         (REPLAY_ROUTE, post(replay)),
         (SKIP_ROUTE, post(skip)),
         (STATUS_ROUTE, get(status)),
@@ -1314,6 +1320,142 @@ async fn table_row(
         }
         Err(err) => {
             metrics::table_read(&table, "error");
+            task_panicked(err)
+        }
+    }
+}
+
+/// `GET /tables/{table}/history?<part>=<value>...&columns=&limit=&before=&since=`: the
+/// positions where a row's columns changed, newest first, read off the log rather than the
+/// store, so it neither waits for the store nor lags it.
+async fn table_history(
+    State(runtime): State<Shared>,
+    Path(table): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let shared = match find_table(&runtime, &table) {
+        Ok(shared) => shared,
+        Err(response) => return *response,
+    };
+    let def = table_read::find(shared.tables(), &table).expect("found above");
+    let (window, rest) = match history::parse_window(&params) {
+        Ok(parsed) => parsed,
+        Err(refusal) => return table_refused(&table, refusal),
+    };
+    let key = match table_read::parse_key(def, &rest) {
+        Ok(key) => key,
+        Err(refusal) => return table_refused(&table, refusal),
+    };
+    let columns: Vec<&ColumnDef> = def
+        .columns
+        .iter()
+        .chain(
+            side_of(shared.tables(), def)
+                .into_iter()
+                .flat_map(|side| side.columns.iter()),
+        )
+        .collect();
+    let chosen: Vec<String> = match history::chosen(&columns, window.columns.as_deref(), &table) {
+        Ok(chosen) => chosen.iter().map(|column| column.name.clone()).collect(),
+        Err(refusal) => return table_refused(&table, refusal),
+    };
+    history_response(&runtime, shared, table, chosen, key, window).await
+}
+
+/// `GET /folds/{fold}/history?<param>=<value>...&limit=&before=&since=`: one fold's
+/// history at the key its arguments name, its parameters named as the fold declares them.
+async fn fold_history(
+    State(runtime): State<Shared>,
+    Path(fold): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let shared = Arc::clone(runtime.fold_handle());
+    let Some(at) = table_read::find_fold(shared.tables(), &fold) else {
+        return match runtime.program().fold(&fold) {
+            Some(_) => json_response(400, read_error("not_stored", &not_stored(&shared, &fold))),
+            None => not_found(&format!("no named fold `{fold}`")),
+        };
+    };
+    let refused = |refusal: table_read::Refusal| {
+        json_response(400, read_error(refusal.code, &refusal.message))
+    };
+    let (window, rest) = match history::parse_window(&params) {
+        Ok(parsed) => parsed,
+        Err(refusal) => return refused(refusal),
+    };
+    if window.columns.is_some() {
+        return refused(table_read::Refusal {
+            code: "invalid_input",
+            message: "a fold's history is its own column's; `columns` is for a table's".into(),
+        });
+    }
+    let key = match table_read::parse_args(at, &rest) {
+        Ok(key) => key,
+        Err(refusal) => return refused(refusal),
+    };
+    if let Err(refusal) = history::chosen(&[at.column], None, &at.main.name) {
+        return refused(refusal);
+    }
+    let table = at.main.name.clone();
+    let column = at.column.name.clone();
+    history_response(&runtime, shared, table, vec![column], key, window).await
+}
+
+/// Read a history on a blocking thread and answer it.
+async fn history_response(
+    runtime: &Runtime,
+    shared: Arc<FoldShared>,
+    table: String,
+    columns: Vec<String>,
+    key: Vec<String>,
+    window: history::Window,
+) -> Response {
+    let source = history::Source {
+        program: Arc::clone(runtime.program_shared()),
+        events: Arc::clone(runtime.events_shared()),
+        store: runtime.store().clone(),
+        keystore: runtime.keystore_shared().cloned(),
+    };
+    let label = table.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let def = table_read::find(shared.tables(), &table).expect("found above");
+        let all: Vec<&ColumnDef> = def
+            .columns
+            .iter()
+            .chain(
+                side_of(shared.tables(), def)
+                    .into_iter()
+                    .flat_map(|side| side.columns.iter()),
+            )
+            .collect();
+        let chosen: Vec<&ColumnDef> = columns
+            .iter()
+            .filter_map(|name| all.iter().copied().find(|column| &column.name == name))
+            .collect();
+        history::read(&source, def, &chosen, &key, &window)
+    });
+    match task.await {
+        Ok(Ok(page)) => {
+            metrics::table_read(&label, "history");
+            json_response(
+                200,
+                json!({
+                    "items": page.items,
+                    "next_before": page.next_before,
+                    "position": page.head,
+                }),
+            )
+        }
+        Ok(Err(err)) if err.is::<history::TooLong>() => {
+            metrics::table_read(&label, "invalid_input");
+            json_response(400, read_error("history_too_long", &err.to_string()))
+        }
+        Ok(Err(err)) => {
+            metrics::table_read(&label, "error");
+            read_failed(err)
+        }
+        Err(err) => {
+            metrics::table_read(&label, "error");
             task_panicked(err)
         }
     }

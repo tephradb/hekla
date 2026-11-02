@@ -252,8 +252,20 @@ pub fn build(surface: &Surface) -> Value {
             format!("/tables/{}/row", table.main.name),
             table_row_path(table, &names),
         );
+        if table.columns().any(|column| column.history) {
+            paths.insert(
+                format!("/tables/{}/history", table.main.name),
+                table_history_path(table),
+            );
+        }
         for column in table.columns() {
             paths.insert(format!("/folds/{}", column.fold), fold_path(table, column));
+            if column.history {
+                paths.insert(
+                    format!("/folds/{}/history", column.fold),
+                    fold_history_path(table, column),
+                );
+            }
         }
     }
     for (path, item) in operation_paths(surface) {
@@ -843,8 +855,8 @@ fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
 
 /// `/folds/{Name}`: one stored fold's value for one key, its parameters named as the fold
 /// declares them rather than as the table spells its key parts.
-fn fold_path(table: &TableSurface, column: &ColumnDef) -> Value {
-    let mut parameters: Vec<Value> = column
+fn fold_args(table: &TableSurface, column: &ColumnDef) -> Vec<Value> {
+    column
         .args
         .iter()
         .zip(&table.main.key)
@@ -863,7 +875,151 @@ fn fold_path(table: &TableSurface, column: &ColumnDef) -> Value {
             param["required"] = json!(true);
             param
         })
+        .collect()
+}
+
+/// What a history read takes besides the key.
+fn history_params() -> Vec<Value> {
+    vec![
+        query_param(
+            "limit",
+            &format!(
+                "Changes per page. Defaults to {}; a larger value is capped at {}.",
+                read_api::DEFAULT_LIMIT,
+                read_api::MAX_LIMIT,
+            ),
+            json!({ "type": "integer", "minimum": 1, "default": read_api::DEFAULT_LIMIT }),
+        ),
+        query_param(
+            "before",
+            "Only changes at log positions below this one: the previous page's `next_before`.",
+            json!({ "type": "integer", "minimum": 0 }),
+        ),
+        query_param(
+            "since",
+            "Only changes at this log position or above.",
+            json!({ "type": "integer", "minimum": 0 }),
+        ),
+    ]
+}
+
+/// One page of a history, which every history route answers with.
+fn history_page() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "description": "Newest first, one per record that changed a column it reads.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "position": { "type": "integer", "minimum": 1 },
+                        "event": {
+                            "type": "object",
+                            "description": "The record that made the change, named rather than rendered: its payload is `/admin/events/{position}`.",
+                            "properties": {
+                                "type": { "type": "string" },
+                                "at": { "type": ["string", "null"], "format": "date-time" },
+                            },
+                            "required": ["type", "at"],
+                            "additionalProperties": false,
+                        },
+                        "changed": {
+                            "type": "object",
+                            "description": "Each column it changed, as `{before, after}`, rendered as a row read renders them.",
+                            "additionalProperties": {
+                                "type": "object",
+                                "properties": { "before": {}, "after": {} },
+                                "required": ["before", "after"],
+                            },
+                        },
+                    },
+                    "required": ["position", "event", "changed"],
+                },
+            },
+            "next_before": {
+                "type": ["integer", "null"],
+                "description": "Pass as `before` for the next page. Null on the last.",
+            },
+            "position": position_schema("The log length the history was read to."),
+        },
+        "required": ["items", "next_before", "position"],
+        "additionalProperties": false,
+    })
+}
+
+const HISTORY_NOTE: &str = "Read off the log rather than the derived store, so it is \
+    never behind and never waits. A fold whose arm leaves a key part open has no history: \
+    a key made after such a record never saw it, and a history read off the log would \
+    show a change the stored column never took.";
+
+fn fold_history_path(table: &TableSurface, column: &ColumnDef) -> Value {
+    let mut parameters = fold_args(table, column);
+    parameters.extend(history_params());
+    json!({
+        "get": {
+            "tags": [TABLES_TAG],
+            "operationId": format!("fold_history_{}", identifier(&column.fold)),
+            "summary": format!("the history of `{}` for one key", column.fold),
+            "description": format!(
+                "Every record that changed `{}` for this key, newest first, with its value \
+                 before and after. {HISTORY_NOTE}",
+                column.fold
+            ),
+            "parameters": parameters,
+            "responses": {
+                "200": response("a page of changes", history_page()),
+                "400": response(
+                    "a parameter is missing, unknown or malformed",
+                    schema_ref("Error"),
+                ),
+            },
+        },
+    })
+}
+
+fn table_history_path(table: &TableSurface) -> Value {
+    let name = &table.main.name;
+    let mut parameters = key_params(&table.main, true);
+    let columns: Vec<&str> = table
+        .columns()
+        .filter(|column| column.history)
+        .map(|column| column.name.as_str())
         .collect();
+    parameters.push(query_param(
+        "columns",
+        &format!(
+            "Comma-separated columns to read the history of: {}. Every one that has a history \
+             when left out.",
+            columns.join(", ")
+        ),
+        json!({ "type": "string" }),
+    ));
+    parameters.extend(history_params());
+    json!({
+        "get": {
+            "tags": [TABLES_TAG],
+            "operationId": format!("table_history_{}", identifier(name)),
+            "summary": format!("the history of one `{name}` row"),
+            "description": format!(
+                "Every record that changed one of this row's columns, newest first, one entry \
+                 per record with each column it changed. {HISTORY_NOTE}"
+            ),
+            "parameters": parameters,
+            "responses": {
+                "200": response("a page of changes", history_page()),
+                "400": response(
+                    "a parameter is missing, unknown or malformed, or a column has no history",
+                    schema_ref("Error"),
+                ),
+            },
+        },
+    })
+}
+
+fn fold_path(table: &TableSurface, column: &ColumnDef) -> Value {
+    let mut parameters = fold_args(table, column);
     parameters.extend(wait_params());
     let mut value = field_schema(&column.meta.kind);
     let mut notes = vec![format!(
@@ -2276,8 +2432,13 @@ fn table_detail_schema() -> Value {
                             "description": "Stored in the table's side table, and joined \
                                 back into every row served.",
                         },
+                        "history": {
+                            "type": "boolean",
+                            "description": "Whether `/folds/{fold}/history` serves it: false for a \
+                                fold with an arm that leaves a key part open.",
+                        },
                     },
-                    "required": ["name", "fold", "args", "kind", "optional", "subject", "collection"],
+                    "required": ["name", "fold", "args", "kind", "optional", "subject", "collection", "history"],
                     "additionalProperties": false,
                 },
             },

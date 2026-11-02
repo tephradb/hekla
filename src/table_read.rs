@@ -33,7 +33,16 @@ use crate::schema::{FieldKind, FieldMeta};
 use crate::tables::{ColumnDef, SortDef, TableDef, main_of, side_of};
 
 /// Query parameters that are not a key part.
-pub const RESERVED: [&str; 5] = ["limit", "cursor", "after", "timeout_ms", "order_by"];
+pub const RESERVED: [&str; 8] = [
+    "limit",
+    "cursor",
+    "after",
+    "timeout_ms",
+    "order_by",
+    "columns",
+    "before",
+    "since",
+];
 
 /// How long a read waits on the single writer's lock before failing.
 const BUSY: Duration = Duration::from_secs(5);
@@ -901,7 +910,11 @@ fn key_text(raw: ValueRef) -> String {
 /// everywhere: the key is gone, or the ciphertext will not open under it. Only a key that
 /// cannot be reached at all, a missing master, is an error, so a misconfigured deployment
 /// surfaces loudly instead of blanking every personal column it has.
-fn rendered(meta: &FieldMeta, raw: ValueRef, keystore: Option<&KeyStore>) -> anyhow::Result<Value> {
+pub(crate) fn rendered(
+    meta: &FieldMeta,
+    raw: ValueRef,
+    keystore: Option<&KeyStore>,
+) -> anyhow::Result<Value> {
     let json = from_sql(meta, raw)?;
     if meta.sealed_under.is_none() {
         return Ok(json);

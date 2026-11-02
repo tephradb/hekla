@@ -205,9 +205,8 @@ use std::time::Duration;
 use heklang::Digest;
 use tephra::Position;
 
-use crate::context::CommandContext;
 use crate::crypto::KeyStore;
-use crate::heklang_host::{HeklaHost, Stamp};
+use crate::heklang_host::HeklaHost;
 use crate::schema::EventDefs;
 use crate::store::Store;
 
@@ -418,28 +417,12 @@ fn follow(
     tables: &[TableDef],
 ) -> anyhow::Result<()> {
     let derived = Tables::new(program.as_ref());
-    // The host reads and never appends, which is why every field an append accumulates is
-    // empty here: a fold has no clock, no network and no `secret`, and the sink never reaches
-    // `Keys` either, since it hands a sealed value through rather than shredding it.
-    let host = HeklaHost {
-        program: Arc::clone(program),
-        events: Arc::clone(events),
-        store: store.clone(),
+    let host = HeklaHost::reader(
+        Arc::clone(program),
+        Arc::clone(events),
+        store.clone(),
         keystore,
-        ctx: CommandContext::new(uuid::Uuid::nil()),
-        stamp: Stamp::Pinned,
-        idem_tag: None,
-        call: None,
-        appended: None,
-        emitted: Vec::new(),
-        unavailable: None,
-        duplicated: false,
-        retry_after: None,
-        last_transport: None,
-        sealed: false,
-        http: None,
-        secrets: None,
-    };
+    );
     // **The subscription comes from `Tables::query`**, lowered through the same `query_of`
     // a command's append condition uses. Spelling the event types here instead is how the
     // first version of this thread followed the log, folded none of it, and reported

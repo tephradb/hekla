@@ -141,6 +141,28 @@ GET /tables/org__owner?org=1&limit=50
   answering `none`) are left out of an ordered scan. The cursor records its ordering, so one taken
   under another `order_by` is a 400. `GET /admin/tables/{table}` lists them as `sorts`.
 
+## A row's or a fold's history
+
+`GET /tables/{table}/history?<every key part>&columns=a,b` and `GET /folds/{Fold}/history?<params>`
+answer `{items, next_before, position}`: one item per record that **changed** a column, newest first,
+as `{position, event: {type, at}, changed: {column: {before, after}}}`. The event is named, not
+rendered: its payload is `GET /admin/events/{position}`, which stays behind the admin boundary.
+
+- Read off the log, not the store, so it never lags and never 503s. `position` is the log length it
+  read to.
+- Only real changes: a record whose arm ran but left the value as it was is not listed.
+- `before`/`after` render as a row read renders the column (a sealed one opened, an erased one
+  `null`), and two seals of one plaintext are not a change.
+- `columns` defaults to every column that has a history. Page with `before=<next_before>`; `since=<p>`
+  keeps changes at or above `p`. A history is always folded from the start of the key's log, since a
+  value depends on every record before it, so `since` filters rather than skips work.
+- A fold with an arm that leaves a key part open (a range arm) has **no history**, `400 no_history`:
+  a key made after such a record never saw it, so a history read off the log would show a change the
+  stored column never took. `GET /admin/tables/{table}` marks each column's `history`.
+- `columns`, `before` and `since` join the reserved names a key part or a fold parameter cannot take.
+- One request folds at most 100,000 records across its columns, or it is `400 history_too_long`;
+  asking for a column twice is `400 invalid_input`.
+
 ## `GET /folds/{Fold}`
 
 One named fold for one key: the same cell a row read serves, addressed by the fold's name, with its

@@ -9,6 +9,7 @@ pub mod fold_sink;
 pub mod fold_store;
 pub mod hash;
 pub mod heklang_host;
+pub mod history;
 pub mod http;
 pub mod invariant;
 pub mod lane;

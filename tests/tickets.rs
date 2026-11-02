@@ -1514,3 +1514,144 @@ fn an_index_on_a_column_the_store_cannot_order_is_refused() {
         loaded.findings
     );
 }
+
+/// A row's history, newest first: only the records that moved a column, each with its value
+/// before and after and the event that did it, sealed columns opened as a row read opens
+/// them. A fold's history by its own parameters, and a range arm's refused.
+#[tokio::test]
+async fn a_derived_row_and_a_fold_have_a_history() {
+    let harness = boot();
+    let opened = open(&harness, ALICE, 1, 10, Some("ada@example.com"));
+    let second = open(&harness, BOB, 1, 10, None);
+    let result = harness
+        .rt
+        .execute(
+            "CloseTicket",
+            json!({ "ticket_id": ALICE, "org_id": 1 }),
+            &ctx(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.status, 200, "{:?}", result.body);
+    let closed = result.body["positions"]["last"].as_u64().unwrap();
+    let app = harness.app();
+    let positions = |body: &Value| -> Vec<u64> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["position"].as_u64().unwrap())
+            .collect()
+    };
+
+    let (status, body) = support::get(
+        &app,
+        &format!("/tables/ticket/history?ticket={ALICE}&columns=ticket_opened,ticket_closed,ticket_contact"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(positions(&body), vec![closed, opened], "newest first");
+    let newest = &body["items"][0];
+    assert_eq!(newest["event"]["type"], "ticket.closed");
+    assert!(
+        newest["event"].get("data").is_none(),
+        "the payload is `/admin/events`'s, not a public route's: {newest}"
+    );
+    assert!(
+        newest["event"]["at"]
+            .as_str()
+            .is_some_and(|at| at.ends_with('Z'))
+    );
+    assert_eq!(
+        newest["changed"],
+        json!({ "ticket_closed": { "before": false, "after": true } })
+    );
+    let first = &body["items"][1]["changed"];
+    assert_eq!(
+        first["ticket_opened"],
+        json!({ "before": false, "after": true })
+    );
+    assert_eq!(
+        first["ticket_contact"],
+        json!({ "before": null, "after": "ada@example.com" }),
+        "a sealed column opened, as a row read opens it"
+    );
+    assert!(body["position"].as_u64().unwrap() >= closed);
+
+    // Two tickets, one change: the second ran the arm and moved nothing.
+    let (status, body) = support::get(&app, "/folds/OrgHasTickets/history?org_id=1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(positions(&body), vec![opened]);
+
+    // A seed that is not `none`, written back: no change.
+    let (status, body) = support::get(&app, "/folds/OrgPlan/history?org_id=1").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(positions(&body).is_empty(), "{body}");
+
+    // A page at a time, and a lower bound.
+    let (_, first) = support::get(
+        &app,
+        "/folds/OwnerTickets/history?org_id=1&owner_id=10&limit=1",
+    )
+    .await;
+    assert_eq!(positions(&first), vec![second]);
+    assert_eq!(
+        first["items"][0]["changed"]["owner_tickets"],
+        json!({ "before": 1, "after": 2 })
+    );
+    let before = first["next_before"].as_u64().expect("another page follows");
+    let (_, rest) = support::get(
+        &app,
+        &format!("/folds/OwnerTickets/history?org_id=1&owner_id=10&before={before}"),
+    )
+    .await;
+    assert_eq!(positions(&rest), vec![opened]);
+    assert_eq!(rest["next_before"], Value::Null);
+    let (_, since) = support::get(
+        &app,
+        &format!("/folds/OwnerTickets/history?org_id=1&owner_id=10&since={second}"),
+    )
+    .await;
+    assert_eq!(positions(&since), vec![second]);
+
+    for (uri, code) in [
+        (
+            "/folds/OwnerAnyClosed/history?org_id=1&owner_id=10",
+            "no_history",
+        ),
+        (
+            "/tables/org__owner/history?org=1&owner=10&columns=owner_any_closed",
+            "no_history",
+        ),
+        (
+            "/tables/org__owner/history?org=1&owner=10&columns=nope",
+            "invalid_input",
+        ),
+        (
+            "/folds/OwnerTickets/history?org_id=1&owner_id=10&columns=x",
+            "invalid_input",
+        ),
+        ("/folds/OwnerTickets/history?org_id=1", "invalid_input"),
+        (
+            "/folds/OwnerTickets/history?org_id=1&owner_id=10&before=x",
+            "invalid_input",
+        ),
+    ] {
+        let (status, body) = support::get(&app, uri).await;
+        assert_eq!(status, 400, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], code, "{uri}: {body}");
+    }
+    // A table's default leaves out the column with no history rather than refusing.
+    let (status, body) = support::get(&app, "/tables/org__owner/history?org=1&owner=10").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["changed"].get("owner_any_closed").is_none()),
+        "{body}"
+    );
+
+    harness.shutdown();
+}
