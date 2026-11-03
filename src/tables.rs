@@ -96,7 +96,7 @@ pub struct ColumnDef {
     /// section 11). `None` is a column whose history is exact.
     pub ranged_through: Option<String>,
     /// Whether a read route serves it: every unsealed fold, and a sealed one only when
-    /// `hekla.toml` names it in `[folds] serve_sealed` ([`serve_sealed`]).
+    /// `hekla.toml` names it in `[folds] serve_sealed` ([`TableDef::served`]).
     pub served: bool,
 }
 
