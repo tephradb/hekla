@@ -1254,3 +1254,51 @@ command SignUp(person_id: Uuid, email: String, plan: String, region: String) {
     );
     assert!(errors(&project).is_empty(), "must not fail the check");
 }
+
+/// `[folds] serve_sealed` widens what leaves the server, so every name in it has to be a
+/// stored, sealed fold: anything else is an error naming why, never a line that does
+/// nothing or a rename that quietly changes what is served.
+#[test]
+fn serve_sealed_names_only_stored_sealed_folds() {
+    let dir = write_project(&[
+        (
+            "events/order.hk",
+            "subject Customer(Int)\n\nevent @order.placed { order_id: Int, customer_id: Customer, \
+             email: String @subject(customer_id) @max(100) }\n",
+        ),
+        (
+            "lib/folds.hk",
+            r#"
+fold Email(customer_id: Customer) -> Sealed(String, Customer)? = none {
+  on @order.placed(customer_id) { email } => email
+}
+
+fold Orders(customer_id: Customer) -> n: Int = 0 {
+  on @order.placed(customer_id) => n + 1
+}
+
+fold Never(customer_id: Customer, coupon: Int) -> n: Int = 0 {
+  on @order.placed(customer_id) => n + 1
+}
+"#,
+        ),
+        (
+            "hekla.toml",
+            "[folds]\nserve_sealed = [\"Email\", \"Orders\", \"Never\", \"Nope\"]\n",
+        ),
+    ]);
+    let errs = errors(&LoadedProject::load(dir.path()));
+    let about = |fold: &str| {
+        errs.iter()
+            .filter(|err| err.contains(&format!("serve_sealed names `{fold}`")))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        about("Email").is_empty(),
+        "a stored, sealed fold is fine: {errs:?}"
+    );
+    assert!(about("Orders")[0].contains("not sealed"), "{errs:?}");
+    assert!(about("Never")[0].contains("not stored"), "{errs:?}");
+    assert!(about("Nope")[0].contains("does not declare"), "{errs:?}");
+}

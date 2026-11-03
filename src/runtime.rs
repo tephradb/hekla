@@ -466,6 +466,7 @@ impl Runtime {
             Arc::clone(&events),
             keystore.clone(),
             &project.digest,
+            &project.config.folds.serve_sealed,
         )?;
 
         let runtime = Arc::new(Runtime {
@@ -592,7 +593,10 @@ impl Runtime {
             secret_report,
             started: Instant::now(),
             projectors: HashMap::new(),
-            folds: crate::fold_runtime::FoldShared::idle(&project.program),
+            folds: crate::fold_runtime::FoldShared::idle(
+                &project.program,
+                &project.config.folds.serve_sealed,
+            ),
             effects: OnceLock::new(),
             openapi_json: String::new(),
             config: project.config.clone(),
@@ -666,7 +670,10 @@ impl Runtime {
             secret_report,
             started: Instant::now(),
             projectors: HashMap::new(),
-            folds: crate::fold_runtime::FoldShared::idle(&project.program),
+            folds: crate::fold_runtime::FoldShared::idle(
+                &project.program,
+                &project.config.folds.serve_sealed,
+            ),
             effects: OnceLock::new(),
             openapi_json: String::new(),
             config: project.config.clone(),

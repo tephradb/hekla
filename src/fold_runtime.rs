@@ -331,17 +331,19 @@ pub fn start(
     events: Arc<EventDefs>,
     keystore: Option<Arc<KeyStore>>,
     digest: &Digest,
+    serve_sealed: &[String],
 ) -> anyhow::Result<(Arc<FoldShared>, FoldThread)> {
-    let tables = TableDef::all(&program);
+    let tables = TableDef::served(&program, serve_sealed);
     // **No tables, no store and no thread.** A project whose folds are all unstorable, or
     // that declares none, has nothing to keep: creating the file anyway would put a
     // database in every data directory that nothing ever reads, and leave a thread writing
     // a checkpoint for it.
     if tables.is_empty() {
+        let idle = FoldShared::idle(&program, serve_sealed);
         return Ok((
-            FoldShared::idle(&program),
+            Arc::clone(&idle),
             FoldThread {
-                shared: FoldShared::idle(&program),
+                shared: idle,
                 join: None,
             },
         ));
@@ -494,9 +496,9 @@ impl FoldShared {
     ///
     /// The tables are what the program declares, with no file behind them, so a read of one is
     /// told this node does not serve it rather than that it does not exist.
-    pub fn idle(program: &Program) -> Arc<FoldShared> {
+    pub fn idle(program: &Program, serve_sealed: &[String]) -> Arc<FoldShared> {
         Arc::new(FoldShared {
-            tables: TableDef::all(program),
+            tables: TableDef::served(program, serve_sealed),
             unstored: heklang::layout(program).unstored,
             head: AtomicU64::new(0),
             behind: AtomicU64::new(0),

@@ -123,6 +123,14 @@ GET /folds/OwnerTickets?org_id=1&owner_id=10
 - `503 rebuilding` while any fold a deploy changed is still being folded, or while the store is
   folding from empty over an existing log. Every fold is served or none is: they share one position.
 - `after`, `timeout_ms` wait for the stored folds to reach a position, as on `/read`.
+- **A sealed fold is not served** unless `hekla.toml` lists it under `[folds] serve_sealed`. It is
+  stored and folded like any other, and commands and effects read it as usual, but every read route
+  answers `404 sealed` for it (naming the fix), `/row` and `/rows` refuse a `folds` list that names
+  it, and it is left out of `/openapi.json`. Sealing is how a program keeps a token or an address it
+  must forget with its subject, so the safe default is that none leaves the server until the program
+  says so. A fold whose value reads a sealed fold is sealed too, and so unserved the same way.
+  Unserved hides the value, not the key: a subject id is never sealed, so other folds of the same
+  key still serve it. `hekla check` refuses a `serve_sealed` name that is not a stored, sealed fold.
 
 ## `GET /row` and `GET /rows`
 

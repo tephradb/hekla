@@ -355,7 +355,8 @@ subject columns decrypted. The selection lives in the query string, so a row is 
 `/admin/tables` (the console's **Folds** page) lists every group of folds that share a key, labelled
 by its key and its folds, with the store's one position. `/admin/tables/{id}` shows one group: its
 key, each fold with its parameters and whether it is stored in the row or apart, and its rows, read
-through the public `/rows` and `/row` routes with every fold of the group listed. The `id` is the
+through the public `/rows` and `/row` routes with every served fold of the group listed. A sealed fold
+`[folds] serve_sealed` does not name is listed as "not served" and never read. The `id` is the
 opaque storage name, used only in the URL. Any key parameter can be filtered (a value, or bounds like
 `>=a <b`); a set the store does not serve shows the server's `400 unindexed_filter`, which names the
 sets that are. The selection lives in the query string:

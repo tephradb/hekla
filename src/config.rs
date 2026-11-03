@@ -33,6 +33,7 @@ pub struct Config {
     pub projectors: Projectors,
     pub verify: Verify,
     pub admin: Admin,
+    pub folds: Folds,
     /// Where each `secret` the project declares is read from. A name absent here falls
     /// back to `HEKLA_SECRET_<NAME>`, so a project needs no entry at all; the table is
     /// for naming a variable a platform already sets, or a file an orchestrator mounts.
@@ -141,6 +142,21 @@ pub struct Admin {
     /// return its rows, deploying nothing. `hekla project` does the same from a shell
     /// and needs no setting, because a shell is already a stronger thing to hold.
     pub projections: bool,
+}
+
+/// What the stored folds' read routes serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Folds {
+    /// The sealed folds `/folds`, `/row` and `/rows` serve, by name. Every other sealed fold is
+    /// stored and folded as usual but never read over HTTP.
+    ///
+    /// **Opt-in, because the failure is a credential on the wire.** A sealed fold is how a
+    /// program keeps a token or an address it has to forget with its subject, and the
+    /// next one somebody adds must not be served until somebody says it should be.
+    /// `validate` refuses a name that is not a stored, sealed fold, so a rename fails
+    /// loudly rather than quietly changing what is exposed.
+    pub serve_sealed: Vec<String>,
 }
 
 impl Default for Projectors {
@@ -309,6 +325,15 @@ mod tests {
     fn an_empty_secret_source_is_rejected() {
         assert!(Config::parse("[secrets]\nK = { env = \"\" }\n").is_err());
         assert!(Config::parse("[secrets]\nK = { file = \"\" }\n").is_err());
+    }
+
+    /// Nothing is opted in by saying nothing, so a sealed fold is unserved by default.
+    #[test]
+    fn sealed_folds_are_served_only_by_name() {
+        assert!(Config::default().folds.serve_sealed.is_empty());
+        let config = Config::parse("[folds]\nserve_sealed = [\"Email\"]\n").unwrap();
+        assert_eq!(config.folds.serve_sealed, vec!["Email".to_owned()]);
+        assert!(Config::parse("[folds]\nserve = [\"Email\"]\n").is_err());
     }
 
     #[test]

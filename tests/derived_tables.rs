@@ -1901,3 +1901,52 @@ fold ThingSeenAt(id: Int) -> Timestamp? @index = none {
         ]
     );
 }
+
+/// A sealed fold is stored and never served unless `[folds] serve_sealed` names it, and a
+/// fold whose value reads a sealed one is sealed itself, so the same default covers it
+/// without its own entry.
+#[test]
+fn a_sealed_fold_is_served_only_when_named() {
+    let program = program(
+        "subject Customer(Int)
+event @order.placed { order_id: Int, customer_id: Customer, email: String @subject(customer_id) }
+fold Email(customer_id: Customer) -> Sealed(String, Customer)? = none {
+  on @order.placed(customer_id) { email } => email
+}
+fold LastEmail(order_id: Int) -> Sealed(String, Customer)? = none {
+  on @order.placed(order_id) { customer_id } => Email { customer_id }
+}
+fold Orders(customer_id: Customer) -> n: Int = 0 {
+  on @order.placed(customer_id) => n + 1
+}
+",
+    );
+    let served = |tables: &[TableDef]| -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = tables
+            .iter()
+            .flat_map(|table| table.columns.iter())
+            .map(|column| (column.fold.clone(), column.served))
+            .collect();
+        out.sort();
+        out
+    };
+    let tables = TableDef::all(&program);
+    assert_eq!(
+        served(&tables),
+        vec![
+            ("Email".to_owned(), false),
+            ("LastEmail".to_owned(), false),
+            ("Orders".to_owned(), true),
+        ],
+        "sealed is unserved by default, and reading a seal keeps it one"
+    );
+    assert_eq!(
+        served(&TableDef::served(&program, &["Email".to_owned()])),
+        vec![
+            ("Email".to_owned(), true),
+            ("LastEmail".to_owned(), false),
+            ("Orders".to_owned(), true),
+        ],
+        "naming one serves that one only"
+    );
+}

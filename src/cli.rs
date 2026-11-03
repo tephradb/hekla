@@ -1609,7 +1609,8 @@ fn print_findings(findings: &[Finding]) {
 /// side table a collection-typed fold is split into. Both come out of the same
 /// `heklang::layout`, so an author reading either is reading what will exist.
 fn print_tables(project: &crate::loader::LoadedProject) {
-    let tables = crate::tables::TableDef::all(&project.program);
+    let tables =
+        crate::tables::TableDef::served(&project.program, &project.config.folds.serve_sealed);
     if tables.is_empty() {
         println!("\nno stored folds: this project declares no storable named fold");
         return;
@@ -1630,7 +1631,8 @@ fn print_tables(project: &crate::loader::LoadedProject) {
         println!("({keyed}){kind}  stored as {}", table.name);
         for column in &table.columns {
             let sealed = match &column.meta.sealed_under {
-                Some(seal) => format!("  sealed under {}", seal.subject()),
+                Some(seal) if column.served => format!("  sealed under {}", seal.subject()),
+                Some(seal) => format!("  sealed under {}, not served", seal.subject()),
                 None => String::new(),
             };
             println!(

@@ -13,3 +13,8 @@ effect_journal_days = 3650
 # configured.
 [secrets]
 NOTIFY_URL = { file = "notify-url" }
+
+# The sealed folds the tests read over HTTP. A sealed fold is stored and folded either way;
+# only a listed one is served, so the default keeps a credential off the wire.
+[folds]
+serve_sealed = ["TicketContact", "TicketContactedAt", "TicketReporter"]

@@ -571,9 +571,11 @@ fn self_entity(entity: &EntityDef, count: Option<&u64>) -> Value {
 /// row count when one was taken.
 ///
 /// **Named by its folds, not a table.** `id` is the storage name, for an operator opening
-/// the SQLite file and for the console's own URL; nothing a reader sends takes it. The key
-/// and every lead are spelled in the first fold's parameters, which is the vocabulary a
-/// `/rows` request listing the folds in this order speaks. A collection fold lives in the
+/// the SQLite file and for the console's own URL; nothing a reader sends takes it. A sealed
+/// fold `[folds] serve_sealed` does not name is listed with `served: false`, and no read
+/// route answers for it. The key and every lead are spelled in the first served fold's
+/// parameters, which is the vocabulary a `/rows` request listing the served folds in this
+/// order speaks. A collection fold lives in the
 /// side table and is listed here with `collection: true`, because the served row joins
 /// them and the split is storage.
 pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> Value {
@@ -587,7 +589,13 @@ pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> 
                 .flat_map(|side| side.columns.iter().map(|column| (column, true))),
         )
         .collect();
-    let params: &[String] = held.first().map_or(&[], |(column, _)| &column.args);
+    // The first fold a `/rows` request can list, which is the first one served: the
+    // console lists only those, and a request names the key in its first fold's words.
+    let params: &[String] = held
+        .iter()
+        .find(|(column, _)| column.served)
+        .or(held.first())
+        .map_or(&[], |(column, _)| &column.args);
     let spoken = |part: &str| {
         main.key
             .iter()
@@ -612,6 +620,7 @@ pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> 
                 "subject": column.meta.subject(),
                 "collection": collection,
                 "history": column.history(),
+                "served": column.served,
             })
         })
         .collect();

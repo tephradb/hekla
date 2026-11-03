@@ -79,12 +79,14 @@ pub struct TableSurface {
 }
 
 impl TableSurface {
-    /// Every column of a served row, the side table's collections included.
+    /// Every fold a read serves, the side table's collections included. A sealed fold
+    /// `[folds] serve_sealed` does not name is not in the document at all.
     fn columns(&self) -> impl Iterator<Item = &ColumnDef> {
         self.main
             .columns
             .iter()
             .chain(self.side.iter().flat_map(|side| side.columns.iter()))
+            .filter(|column| column.served)
     }
 }
 
@@ -144,12 +146,15 @@ impl<'a> Surface<'a> {
             .collect();
         events.sort_by_key(|(event_type, _)| *event_type);
 
-        let all = TableDef::all(&project.program);
+        let all = TableDef::served(&project.program, &project.config.folds.serve_sealed);
         let mut tables: Vec<TableSurface> = crate::table_read::readable(&all)
             .map(|main| TableSurface {
                 main: main.clone(),
                 side: crate::tables::side_of(&all, main).cloned(),
             })
+            // A group with nothing served has nothing to document, so it is dropped here once
+            // rather than skipped by everything that walks the groups.
+            .filter(|table| table.columns().next().is_some())
             .collect();
         tables.sort_by(|one, two| one.main.name.cmp(&two.main.name));
 
@@ -242,6 +247,13 @@ pub fn build(surface: &Surface) -> Value {
     if !surface.tables.is_empty() {
         paths.insert(server::ROWS_ROUTE.to_owned(), rows_path(surface));
         paths.insert(server::ROW_ROUTE.to_owned(), row_path(surface));
+    }
+    if surface
+        .tables
+        .iter()
+        .flat_map(TableSurface::columns)
+        .any(ColumnDef::history)
+    {
         paths.insert(
             server::ROW_HISTORY_ROUTE.to_owned(),
             row_history_path(surface),
@@ -824,7 +836,7 @@ fn rows_path(surface: &Surface) -> Value {
                      stored, or a filter no index can serve",
                     schema_ref("Error"),
                 ),
-                "404": response("no such fold", schema_ref("Error")),
+                "404": response(UNSERVED_404, schema_ref("Error")),
                 "503": table_unavailable_response(),
                 "500": response("internal error", schema_ref("Error")),
             },
@@ -862,7 +874,8 @@ fn row_path(surface: &Surface) -> Value {
                     schema_ref("Error"),
                 ),
                 "404": response(
-                    "no such fold, or no event has named this key, so every fold holds its seed",
+                    "no such fold, a sealed fold `[folds] serve_sealed` does not name (`sealed`), or no \
+                     event has named this key, so every fold holds its seed",
                     schema_ref("Error"),
                 ),
                 "503": table_unavailable_response(),
@@ -893,7 +906,7 @@ fn row_history_path(surface: &Surface) -> Value {
                      key, or a fold with no history",
                     schema_ref("Error"),
                 ),
-                "404": response("no such fold", schema_ref("Error")),
+                "404": response(UNSERVED_404, schema_ref("Error")),
             },
         },
     })
@@ -995,6 +1008,10 @@ fn history_page() -> Value {
     })
 }
 
+/// A 404 from a route that names folds: one nobody declared, or a sealed one nothing serves.
+const UNSERVED_404: &str = "no such fold, or a sealed fold `[folds] serve_sealed` does not name \
+    (`sealed`)";
+
 const HISTORY_NOTE: &str = "Read off the log rather than the stored folds, so it is never \
     behind and never waits. A fold whose arm leaves a key part open has no history: a key \
     made after such a record never saw it, and a history read off the log would show a \
@@ -1020,6 +1037,7 @@ fn fold_history_path(table: &TableSurface, column: &ColumnDef) -> Value {
                     "a parameter is missing, unknown or malformed",
                     schema_ref("Error"),
                 ),
+                "404": response(UNSERVED_404, schema_ref("Error")),
             },
         },
     })
@@ -1066,7 +1084,8 @@ fn fold_path(table: &TableSurface, column: &ColumnDef) -> Value {
                     schema_ref("Error"),
                 ),
                 "404": response(
-                    "no event has named this key, so the fold holds its seed",
+                    "no event has named this key, so the fold holds its seed, or the fold is sealed \
+                     and `[folds] serve_sealed` does not name it (`sealed`)",
                     schema_ref("Error"),
                 ),
                 "503": table_unavailable_response(),
@@ -2316,8 +2335,8 @@ fn table_detail_schema() -> Value {
     json!({
         "type": "object",
         "description": "The folds that share one key, stored together with one row per key. \
-            The key and every lead are named with the first fold's parameters, which is what \
-            a `/rows` request listing the folds in this order takes.",
+            The key and every lead are named with the first served fold's parameters, which is \
+            what a `/rows` request listing the served folds in this order takes.",
         "properties": {
             "id": {
                 "type": "string",
@@ -2361,8 +2380,13 @@ fn table_detail_schema() -> Value {
                             "description": "Whether `/folds/{fold}/history` serves it: false for a \
                                 fold with an arm that leaves a key part open.",
                         },
+                        "served": {
+                            "type": "boolean",
+                            "description": "Whether a read route serves it: false for a sealed \
+                                fold `[folds] serve_sealed` does not name.",
+                        },
                     },
-                    "required": ["fold", "args", "kind", "optional", "subject", "collection", "history"],
+                    "required": ["fold", "args", "kind", "optional", "subject", "collection", "history", "served"],
                     "additionalProperties": false,
                 },
             },

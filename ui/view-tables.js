@@ -46,10 +46,16 @@ function keyText(table) {
   return table.key.length ? `(${table.key.map((part) => part.name).join(', ')})` : 'one row'
 }
 
+/** The folds a read route serves. A sealed one `[folds] serve_sealed` does not name is
+ * stored and never served, so it is listed and never read. */
+function served(table) {
+  return table.folds.filter((fold) => fold.served)
+}
+
 /** The folds to name in a read of this group, the first one first so the key is spelled
  * in its parameters. */
 function foldNames(table) {
-  return table.folds.map((fold) => fold.fold)
+  return served(table).map((fold) => fold.fold)
 }
 
 /* Every fold of the store is at one position, so the store's state is one line and not
@@ -94,7 +100,7 @@ function TableList() {
       key: 'folds',
       header: 'Folds',
       render: (row) =>
-        html`<span class="tiny">${truncate(foldNames(row).join(' · '), 110)}</span>`,
+        html`<span class="tiny">${truncate(row.folds.map((fold) => fold.fold).join(' · '), 110)}</span>`,
     },
     {
       key: 'count',
@@ -279,8 +285,11 @@ function TableDetail({ id, search }) {
         `}
 
         <div class=${row === null ? undefined : 'with-detail'}>
-          <${Rows} table=${table} filters=${filters} cursor=${cursor} openRow=${row} />
+          ${foldNames(table).length > 0
+            ? html`<${Rows} table=${table} filters=${filters} cursor=${cursor} openRow=${row} />`
+            : html`<p class="tiny faint">every fold here is sealed and not served, so no rows can be read</p>`}
           ${row !== null &&
+          foldNames(table).length > 0 &&
           html`
             <${RowDetail}
               key=${row}
@@ -314,16 +323,18 @@ function Folds({ table, onFold }) {
           (fold) => html`
             <tr key=${fold.fold}>
               <td>
-                <a
-                  href=${foldHref(fold.fold)}
-                  onClick=${(clicked) => {
-                    clicked.preventDefault()
-                    onFold(fold.fold)
-                  }}
-                  title="Look this fold up for one key"
-                >
-                  <code>${fold.fold}</code>
-                </a>
+                ${fold.served
+                  ? html`<a
+                      href=${foldHref(fold.fold)}
+                      onClick=${(clicked) => {
+                        clicked.preventDefault()
+                        onFold(fold.fold)
+                      }}
+                      title="Look this fold up for one key"
+                    >
+                      <code>${fold.fold}</code>
+                    </a>`
+                  : html`<code title="sealed, and not in [folds] serve_sealed">${fold.fold}</code>`}
               </td>
               <td>
                 <span class="mono tiny dim">
@@ -333,7 +344,8 @@ function Folds({ table, onFold }) {
               <td><span class="mono tiny dim">${fold.kind}</span></td>
               <td>
                 ${fold.subject
-                  ? html`<code class="tiny">${fold.subject}</code>`
+                  ? html`<code class="tiny">${fold.subject}</code>
+                      ${!fold.served && html`<span class="tiny faint"> not served</span>`}`
                   : html`<span class="faint">·</span>`}
               </td>
               <td>
@@ -500,7 +512,7 @@ function Rows({ table, filters, cursor, openRow }) {
   }))
   const columns = [
     ...keyColumns,
-    ...table.folds.map((fold) => ({
+    ...served(table).map((fold) => ({
       key: fold.fold,
       header: fold.fold,
       align: numeric(fold.kind) ? 'right' : undefined,
@@ -639,7 +651,7 @@ function RowDetail({ table, keyText: text, onClose, onFold }) {
     values = []
   }
   const folds = foldNames(table)
-  const withHistory = table.folds.filter((fold) => fold.history)
+  const withHistory = served(table).filter((fold) => fold.history)
   const kept = withHistory.map((fold) => fold.fold)
   const key = table.key.map((part, index) => [part.name, values[index]])
   // A history read is named in its own first fold's parameters, which need not be the
@@ -672,7 +684,7 @@ function RowDetail({ table, keyText: text, onClose, onFold }) {
                 <dd><span class="mono">${String(value)}</span><span class="note">key</span></dd>
               `,
             )}
-            ${table.folds.map(
+            ${served(table).map(
               (fold) => html`
                 <dt key=${fold.fold}>
                   <a
@@ -821,7 +833,8 @@ function foldHref(fold) {
  * than as the first fold spells the key. Opened from a row, it starts with that row's key.
  */
 function FoldLookup({ table, fold, args, onClose }) {
-  const declared = table.folds.find((candidate) => candidate.fold === fold)
+  // Only a served fold: a sealed one no route answers for falls into the not-keyed-here state.
+  const declared = served(table).find((candidate) => candidate.fold === fold)
   const [draft, setDraft] = useState(() => Object.fromEntries(args))
   const complete =
     declared !== undefined && declared.args.every((arg) => (draft[arg] ?? '').trim() !== '')
@@ -836,12 +849,17 @@ function FoldLookup({ table, fold, args, onClose }) {
   )
 
   if (declared === undefined) {
+    const sealed = table.folds.some((candidate) => candidate.fold === fold)
     return html`
       <section class="card">
         <header>Fold <code>${fold}</code></header>
-        <${Empty} title="Not keyed here">
-          <code>${fold}</code> is keyed otherwise than these folds, or not stored at all.
-        <//>
+        ${sealed
+          ? html`<${Empty} title="Not served">
+              <code>${fold}</code> is sealed, and <code>[folds] serve_sealed</code> does not name it.
+            <//>`
+          : html`<${Empty} title="Not keyed here">
+              <code>${fold}</code> is keyed otherwise than these folds, or not stored at all.
+            <//>`}
       </section>
     `
   }

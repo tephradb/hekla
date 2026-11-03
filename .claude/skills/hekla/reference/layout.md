@@ -58,6 +58,10 @@ auto_rebuild = true         # default true. Rebuild a projector whose definition
 enabled = false             # default false. Replay every completed invocation against a sealed
                             # journal and quarantine an effect that diverges
 
+[folds]
+serve_sealed = ["CustomerEmail"]  # default []. The sealed folds the read routes serve; every
+                            # other sealed fold is stored and folded but never read over HTTP
+
 [secrets]                   # where each `secret NAME` the project declares is read from. A name
                             # absent here falls back to HEKLA_SECRET_<NAME>, so this table is
                             # optional even for a project that declares credentials

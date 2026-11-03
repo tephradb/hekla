@@ -1144,6 +1144,18 @@ fn picked(runtime: &Runtime, folds: &[String]) -> Result<Arc<FoldShared>, Box<Re
             Some(_) => json_response(400, read_error("not_stored", &not_stored(shared, &fold))),
             None => not_found(&format!("no named fold `{fold}`")),
         })),
+        // A 404 as an internal command is, but saying why: the name is no secret, and an
+        // author whose fold vanished from the API should not have to guess.
+        Err(Unselected::Unserved(fold)) => Err(Box::new(json_response(
+            404,
+            read_error(
+                "sealed",
+                &format!(
+                    "`{fold}` is sealed, so no read route serves it; name it in `hekla.toml` \
+                     under `[folds] serve_sealed` to serve it"
+                ),
+            ),
+        ))),
         Err(Unselected::Refused(refusal)) => Err(Box::new(json_response(
             400,
             read_error(refusal.code, &refusal.message),

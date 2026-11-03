@@ -115,6 +115,7 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
     );
     check_entities(&project.projectors, &mut findings);
     check_secrets(project, &mut findings);
+    check_served(project, &mut findings);
     let defs = Defs::of(&project.program);
     for command in &project.program.commands {
         let location = command.module.clone().unwrap_or_default();
@@ -408,6 +409,40 @@ fn check_secrets(project: &LoadedProject, findings: &mut Vec<Finding>) {
             .with_hint(format!(
                 "declare `secret {name}` in a .hk file, or drop the entry: nothing reads it"
             )),
+        );
+    }
+}
+
+/// Every name `[folds] serve_sealed` lists is a stored, sealed fold.
+///
+/// **Errors, not the warnings `[secrets]` gets**, because this list widens what leaves the
+/// server: a name that matches nothing is a fold somebody meant to serve and is not, and
+/// one that is not sealed says the author misread what the list is for.
+fn check_served(project: &LoadedProject, findings: &mut Vec<Finding>) {
+    // For the reason `check_secrets` gives: an unchecked program is an empty one.
+    if project.has_errors() {
+        return;
+    }
+    let tables = crate::tables::TableDef::all(&project.program);
+    for name in &project.config.folds.serve_sealed {
+        let stored = tables
+            .iter()
+            .flat_map(|table| table.columns.iter())
+            .find(|column| &column.fold == name);
+        let why = match stored {
+            Some(column) if column.meta.sealed_under.is_some() => continue,
+            Some(_) => "which is not sealed, so it is served already",
+            None if project.program.fold(name).is_some() => {
+                "which is not stored, so no read route serves it at all"
+            }
+            None => "which the project does not declare",
+        };
+        findings.push(
+            Finding::error(
+                crate::config::FILE_NAME,
+                format!("[folds] serve_sealed names `{name}`, {why}"),
+            )
+            .with_hint("list only sealed folds a read should serve"),
         );
     }
 }

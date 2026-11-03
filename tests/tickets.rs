@@ -16,6 +16,8 @@
 //! examples use no `delete`, no enum column, no `Decimal`, no `Json` column, no
 //! `Timestamp` column and no `Int @key`, and every one of those is shipped surface.
 
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use hekla::crypto::KeyStore;
@@ -1763,6 +1765,117 @@ async fn a_derived_row_and_a_fold_have_a_history() {
                 .as_object()
                 .is_some_and(|changed| changed.keys().eq(["OwnerTickets"]))),
         "{body}"
+    );
+
+    harness.shutdown();
+}
+
+/// The tickets fixture with its `hekla.toml`'s `[folds]` table replaced, so `serve_sealed`
+/// lists only `served` and every other setting, retention included, stays the fixture's.
+fn tickets_serving(served: &[&str]) -> tempfile::TempDir {
+    fn copy(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    copy(&fixture_dir("tickets"), dir.path());
+    let listed: Vec<String> = served.iter().map(|fold| format!("\"{fold}\"")).collect();
+    let config = dir.path().join("hekla.toml");
+    let fixture = fs::read_to_string(&config).unwrap();
+    let (rest, _) = fixture
+        .split_once("[folds]")
+        .expect("the fixture lists its served seals under [folds], last");
+    fs::write(
+        &config,
+        format!("{rest}[folds]\nserve_sealed = [{}]\n", listed.join(", ")),
+    )
+    .unwrap();
+    dir
+}
+
+/// A sealed fold is stored and folded, and no read route serves it until
+/// `[folds] serve_sealed` names it: a 404 that says why on every route, and no path in the
+/// document. Its unsealed neighbours, and the key, are served as before.
+#[tokio::test]
+async fn a_sealed_fold_is_not_served_unless_the_project_names_it() {
+    let project = tickets_serving(&["TicketContact"]);
+    let harness = Boot::new(project.path())
+        .with_master_key()
+        .http_status(200)
+        .start();
+    let position = open(&harness, UUID_A, 1, 10, Some("ada@example.com"));
+    let app = harness.app();
+
+    let (status, body) = support::get(
+        &app,
+        &format!("/row?folds=TicketOpened,TicketContact&ticket_id={UUID_A}&after={position}"),
+    )
+    .await;
+    assert_eq!(status, 200, "a named seal is served: {body}");
+    assert_eq!(body["item"]["TicketContact"], "ada@example.com");
+    assert_eq!(body["item"]["ticket_id"], UUID_A, "and the key with it");
+
+    for path in [
+        format!("/folds/TicketContactedAt?ticket_id={UUID_A}"),
+        format!("/folds/TicketContactedAt/history?ticket_id={UUID_A}"),
+        format!("/row?folds=TicketOpened,TicketContactedAt&ticket_id={UUID_A}"),
+        format!("/row?folds=TicketReporter,TicketOpened&ticket_id={UUID_A}"),
+        "/rows?folds=TicketContactedAt".to_owned(),
+        format!("/row/history?folds=TicketOpened,TicketContactedAt&ticket_id={UUID_A}"),
+    ] {
+        let (status, body) = support::get(&app, &path).await;
+        assert_eq!(status, 404, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "sealed", "{path}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("serve_sealed"),
+            "{path}: the refusal names the fix: {body}"
+        );
+    }
+
+    let (status, doc) = support::get(&app, "/openapi.json").await;
+    assert_eq!(status, 200);
+    let paths = doc["paths"].as_object().unwrap();
+    assert!(paths.contains_key("/folds/TicketContact"));
+    for unserved in ["/folds/TicketContactedAt", "/folds/TicketReporter"] {
+        assert!(
+            !paths.contains_key(unserved),
+            "{unserved} is not documented"
+        );
+    }
+
+    let (status, admin) = support::get(&app, "/admin/tables").await;
+    assert_eq!(status, 200);
+    let listed: Vec<(String, bool)> = admin["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|table| table["folds"].as_array().unwrap().iter())
+        .filter(|fold| fold["fold"].as_str().unwrap().starts_with("TicketContact"))
+        .map(|fold| {
+            (
+                fold["fold"].as_str().unwrap().to_owned(),
+                fold["served"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert!(
+        listed.contains(&("TicketContact".to_owned(), true)),
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains(&("TicketContactedAt".to_owned(), false)),
+        "the console still lists it: {listed:?}"
     );
 
     harness.shutdown();

@@ -104,6 +104,8 @@ pub enum Unselected {
     /// A fold no table keeps. Undeclared or unstored is the caller's to tell apart, since
     /// it needs the program and this needs only the tables.
     Missing(String),
+    /// A sealed fold `[folds] serve_sealed` does not name: stored, and never served.
+    Unserved(String),
     Refused(Refusal),
 }
 
@@ -176,6 +178,9 @@ pub fn pick<'a>(tables: &'a [TableDef], folds: &[&str]) -> Result<Selection<'a>,
     };
     let (main, column) =
         locate(tables, first).ok_or_else(|| Unselected::Missing((*first).into()))?;
+    if !column.served {
+        return Err(Unselected::Unserved((*first).into()));
+    }
     let mut selection = Selection {
         main,
         folds: vec![column],
@@ -183,6 +188,9 @@ pub fn pick<'a>(tables: &'a [TableDef], folds: &[&str]) -> Result<Selection<'a>,
     for fold in rest {
         let (held, column) =
             locate(tables, fold).ok_or_else(|| Unselected::Missing((*fold).into()))?;
+        if !column.served {
+            return Err(Unselected::Unserved((*fold).into()));
+        }
         if selection.folds.iter().any(|kept| kept.fold == *fold) {
             return Err(Unselected::Refused(Refusal::invalid(format!(
                 "`{fold}` is listed twice"

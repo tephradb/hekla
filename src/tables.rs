@@ -95,6 +95,9 @@ pub struct ColumnDef {
     /// column never took (`heklang`'s `Layout::ranged_through`, and `docs/folds.md`
     /// section 11). `None` is a column whose history is exact.
     pub ranged_through: Option<String>,
+    /// Whether a read route serves it: every unsealed fold, and a sealed one only when
+    /// `hekla.toml` names it in `[folds] serve_sealed` ([`serve_sealed`]).
+    pub served: bool,
 }
 
 impl ColumnDef {
@@ -150,6 +153,24 @@ impl TableDef {
             }
         }
         out
+    }
+
+    /// [`TableDef::all`], with the sealed folds `serve_sealed` names marked served: what
+    /// anything that answers or documents a read builds, so none of them can forget the
+    /// config. Every other sealed fold stays unserved: its value is a credential or an
+    /// address, and a read route is not where either should leave the server unless the
+    /// program says so.
+    ///
+    /// A fold whose value reads a sealed one is sealed itself, since nothing but an effect
+    /// can open a seal, so what it would reveal is covered by the same rule.
+    pub fn served(program: &Program, serve_sealed: &[String]) -> Vec<TableDef> {
+        let mut tables = TableDef::all(program);
+        for column in tables.iter_mut().flat_map(|table| table.columns.iter_mut()) {
+            if serve_sealed.contains(&column.fold) {
+                column.served = true;
+            }
+        }
+        tables
     }
 
     /// DDL generation. The payoff of a derived schema: nobody writes SQL or migrations.
@@ -282,6 +303,7 @@ fn column_def(program: &Program, laid: &Layout, column: &Column, defs: Defs<'_>)
         args: column.args.clone(),
         default: seed_literal(program, column, &kind, sealed_under.is_some()),
         ranged_through: laid.ranged_through(&column.fold).cloned(),
+        served: sealed_under.is_none(),
         ty: column.ty.clone(),
         meta: FieldMeta {
             kind,
