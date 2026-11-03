@@ -186,36 +186,42 @@ export const api = {
 
   tables: (signal) => request('/admin/tables', { signal }),
 
-  table: (name, { counts = false } = {}, signal) =>
-    request(`/admin/tables/${encodeURIComponent(name)}`, {
+  table: (id, { counts = false } = {}, signal) =>
+    request(`/admin/tables/${encodeURIComponent(id)}`, {
       signal,
       params: [['counts', String(counts)]],
     }),
 
-  /* Through the public tables API, as `rows` goes through the projector read API. A
-   * filter is a parameter named after a key part, and `hekla check` refuses a key part
-   * named like one of the control parameters, so this cannot shadow one. */
-  tableRows: (name, { filters = [], cursor, limit } = {}, signal) =>
-    request(`/tables/${encodeURIComponent(name)}`, {
+  /* Through the public rows API, as `rows` goes through the projector read API. A row is
+   * named by the folds read from it, never by the table they are kept in. A filter is a
+   * parameter named as the first fold names its own, and `hekla check` refuses one named
+   * like a control parameter, so this cannot shadow one. */
+  foldRows: (folds, { filters = [], cursor, limit } = {}, signal) =>
+    request('/rows', {
       signal,
-      params: [...filters, ['cursor', cursor], ['limit', limit]],
+      params: [['folds', folds.join(',')], ...filters, ['cursor', cursor], ['limit', limit]],
     }),
 
-  tableRow: (name, key, signal) =>
-    request(`/tables/${encodeURIComponent(name)}/row`, {
+  foldRow: (folds, key, signal) =>
+    request('/row', {
       signal,
-      params: key.map(([part, value]) => [part, String(value)]),
+      params: [['folds', folds.join(',')], ...key.map(([part, value]) => [part, String(value)])],
     }),
 
   /* One named fold, its arguments named as the fold declares its parameters. */
   fold: (name, args, signal) =>
     request(`/folds/${encodeURIComponent(name)}`, { signal, params: args }),
 
-  /* What changed a row's columns, or one fold's, newest first, a page before `before`. */
-  tableHistory: (name, key, { before } = {}, signal) =>
-    request(`/tables/${encodeURIComponent(name)}/history`, {
+  /* What changed a row's folds, or one fold, newest first, a page before `before`. Every
+   * fold listed must keep a history, or the server refuses the read. */
+  rowHistory: (folds, key, { before } = {}, signal) =>
+    request('/row/history', {
       signal,
-      params: [...key.map(([part, value]) => [part, String(value)]), ['before', before]],
+      params: [
+        ['folds', folds.join(',')],
+        ...key.map(([part, value]) => [part, String(value)]),
+        ['before', before],
+      ],
     }),
 
   foldHistory: (name, args, { before } = {}, signal) =>

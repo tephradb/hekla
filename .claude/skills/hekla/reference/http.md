@@ -100,81 +100,19 @@ not_found` with the message `no such row`. Unknown entity or projector: `404 not
 
 `next_cursor` is `null` on the last page. Pagination is cursor-based over the ordering, never offset.
 
-## `GET /tables/{table}` and `GET /tables/{table}/row`
-
-A named fold is kept as a column of a **derived table**, one row per key, with no projector to write
-it. `hekla check --tables <dir>` prints every table: its name, its key parts, and the fold behind
-each column. `fold OwnerTickets(org_id: Org, owner_id: Owner)` lives in `org__owner`, keyed on `org`
-and `owner`: a key part is named for its subject when it has one, and otherwise for the parameter
-with one `_id` off.
-
-```
-GET /tables/org__owner/row?org=1&owner=10
-{ "item": { "org": 1, "owner": 10, "owner_tickets": 2 }, "position": 7 }
-
-GET /tables/org__owner?org=1&limit=50
-{ "items": [ ... ], "next_cursor": "eyJ0Ijoi...", "position": 7 }
-```
-
-| Query parameter | Means |
-| --- | --- |
-| `<part>=<value>` | a row read needs **every** key part; a scan takes the **leading** parts of the key, or of an index a range arm derived |
-| `limit`, `cursor` | as on `/read`; the cursor is over the whole key and only valid for its own table |
-| `after`, `timeout_ms` | wait for the derived tables to reach a position, as on `/read` |
-
-- A row is every fold's value for its key, collections included (they are stored in a side table and
-  joined back), sealed columns opened. A NULL or an erased seal is left out, as on `/read`.
-- `404 not_found` on a row read means no event has named that key, so every column would read its
-  fold's seed.
-- `503 rebuilding` while any column a deploy changed is still being folded, or while the store is
-  folding from empty over an existing log. Every table is served or none is: they share one position.
-- A malformed key part, a part that is not a key part, or a cursor from elsewhere is `400
-  invalid_input`; a filter that skips a leading part is `400 unindexed_filter`.
-- A range (`part.gte=`, `.gt`, `.lte`, `.lt`, either end or both) goes on one key part, the one
-  right after the pinned ones in the key or in a derived index: `?org=1&month.gte=2023-11`. A range
-  anywhere else is `400 unindexed_filter`; an unknown operator, two bounds at one end, a part both
-  pinned and ranged, or ranges on two parts are `400 invalid_input`.
-- `order_by=<column>` (or `-<column>` descending) orders by a column a fold's `@index` declares,
-  served by the index `(lead parts, column, rest of the key)`. Pin exactly the parts `@index(..)`
-  names, and no range, or it is `400 unindexed_filter`; a column nothing indexes is `400
-  invalid_input` naming the orderings the table has. Rows whose column is absent (an optional fold
-  answering `none`) are left out of an ordered scan. The cursor records its ordering, so one taken
-  under another `order_by` is a 400. `GET /admin/tables/{table}` lists them as `sorts`.
-
-## A row's or a fold's history
-
-`GET /tables/{table}/history?<every key part>&columns=a,b` and `GET /folds/{Fold}/history?<params>`
-answer `{items, next_before, position}`: one item per record that **changed** a column, newest first,
-as `{position, event: {type, at}, changed: {column: {before, after}}}`. The event is named, not
-rendered: its payload is `GET /admin/events/{position}`, which stays behind the admin boundary.
-
-- Read off the log, not the store, so it never lags and never 503s. `position` is the log length it
-  read to.
-- Only real changes: a record whose arm ran but left the value as it was is not listed.
-- `before`/`after` render as a row read renders the column (a sealed one opened, an erased one
-  `null`), and two seals of one plaintext are not a change.
-- `columns` defaults to every column that has a history. Page with `before=<next_before>`; `since=<p>`
-  keeps changes at or above `p`. A history is always folded from the start of the key's log, since a
-  value depends on every record before it, so `since` filters rather than skips work.
-- A fold with an arm that leaves a key part open (a range arm) has **no history**, `400 no_history`:
-  a key made after such a record never saw it, so a history read off the log would show a change the
-  stored column never took. `GET /admin/tables/{table}` marks each column's `history`.
-- `columns`, `before` and `since` join the reserved names a key part or a fold parameter cannot take.
-- One request folds at most 100,000 records across its columns, or it is `400 history_too_long`;
-  asking for a column twice is `400 invalid_input`.
-
 ## `GET /folds/{Fold}`
 
-One named fold for one key: the same cell a row read serves, addressed by the fold's name, with its
-arguments named as the fold declares its parameters rather than as the table spells its key parts.
+A named fold is served by name, with no projector to write it. Folds that share a key are stored
+together, one row per key, but that grouping is storage: no route takes a table name, and its
+SQLite name is a hash. `hekla check --tables <dir>` prints the grouping for debugging.
 
 ```
 GET /folds/OwnerTickets?org_id=1&owner_id=10
 { "value": 2, "position": 7 }
 ```
 
-- Every parameter is required. A missing, unknown or malformed one is `400 invalid_input`; passing the
-  table's part name (`org`) instead of the parameter's (`org_id`) is one of those.
+- Every parameter is required, named as the fold declares it. A missing, unknown or malformed one is
+  `400 invalid_input`.
 - `value` is `null` when the fold answers `none`, or when it is sealed and its subject is erased.
 - `404 not_found` for a key no event has named (the fold holds its seed there), or an undeclared fold.
 - `400 not_stored` for a fold with a parameter no arm matches, naming it: its keys cannot be listed,
@@ -182,7 +120,72 @@ GET /folds/OwnerTickets?org_id=1&owner_id=10
   envelope, or computes a key part with `key month = month_of(at)`) *is* stored and served here,
   and this is the only place it can be read. A computed part is passed like any other argument:
   `/folds/OrgTicketsDue?org_id=1&month=2023-11`.
-- `after`, `timeout_ms` and the `503`s are the table routes'.
+- `503 rebuilding` while any fold a deploy changed is still being folded, or while the store is
+  folding from empty over an existing log. Every fold is served or none is: they share one position.
+- `after`, `timeout_ms` wait for the stored folds to reach a position, as on `/read`.
+
+## `GET /row` and `GET /rows`
+
+Several folds of one key at once. `folds` lists them, comma separated; they must share a key, or it
+is `400 invalid_input`. The key is named with the **first listed fold's own parameters**, and each
+fold's value comes back under the fold's name.
+
+```
+GET /row?folds=OwnerTickets,OwnerAnyClosed&org_id=1&owner_id=10
+{ "item": { "org_id": 1, "owner_id": 10, "OwnerTickets": 2, "OwnerAnyClosed": true }, "position": 7 }
+
+GET /rows?folds=OwnerTickets&org_id=1&limit=50
+{ "items": [ ... ], "next_cursor": "eyJ0Ijoi...", "position": 7 }
+```
+
+| Query parameter | Means |
+| --- | --- |
+| `folds=A,B` | required: the folds to read, which share a key |
+| `<param>=<value>` | a row read needs **every** parameter of the first fold; a scan pins a **set** of them that the key or an index serves |
+| `limit`, `cursor` | as on `/read`; the cursor is over the whole key and only valid for folds of that key |
+| `after`, `timeout_ms` | wait for the stored folds to reach a position, as on `/read` |
+
+- A row is the key plus each listed fold, collections included and sealed values opened. A NULL or
+  an erased seal is left out, as on `/read`. Only the listed folds are read.
+- `404 not_found` on `/row` means no event has named that key, so every fold would read its seed.
+  An undeclared fold in `folds` is a 404 too; a declared one nothing stores is `400 not_stored`.
+- A malformed value, a parameter the first fold does not take, or a cursor from elsewhere is `400
+  invalid_input`. A pinned set no index serves is `400 unindexed_filter`, and its message names the
+  sets that are served: which order the store keeps a key in is not something to know in advance.
+- A range (`param.gte=`, `.gt`, `.lte`, `.lt`, either end or both) goes on one parameter, the one the
+  key or an index orders right after the pinned set: `?org_id=1&month.gte=2023-11`. A range anywhere
+  else is `400 unindexed_filter`; an unknown operator, two bounds at one end, a parameter both pinned
+  and ranged, or ranges on two parameters are `400 invalid_input`.
+- `order_by=<Fold>` (or `-<Fold>` descending) orders by a fold whose `@index` orders this key. Pin
+  exactly the parameters `@index(..)` names (in any order), and no range, or it is `400
+  unindexed_filter`; a fold nothing indexes is `400 invalid_input` naming the orderings there are.
+  The ordering fold need not be listed in `folds`. Rows whose value is absent (an optional fold
+  answering `none`) are left out of an ordered scan. The cursor records its ordering, so one taken
+  under another `order_by` is a 400. `GET /admin/tables/{id}` lists them as `sorts`.
+- `folds`, `limit`, `cursor`, `after`, `timeout_ms`, `order_by`, `before` and `since` are reserved:
+  `hekla check` refuses a fold parameter with one of those names.
+
+## A row's or a fold's history
+
+`GET /row/history?folds=A,B&<every param>` and `GET /folds/{Fold}/history?<params>` answer
+`{items, next_before, position}`: one item per record that **changed** a listed fold, newest first,
+as `{position, event: {type, at}, changed: {Fold: {before, after}}}`. The event is named, not
+rendered: its payload is `GET /admin/events/{position}`, which stays behind the admin boundary.
+
+- Read off the log, not the store, so it never lags and never 503s. `position` is the log length it
+  read to.
+- Only real changes: a record whose arm ran but left the value as it was is not listed.
+- `before`/`after` render as a row read renders the fold (a sealed one opened, an erased one
+  `null`), and two seals of one plaintext are not a change.
+- Page with `before=<next_before>`; `since=<p>` keeps changes at or above `p`. A history is always
+  folded from the start of the key's log, since a value depends on every record before it, so
+  `since` filters rather than skips work.
+- A fold with an arm that leaves a key part open (a range arm) has **no history**, `400 no_history`,
+  and so does a `/row/history` listing one: a key made after such a record never saw it, so a
+  history read off the log would show a change the stored value never took. `GET /admin/tables/{id}`
+  marks each fold's `history`.
+- One request folds at most 100,000 records across its folds, or it is `400 history_too_long`;
+  listing a fold twice is `400 invalid_input`.
 
 ## Ordering a scan
 

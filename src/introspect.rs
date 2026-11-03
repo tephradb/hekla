@@ -44,7 +44,7 @@ use crate::schema::EventDefs;
 use crate::schema::{EntityDef, EventDef, FieldMeta, ModuleDef, scalar_to_string};
 use crate::secrets::Resolution;
 use crate::store::Store;
-use crate::tables::TableDef;
+use crate::tables::{ColumnDef, TableDef};
 use crate::tags;
 use crate::tags::RESERVED_TAG_PREFIX;
 
@@ -566,14 +566,19 @@ fn self_entity(entity: &EntityDef, count: Option<&u64>) -> Value {
     })
 }
 
-/// One derived table as a reader sees it: its key, every fold kept in it, the indexes a
-/// filter may lead with, and its row count when one was taken.
+/// One group of folds that share a key, as a reader sees it: the key, every fold kept for
+/// it, the filters an index serves beyond the key, the orderings `@index` declares, and its
+/// row count when one was taken.
 ///
-/// One table, not two: a collection column lives in the side table and is listed here
-/// with `collection: true`, because the served row joins them and the split is storage.
+/// **Named by its folds, not a table.** `id` is the storage name, for an operator opening
+/// the SQLite file and for the console's own URL; nothing a reader sends takes it. The key
+/// and every lead are spelled in the first fold's parameters, which is the vocabulary a
+/// `/rows` request listing the folds in this order speaks. A collection fold lives in the
+/// side table and is listed here with `collection: true`, because the served row joins
+/// them and the split is storage.
 pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> Value {
     let side = crate::tables::side_of(tables, main);
-    let columns: Vec<Value> = main
+    let held: Vec<(&ColumnDef, bool)> = main
         .columns
         .iter()
         .map(|column| (column, false))
@@ -581,9 +586,25 @@ pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> 
             side.into_iter()
                 .flat_map(|side| side.columns.iter().map(|column| (column, true))),
         )
+        .collect();
+    let params: &[String] = held.first().map_or(&[], |(column, _)| &column.args);
+    let spoken = |part: &str| {
+        main.key
+            .iter()
+            .position(|(name, _)| name == part)
+            .and_then(|at| params.get(at))
+            .map_or_else(|| part.to_owned(), Clone::clone)
+    };
+    let fold_of = |column: &str| {
+        main.columns
+            .iter()
+            .find(|held| held.name == column)
+            .map_or_else(|| column.to_owned(), |held| held.fold.clone())
+    };
+    let folds: Vec<Value> = held
+        .iter()
         .map(|(column, collection)| {
             json!({
-                "name": column.name,
                 "fold": column.fold,
                 "args": column.args,
                 "kind": column.meta.kind.describe(),
@@ -599,23 +620,27 @@ pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> 
         .iter()
         .map(|(name, meta)| {
             json!({
-                "name": name,
+                "name": spoken(name),
                 "kind": meta.kind.describe(),
                 "identifies": meta.identifies,
             })
         })
         .collect();
+    // The key parts a range arm's index leads with. A sort's index is listed under `sorts`.
+    let indexes: Vec<Vec<String>> = main
+        .indexes
+        .iter()
+        .filter(|index| !main.sorts.iter().any(|sort| sort.index == index.name))
+        .map(|index| index.columns.iter().map(|part| spoken(part)).collect())
+        .collect();
     json!({
-        "name": main.name,
+        "id": main.name,
         "key": key,
-        "columns": columns,
-        "indexes": main.indexes.iter().map(|index| json!({
-            "name": index.name,
-            "columns": index.columns,
-        })).collect::<Vec<_>>(),
+        "folds": folds,
+        "indexes": indexes,
         "sorts": main.sorts.iter().map(|sort| json!({
-            "column": sort.column,
-            "lead": sort.lead,
+            "fold": fold_of(&sort.column),
+            "lead": sort.lead.iter().map(|part| spoken(part)).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "rows": rows,
     })

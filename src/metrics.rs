@@ -86,7 +86,7 @@ const EFFECT_PROGRESS: &str = "hekla_effect_last_progress_timestamp_seconds";
 const EFFECT_HTTP: &str = "hekla_effect_http_requests_total";
 const READS: &str = "hekla_reads_total";
 const READ_WAITS: &str = "hekla_read_waits_total";
-const TABLE_READS: &str = "hekla_table_reads_total";
+const ROW_READS: &str = "hekla_row_reads_total";
 const FOLD_READS: &str = "hekla_fold_reads_total";
 
 /// Every `CommandOutcome` variant, plus the `error` the 500 paths report. Enumerated so
@@ -279,8 +279,8 @@ fn describe() {
         "Read-your-writes waits, by projector and whether the projector arrived in time."
     );
     describe_counter!(
-        TABLE_READS,
-        "Derived-table read requests, by table and outcome."
+        ROW_READS,
+        "Row read requests (`/rows`, `/row`, `/row/history`), by the first fold listed and outcome."
     );
     describe_counter!(
         FOLD_READS,
@@ -498,10 +498,10 @@ pub fn fold_batch(columns: usize) {
     counter!("hekla_fold_columns_total").increment(columns as u64);
 }
 
-/// One `GET /tables/...` request. The table label is a declared table, never what the URL
-/// carried: a request for a table that does not exist is not counted.
-pub fn table_read(table: &str, outcome: &'static str) {
-    counter!(TABLE_READS, "table" => table.to_owned(), "outcome" => outcome).increment(1);
+/// One `GET /rows`, `/row` or `/row/history` request, labelled by the first fold it lists,
+/// which is always a stored fold: a request naming one that does not exist is not counted.
+pub fn row_read(fold: &str, outcome: &'static str) {
+    counter!(ROW_READS, "fold" => fold.to_owned(), "outcome" => outcome).increment(1);
 }
 
 /// One `GET /folds/...` request, labelled by a declared fold only.

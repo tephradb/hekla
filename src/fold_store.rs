@@ -393,7 +393,9 @@ impl FoldStore {
 /// 1: a sealed cell is a [`SealedCell`] rather than bare ciphertext.
 /// 2: a key a collection column was written for is in its main table too.
 /// 3: a `Timestamp` is stored at one fixed width, so its text order is its time order.
-const FORMAT: i64 = 3;
+/// 4: a table is named by a hash of its key signature, not a name `layout` derived, so a
+/// store of 3 holds every table under a name nothing would drop.
+const FORMAT: i64 = 4;
 
 /// Empty a store written in another format, so it refolds from the log.
 ///

@@ -12,7 +12,7 @@
 
 use std::error::Error as StdError;
 use std::sync::Arc;
-use std::{fmt, mem, slice};
+use std::{fmt, mem};
 
 use anyhow::Context;
 use heklang::host::Log;
@@ -48,16 +48,13 @@ impl fmt::Display for TooLong {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "this history folds more than {MAX_FOLDED} records; ask for fewer columns, or \
+            "this history folds more than {MAX_FOLDED} records; ask for fewer folds, or \
              narrow the fold"
         )
     }
 }
 
 impl StdError for TooLong {}
-
-/// The parameters a history read takes besides the key.
-pub const CONTROL: [&str; 4] = ["columns", "limit", "before", "since"];
 
 /// Which part of a history to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,8 +64,6 @@ pub struct Window {
     /// Changes at or above this position.
     pub since: Option<u64>,
     pub limit: usize,
-    /// The columns asked for by name, or `None` for every one with a history.
-    pub columns: Option<Vec<String>>,
 }
 
 /// The control parameters off a query string, and the key parameters left over.
@@ -79,7 +74,6 @@ pub fn parse_window(
         before: None,
         since: None,
         limit: crate::read_api::DEFAULT_LIMIT,
-        columns: None,
     };
     let mut rest = Vec::new();
     let position = |name: &str, value: &str| {
@@ -103,77 +97,35 @@ pub fn parse_window(
             }
             "before" => window.before = Some(position(name, value)?),
             "since" => window.since = Some(position(name, value)?),
-            "columns" => {
-                window.columns = Some(
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
-                )
-            }
             _ => rest.push((name.clone(), value.clone())),
         }
     }
     Ok((window, rest))
 }
 
-/// The columns a history is read over: the ones asked for, or every column that has one.
-pub fn chosen<'a>(
-    columns: &'a [&'a ColumnDef],
-    asked: Option<&[String]>,
-    table: &str,
-) -> Result<Vec<&'a ColumnDef>, Refusal> {
-    if let Some(asked) = asked
-        && let Some((_, name)) = asked
-            .iter()
-            .enumerate()
-            .find(|(at, name)| asked[..*at].contains(name))
-    {
-        return Err(Refusal {
-            code: "invalid_input",
-            message: format!("`{name}` is asked for twice"),
-        });
+/// Refuse a read over any fold that has no history, naming every one that does not.
+pub fn check(columns: &[&ColumnDef]) -> Result<(), Refusal> {
+    let without: Vec<&ColumnDef> = columns.iter().copied().filter(|c| !c.history()).collect();
+    if without.is_empty() {
+        Ok(())
+    } else {
+        Err(no_history(&without))
     }
-    let Some(asked) = asked else {
-        let kept: Vec<&ColumnDef> = columns.iter().copied().filter(|c| c.history()).collect();
-        if kept.is_empty() {
-            return Err(no_history(table, columns));
-        }
-        return Ok(kept);
-    };
-    asked
-        .iter()
-        .map(|name| {
-            let column = columns
-                .iter()
-                .find(|column| &column.name == name)
-                .ok_or_else(|| Refusal {
-                    code: "invalid_input",
-                    message: format!("`{name}` is not a column of `{table}`"),
-                })?;
-            if !column.history() {
-                return Err(no_history(table, slice::from_ref(column)));
-            }
-            Ok(*column)
-        })
-        .collect()
 }
 
-fn no_history(table: &str, columns: &[&ColumnDef]) -> Refusal {
+fn no_history(columns: &[&ColumnDef]) -> Refusal {
     let names: Vec<String> = columns
         .iter()
         .map(|column| match column.ranged_through.as_deref() {
-            Some(ranged) if ranged == column.fold => format!("`{}`", column.name),
-            Some(ranged) => format!("`{}` (through `{ranged}`)", column.name),
-            None => format!("`{}`", column.name),
+            Some(ranged) if ranged == column.fold => format!("`{}`", column.fold),
+            Some(ranged) => format!("`{}` (through `{ranged}`)", column.fold),
+            None => format!("`{}`", column.fold),
         })
         .collect();
     Refusal {
         code: "no_history",
         message: format!(
-            "{} of `{table}` has no history: a fold it depends on has an arm that leaves a key \
+            "{} has no history: a fold it depends on has an arm that leaves a key \
              part open, so a key made after such a record never saw it, and a history read off \
              the log would report a change the stored column never took",
             names.join(", ")
@@ -326,7 +278,7 @@ pub fn read(
         for step in &group {
             let column = columns[step.column];
             changed.insert(
-                column.name.clone(),
+                column.fold.clone(),
                 json!({
                     "before": render(table, column, &step.before, keystore)?,
                     "after": render(table, column, &step.after, keystore)?,

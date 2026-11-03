@@ -37,7 +37,7 @@ use crate::ui;
 const COMMANDS_TAG: &str = "commands";
 const OPERATIONS_TAG: &str = "operations";
 const INTROSPECTION_TAG: &str = "introspection";
-const TABLES_TAG: &str = "tables";
+const FOLDS_TAG: &str = "folds";
 
 // ---------------------------------------------------------------------------
 // The surface
@@ -61,8 +61,8 @@ pub struct Surface<'a> {
     pub projectors: Vec<ProjectorSurface<'a>>,
     pub effects: Vec<EffectSurface<'a>>,
     pub events: Vec<(&'a str, &'a EventDef)>,
-    /// The derived tables a reader can name, each with the side table its collections
-    /// live in, since the served row joins the two.
+    /// The stored folds grouped by key, each group with the side table its collections
+    /// live in, since a served row joins the two.
     pub tables: Vec<TableSurface>,
 }
 
@@ -163,10 +163,6 @@ impl<'a> Surface<'a> {
         }
     }
 
-    fn table_names(&self) -> Vec<&str> {
-        self.tables.iter().map(|t| t.main.name.as_str()).collect()
-    }
-
     fn projector_names(&self) -> Vec<&str> {
         self.projectors.iter().map(|p| p.name).collect()
     }
@@ -243,21 +239,15 @@ pub fn build(surface: &Surface) -> Value {
             );
         }
     }
+    if !surface.tables.is_empty() {
+        paths.insert(server::ROWS_ROUTE.to_owned(), rows_path(surface));
+        paths.insert(server::ROW_ROUTE.to_owned(), row_path(surface));
+        paths.insert(
+            server::ROW_HISTORY_ROUTE.to_owned(),
+            row_history_path(surface),
+        );
+    }
     for table in &surface.tables {
-        paths.insert(
-            format!("/tables/{}", table.main.name),
-            table_scan_path(table, &names),
-        );
-        paths.insert(
-            format!("/tables/{}/row", table.main.name),
-            table_row_path(table, &names),
-        );
-        if table.columns().any(|column| column.history()) {
-            paths.insert(
-                format!("/tables/{}/history", table.main.name),
-                table_history_path(table),
-            );
-        }
         for column in table.columns() {
             paths.insert(format!("/folds/{}", column.fold), fold_path(table, column));
             if column.history() {
@@ -301,7 +291,6 @@ pub fn build(surface: &Surface) -> Value {
 struct ComponentNames {
     events: HashMap<String, String>,
     entities: HashMap<(String, String), String>,
-    tables: HashMap<String, String>,
 }
 
 impl ComponentNames {
@@ -340,24 +329,11 @@ impl ComponentNames {
                 entities.insert((projector.name.to_owned(), entity.name.clone()), key);
             }
         }
-        let mut tables = HashMap::new();
-        for table in &surface.tables {
-            let key = claim(format!("table.{}", component_name(&table.main.name)));
-            tables.insert(table.main.name.clone(), key);
-        }
-        ComponentNames {
-            events,
-            entities,
-            tables,
-        }
+        ComponentNames { events, entities }
     }
 
     fn event(&self, event_type: &str) -> &str {
         &self.events[event_type]
-    }
-
-    fn table(&self, table: &str) -> &str {
-        &self.tables[table]
     }
 
     fn entity(&self, projector: &str, entity: &str) -> &str {
@@ -471,8 +447,8 @@ fn tags(surface: &Surface) -> Value {
     }
     if !surface.tables.is_empty() {
         out.push(json!({
-            "name": TABLES_TAG,
-            "description": TABLES_TAG_DESCRIPTION,
+            "name": FOLDS_TAG,
+            "description": FOLDS_TAG_DESCRIPTION,
         }));
     }
     out.push(json!({
@@ -652,12 +628,12 @@ fn read_unavailable_response() -> Value {
     response
 }
 
-const TABLES_TAG_DESCRIPTION: &str = "\
-The derived tables: every storable named fold, kept for every key. A table is one key \
-signature, a row is one key, and a column is one fold's value for it. No projector \
-writes them; they follow the log on their own, every table at one position, so a row is \
-never half updated and two tables are never read at different points. A column a deploy \
-changed is refolded before any table is served again.";
+const FOLDS_TAG_DESCRIPTION: &str = "\
+The stored folds: every storable named fold, kept for every key and read by name. \
+`/folds/{Fold}` reads one fold, and `/rows`, `/row` and `/row/history` read several that \
+share a key at once. No projector writes them; they follow the log on their own, all at \
+one position, so a row is never half updated and two folds are never read at different \
+points. A fold a deploy changed is refolded before any is served again.";
 
 const TABLE_READ_YOUR_WRITES: &str = "\
 Pass `after` with the `positions.last` a command returned to block until the derived \
@@ -689,73 +665,83 @@ fn table_unavailable_response() -> Value {
     response
 }
 
-/// The key parts a table's filters and row reads name, as the query parameters they are.
-fn key_params(table: &TableDef, required: bool) -> Vec<Value> {
-    table
-        .key
+/// The folds that can be read together, one group per key, for the `folds` parameter.
+fn groups(surface: &Surface) -> String {
+    surface
+        .tables
         .iter()
-        .map(|(name, meta)| {
-            let mut param = query_param(
-                name,
-                &format!(
-                    "The `{name}` part of the key{}.",
-                    meta.identifies
-                        .as_deref()
-                        .map(|subject| format!(", a `{subject}` id"))
-                        .unwrap_or_default()
-                ),
-                field_schema(&meta.kind),
-            );
-            param["required"] = json!(required);
-            param
+        .map(|table| {
+            let folds: Vec<String> = table
+                .columns()
+                .map(|column| format!("`{}`", column.fold))
+                .collect();
+            format!("({})", folds.join(", "))
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
-/// The range bounds a scan takes on each key part with an order, for the reason
-/// [`range_params`] gives a projector's columns.
-fn key_range_params(table: &TableDef) -> Vec<Value> {
-    let mut out = Vec::new();
-    for (name, meta) in &table.key {
-        if !meta.kind.base().is_comparable() {
-            continue;
-        }
-        for (operator, lower, bound) in read_api::RANGE_OPERATORS {
-            let end = if lower { "at or above" } else { "at or below" };
-            let end = match bound {
-                read_api::Bound::Inclusive => end.to_owned(),
-                read_api::Bound::Exclusive => end.replace("at or ", ""),
-            };
-            out.push(query_param(
-                &format!("{name}.{operator}"),
-                &format!(
-                    "Match rows whose `{name}` is {end} this. One key part per request may \
-                     carry a range, and it must be the part right after the pinned ones, in \
-                     the key or in an index. Both ends may be given together.",
-                ),
-                field_schema(&meta.kind),
-            ));
-        }
-    }
-    out
+/// Every stored fold, for the `folds` parameter's description.
+fn folds_param(surface: &Surface) -> Value {
+    let mut param = query_param(
+        "folds",
+        &format!(
+            "Comma-separated folds to read, which must share a key. The key is named with \
+             the first one's parameters, and a row carries each fold's value under its own \
+             name. These can be read together: {}.",
+            groups(surface)
+        ),
+        json!({ "type": "string" }),
+    );
+    param["required"] = json!(true);
+    param
 }
 
-fn key_list(table: &TableDef) -> String {
-    let parts: Vec<String> = table
-        .key
-        .iter()
-        .map(|(name, _)| format!("`{name}`"))
-        .collect();
-    if parts.is_empty() {
-        "nothing, so it holds one row".to_owned()
-    } else {
-        parts.join(", ")
-    }
+/// The key, as the first listed fold's parameters: which ones depends on `folds`, so the
+/// document gives them as a free-form object a client spreads into the query string.
+fn key_param(required: bool, scan: bool) -> Value {
+    let mut param = query_param(
+        "key",
+        &if scan {
+            format!(
+                "The first listed fold's parameters to filter on, each `<param>=<value>`. \
+                 Equality on any set of them that the key or an index serves, plus at most one \
+                 range, `<param>.<op>=<value>` with `<op>` one of {}, on the parameter the \
+                 key or an index orders right after the pinned ones. Anything else would be a \
+                 table scan, so it is a 400 whose message names the sets that are served.",
+                read_api::RANGE_OPERATORS
+                    .iter()
+                    .map(|(word, ..)| format!("`{word}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            "Every parameter of the first listed fold, each `<param>=<value>`.".to_owned()
+        },
+        json!({ "type": "object", "additionalProperties": { "type": "string" } }),
+    );
+    param["required"] = json!(required);
+    param["style"] = json!("form");
+    param["explode"] = json!(true);
+    param
 }
 
-fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
-    let name = &table.main.name;
+/// A served row: the key under the first fold's parameter names, then each listed fold's
+/// value under its own name. Which properties those are depends on `folds`.
+fn row_item() -> Value {
+    json!({
+        "type": "object",
+        "description": "One key: each of the first listed fold's parameters, then each listed \
+            fold's value under the fold's name. A fold answering `none`, or a sealed one whose \
+            subject is erased, is absent.",
+        "additionalProperties": true,
+    })
+}
+
+fn rows_path(surface: &Surface) -> Value {
     let mut parameters = vec![
+        folds_param(surface),
+        key_param(false, true),
         query_param(
             "limit",
             &format!(
@@ -772,80 +758,73 @@ fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
             json!({ "type": "string" }),
         ),
     ];
-    parameters.extend(key_params(&table.main, false));
-    parameters.extend(key_range_params(&table.main));
-    if !table.main.sorts.is_empty() {
-        let mut orderings: Vec<String> = Vec::new();
-        let mut ways: Vec<String> = Vec::new();
+    let mut orderings: Vec<String> = Vec::new();
+    for table in &surface.tables {
         for sort in &table.main.sorts {
-            for sign in ["", "-"] {
-                let token = format!("{sign}{}", sort.column);
-                if !orderings.contains(&token) {
-                    orderings.push(token);
-                }
-            }
-            ways.push(if sort.lead.is_empty() {
-                format!("`{}`", sort.column)
+            let Some(column) = table.columns().find(|column| column.name == sort.column) else {
+                continue;
+            };
+            let lead: Vec<&str> = sort
+                .lead
+                .iter()
+                .filter_map(|part| {
+                    let at = table.main.key.iter().position(|(name, _)| name == part)?;
+                    column.args.get(at).map(String::as_str)
+                })
+                .collect();
+            orderings.push(if lead.is_empty() {
+                format!("`{}`", column.fold)
             } else {
-                format!("`{}` with ({}) pinned", sort.column, sort.lead.join(", "))
+                format!("`{}` with ({}) pinned", column.fold, lead.join(", "))
             });
         }
+    }
+    if !orderings.is_empty() {
         parameters.push(query_param(
             "order_by",
             &format!(
-                "Order by a column a fold's `@index` declares instead of the key, `-` first to \
-                 reverse it: {}. Pin exactly the key parts that lead that index, and no range. \
-                 Rows whose column is absent are left out, and the key breaks ties.",
-                ways.join(", ")
+                "Order by a fold whose `@index` orders this key instead of by the key, `-` \
+                 first to reverse it: {}. Each is spelled in that fold's own parameters, which \
+                 is how to pin it when it is listed first in `folds`; listed later, pin the same \
+                 key parts by the first fold's names. Pin exactly the parameters its `@index` \
+                 names, and no range. Rows whose value is absent are left out, and the key breaks ties.",
+                orderings.join(", ")
             ),
-            json!({ "type": "string", "enum": orderings }),
+            json!({ "type": "string" }),
         ));
     }
     parameters.extend(wait_params());
-    let indexes: Vec<String> = table
-        .main
-        .indexes
-        .iter()
-        .map(|index| format!("({})", index.columns.join(", ")))
-        .collect();
     let page = json!({
         "type": "object",
         "properties": {
-            "items": { "type": "array", "items": schema_ref(names.table(name)) },
+            "items": { "type": "array", "items": row_item() },
             "next_cursor": {
                 "type": ["string", "null"],
                 "description": "Pass as `cursor` for the next page. Null on the last page.",
             },
-            "position": position_schema("The derived tables' log position, read in the same snapshot as the rows."),
+            "position": position_schema("The stored folds' log position, read in the same snapshot as the rows."),
         },
         "required": ["items", "next_cursor", "position"],
         "additionalProperties": false,
     });
     json!({
         "get": {
-            "tags": [TABLES_TAG],
-            "operationId": format!("scan_table_{}", identifier(name)),
-            "summary": format!("scan the `{name}` table"),
+            "tags": [FOLDS_TAG],
+            "operationId": "scan_rows",
+            "summary": "scan the rows of folds that share a key",
             "description": format!(
-                "The rows of `{name}`, keyed on {}, in key order and cursor-paginated. A \
-                 filter is equality on the leading parts of the key{}, plus an optional range \
-                 on the part right after them; anything else would be a table scan, so it is \
-                 a 400 rather than a slow query. {TABLE_READ_YOUR_WRITES}",
-                key_list(&table.main),
-                if indexes.is_empty() {
-                    String::new()
-                } else {
-                    format!(", or of an index a range arm derived: {}", indexes.join(", "))
-                },
+                "Every key the listed folds hold, in key order or by an `@index`, \
+                 cursor-paginated. {TABLE_READ_YOUR_WRITES}"
             ),
             "parameters": parameters,
             "responses": {
                 "200": response("one page of rows, and the position they were read at", page),
                 "400": response(
-                    "a malformed parameter, or a filter no index can serve",
+                    "a malformed parameter, folds that do not share a key, a fold that is not \
+                     stored, or a filter no index can serve",
                     schema_ref("Error"),
                 ),
-                "404": response("no such table", schema_ref("Error")),
+                "404": response("no such fold", schema_ref("Error")),
                 "503": table_unavailable_response(),
                 "500": response("internal error", schema_ref("Error")),
             },
@@ -853,8 +832,75 @@ fn table_scan_path(table: &TableSurface, names: &ComponentNames) -> Value {
     })
 }
 
+fn row_path(surface: &Surface) -> Value {
+    let mut parameters = vec![folds_param(surface), key_param(true, false)];
+    parameters.extend(wait_params());
+    let item = json!({
+        "type": "object",
+        "properties": {
+            "item": row_item(),
+            "position": position_schema("The stored folds' log position, read in the same snapshot as the row."),
+        },
+        "required": ["item", "position"],
+        "additionalProperties": false,
+    });
+    json!({
+        "get": {
+            "tags": [FOLDS_TAG],
+            "operationId": "read_row",
+            "summary": "read the listed folds for one key",
+            "description": format!(
+                "The listed folds' values for the key the first one's parameters name, every \
+                 parameter given. {TABLE_READ_YOUR_WRITES}"
+            ),
+            "parameters": parameters,
+            "responses": {
+                "200": response("the row, and the position it was read at", item),
+                "400": response(
+                    "a parameter is missing or malformed, folds that do not share a key, or a \
+                     fold that is not stored",
+                    schema_ref("Error"),
+                ),
+                "404": response(
+                    "no such fold, or no event has named this key, so every fold holds its seed",
+                    schema_ref("Error"),
+                ),
+                "503": table_unavailable_response(),
+                "500": response("internal error", schema_ref("Error")),
+            },
+        }
+    })
+}
+
+fn row_history_path(surface: &Surface) -> Value {
+    let mut parameters = vec![folds_param(surface), key_param(true, false)];
+    parameters.extend(history_params());
+    json!({
+        "get": {
+            "tags": [FOLDS_TAG],
+            "operationId": "row_history",
+            "summary": "the history of the listed folds for one key",
+            "description": format!(
+                "Every record that changed one of the listed folds for this key, newest first, \
+                 one entry per record with each fold it changed. Every listed fold must have a \
+                 history. {HISTORY_NOTE}"
+            ),
+            "parameters": parameters,
+            "responses": {
+                "200": response("a page of changes", history_page()),
+                "400": response(
+                    "a parameter is missing, unknown or malformed, folds that do not share a \
+                     key, or a fold with no history",
+                    schema_ref("Error"),
+                ),
+                "404": response("no such fold", schema_ref("Error")),
+            },
+        },
+    })
+}
+
 /// `/folds/{Name}`: one stored fold's value for one key, its parameters named as the fold
-/// declares them rather than as the table spells its key parts.
+/// declares them.
 fn fold_args(table: &TableSurface, column: &ColumnDef) -> Vec<Value> {
     column
         .args
@@ -910,7 +956,7 @@ fn history_page() -> Value {
         "properties": {
             "items": {
                 "type": "array",
-                "description": "Newest first, one per record that changed a column it reads.",
+                "description": "Newest first, one per record that changed a fold it reads.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -927,7 +973,7 @@ fn history_page() -> Value {
                         },
                         "changed": {
                             "type": "object",
-                            "description": "Each column it changed, as `{before, after}`, rendered as a row read renders them.",
+                            "description": "Each fold it changed, by name, as `{before, after}`, rendered as a row read renders them.",
                             "additionalProperties": {
                                 "type": "object",
                                 "properties": { "before": {}, "after": {} },
@@ -949,17 +995,17 @@ fn history_page() -> Value {
     })
 }
 
-const HISTORY_NOTE: &str = "Read off the log rather than the derived store, so it is \
-    never behind and never waits. A fold whose arm leaves a key part open has no history: \
-    a key made after such a record never saw it, and a history read off the log would \
-    show a change the stored column never took.";
+const HISTORY_NOTE: &str = "Read off the log rather than the stored folds, so it is never \
+    behind and never waits. A fold whose arm leaves a key part open has no history: a key \
+    made after such a record never saw it, and a history read off the log would show a \
+    change the stored value never took.";
 
 fn fold_history_path(table: &TableSurface, column: &ColumnDef) -> Value {
     let mut parameters = fold_args(table, column);
     parameters.extend(history_params());
     json!({
         "get": {
-            "tags": [TABLES_TAG],
+            "tags": [FOLDS_TAG],
             "operationId": format!("fold_history_{}", identifier(&column.fold)),
             "summary": format!("the history of `{}` for one key", column.fold),
             "description": format!(
@@ -972,45 +1018,6 @@ fn fold_history_path(table: &TableSurface, column: &ColumnDef) -> Value {
                 "200": response("a page of changes", history_page()),
                 "400": response(
                     "a parameter is missing, unknown or malformed",
-                    schema_ref("Error"),
-                ),
-            },
-        },
-    })
-}
-
-fn table_history_path(table: &TableSurface) -> Value {
-    let name = &table.main.name;
-    let mut parameters = key_params(&table.main, true);
-    let columns: Vec<&str> = table
-        .columns()
-        .filter(|column| column.history())
-        .map(|column| column.name.as_str())
-        .collect();
-    parameters.push(query_param(
-        "columns",
-        &format!(
-            "Comma-separated columns to read the history of: {}. Every one that has a history \
-             when left out.",
-            columns.join(", ")
-        ),
-        json!({ "type": "string" }),
-    ));
-    parameters.extend(history_params());
-    json!({
-        "get": {
-            "tags": [TABLES_TAG],
-            "operationId": format!("table_history_{}", identifier(name)),
-            "summary": format!("the history of one `{name}` row"),
-            "description": format!(
-                "Every record that changed one of this row's columns, newest first, one entry \
-                 per record with each column it changed. {HISTORY_NOTE}"
-            ),
-            "parameters": parameters,
-            "responses": {
-                "200": response("a page of changes", history_page()),
-                "400": response(
-                    "a parameter is missing, unknown or malformed, or a column has no history",
                     schema_ref("Error"),
                 ),
             },
@@ -1036,20 +1043,20 @@ fn fold_path(table: &TableSurface, column: &ColumnDef) -> Value {
         "type": "object",
         "properties": {
             "value": value,
-            "position": position_schema("The derived tables' log position, read in the same snapshot as the value."),
+            "position": position_schema("The stored folds' log position, read in the same snapshot as the value."),
         },
         "required": ["value", "position"],
         "additionalProperties": false,
     });
     json!({
         "get": {
-            "tags": [TABLES_TAG],
+            "tags": [FOLDS_TAG],
             "operationId": format!("read_fold_{}", identifier(&column.fold)),
             "summary": format!("read `{}` for one key", column.fold),
             "description": format!(
-                "The value of the named fold `{}`, kept as the `{}` column of the derived table \
-                 `{}`. Every parameter is required. {TABLE_READ_YOUR_WRITES}",
-                column.fold, column.name, table.main.name,
+                "The value of the named fold `{}`. Every parameter is required. \
+                 {TABLE_READ_YOUR_WRITES}",
+                column.fold,
             ),
             "parameters": parameters,
             "responses": {
@@ -1066,95 +1073,6 @@ fn fold_path(table: &TableSurface, column: &ColumnDef) -> Value {
                 "500": response("internal error", schema_ref("Error")),
             },
         }
-    })
-}
-
-fn table_row_path(table: &TableSurface, names: &ComponentNames) -> Value {
-    let name = &table.main.name;
-    let mut parameters = key_params(&table.main, true);
-    parameters.extend(wait_params());
-    let item = json!({
-        "type": "object",
-        "properties": {
-            "item": schema_ref(names.table(name)),
-            "position": position_schema("The derived tables' log position, read in the same snapshot as the row."),
-        },
-        "required": ["item", "position"],
-        "additionalProperties": false,
-    });
-    json!({
-        "get": {
-            "tags": [TABLES_TAG],
-            "operationId": format!("read_table_{}", identifier(name)),
-            "summary": format!("read one `{name}` row by its key"),
-            "description": format!(
-                "The row whose key is {}, every part given. {TABLE_READ_YOUR_WRITES}",
-                key_list(&table.main),
-            ),
-            "parameters": parameters,
-            "responses": {
-                "200": response("the row, and the position it was read at", item),
-                "400": response(
-                    "a key part is missing or malformed",
-                    schema_ref("Error"),
-                ),
-                "404": response(
-                    "no such table, or no event has named this key, so every column would \
-                     hold its fold's seed",
-                    schema_ref("Error"),
-                ),
-                "503": table_unavailable_response(),
-                "500": response("internal error", schema_ref("Error")),
-            },
-        }
-    })
-}
-
-/// A served row of a derived table: its key parts, then one property per fold.
-fn table_schema(table: &TableSurface) -> Value {
-    let mut properties = Map::new();
-    let mut required = Vec::new();
-    for (name, meta) in &table.main.key {
-        let mut schema = field_schema(&meta.kind);
-        schema["description"] = json!("A part of the row's key.");
-        if let Some(subject) = &meta.identifies {
-            schema["x-hekla-identifies"] = json!(subject);
-        }
-        properties.insert(name.clone(), schema);
-        required.push(json!(name));
-    }
-    for column in table.columns() {
-        let mut schema = field_schema(&column.meta.kind);
-        let mut notes = vec![format!(
-            "The value of the `{}` fold for this key.",
-            column.fold
-        )];
-        if let Some(subject) = column.meta.subject() {
-            notes.push(format!(
-                "Sealed under `{subject}`: absent once that subject is erased."
-            ));
-            schema["x-hekla-subject"] = json!(subject);
-        }
-        schema["description"] = json!(notes.join(" "));
-        schema["x-hekla-fold"] = json!(column.fold);
-        properties.insert(column.name.clone(), schema);
-        // A NULL column is left out of a row, and so is a sealed one whose subject is
-        // gone, so neither can be required.
-        if !column.meta.kind.is_nullable() && column.meta.sealed_under.is_none() {
-            required.push(json!(column.name));
-        }
-    }
-    json!({
-        "type": "object",
-        "title": table.main.name,
-        "description": format!(
-            "A row of the derived table `{}`, keyed on {}.",
-            table.main.name,
-            key_list(&table.main)
-        ),
-        "properties": Value::Object(properties),
-        "required": required,
-        "additionalProperties": false,
     })
 }
 
@@ -1704,10 +1622,7 @@ fn introspection_paths(surface: &Surface) -> Vec<(String, Value)> {
             projector_path(&projectors),
         ),
         (server::ADMIN_TABLES_ROUTE.to_owned(), tables_path()),
-        (
-            server::ADMIN_TABLE_ROUTE.to_owned(),
-            table_path(&surface.table_names()),
-        ),
+        (server::ADMIN_TABLE_ROUTE.to_owned(), table_path()),
         (server::ADMIN_COMMANDS_ROUTE.to_owned(), commands_path()),
         (
             server::ADMIN_COMMAND_ROUTE.to_owned(),
@@ -2334,7 +2249,7 @@ fn tables_path() -> Value {
         "type": "object",
         "properties": {
             "tables": { "type": "array", "items": schema_ref("TableDetail") },
-            "head": position_schema("The one position every column of every table is folded to."),
+            "head": position_schema("The one position every stored fold is folded to."),
             "log_head": position_schema("The log's head position."),
             "behind": {
                 "type": "integer",
@@ -2344,7 +2259,7 @@ fn tables_path() -> Value {
             },
             "serving": {
                 "type": "boolean",
-                "description": "Whether `/tables` answers. False while a column is behind, \
+                "description": "Whether `/rows` and `/folds` answer. False while a column is behind, \
                     while the store is folding from an empty start over a log that already \
                     has events, and on a process that keeps no derived tables.",
             },
@@ -2358,33 +2273,38 @@ fn tables_path() -> Value {
         "get": {
             "tags": [INTROSPECTION_TAG],
             "operationId": "list_tables",
-            "summary": "every derived table and the store's one position",
-            "description": "Reads no table, so each table's `rows` is null here. Ask for one \
-                table to count it.",
-            "responses": { "200": response("every derived table", body) },
+            "summary": "every group of folds that share a key, and the store's one position",
+            "description": "Reads no row, so each group's `rows` is null here. Ask for one \
+                group to count it.",
+            "responses": { "200": response("every group of stored folds", body) },
         }
     })
 }
 
-fn table_path(tables: &[&str]) -> Value {
+fn table_path() -> Value {
     json!({
         "get": {
             "tags": [INTROSPECTION_TAG],
             "operationId": "get_table",
-            "summary": "one derived table, its key and the fold behind every column",
+            "summary": "one group of folds that share a key, and the filters and orderings it serves",
             "parameters": [
-                path_param("name", "The table.", name_schema(tables)),
+                path_param(
+                    "id",
+                    "The group's storage id, as `/admin/tables` lists it. Opaque: a hash of the \
+                     key, and nothing a read takes.",
+                    json!({ "type": "string" }),
+                ),
                 query_param(
                     "counts",
                     "Include the row count (default `false`). Opt-in because a count is a \
-                     scan of the whole table.",
+                     scan of every row.",
                     json!({ "type": "boolean", "default": false }),
                 ),
             ],
             "responses": {
-                "200": response("the table", schema_ref("TableDetail")),
+                "200": response("the group", schema_ref("TableDetail")),
                 "400": response("a malformed `counts`", schema_ref("Error")),
-                "404": response("no such table", schema_ref("Error")),
+                "404": response("no such group", schema_ref("Error")),
                 "500": response("the store could not be read", schema_ref("Error")),
             },
         }
@@ -2392,12 +2312,17 @@ fn table_path(tables: &[&str]) -> Value {
 }
 
 fn table_detail_schema() -> Value {
+    let names = json!({ "type": "array", "items": { "type": "string" } });
     json!({
         "type": "object",
-        "description": "A derived table: one key signature, one row per key, one column \
-            per fold.",
+        "description": "The folds that share one key, stored together with one row per key. \
+            The key and every lead are named with the first fold's parameters, which is what \
+            a `/rows` request listing the folds in this order takes.",
         "properties": {
-            "name": { "type": "string" },
+            "id": {
+                "type": "string",
+                "description": "The storage id, for opening the SQLite file. No read takes it.",
+            },
             "key": {
                 "type": "array",
                 "items": {
@@ -2411,26 +2336,25 @@ fn table_detail_schema() -> Value {
                     "additionalProperties": false,
                 },
             },
-            "columns": {
+            "folds": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string" },
                         "fold": { "type": "string" },
                         "args": {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "The fold's parameter names in key order: what \
-                                `/folds/{fold}` takes, where the table names its key parts.",
+                                `/folds/{fold}` takes.",
                         },
                         "kind": { "type": "string" },
                         "optional": { "type": "boolean" },
                         "subject": { "type": ["string", "null"] },
                         "collection": {
                             "type": "boolean",
-                            "description": "Stored in the table's side table, and joined \
-                                back into every row served.",
+                            "description": "Stored beside the row, and joined back into every \
+                                row served.",
                         },
                         "history": {
                             "type": "boolean",
@@ -2438,38 +2362,32 @@ fn table_detail_schema() -> Value {
                                 fold with an arm that leaves a key part open.",
                         },
                     },
-                    "required": ["name", "fold", "args", "kind", "optional", "subject", "collection", "history"],
+                    "required": ["fold", "args", "kind", "optional", "subject", "collection", "history"],
                     "additionalProperties": false,
                 },
             },
             "indexes": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string" },
-                        "columns": { "type": "array", "items": { "type": "string" } },
-                    },
-                    "required": ["name", "columns"],
-                    "additionalProperties": false,
-                },
+                "description": "The parameters an index a range arm derived leads with, beyond \
+                    the key's own order.",
+                "items": names,
             },
             "sorts": {
                 "type": "array",
-                "description": "The orderings a scan may ask for with `order_by`: a column a fold's `@index` declares, after the key parts that must be pinned to use it.",
+                "description": "The orderings a scan may ask for with `order_by`: a fold whose `@index` orders this key, and the parameters that must be pinned to use it.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "column": { "type": "string" },
-                        "lead": { "type": "array", "items": { "type": "string" } },
+                        "fold": { "type": "string" },
+                        "lead": names,
                     },
-                    "required": ["column", "lead"],
+                    "required": ["fold", "lead"],
                     "additionalProperties": false,
                 },
             },
             "rows": { "type": ["integer", "null"], "minimum": 0 },
         },
-        "required": ["name", "key", "columns", "indexes", "sorts", "rows"],
+        "required": ["id", "key", "folds", "indexes", "sorts", "rows"],
         "additionalProperties": false,
     })
 }
@@ -2723,12 +2641,6 @@ fn schemas(surface: &Surface, names: &ComponentNames) -> Value {
     out.insert("Status".to_owned(), status_schema());
     out.insert("ProjectorStatus".to_owned(), projector_status_schema());
     out.insert("TableStatus".to_owned(), table_status_schema());
-    for table in &surface.tables {
-        out.insert(
-            names.table(&table.main.name).to_owned(),
-            table_schema(table),
-        );
-    }
     out.insert("EffectStatus".to_owned(), effect_status_schema());
     out.insert("LogEvent".to_owned(), log_event_schema());
     out.insert("SubjectState".to_owned(), subject_state_schema());
@@ -3251,7 +3163,7 @@ fn table_status_schema() -> Value {
             },
             "serving": {
                 "type": "boolean",
-                "description": "Whether `/tables` answers: no column behind, not folding from an \
+                "description": "Whether `/rows` and `/folds` answer: no column behind, not folding from an \
                                 empty start, and a store this process keeps.",
             },
             "running": { "type": "boolean" },

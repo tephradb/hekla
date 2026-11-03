@@ -114,14 +114,15 @@ fn the_document_describes_the_projects_real_modules() {
     ] {
         assert!(paths.contains_key(path), "missing read path {path}");
     }
-    // The derived table the named folds imply, both operations.
+    // The stored folds: the row routes once each, and each fold by name with its history.
     for path in [
-        "/tables/user",
-        "/tables/user/row",
+        "/rows",
+        "/row",
+        "/row/history",
         "/folds/UserName",
         "/folds/UserWelcomed",
     ] {
-        assert!(paths.contains_key(path), "missing table path {path}");
+        assert!(paths.contains_key(path), "missing fold path {path}");
     }
 
     // One tag per projector, in the declared render order.
@@ -137,7 +138,7 @@ fn the_document_describes_the_projects_real_modules() {
             "commands",
             "read: UserStats",
             "read: Users",
-            "tables",
+            "folds",
             "operations",
             "introspection",
         ],

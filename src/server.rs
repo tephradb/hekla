@@ -1,6 +1,6 @@
 //! The HTTP surface: `POST /commands/{name}`, the generated read API
-//! (`GET /read/{projector}/{entity}[/{key}]`), the derived tables
-//! (`GET /tables/{table}[/row]`) and their folds one at a time (`GET /folds/{fold}`),
+//! (`GET /read/{projector}/{entity}[/{key}]`), the stored folds by row (`GET /rows`,
+//! `GET /row`, `GET /row/history`) and one at a time (`GET /folds/{fold}[/history]`),
 //! `POST /projectors/{name}/replay`,
 //! `POST /effects/{name}/skip/{position}`, `GET /status`, `GET /health`, the Prometheus
 //! scrape at `GET /metrics`, the generated `GET /openapi.json`, a Scalar reference UI
@@ -58,8 +58,7 @@ use crate::read_api;
 use crate::runtime::{self, Runtime, error_body};
 use crate::schema::{EntityDef, EventDef};
 use crate::store::Store;
-use crate::table_read;
-use crate::tables::{ColumnDef, side_of};
+use crate::table_read::{self, Unselected};
 use crate::ui;
 use crate::validate;
 
@@ -107,9 +106,9 @@ pub async fn serve(
 pub const COMMAND_ROUTE: &str = "/commands/{name}";
 pub const READ_ONE_ROUTE: &str = "/read/{projector}/{entity}/{key}";
 pub const READ_SCAN_ROUTE: &str = "/read/{projector}/{entity}";
-pub const TABLE_SCAN_ROUTE: &str = "/tables/{table}";
-pub const TABLE_ROW_ROUTE: &str = "/tables/{table}/row";
-pub const TABLE_HISTORY_ROUTE: &str = "/tables/{table}/history";
+pub const ROWS_ROUTE: &str = "/rows";
+pub const ROW_ROUTE: &str = "/row";
+pub const ROW_HISTORY_ROUTE: &str = "/row/history";
 pub const FOLD_ROUTE: &str = "/folds/{fold}";
 pub const FOLD_HISTORY_ROUTE: &str = "/folds/{fold}/history";
 pub const REPLAY_ROUTE: &str = "/projectors/{name}/replay";
@@ -133,7 +132,7 @@ pub const ADMIN_INVOCATION_ROUTE: &str = "/admin/effects/{name}/invocations/{pos
 pub const ADMIN_PROJECTORS_ROUTE: &str = "/admin/projectors";
 pub const ADMIN_PROJECTOR_ROUTE: &str = "/admin/projectors/{name}";
 pub const ADMIN_TABLES_ROUTE: &str = "/admin/tables";
-pub const ADMIN_TABLE_ROUTE: &str = "/admin/tables/{name}";
+pub const ADMIN_TABLE_ROUTE: &str = "/admin/tables/{id}";
 pub const ADMIN_COMMANDS_ROUTE: &str = "/admin/commands";
 pub const ADMIN_COMMAND_ROUTE: &str = "/admin/commands/{name}";
 pub const ADMIN_SCHEMA_ROUTE: &str = "/admin/schema";
@@ -209,10 +208,10 @@ fn route_table() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (COMMAND_ROUTE, post(execute)),
         (READ_ONE_ROUTE, get(read_one)),
         (READ_SCAN_ROUTE, get(read_scan)),
-        (TABLE_SCAN_ROUTE, get(table_scan)),
-        (TABLE_ROW_ROUTE, get(table_row)),
+        (ROWS_ROUTE, get(rows_scan)),
+        (ROW_ROUTE, get(row_read)),
         (FOLD_ROUTE, get(fold_read)),
-        (TABLE_HISTORY_ROUTE, get(table_history)),
+        (ROW_HISTORY_ROUTE, get(row_history)),
         (FOLD_HISTORY_ROUTE, get(fold_history)),
         (REPLAY_ROUTE, post(replay)),
         (SKIP_ROUTE, post(skip)),
@@ -1038,15 +1037,6 @@ fn not_caught_up(who: &str, after: u64, timeout: Duration) -> Response {
     response
 }
 
-/// The derived store, if it declares `table`: 404 otherwise.
-fn find_table(runtime: &Runtime, table: &str) -> Result<Arc<FoldShared>, Box<Response>> {
-    let shared = runtime.fold_handle();
-    if table_read::find(shared.tables(), table).is_none() {
-        return Err(Box::new(not_found(&format!("no derived table `{table}`"))));
-    }
-    Ok(Arc::clone(shared))
-}
-
 /// A 503 when the store cannot serve right now, or `None` when it can. `count` records the
 /// outcome against whatever the request named, a table or a fold.
 ///
@@ -1119,67 +1109,6 @@ async fn table_wait(
     ))
 }
 
-fn table_refused(table: &str, refusal: table_read::Refusal) -> Response {
-    metrics::table_read(table, "invalid_input");
-    json_response(400, read_error(refusal.code, &refusal.message))
-}
-
-/// `GET /tables/{table}?<part>=<value>&limit=&cursor=`: a derived table's rows in key
-/// order, filtered for equality on the leading parts of its key, or of an index a range
-/// arm derived. Anything else is a 400, never a table scan. A row is every fold kept for
-/// its key, collections included, with sealed columns opened. An optional `?after=<pos>`
-/// first waits for the store to reach that position, for read-your-writes.
-async fn table_scan(
-    State(runtime): State<Shared>,
-    Path(table): Path<String>,
-    Query(params): Query<Vec<(String, String)>>,
-) -> Response {
-    let shared = match find_table(&runtime, &table) {
-        Ok(shared) => shared,
-        Err(response) => return *response,
-    };
-    let def = table_read::find(shared.tables(), &table).expect("found above");
-    let scan = match table_read::parse_scan(def, &params) {
-        Ok(scan) => scan,
-        Err(refusal) => return table_refused(&table, refusal),
-    };
-    let count = |outcome| metrics::table_read(&table, outcome);
-    if let Some(response) = table_unready(&shared, &count) {
-        return response;
-    }
-    if let Some(response) = table_wait(&shared, &count, &params).await {
-        return response;
-    }
-    let keystore = runtime.keystore_shared().cloned();
-    let name = table.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        let def = table_read::find(shared.tables(), &name).expect("found above");
-        let path = shared.path().context("the derived store has no file")?;
-        table_read::scan(path, shared.tables(), def, &scan, keystore.as_deref())
-    });
-    match task.await {
-        Ok(Ok(page)) => {
-            metrics::table_read(&table, "ok");
-            json_response(
-                200,
-                json!({
-                    "items": page.items,
-                    "next_cursor": page.next_cursor,
-                    "position": page.position,
-                }),
-            )
-        }
-        Ok(Err(err)) => {
-            metrics::table_read(&table, "error");
-            read_failed(err)
-        }
-        Err(err) => {
-            metrics::table_read(&table, "error");
-            task_panicked(err)
-        }
-    }
-}
-
 /// Why a declared fold has no stored value to read. `layout` stores every named fold whose
 /// key some event supplies, query-only ones included (they are read nowhere else, since a
 /// command may not fold one), so the one kind it leaves out is a fold with a parameter no
@@ -1203,26 +1132,125 @@ fn not_stored(shared: &FoldShared, fold: &str) -> String {
          A command can still fold it"
     )
 }
+
+/// The folds a read names, checked against the store: 404 for one nobody declared, 400 for
+/// one declared and not stored or for a list that does not share a key.
+fn picked(runtime: &Runtime, folds: &[String]) -> Result<Arc<FoldShared>, Box<Response>> {
+    let shared = runtime.fold_handle();
+    let names: Vec<&str> = folds.iter().map(String::as_str).collect();
+    match table_read::pick(shared.tables(), &names) {
+        Ok(_) => Ok(Arc::clone(shared)),
+        Err(Unselected::Missing(fold)) => Err(Box::new(match runtime.program().fold(&fold) {
+            Some(_) => json_response(400, read_error("not_stored", &not_stored(shared, &fold))),
+            None => not_found(&format!("no named fold `{fold}`")),
+        })),
+        Err(Unselected::Refused(refusal)) => Err(Box::new(json_response(
+            400,
+            read_error(refusal.code, &refusal.message),
+        ))),
+    }
+}
+
+/// The selection a handler already checked with [`picked`], taken again on the blocking
+/// thread, which needs one it owns the tables for.
+fn repick<'a>(shared: &'a FoldShared, folds: &[String]) -> table_read::Selection<'a> {
+    let names: Vec<&str> = folds.iter().map(String::as_str).collect();
+    table_read::pick(shared.tables(), &names).expect("picked above")
+}
+
+/// A row read's `folds` and the rest of its query string, checked: the shared store and
+/// the folds, or the response that refuses them.
+fn row_request(
+    runtime: &Runtime,
+    params: &[(String, String)],
+) -> Result<(Arc<FoldShared>, Vec<String>, table_read::Params), Box<Response>> {
+    let (folds, rest) = table_read::split_folds(params).map_err(|refusal| {
+        Box::new(json_response(
+            400,
+            read_error(refusal.code, &refusal.message),
+        ))
+    })?;
+    let shared = picked(runtime, &folds)?;
+    Ok((shared, folds, rest))
+}
+
+fn row_refused(fold: &str, refusal: table_read::Refusal) -> Response {
+    metrics::row_read(fold, "invalid_input");
+    json_response(400, read_error(refusal.code, &refusal.message))
+}
+
+/// `GET /rows?folds=<Fold>,...&<param>=<value>&limit=&cursor=&order_by=`: the rows of a
+/// set of folds that share a key, in key order or by a fold's `@index`, filtered for
+/// equality on a set of the first fold's parameters that an index serves. Anything else is
+/// a 400, never a table scan. A row is the key, named as the first fold names it, and
+/// each listed fold's value under its own name. An optional `?after=<pos>` first waits for
+/// the store to reach that position, for read-your-writes.
+async fn rows_scan(
+    State(runtime): State<Shared>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let (shared, folds, rest) = match row_request(&runtime, &params) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    let label = folds[0].clone();
+    let scan = match table_read::parse_scan(&repick(&shared, &folds), &rest) {
+        Ok(scan) => scan,
+        Err(refusal) => return row_refused(&label, refusal),
+    };
+    let count = |outcome| metrics::row_read(&label, outcome);
+    if let Some(response) = table_unready(&shared, &count) {
+        return response;
+    }
+    if let Some(response) = table_wait(&shared, &count, &rest).await {
+        return response;
+    }
+    let keystore = runtime.keystore_shared().cloned();
+    let task = tokio::task::spawn_blocking(move || {
+        let sel = repick(&shared, &folds);
+        let path = shared.path().context("the derived store has no file")?;
+        table_read::scan(path, shared.tables(), &sel, &scan, keystore.as_deref())
+    });
+    match task.await {
+        Ok(Ok(page)) => {
+            metrics::row_read(&label, "ok");
+            json_response(
+                200,
+                json!({
+                    "items": page.items,
+                    "next_cursor": page.next_cursor,
+                    "position": page.position,
+                }),
+            )
+        }
+        Ok(Err(err)) => {
+            metrics::row_read(&label, "error");
+            read_failed(err)
+        }
+        Err(err) => {
+            metrics::row_read(&label, "error");
+            task_panicked(err)
+        }
+    }
+}
+
 /// `GET /folds/{fold}?<param>=<value>...`: one named fold's value for one key, its
 /// arguments named as the fold declares its parameters.
 ///
-/// The same cell `/tables/{table}/row` serves inside a row, addressed the way a caller
-/// already thinks of it. 404 for a key no event has named, 400 for a declared fold nothing
-/// stores, which is a fold this API would have to fold over the whole log on every request
-/// to answer.
+/// The same value `/row?folds=<fold>` serves inside a row. 404 for a key no event has
+/// named, 400 for a declared fold nothing stores, which is a fold this API would have to
+/// fold over the whole log on every request to answer.
 async fn fold_read(
     State(runtime): State<Shared>,
     Path(fold): Path<String>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let shared = Arc::clone(runtime.fold_handle());
-    let Some(at) = table_read::find_fold(shared.tables(), &fold) else {
-        return match runtime.program().fold(&fold) {
-            Some(_) => json_response(400, read_error("not_stored", &not_stored(&shared, &fold))),
-            None => not_found(&format!("no named fold `{fold}`")),
-        };
+    let folds = vec![fold.clone()];
+    let shared = match picked(&runtime, &folds) {
+        Ok(shared) => shared,
+        Err(response) => return *response,
     };
-    let key = match table_read::parse_args(at, &params) {
+    let key = match table_read::parse_key(&repick(&shared, &folds), &params) {
         Ok(key) => key,
         Err(refusal) => {
             metrics::fold_read(&fold, "invalid_input");
@@ -1237,11 +1265,10 @@ async fn fold_read(
         return response;
     }
     let keystore = runtime.keystore_shared().cloned();
-    let name = fold.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let at = table_read::find_fold(shared.tables(), &name).expect("found above");
+        let sel = repick(&shared, &folds);
         let path = shared.path().context("the derived store has no file")?;
-        table_read::get_fold(path, shared.tables(), at, &key, keystore.as_deref())
+        table_read::get_fold(path, shared.tables(), &sel, &key, keystore.as_deref())
     });
     match task.await {
         Ok(Ok((Some(value), position))) => {
@@ -1269,97 +1296,93 @@ async fn fold_read(
     }
 }
 
-/// `GET /tables/{table}/row?<part>=<value>...`: one row, named by every part of its key.
-/// 404 for a key no event has named, whose every column would read its fold's seed.
-async fn table_row(
+/// `GET /row?folds=<Fold>,...&<param>=<value>...`: one row, named by every parameter of
+/// the first fold. 404 for a key no event has named, where every fold holds its seed.
+async fn row_read(
     State(runtime): State<Shared>,
-    Path(table): Path<String>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let shared = match find_table(&runtime, &table) {
-        Ok(shared) => shared,
+    let (shared, folds, rest) = match row_request(&runtime, &params) {
+        Ok(request) => request,
         Err(response) => return *response,
     };
-    let def = table_read::find(shared.tables(), &table).expect("found above");
-    let key = match table_read::parse_key(def, &params) {
+    let label = folds[0].clone();
+    let key = match table_read::parse_key(&repick(&shared, &folds), &rest) {
         Ok(key) => key,
-        Err(refusal) => return table_refused(&table, refusal),
+        Err(refusal) => return row_refused(&label, refusal),
     };
-    let count = |outcome| metrics::table_read(&table, outcome);
+    let count = |outcome| metrics::row_read(&label, outcome);
     if let Some(response) = table_unready(&shared, &count) {
         return response;
     }
-    if let Some(response) = table_wait(&shared, &count, &params).await {
+    if let Some(response) = table_wait(&shared, &count, &rest).await {
         return response;
     }
     let keystore = runtime.keystore_shared().cloned();
-    let name = table.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let def = table_read::find(shared.tables(), &name).expect("found above");
+        let sel = repick(&shared, &folds);
         let path = shared.path().context("the derived store has no file")?;
-        table_read::get_one(path, shared.tables(), def, &key, keystore.as_deref())
+        table_read::get_one(path, shared.tables(), &sel, &key, keystore.as_deref())
     });
     match task.await {
         Ok(Ok((Some(item), position))) => {
-            metrics::table_read(&table, "ok");
+            metrics::row_read(&label, "ok");
             json_response(200, json!({ "item": item, "position": position }))
         }
         Ok(Ok((None, _))) => {
-            metrics::table_read(&table, "not_found");
+            metrics::row_read(&label, "not_found");
             json_response(
                 404,
                 read_error(
                     "not_found",
-                    "no event has named this key, so every column holds its fold's seed",
+                    "no event has named this key, so every fold holds its seed",
                 ),
             )
         }
         Ok(Err(err)) => {
-            metrics::table_read(&table, "error");
+            metrics::row_read(&label, "error");
             read_failed(err)
         }
         Err(err) => {
-            metrics::table_read(&table, "error");
+            metrics::row_read(&label, "error");
             task_panicked(err)
         }
     }
 }
 
-/// `GET /tables/{table}/history?<part>=<value>...&columns=&limit=&before=&since=`: the
-/// positions where a row's columns changed, newest first, read off the log rather than the
+/// `GET /row/history?folds=<Fold>,...&<param>=<value>...&limit=&before=&since=`: the
+/// positions where a row's folds changed, newest first, read off the log rather than the
 /// store, so it neither waits for the store nor lags it.
-async fn table_history(
+async fn row_history(
     State(runtime): State<Shared>,
-    Path(table): Path<String>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let shared = match find_table(&runtime, &table) {
-        Ok(shared) => shared,
+    let (shared, folds, rest) = match row_request(&runtime, &params) {
+        Ok(request) => request,
         Err(response) => return *response,
     };
-    let def = table_read::find(shared.tables(), &table).expect("found above");
-    let (window, rest) = match history::parse_window(&params) {
+    let label = folds[0].clone();
+    let (window, rest) = match history::parse_window(&rest) {
         Ok(parsed) => parsed,
-        Err(refusal) => return table_refused(&table, refusal),
+        Err(refusal) => return row_refused(&label, refusal),
     };
-    let key = match table_read::parse_key(def, &rest) {
+    let sel = repick(&shared, &folds);
+    let key = match table_read::parse_key(&sel, &rest) {
         Ok(key) => key,
-        Err(refusal) => return table_refused(&table, refusal),
+        Err(refusal) => return row_refused(&label, refusal),
     };
-    let columns: Vec<&ColumnDef> = def
-        .columns
-        .iter()
-        .chain(
-            side_of(shared.tables(), def)
-                .into_iter()
-                .flat_map(|side| side.columns.iter()),
-        )
-        .collect();
-    let chosen: Vec<String> = match history::chosen(&columns, window.columns.as_deref(), &table) {
-        Ok(chosen) => chosen.iter().map(|column| column.name.clone()).collect(),
-        Err(refusal) => return table_refused(&table, refusal),
-    };
-    history_response(&runtime, shared, table, chosen, key, window).await
+    if let Err(refusal) = history::check(&sel.folds) {
+        return row_refused(&label, refusal);
+    }
+    history_response(
+        &runtime,
+        Arc::clone(&shared),
+        folds,
+        key,
+        window,
+        |outcome| metrics::row_read(&label, outcome),
+    )
+    .await
 }
 
 /// `GET /folds/{fold}/history?<param>=<value>...&limit=&before=&since=`: one fold's
@@ -1369,12 +1392,10 @@ async fn fold_history(
     Path(fold): Path<String>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let shared = Arc::clone(runtime.fold_handle());
-    let Some(at) = table_read::find_fold(shared.tables(), &fold) else {
-        return match runtime.program().fold(&fold) {
-            Some(_) => json_response(400, read_error("not_stored", &not_stored(&shared, &fold))),
-            None => not_found(&format!("no named fold `{fold}`")),
-        };
+    let folds = vec![fold.clone()];
+    let shared = match picked(&runtime, &folds) {
+        Ok(shared) => shared,
+        Err(response) => return *response,
     };
     let refused = |refusal: table_read::Refusal| {
         json_response(400, read_error(refusal.code, &refusal.message))
@@ -1383,32 +1404,33 @@ async fn fold_history(
         Ok(parsed) => parsed,
         Err(refusal) => return refused(refusal),
     };
-    if window.columns.is_some() {
-        return refused(table_read::Refusal {
-            code: "invalid_input",
-            message: "a fold's history is its own column's; `columns` is for a table's".into(),
-        });
-    }
-    let key = match table_read::parse_args(at, &rest) {
+    let sel = repick(&shared, &folds);
+    let key = match table_read::parse_key(&sel, &rest) {
         Ok(key) => key,
         Err(refusal) => return refused(refusal),
     };
-    if let Err(refusal) = history::chosen(&[at.column], None, &at.main.name) {
+    if let Err(refusal) = history::check(&sel.folds) {
         return refused(refusal);
     }
-    let table = at.main.name.clone();
-    let column = at.column.name.clone();
-    history_response(&runtime, shared, table, vec![column], key, window).await
+    history_response(
+        &runtime,
+        Arc::clone(&shared),
+        folds,
+        key,
+        window,
+        |outcome| metrics::fold_read(&fold, outcome),
+    )
+    .await
 }
 
 /// Read a history on a blocking thread and answer it.
 async fn history_response(
     runtime: &Runtime,
     shared: Arc<FoldShared>,
-    table: String,
-    columns: Vec<String>,
+    folds: Vec<String>,
     key: Vec<String>,
     window: history::Window,
+    count: impl Fn(&'static str),
 ) -> Response {
     let source = history::Source {
         program: Arc::clone(runtime.program_shared()),
@@ -1416,27 +1438,13 @@ async fn history_response(
         store: runtime.store().clone(),
         keystore: runtime.keystore_shared().cloned(),
     };
-    let label = table.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let def = table_read::find(shared.tables(), &table).expect("found above");
-        let all: Vec<&ColumnDef> = def
-            .columns
-            .iter()
-            .chain(
-                side_of(shared.tables(), def)
-                    .into_iter()
-                    .flat_map(|side| side.columns.iter()),
-            )
-            .collect();
-        let chosen: Vec<&ColumnDef> = columns
-            .iter()
-            .filter_map(|name| all.iter().copied().find(|column| &column.name == name))
-            .collect();
-        history::read(&source, def, &chosen, &key, &window)
+        let sel = repick(&shared, &folds);
+        history::read(&source, sel.main, &sel.folds, &key, &window)
     });
     match task.await {
         Ok(Ok(page)) => {
-            metrics::table_read(&label, "history");
+            count("history");
             json_response(
                 200,
                 json!({
@@ -1447,15 +1455,15 @@ async fn history_response(
             )
         }
         Ok(Err(err)) if err.is::<history::TooLong>() => {
-            metrics::table_read(&label, "invalid_input");
+            count("invalid_input");
             json_response(400, read_error("history_too_long", &err.to_string()))
         }
         Ok(Err(err)) => {
-            metrics::table_read(&label, "error");
+            count("error");
             read_failed(err)
         }
         Err(err) => {
-            metrics::table_read(&label, "error");
+            count("error");
             task_panicked(err)
         }
     }
@@ -1646,8 +1654,8 @@ async fn admin_index() -> Json<Value> {
             { "path": ADMIN_INVOCATION_ROUTE, "description": "one invocation and every call it journaled" },
             { "path": ADMIN_PROJECTORS_ROUTE, "description": "every projector and its readiness" },
             { "path": ADMIN_PROJECTOR_ROUTE, "description": "one projector, its entities and their shapes" },
-            { "path": ADMIN_TABLES_ROUTE, "description": "every derived table and the store's one position" },
-            { "path": ADMIN_TABLE_ROUTE, "description": "one derived table, its key and the fold behind every column" },
+            { "path": ADMIN_TABLES_ROUTE, "description": "every group of folds that share a key, and the store's one position" },
+            { "path": ADMIN_TABLE_ROUTE, "description": "one group of folds that share a key, its filters and orderings" },
             { "path": ADMIN_COMMANDS_ROUTE, "description": "every command and its parameters, internal ones included" },
             { "path": ADMIN_COMMAND_ROUTE, "description": "one command" },
             { "path": ADMIN_SCHEMA_ROUTE, "description": "the loaded project: events, commands, projectors, effects" },
@@ -2027,7 +2035,8 @@ async fn admin_tables(State(runtime): State<Shared>) -> Response {
     )
 }
 
-/// `GET /admin/tables/{name}`: one derived table, and on `?counts=true` its row count.
+/// `GET /admin/tables/{id}`: one group of folds that share a key, by its storage id, and
+/// on `?counts=true` its row count.
 /// Opt-in, as a projector's is, because a count is a scan of the whole table.
 async fn admin_table(
     State(runtime): State<Shared>,
@@ -2036,7 +2045,7 @@ async fn admin_table(
 ) -> Response {
     let shared = Arc::clone(runtime.fold_handle());
     if table_read::find(shared.tables(), &name).is_none() {
-        return not_found(&format!("no derived table `{name}`"));
+        return not_found(&format!("no stored fold group `{name}`"));
     }
     let counts = match parse_flag(&params, "counts", false) {
         Ok(counts) => counts,

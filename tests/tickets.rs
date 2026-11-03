@@ -957,9 +957,20 @@ async fn the_derived_tables_follow_the_log_in_a_running_deployment() {
 
     let path = harness.data_dir().join(hekla::fold_runtime::FILE_NAME);
     let conn = rusqlite::Connection::open(&path).expect("the store exists");
+    // A hash of the key signature, so found through the fold rather than spelled.
+    let ticket = hekla::tables::TableDef::all(harness.rt.program())
+        .into_iter()
+        .find(|table| {
+            table
+                .columns
+                .iter()
+                .any(|column| column.fold == "TicketOpened")
+        })
+        .expect("a table keeps `TicketOpened`")
+        .name;
     let opened: i64 = conn
         .query_row(
-            "SELECT \"ticket_opened\" FROM \"ticket\" WHERE \"ticket\" = ?1",
+            &format!("SELECT \"ticket_opened\" FROM \"{ticket}\" WHERE \"ticket\" = ?1"),
             [UUID_A],
             |row| row.get(0),
         )
@@ -967,7 +978,7 @@ async fn the_derived_tables_follow_the_log_in_a_running_deployment() {
     assert_eq!(opened, 1, "`TicketOpened` folded to true for this ticket");
     let closed: i64 = conn
         .query_row(
-            "SELECT \"ticket_closed\" FROM \"ticket\" WHERE \"ticket\" = ?1",
+            &format!("SELECT \"ticket_closed\" FROM \"{ticket}\" WHERE \"ticket\" = ?1"),
             [UUID_A],
             |row| row.get(0),
         )
@@ -991,32 +1002,41 @@ async fn a_derived_row_is_served_with_its_sealed_columns_opened() {
     let harness = boot();
     let position = open(&harness, UUID_A, 1, 10, Some("ada@example.com"));
     let app = harness.app();
+    const FOLDS: &str = "TicketOpened,TicketClosed,TicketContact,TicketContactedAt,TicketReporter";
 
     let (status, body) = support::get(
         &app,
-        &format!("/tables/ticket/row?ticket={UUID_A}&after={position}"),
+        &format!("/row?folds={FOLDS}&ticket_id={UUID_A}&after={position}"),
     )
     .await;
     assert_eq!(status, 200, "{body}");
     let row = &body["item"];
-    assert_eq!(row["ticket"], UUID_A);
-    assert_eq!(row["ticket_opened"], true);
-    assert_eq!(row["ticket_closed"], false);
-    assert_eq!(row["ticket_contact"], "ada@example.com");
+    assert_eq!(
+        row["ticket_id"], UUID_A,
+        "the key, named as the first fold names it"
+    );
+    assert_eq!(row["TicketOpened"], true);
+    assert_eq!(row["TicketClosed"], false);
+    assert_eq!(row["TicketContact"], "ada@example.com");
     // RFC 3339 in a column, as a projector serves it, though the log holds micros.
-    assert_eq!(row["ticket_contacted_at"], "2023-11-15T09:20:00Z");
+    assert_eq!(row["TicketContactedAt"], "2023-11-15T09:20:00Z");
     // From the side table, joined back into the one row.
-    assert_eq!(row["ticket_reporter"], reporter());
+    assert_eq!(row["TicketReporter"], reporter());
     assert!(body["position"].as_u64().unwrap() >= position);
+    assert!(
+        row.get("TicketOpenedAt").is_none(),
+        "only the folds listed: {row}"
+    );
 
     harness.rt.keystore().unwrap().erase("Owner", "10").unwrap();
-    let (status, body) = support::get(&app, &format!("/tables/ticket/row?ticket={UUID_A}")).await;
+    let (status, body) =
+        support::get(&app, &format!("/row?folds={FOLDS}&ticket_id={UUID_A}")).await;
     assert_eq!(status, 200, "{body}");
-    for gone in ["ticket_contact", "ticket_contacted_at", "ticket_reporter"] {
+    for gone in ["TicketContact", "TicketContactedAt", "TicketReporter"] {
         absent(&body["item"], gone);
     }
     assert_eq!(
-        body["item"]["ticket_opened"], true,
+        body["item"]["TicketOpened"], true,
         "the rest of the row stands"
     );
 
@@ -1034,40 +1054,70 @@ async fn a_derived_table_is_scanned_by_the_leading_parts_of_its_key() {
     }
     let app = harness.app();
 
-    let (status, body) =
-        support::get(&app, &format!("/tables/org__owner?org=1&after={position}")).await;
+    let (status, body) = support::get(
+        &app,
+        &format!("/rows?folds=OwnerTickets&org_id=1&after={position}"),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     let owners: Vec<i64> = body["items"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|row| row["owner"].as_i64().unwrap())
+        .map(|row| row["owner_id"].as_i64().unwrap())
         .collect();
     assert_eq!(owners, vec![10, 11], "org 1's rows, in key order");
 
     // A page of one, then the rest from its cursor.
-    let (_, first) = support::get(&app, "/tables/org__owner?limit=1").await;
+    let (_, first) = support::get(&app, "/rows?folds=OwnerTickets&limit=1").await;
     assert_eq!(first["items"].as_array().unwrap().len(), 1);
     let cursor = first["next_cursor"].as_str().expect("another page follows");
     let (_, rest) = support::get(
         &app,
-        &format!("/tables/org__owner?limit=10&cursor={cursor}"),
+        &format!("/rows?folds=OwnerTickets&limit=10&cursor={cursor}"),
     )
     .await;
     assert_eq!(rest["items"].as_array().unwrap().len(), 2);
     assert_eq!(rest["next_cursor"], Value::Null);
-    assert_eq!(first["items"][0]["owner_tickets"], 1);
+    assert_eq!(first["items"][0]["OwnerTickets"], 1);
 
-    let (status, body) = support::get(&app, "/tables/org__owner?owner=10").await;
+    let (status, body) = support::get(&app, "/rows?folds=OwnerTickets&owner_id=10").await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["error"]["code"], "unindexed_filter");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("(org_id)")),
+        "the refusal names a set of parameters that serves: {body}"
+    );
 
-    let (status, body) = support::get(&app, "/tables/org__owner/row?org=9&owner=9").await;
+    let (status, body) = support::get(&app, "/row?folds=OwnerTickets&org_id=9&owner_id=9").await;
     assert_eq!(status, 404, "{body}");
-    let (status, body) = support::get(&app, "/tables/org__owner/row?org=1").await;
+    let (status, body) = support::get(&app, "/row?folds=OwnerTickets&org_id=1").await;
     assert_eq!(status, 400, "{body}");
-    let (status, _) = support::get(&app, "/tables/_side_ticket").await;
-    assert_eq!(status, 404, "a side table is storage, not a route");
+
+    // A table is storage, never an address: its id is no fold, and folds of two keys
+    // share no row.
+    let ticket = hekla::tables::TableDef::all(harness.rt.program())
+        .into_iter()
+        .find(|table| {
+            table
+                .columns
+                .iter()
+                .any(|column| column.fold == "TicketOpened")
+        })
+        .expect("a table keeps `TicketOpened`")
+        .name;
+    for uri in [
+        format!("/rows?folds={ticket}"),
+        format!("/rows?folds={ticket}_side"),
+    ] {
+        let (status, body) = support::get(&app, &uri).await;
+        assert_eq!(status, 404, "a table id is not a fold: {uri}: {body}");
+    }
+    let (status, body) = support::get(&app, "/rows?folds=OwnerTickets,TicketOpened").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_input", "{body}");
 
     harness.shutdown();
 }
@@ -1079,50 +1129,83 @@ async fn a_malformed_derived_read_is_refused_with_its_reason() {
     let harness = boot();
     let position = open(&harness, UUID_A, 1, 10, None);
     let app = harness.app();
-    let (status, _) = support::get(&app, &format!("/tables/ticket?after={position}")).await;
+    let (status, _) =
+        support::get(&app, &format!("/rows?folds=TicketOpened&after={position}")).await;
     assert_eq!(status, 200);
 
     for (uri, why) in [
         (
-            "/tables/ticket/row?ticket=not-a-uuid",
+            "/row?folds=TicketOpened&ticket_id=not-a-uuid",
             "a malformed key part",
         ),
-        ("/tables/org__owner?org=one", "a key part of the wrong type"),
         (
-            "/tables/org__owner?cursor=bm90IGEgY3Vyc29y",
+            "/rows?folds=OwnerTickets&org_id=one",
+            "a key part of the wrong type",
+        ),
+        (
+            "/rows?folds=OwnerTickets&cursor=bm90IGEgY3Vyc29y",
             "a cursor this server did not issue",
         ),
         (
-            "/tables/ticket/row?ticket=x&limit=1",
+            "/row?folds=TicketOpened&ticket_id=x&limit=1",
             "a parameter a row read does not take",
+        ),
+        (
+            "/rows?folds=OwnerTickets&org=1",
+            "a layout part name rather than the fold's parameter",
+        ),
+        ("/rows?org_id=1", "no folds listed"),
+        (
+            "/rows?folds=OwnerTickets,OwnerTickets",
+            "a fold listed twice",
         ),
     ] {
         let (status, body) = support::get(&app, uri).await;
         assert_eq!(status, 400, "{why}: {body}");
         assert_eq!(body["error"]["code"], "invalid_input", "{why}: {body}");
     }
+    for (uri, status, code) in [
+        ("/rows?folds=NoSuchFold", 404, "not_found"),
+        ("/rows?folds=OrgTicketsSince", 400, "not_stored"),
+    ] {
+        let (got, body) = support::get(&app, uri).await;
+        assert_eq!(got, status, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], code, "{uri}: {body}");
+    }
 
     // An edited cursor: right table, right length, a value of the wrong type.
+    let table = hekla::tables::TableDef::all(harness.rt.program())
+        .into_iter()
+        .find(|table| {
+            table
+                .columns
+                .iter()
+                .any(|column| column.fold == "OwnerTickets")
+        })
+        .expect("a table keeps `OwnerTickets`")
+        .name;
     let cursor = base64::Engine::encode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        br#"{"t":"org__owner","k":["x","y"]}"#,
+        format!(r#"{{"t":"{table}","k":["x","y"]}}"#),
     );
-    let (status, body) = support::get(&app, &format!("/tables/org__owner?cursor={cursor}")).await;
+    let (status, body) =
+        support::get(&app, &format!("/rows?folds=OwnerTickets&cursor={cursor}")).await;
     assert_eq!(status, 400, "{body}");
 
     harness.shutdown();
 }
 
-/// A key part is a query parameter of its table's routes, so one named like a control
-/// parameter could never be filtered on. `hekla check` says so rather than the first read.
+/// A fold's parameter is a query parameter of every read of it, so one named like a
+/// control parameter could never be given. `hekla check` says so rather than the first
+/// read. A key part `layout` derives is no longer public, so it may be named anything.
 #[test]
-fn a_key_part_named_like_a_control_parameter_is_refused() {
+fn a_fold_parameter_named_like_a_control_parameter_is_refused() {
     let project = support::write_project(&[
         ("hekla.toml", ""),
-        ("events/page.hk", "event @page.viewed { limit_id: Int }\n"),
+        ("events/page.hk", "event @page.viewed { limit: Int }\n"),
         (
             "lib/folds.hk",
-            "fold Views(limit_id: Int) -> views: Int = 0 {\n  on @page.viewed(limit_id) => views + 1\n}\n",
+            "fold Views(limit: Int) -> views: Int = 0 {\n  on @page.viewed(limit) => views + 1\n}\n",
         ),
     ]);
     let loaded = hekla::loader::LoadedProject::load(project.path());
@@ -1135,6 +1218,18 @@ fn a_key_part_named_like_a_control_parameter_is_refused() {
         "{:?}",
         loaded.findings
     );
+
+    // `limit_id` keys a part named `limit`, which nothing reads by that name.
+    let project = support::write_project(&[
+        ("hekla.toml", ""),
+        ("events/page.hk", "event @page.viewed { limit_id: Int }\n"),
+        (
+            "lib/folds.hk",
+            "fold Views(limit_id: Int) -> views: Int = 0 {\n  on @page.viewed(limit_id) => views + 1\n}\n",
+        ),
+    ]);
+    let loaded = hekla::loader::LoadedProject::load(project.path());
+    assert!(!loaded.has_errors(), "{:?}", loaded.findings);
 }
 
 /// One fold by name: its arguments named as the fold declares them, its value alone, and
@@ -1202,8 +1297,8 @@ async fn a_fold_is_read_by_name_with_its_own_parameter_names() {
 }
 
 /// `/folds/{Fold}` reads `after` and `timeout_ms` as its wait, so a fold parameter of either
-/// name could never be passed. Its key part may be named otherwise (`after: Org` is the
-/// part `org`), so the table check alone would let it through.
+/// name could never be passed. Its key part is named otherwise (`after: Org` is the part
+/// `org`), which is why the check is on the fold's parameter and not on the part.
 #[test]
 fn a_fold_parameter_named_like_the_wait_is_refused() {
     let project = support::write_project(&[
@@ -1222,7 +1317,7 @@ fn a_fold_parameter_named_like_the_wait_is_refused() {
         loaded
             .findings
             .iter()
-            .any(|finding| format!("{finding:?}").contains("read-your-writes wait")),
+            .any(|finding| format!("{finding:?}").contains("control parameter")),
         "{:?}",
         loaded.findings
     );
@@ -1251,8 +1346,11 @@ async fn a_computed_key_part_buckets_rows_by_what_the_record_holds() {
     }
     let app = harness.app();
 
-    let (status, body) =
-        support::get(&app, &format!("/tables/org__month?org=1&after={position}")).await;
+    let (status, body) = support::get(
+        &app,
+        &format!("/rows?folds=OrgTicketsDue&org_id=1&after={position}"),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     let months: Vec<(String, i64)> = body["items"]
         .as_array()
@@ -1261,7 +1359,7 @@ async fn a_computed_key_part_buckets_rows_by_what_the_record_holds() {
         .map(|row| {
             (
                 row["month"].as_str().unwrap().to_owned(),
-                row["org_tickets_due"].as_i64().unwrap(),
+                row["OrgTicketsDue"].as_i64().unwrap(),
             )
         })
         .collect();
@@ -1270,9 +1368,10 @@ async fn a_computed_key_part_buckets_rows_by_what_the_record_holds() {
         vec![("2023-11".to_owned(), 2), ("2023-12".to_owned(), 1)]
     );
 
-    let (status, body) = support::get(&app, "/tables/org__month/row?org=1&month=2023-12").await;
+    let (status, body) =
+        support::get(&app, "/row?folds=OrgTicketsDue&org_id=1&month=2023-12").await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["item"]["org_tickets_due"], 1);
+    assert_eq!(body["item"]["OrgTicketsDue"], 1);
 
     let (status, body) = support::get(&app, "/folds/OrgTicketsDue?org_id=1&month=2023-11").await;
     assert_eq!(status, 200, "{body}");
@@ -1320,7 +1419,7 @@ async fn a_derived_table_is_ranged_on_the_part_after_its_pinned_ones() {
 
     let (status, body) = support::get(
         &app,
-        &format!("/tables/org__month?org=1&month.gte=2023-12&after={position}"),
+        &format!("/rows?folds=OrgTicketsDue&org_id=1&month.gte=2023-12&after={position}"),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -1328,7 +1427,7 @@ async fn a_derived_table_is_ranged_on_the_part_after_its_pinned_ones() {
 
     let (_, body) = support::get(
         &app,
-        "/tables/org__month?org=1&month.gte=2023-11&month.lt=2023-12",
+        "/rows?folds=OrgTicketsDue&org_id=1&month.gte=2023-11&month.lt=2023-12",
     )
     .await;
     assert_eq!(
@@ -1337,32 +1436,32 @@ async fn a_derived_table_is_ranged_on_the_part_after_its_pinned_ones() {
         "both ends, the upper exclusive"
     );
 
-    let (status, body) = support::get(&app, "/tables/org__month?org.gte=1").await;
+    let (status, body) = support::get(&app, "/rows?folds=OrgTicketsDue&org_id.gte=1").await;
     assert_eq!(
         status, 200,
         "the first part needs nothing pinned before it: {body}"
     );
     assert_eq!(months(&body), vec!["2023-11", "2023-12"]);
 
-    let (status, body) = support::get(&app, "/tables/org__month?month.gte=2023-11").await;
+    let (status, body) = support::get(&app, "/rows?folds=OrgTicketsDue&month.gte=2023-11").await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["error"]["code"], "unindexed_filter");
 
     for (uri, why) in [
         (
-            "/tables/org__month?org=1&month.after=2023-11",
+            "/rows?folds=OrgTicketsDue&org_id=1&month.after=2023-11",
             "not an operator",
         ),
         (
-            "/tables/org__month?org=1&month.gte=2023-11&month.gt=2023-10",
+            "/rows?folds=OrgTicketsDue&org_id=1&month.gte=2023-11&month.gt=2023-10",
             "two lower bounds",
         ),
         (
-            "/tables/org__month?org=1&org.gte=1",
+            "/rows?folds=OrgTicketsDue&org_id=1&org_id.gte=1",
             "pinned and bounded at once",
         ),
         (
-            "/tables/org__month?org.gte=1&month.gte=2023-11",
+            "/rows?folds=OrgTicketsDue&org_id.gte=1&month.gte=2023-11",
             "two parts bounded",
         ),
     ] {
@@ -1374,7 +1473,7 @@ async fn a_derived_table_is_ranged_on_the_part_after_its_pinned_ones() {
     harness.shutdown();
 }
 
-/// A fold's `@index` orders its table: `order_by=-owner_tickets` with the part before it
+/// A fold's `@index` orders its table: `order_by=-OwnerTickets` with the part before it
 /// pinned, or a whole-table order. A row without a value is left out, pages follow the
 /// order, and an ordering nothing declares is a 400 rather than a sort.
 #[tokio::test]
@@ -1418,65 +1517,66 @@ async fn a_derived_table_is_ordered_by_a_column_its_fold_indexes() {
 
     let (status, body) = support::get(
         &app,
-        &format!("/tables/org__owner?org=1&order_by=-owner_tickets&after={position}"),
+        &format!("/rows?folds=OwnerTickets&org_id=1&order_by=-OwnerTickets&after={position}"),
     )
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        column(&body, "owner"),
+        column(&body, "owner_id"),
         vec![json!(10), json!(12), json!(11)]
     );
 
     // A page at a time, the cursor carrying the order.
     let (_, first) = support::get(
         &app,
-        "/tables/org__owner?org=1&order_by=owner_tickets&limit=2",
+        "/rows?folds=OwnerTickets&org_id=1&order_by=OwnerTickets&limit=2",
     )
     .await;
-    assert_eq!(column(&first, "owner"), vec![json!(11), json!(12)]);
+    assert_eq!(column(&first, "owner_id"), vec![json!(11), json!(12)]);
     let cursor = first["next_cursor"].as_str().expect("another page follows");
     let (status, rest) = support::get(
         &app,
-        &format!("/tables/org__owner?org=1&order_by=owner_tickets&cursor={cursor}"),
+        &format!("/rows?folds=OwnerTickets&org_id=1&order_by=OwnerTickets&cursor={cursor}"),
     )
     .await;
     assert_eq!(status, 200, "{rest}");
-    assert_eq!(column(&rest, "owner"), vec![json!(10)]);
+    assert_eq!(column(&rest, "owner_id"), vec![json!(10)]);
     assert_eq!(rest["next_cursor"], Value::Null);
     let (status, body) = support::get(
         &app,
-        &format!("/tables/org__owner?org=1&order_by=-owner_tickets&cursor={cursor}"),
+        &format!("/rows?folds=OwnerTickets&org_id=1&order_by=-OwnerTickets&cursor={cursor}"),
     )
     .await;
     assert_eq!(status, 400, "a cursor read under another order: {body}");
 
     // The whole table, the open tickets left out.
-    let (status, body) = support::get(&app, "/tables/ticket?order_by=-ticket_closed_at").await;
+    let (status, body) =
+        support::get(&app, "/rows?folds=TicketClosedAt&order_by=-TicketClosedAt").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        column(&body, "ticket"),
+        column(&body, "ticket_id"),
         vec![json!(ALICE), json!(BOB)],
         "closed last first, and no row for a ticket still open"
     );
 
     for (uri, code, why) in [
         (
-            "/tables/org__owner?org=1&order_by=owner",
+            "/rows?folds=OwnerTickets&org_id=1&order_by=owner_id",
             "invalid_input",
             "not a declared ordering",
         ),
         (
-            "/tables/org__owner?order_by=owner_tickets",
+            "/rows?folds=OwnerTickets&order_by=OwnerTickets",
             "unindexed_filter",
             "the leading part not pinned",
         ),
         (
-            "/tables/org__owner?org=1&owner=10&order_by=owner_tickets",
+            "/rows?folds=OwnerTickets&org_id=1&owner_id=10&order_by=OwnerTickets",
             "unindexed_filter",
             "more pinned than lead the index",
         ),
         (
-            "/tables/org__owner?org=1&owner.gte=10&order_by=owner_tickets",
+            "/rows?folds=OwnerTickets&org_id=1&owner_id.gte=10&order_by=OwnerTickets",
             "unindexed_filter",
             "a range beside an order",
         ),
@@ -1546,7 +1646,7 @@ async fn a_derived_row_and_a_fold_have_a_history() {
 
     let (status, body) = support::get(
         &app,
-        &format!("/tables/ticket/history?ticket={ALICE}&columns=ticket_opened,ticket_closed,ticket_contact"),
+        &format!("/row/history?folds=TicketOpened,TicketClosed,TicketContact&ticket_id={ALICE}"),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -1564,15 +1664,15 @@ async fn a_derived_row_and_a_fold_have_a_history() {
     );
     assert_eq!(
         newest["changed"],
-        json!({ "ticket_closed": { "before": false, "after": true } })
+        json!({ "TicketClosed": { "before": false, "after": true } })
     );
     let first = &body["items"][1]["changed"];
     assert_eq!(
-        first["ticket_opened"],
+        first["TicketOpened"],
         json!({ "before": false, "after": true })
     );
     assert_eq!(
-        first["ticket_contact"],
+        first["TicketContact"],
         json!({ "before": null, "after": "ada@example.com" }),
         "a sealed column opened, as a row read opens it"
     );
@@ -1596,7 +1696,7 @@ async fn a_derived_row_and_a_fold_have_a_history() {
     .await;
     assert_eq!(positions(&first), vec![second]);
     assert_eq!(
-        first["items"][0]["changed"]["owner_tickets"],
+        first["items"][0]["changed"]["OwnerTickets"],
         json!({ "before": 1, "after": 2 })
     );
     let before = first["next_before"].as_u64().expect("another page follows");
@@ -1620,11 +1720,11 @@ async fn a_derived_row_and_a_fold_have_a_history() {
             "no_history",
         ),
         (
-            "/tables/org__owner/history?org=1&owner=10&columns=owner_any_closed",
+            "/row/history?folds=OwnerTickets,OwnerAnyClosed&org_id=1&owner_id=10",
             "no_history",
         ),
         (
-            "/tables/org__owner/history?org=1&owner=10&columns=nope",
+            "/row/history?folds=OwnerTickets&org_id=1&owner_id=10&columns=OwnerTickets",
             "invalid_input",
         ),
         (
@@ -1648,15 +1748,20 @@ async fn a_derived_row_and_a_fold_have_a_history() {
             .is_some_and(|message| message.contains("through `OwnerOrgCloses`")),
         "the refusal names the fold that ranges: {body}"
     );
-    // A table's default leaves out the column with no history rather than refusing.
-    let (status, body) = support::get(&app, "/tables/org__owner/history?org=1&owner=10").await;
+    // A row's history is of the folds listed and no other, so a fold of the same key with
+    // no history is simply not asked for.
+    let (status, body) =
+        support::get(&app, "/row/history?folds=OwnerTickets&org_id=1&owner_id=10").await;
     assert_eq!(status, 200, "{body}");
+    assert_eq!(positions(&body), vec![second, opened]);
     assert!(
         body["items"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|item| item["changed"].get("owner_any_closed").is_none()),
+            .all(|item| item["changed"]
+                .as_object()
+                .is_some_and(|changed| changed.keys().eq(["OwnerTickets"]))),
         "{body}"
     );
 

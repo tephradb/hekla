@@ -56,11 +56,12 @@ enum Command {
         /// The project directory.
         #[arg(default_value = ".")]
         dir: PathBuf,
-        /// Print the derived tables: one per key signature, one column per named fold.
+        /// Print how the stored folds are kept: one group per key, one column per fold.
         ///
         /// The grouping is `heklang::layout`'s, the same answer `hek check --tables`
-        /// prints, so this adds what that cannot say: the SQLite these tables really
-        /// become, including the side table a collection-typed fold is split into.
+        /// prints, so this adds what that cannot say: the SQLite it really becomes,
+        /// including the side table a collection-typed fold is split into. A storage
+        /// view: nothing a read takes is named here.
         #[arg(long)]
         tables: bool,
     },
@@ -1601,7 +1602,7 @@ fn print_findings(findings: &[Finding]) {
     }
 }
 
-/// The derived tables, as the DDL they become.
+/// The stored folds, as the SQLite they become.
 ///
 /// `hek check --tables` prints the layout; this prints what hekla makes of it, which is
 /// the two things heklang cannot say: the SQLite types a column really takes, and the
@@ -1610,7 +1611,7 @@ fn print_findings(findings: &[Finding]) {
 fn print_tables(project: &crate::loader::LoadedProject) {
     let tables = crate::tables::TableDef::all(&project.program);
     if tables.is_empty() {
-        println!("\nno derived tables: this project declares no storable named fold");
+        println!("\nno stored folds: this project declares no storable named fold");
         return;
     }
     println!();
@@ -1621,22 +1622,21 @@ fn print_tables(project: &crate::loader::LoadedProject) {
         } else {
             key.join(", ")
         };
-        println!(
-            "TABLE {}  ({})  {} column(s)",
-            table.name,
-            keyed,
-            table.columns.len()
-        );
+        let kind = if table.name == table.source {
+            ""
+        } else {
+            " collections"
+        };
+        println!("({keyed}){kind}  stored as {}", table.name);
         for column in &table.columns {
             let sealed = match &column.meta.sealed_under {
                 Some(seal) => format!("  sealed under {}", seal.subject()),
                 None => String::new(),
             };
             println!(
-                "  {:<28} {:<8} <- {}{sealed}",
-                column.name,
-                column.meta.sql_type(),
-                column.fold
+                "  {:<28} {:<8}{sealed}",
+                column.fold,
+                column.meta.sql_type()
             );
         }
         for ix in &table.indexes {

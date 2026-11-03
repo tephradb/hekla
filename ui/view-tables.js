@@ -1,19 +1,20 @@
-/* Tables: the derived read model, which is every storable named fold kept for every key.
+/* Folds: the derived read model, which is every storable named fold kept for every key.
  *
- * One page per table: its key, the fold behind each column, and the rows. A table is one
- * key signature, so the folds listed together here are exactly the ones `hekla check
- * --tables` groups together, and a collection column is listed beside the scalars even
- * though it is stored apart, because the served row joins them.
+ * One page per group of folds that share a key: the key, each fold, and the rows. A group
+ * is one key signature, so the folds listed together here are exactly the ones `hekla check
+ * --tables` groups together, and a collection fold is listed beside the scalars even
+ * though it is stored apart, because the served row joins them. Where they are kept is the
+ * store's business: the page is reached by an opaque id, and every read names folds.
  *
- * The rows come from the public tables API, for the reason the projectors page reads the
+ * The rows come from the public rows API, for the reason the projectors page reads the
  * projector read API: what this shows is what an application sees over the same port, sealed
- * columns opened and erased ones absent, not a privileged view of the store. */
+ * folds opened and erased ones absent, not a privileged view of the store. */
 
 import { html, useState } from './vendor-preact.js'
 import { api } from './api.js'
 import { go, setQuery } from './router.js'
 import { useStatus } from './store.js'
-import { Empty, Resource, useResource } from './ui-states.js'
+import { Empty, ErrorState, Resource, useResource } from './ui-states.js'
 import { DataTable, Pager } from './ui-table.js'
 import { Lag } from './ui-badge.js'
 import { Copy } from './ui-copy.js'
@@ -34,16 +35,27 @@ const FILTER = 'k.'
 const ARG = 'a.'
 
 export function TablesView({ params, search }) {
-  if (params?.name) {
-    return html`<${TableDetail} key=${params.name} name=${params.name} search=${search} />`
+  if (params?.id) {
+    return html`<${TableDetail} key=${params.id} id=${params.id} search=${search} />`
   }
   return html`<${TableList} />`
 }
 
-/* Every column of the store is at one position, so the store's state is one line and
- * not a column per table: it says whether anything is served at all. */
+/** The key as the first fold names its parameters, `(shop_id, order_id)`. */
+function keyText(table) {
+  return table.key.length ? `(${table.key.map((part) => part.name).join(', ')})` : 'one row'
+}
+
+/** The folds to name in a read of this group, the first one first so the key is spelled
+ * in its parameters. */
+function foldNames(table) {
+  return table.folds.map((fold) => fold.fold)
+}
+
+/* Every fold of the store is at one position, so the store's state is one line and not
+ * a line per group: it says whether anything is served at all. */
 /* The terms of a `kv` list rather than a list of its own, so the detail page can put
- * them in the same list as the table's key and they line up. */
+ * them in the same list as the key and they line up. */
 function StoreState({ data }) {
   return html`
       <dt>position</dt>
@@ -53,10 +65,10 @@ function StoreState({ data }) {
       <dt>serving</dt>
       <dd>
         ${data.serving
-          ? html`<span class="faint">every table</span>`
+          ? html`<span class="faint">every fold</span>`
           : data.behind > 0
-            ? html`<span class="pill warn plain">${plural(data.behind, 'column')} refolding</span>
-                <span class="note">no table is served until they catch up</span>`
+            ? html`<span class="pill warn plain">${plural(data.behind, 'fold')} refolding</span>
+                <span class="note">no fold is served until they catch up</span>`
             : html`<span class="pill warn plain">not yet</span>
                 <span class="note">folding from the start of the log</span>`}
       </dd>
@@ -73,40 +85,34 @@ function TableList() {
   const listing = useResource((signal) => api.tables(signal), [tick])
 
   const columns = [
-    { key: 'name', header: 'Table', render: (row) => html`<code>${row.name}</code>` },
     {
       key: 'key',
       header: 'Key',
-      render: (row) =>
-        html`<span class="mono tiny dim">
-          ${row.key.map((part) => part.name).join(', ') || 'one row'}
-        </span>`,
-    },
-    {
-      key: 'columns',
-      header: 'Columns',
-      align: 'right',
-      width: '90px',
-      render: (row) => html`<span class="mono">${row.columns.length}</span>`,
+      render: (row) => html`<code>${keyText(row)}</code>`,
     },
     {
       key: 'folds',
       header: 'Folds',
       render: (row) =>
-        html`<span class="tiny dim">
-          ${truncate(row.columns.map((column) => column.fold).join(' · '), 90)}
-        </span>`,
+        html`<span class="tiny">${truncate(foldNames(row).join(' · '), 110)}</span>`,
+    },
+    {
+      key: 'count',
+      header: 'Count',
+      align: 'right',
+      width: '90px',
+      render: (row) => html`<span class="mono">${row.folds.length}</span>`,
     },
   ]
 
   return html`
     <section class="card">
-      <header>Tables</header>
+      <header>Stored folds</header>
       <${Resource}
         state=${listing}
         empty=${(data) =>
           data.tables.length === 0
-            ? html`<${Empty} title="No derived tables">
+            ? html`<${Empty} title="No stored folds">
                 This project declares no storable named fold. A <code>fold</code> with a name
                 and parameters is kept here, one row per key.
               <//>`
@@ -115,10 +121,10 @@ function TableList() {
         ${(data) => html`
           <div class="body"><dl class="kv"><${StoreState} data=${data} /></dl></div>
           <${DataTable}
-            label="Tables"
+            label="Stored folds, by key"
             columns=${columns}
             rows=${data.tables}
-            onOpen=${(row) => go(`/admin/tables/${encodeURIComponent(row.name)}`)}
+            onOpen=${(row) => go(`/admin/tables/${encodeURIComponent(row.id)}`)}
           />
         `}
       <//>
@@ -168,10 +174,10 @@ function browse({ filters = [], cursor, row, fold, args } = {}) {
   ])
 }
 
-function TableDetail({ name, search }) {
+function TableDetail({ id, search }) {
   const { status } = useStatus()
   const [counts, setCounts] = useState(false)
-  const state = useResource((signal) => api.table(name, { counts }, signal), [name, counts])
+  const state = useResource((signal) => api.table(id, { counts }, signal), [id, counts])
   const { filters, cursor, row, fold, args } = browsing(search)
   const lookUp = (name, given = []) => browse({ filters, cursor, row, fold: name, args: given })
 
@@ -187,17 +193,26 @@ function TableDetail({ name, search }) {
                 go('/admin/tables')
               }}
             >
-              ← Tables
+              ← Folds
             </a>
-            <code style=${{ textTransform: 'none', letterSpacing: 0 }}>${table.name}</code>
+            <span style=${{ textTransform: 'none', letterSpacing: 0 }}>
+              ${table.key.length ? html`keyed by <code>${keyText(table)}</code>` : 'one row'}
+            </span>
             <div style=${{ flex: 1 }}></div>
+            <span
+              class="tiny faint mono"
+              style=${{ textTransform: 'none', letterSpacing: 0 }}
+              title="Where the store keeps these folds. No read names it."
+            >
+              ${table.id}
+            </span>
             ${table.rows !== null &&
             html`<span class="pill mute plain mono">${plural(table.rows, 'row')}</span>`}
             <button
               type="button"
               class="btn"
               onClick=${() => setCounts(!counts)}
-              title="a row count is a scan of the whole table, so it is opt-in"
+              title="a row count is a scan of every key, so it is opt-in"
             >
               ${counts ? '✓ counts' : '⟳ count rows'}
             </button>
@@ -224,20 +239,32 @@ function TableDetail({ name, search }) {
                   ? html`<span class="faint">the key only</span>`
                   : table.indexes.map(
                       (index) => html`
-                        <code>(${index.columns.join(', ')})</code>
-                        <span class="note">
-                          ${index.name.startsWith('sorts__')
-                            ? 'an @index orders by it'
-                            : 'a range arm reaches keys through it'}
-                        </span>
+                        <code>(${index.join(', ')})</code>
+                        <span class="note">a range arm reaches keys through it</span>
                       `,
                     )}
               </dd>
+              ${table.sorts.length > 0 &&
+              html`
+                <dt>orderings</dt>
+                <dd>
+                  ${table.sorts.map(
+                    (sort) => html`
+                      <code>${sort.fold}</code>
+                      <span class="note">
+                        ${sort.lead.length
+                          ? `an @index orders by it, with (${sort.lead.join(', ')}) pinned`
+                          : 'an @index orders by it'}
+                      </span>
+                    `,
+                  )}
+                </dd>
+              `}
               ${status?.tables &&
               html`<${StoreState} data=${{ ...status.tables, log_head: status.log_head }} />`}
             </dl>
           </div>
-          <${Columns} table=${table} onFold=${lookUp} />
+          <${Folds} table=${table} onFold=${lookUp} />
         </section>
 
         ${fold !== null &&
@@ -269,47 +296,57 @@ function TableDetail({ name, search }) {
   `
 }
 
-function Columns({ table, onFold }) {
+function Folds({ table, onFold }) {
   return html`
     <table class="data">
       <thead>
         <tr>
-          <th scope="col">Column</th>
           <th scope="col">Fold</th>
+          <th scope="col">Parameters</th>
           <th scope="col">Kind</th>
           <th scope="col" style=${{ width: '130px' }}>Sealed under</th>
           <th scope="col" style=${{ width: '100px' }}>Stored</th>
+          <th scope="col" style=${{ width: '80px' }}>History</th>
         </tr>
       </thead>
       <tbody>
-        ${table.columns.map(
-          (column) => html`
-            <tr key=${column.name}>
-              <td><code>${column.name}</code></td>
+        ${table.folds.map(
+          (fold) => html`
+            <tr key=${fold.fold}>
               <td>
                 <a
-                  href=${foldHref(column.fold)}
+                  href=${foldHref(fold.fold)}
                   onClick=${(clicked) => {
                     clicked.preventDefault()
-                    onFold(column.fold)
+                    onFold(fold.fold)
                   }}
                   title="Look this fold up for one key"
                 >
-                  <code class="tiny">${column.fold}</code>
+                  <code>${fold.fold}</code>
                 </a>
               </td>
-              <td><span class="mono tiny dim">${column.kind}</span></td>
               <td>
-                ${column.subject
-                  ? html`<code class="tiny">${column.subject}</code>`
+                <span class="mono tiny dim">
+                  ${fold.args.length ? `(${fold.args.join(', ')})` : '()'}
+                </span>
+              </td>
+              <td><span class="mono tiny dim">${fold.kind}</span></td>
+              <td>
+                ${fold.subject
+                  ? html`<code class="tiny">${fold.subject}</code>`
                   : html`<span class="faint">·</span>`}
               </td>
               <td>
-                <span class="tiny dim" title=${column.collection
-                  ? 'a collection, kept in the side table and joined back into the row'
+                <span class="tiny dim" title=${fold.collection
+                  ? 'a collection, kept apart and joined back into the row'
                   : undefined}>
-                  ${column.collection ? 'side table' : 'row'}
+                  ${fold.collection ? 'apart' : 'row'}
                 </span>
+              </td>
+              <td>
+                ${fold.history
+                  ? html`<span class="tiny dim">kept</span>`
+                  : html`<span class="faint">·</span>`}
               </td>
             </tr>
           `,
@@ -327,24 +364,24 @@ function keyOf(table, row) {
 }
 
 /**
- * What a column that is not in the response means. A NULL is left out, and so is a
- * sealed column whose subject's key is gone, and the response cannot tell them apart;
- * which of them is possible is a fact about the declaration.
+ * What a fold that is not in the response means. A none is left out, and so is a sealed
+ * fold whose subject's key is gone, and the response cannot tell them apart; which of
+ * them is possible is a fact about the declaration.
  */
-function Absent({ column }) {
-  if (column.subject) {
-    const why = `the key for \`${column.subject}\` cannot be obtained: erased, or written under a superseded one`
-    return html`<span class="pill mute plain" title=${column.optional ? `none, or ${why}` : why}>
+function Absent({ fold }) {
+  if (fold.subject) {
+    const why = `the key for \`${fold.subject}\` cannot be obtained: erased, or written under a superseded one`
+    return html`<span class="pill mute plain" title=${fold.optional ? `none, or ${why}` : why}>
       absent
     </span>`
   }
   return html`<span class="faint" title="the fold answers none for this key">none</span>`
 }
 
-function Cell({ column, row }) {
-  if (!Object.hasOwn(row, column.name)) return html`<${Absent} column=${column} />`
-  const value = row[column.name]
-  if (baseKind(column.kind) === 'Json') {
+function Cell({ fold, row }) {
+  if (!Object.hasOwn(row, fold.fold)) return html`<${Absent} fold=${fold} />`
+  const value = row[fold.fold]
+  if (baseKind(fold.kind) === 'Json') {
     const text = JSON.stringify(value)
     return html`<span class="mono tiny dim" title=${text}>${truncate(text, 48)}</span>`
   }
@@ -355,10 +392,10 @@ function Cell({ column, row }) {
   return html`<span title=${text.length > 44 ? text : undefined}>${truncate(text, 44)}</span>`
 }
 
-function Value({ column, row }) {
-  if (!Object.hasOwn(row, column.name)) return html`<${Absent} column=${column} />`
-  const value = row[column.name]
-  if (baseKind(column.kind) === 'Json') return html`<${JsonTree} value=${value} />`
+function Value({ fold, row }) {
+  if (!Object.hasOwn(row, fold.fold)) return html`<${Absent} fold=${fold} />`
+  const value = row[fold.fold]
+  if (baseKind(fold.kind) === 'Json') return html`<${JsonTree} value=${value} />`
   return html`<span class="mono">${String(value)}</span>`
 }
 
@@ -389,6 +426,7 @@ function parsed(part, value) {
 function draftOf(filters) {
   const draft = {}
   for (const [name, value] of filters) {
+    if (name === ORDER) continue
     const [part, op] = name.split('.')
     const sign = BOUNDS.find(([, word]) => word === op)?.[0]
     const text = sign ? `${sign}${value}` : value
@@ -405,29 +443,24 @@ function spelled([name, value]) {
 }
 
 function Rows({ table, filters, cursor, openRow }) {
+  const folds = foldNames(table)
   /* Not on the shared tick, for the projectors page's reason: rows shifting under
    * someone reading them is worse than rows a few seconds old. ⟳ refreshes. */
   const state = useResource(
-    (signal) => api.tableRows(table.name, { filters, cursor, limit: PAGE }, signal),
-    [table.name, JSON.stringify(filters), cursor],
+    (signal) => api.foldRows(folds, { filters, cursor, limit: PAGE }, signal),
+    [table.id, JSON.stringify(filters), cursor],
   )
   const [trail, setTrail] = useState([])
   const [draft, setDraft] = useState(() => draftOf(filters))
 
-  /* A filter is a leading run of the key, or of an index a range arm derived, so a part
-   * is offered once every key part before it has a value, or when it leads an index: the
-   * server would refuse anything else, and saying so here is kinder than a 400. */
-  const leadsIndex = (name) => table.indexes.some((index) => index.columns[0] === name)
-  const offered = (index) =>
-    leadsIndex(table.key[index].name) ||
-    table.key.slice(0, index).every((part) => (draft[part.name] ?? '').trim() !== '')
-
+  /* Any key part can be filled in. Which sets of them are one index seek is the server's
+   * to say, and its refusal names the sets it serves, which is more use than a guess. */
   const apply = () => {
     setTrail([])
     const chosen = []
-    for (const [index, part] of table.key.entries()) {
+    for (const part of table.key) {
       const value = (draft[part.name] ?? '').trim()
-      if (value && offered(index)) chosen.push(...parsed(part.name, value))
+      if (value) chosen.push(...parsed(part.name, value))
     }
     const order = filters.find(([name]) => name === ORDER)
     browse({ filters: order ? [...chosen, order] : chosen })
@@ -467,11 +500,11 @@ function Rows({ table, filters, cursor, openRow }) {
   }))
   const columns = [
     ...keyColumns,
-    ...table.columns.map((column) => ({
-      key: column.name,
-      header: column.name,
-      align: numeric(column.kind) ? 'right' : undefined,
-      render: (row) => html`<${Cell} column=${column} row=${row} />`,
+    ...table.folds.map((fold) => ({
+      key: fold.fold,
+      header: fold.fold,
+      align: numeric(fold.kind) ? 'right' : undefined,
+      render: (row) => html`<${Cell} fold=${fold} row=${row} />`,
     })),
   ]
 
@@ -504,13 +537,12 @@ function Rows({ table, filters, cursor, openRow }) {
       html`
         <div class="filters">
           ${table.key.map(
-            (part, index) => html`
+            (part) => html`
               <div class="filter-input" key=${part.name}>
                 <span class="chip-kind">${part.name}</span>
                 <input
                   value=${draft[part.name] ?? ''}
-                  placeholder=${offered(index) ? `${part.kind}, or >=a <b` : `set ${table.key[index - 1].name} first`}
-                  disabled=${!offered(index)}
+                  placeholder=${`${part.kind}, or >=a <b`}
                   onInput=${(typed) => setDraft({ ...draft, [part.name]: typed.target.value })}
                   onKeyDown=${(pressed) => {
                     if (pressed.key === 'Enter') {
@@ -526,20 +558,23 @@ function Rows({ table, filters, cursor, openRow }) {
             `,
           )}
           <button type="button" class="btn" onClick=${apply}>apply</button>
-          ${table.sorts?.length > 0 &&
+          ${table.sorts.length > 0 &&
           html`
             <select
               class="btn"
               value=${ordering}
               onChange=${(changed) => reorder(changed.target.value)}
               aria-label="Order rows by"
-              title="Order by a column a fold's @index declares; pin the parts before it first"
+              title="Order by a fold an @index declares; pin the parameters it is ordered within first"
             >
               <option value="">key order</option>
-              ${table.sorts.flatMap((sort) => [
-                html`<option value=${sort.column}>${sort.column} ↑</option>`,
-                html`<option value=${`-${sort.column}`}>${sort.column} ↓</option>`,
-              ])}
+              ${table.sorts.flatMap((sort) => {
+                const within = sort.lead.length ? ` per ${sort.lead.join(', ')}` : ''
+                return [
+                  html`<option value=${sort.fold}>${sort.fold} ↑${within}</option>`,
+                  html`<option value=${`-${sort.fold}`}>${sort.fold} ↓${within}</option>`,
+                ]
+              })}
             </select>
           `}
           ${filters.length > 0 &&
@@ -555,7 +590,9 @@ function Rows({ table, filters, cursor, openRow }) {
 
       ${state.error?.unavailable
         ? html`<${Empty} title=${state.error.code}>${state.error.message}<//>`
-        : html`
+        : state.error?.status === 400
+          ? html`<${ErrorState} error=${state.error} />`
+          : html`
             <${Resource}
               state=${state}
               empty=${(data) =>
@@ -566,14 +603,14 @@ function Rows({ table, filters, cursor, openRow }) {
                           ? 'No key with these parts has been named by any event.'
                           : cursor
                             ? 'You have paged past the last row.'
-                            : 'No event has named a key of this table yet.'}
+                            : 'No event has named a key of these folds yet.'}
                       <//>
                     `
                   : null}
             >
               ${(data) => html`
                 <${DataTable}
-                  label=${`${table.name} rows`}
+                  label=${`Rows keyed by ${keyText(table)}`}
                   columns=${columns}
                   rows=${data.items}
                   selected=${(item) => keyOf(table, item) === openRow}
@@ -594,26 +631,34 @@ function Rows({ table, filters, cursor, openRow }) {
   `
 }
 
-function RowDetail({ table, keyText, onClose, onFold }) {
+function RowDetail({ table, keyText: text, onClose, onFold }) {
   let values = []
   try {
-    values = JSON.parse(keyText)
+    values = JSON.parse(text)
   } catch {
     values = []
   }
+  const folds = foldNames(table)
+  const withHistory = table.folds.filter((fold) => fold.history)
+  const kept = withHistory.map((fold) => fold.fold)
   const key = table.key.map((part, index) => [part.name, values[index]])
+  // A history read is named in its own first fold's parameters, which need not be the
+  // group's first fold's: `(shop: Shop)` and `(shop_id: Shop)` share a key.
+  const historyKey = (withHistory[0]?.args ?? []).map((arg, index) => [arg, values[index]])
   const state = useResource(
-    (signal) => api.tableRow(table.name, key, signal),
-    [table.name, keyText],
+    (signal) => api.foldRow(folds, key, signal),
+    [table.id, text],
   )
-  const query = new URLSearchParams(key.map(([name, value]) => [name, String(value)]))
-  const route = `/tables/${table.name}/row`
-  const path = table.key.length ? `${route}?${query}` : route
+  const query = new URLSearchParams([
+    ['folds', folds.join(',')],
+    ...key.map(([name, value]) => [name, String(value)]),
+  ])
+  const path = `/row?${query}`
 
   return html`
     <${DetailPanel}
       title=${key.map(([, value]) => String(value)).join(' · ') || 'the one row'}
-      subtitle=${table.name}
+      subtitle=${keyText(table)}
       onClose=${onClose}
       actions=${state.data &&
       html`<${Copy} value=${JSON.stringify(state.data.item, null, 2)} title="Copy as JSON" />`}
@@ -627,31 +672,31 @@ function RowDetail({ table, keyText, onClose, onFold }) {
                 <dd><span class="mono">${String(value)}</span><span class="note">key</span></dd>
               `,
             )}
-            ${table.columns.map(
-              (column) => html`
-                <dt key=${column.name}>${column.name}</dt>
-                <dd>
-                  <${Value} column=${column} row=${found.item} />
+            ${table.folds.map(
+              (fold) => html`
+                <dt key=${fold.fold}>
                   <a
-                    class="note"
-                    href=${foldHref(column.fold)}
+                    href=${foldHref(fold.fold)}
                     onClick=${(clicked) => {
                       clicked.preventDefault()
                       onFold(
-                        column.fold,
+                        fold.fold,
                         /* Only a whole key starts the lookup filled in: a part the row
                          * text did not carry would be sent as the word `undefined`. */
-                        values.length === column.args.length &&
+                        values.length === fold.args.length &&
                         values.every((value) => value !== null && value !== undefined)
-                          ? column.args.map((arg, index) => [arg, String(values[index])])
+                          ? fold.args.map((arg, index) => [arg, String(values[index])])
                           : [],
                       )
                     }}
                     title="Look this fold up for this row's key"
                   >
-                    ${column.fold}
+                    ${fold.fold}
                   </a>
-                  ${column.subject && html`<span class="note">sealed under ${column.subject}</span>`}
+                </dt>
+                <dd>
+                  <${Value} fold=${fold} row=${found.item} />
+                  ${fold.subject && html`<span class="note">sealed under ${fold.subject}</span>`}
                 </dd>
               `,
             )}
@@ -665,10 +710,10 @@ function RowDetail({ table, keyText, onClose, onFold }) {
           <p class="tiny faint">
             read at position ${count(found.position)}, in the same snapshot as the row
           </p>
-          ${table.columns.some((column) => column.history) &&
+          ${kept.length > 0 &&
           html`<${History}
-            load=${(before, signal) => api.tableHistory(table.name, key, { before }, signal)}
-            deps=${[table.name, keyText]}
+            load=${(before, signal) => api.rowHistory(kept, historyKey, { before }, signal)}
+            deps=${[table.id, text]}
           />`}
         `}
       <//>
@@ -677,7 +722,7 @@ function RowDetail({ table, keyText, onClose, onFold }) {
 }
 
 /**
- * What changed a row's columns or a fold, newest first: each record that moved one, the
+ * What changed a row's folds or one fold, newest first: each record that moved one, the
  * value before and after, and a link to the event. `load(before, signal)` reads a page.
  */
 function History({ load, deps }) {
@@ -773,36 +818,36 @@ function foldHref(fold) {
 /**
  * One named fold for one key, through `GET /folds/{fold}`: what an application calling a
  * fold by name gets, with its arguments named as the fold declares its parameters rather
- * than as the table spells its key parts. Opened from a row, it starts with that row's key.
+ * than as the first fold spells the key. Opened from a row, it starts with that row's key.
  */
 function FoldLookup({ table, fold, args, onClose }) {
-  const column = table.columns.find((candidate) => candidate.fold === fold)
+  const declared = table.folds.find((candidate) => candidate.fold === fold)
   const [draft, setDraft] = useState(() => Object.fromEntries(args))
   const complete =
-    column !== undefined && column.args.every((arg) => (draft[arg] ?? '').trim() !== '')
+    declared !== undefined && declared.args.every((arg) => (draft[arg] ?? '').trim() !== '')
   /* What was last asked for, so the result belongs to the arguments that produced it
    * rather than to whatever the inputs say now. */
   const [asked, setAsked] = useState(() =>
-    complete ? column.args.map((arg) => [arg, draft[arg].trim()]) : null,
+    complete ? declared.args.map((arg) => [arg, draft[arg].trim()]) : null,
   )
   const state = useResource(
     (signal) => (asked ? api.fold(fold, asked, signal) : Promise.resolve(null)),
     [fold, JSON.stringify(asked)],
   )
 
-  if (column === undefined) {
+  if (declared === undefined) {
     return html`
       <section class="card">
         <header>Fold <code>${fold}</code></header>
-        <${Empty} title="Not in this table">
-          <code>${fold}</code> is kept in another table, or not stored at all.
+        <${Empty} title="Not keyed here">
+          <code>${fold}</code> is keyed otherwise than these folds, or not stored at all.
         <//>
       </section>
     `
   }
 
   const read = () => {
-    if (complete) setAsked(column.args.map((arg) => [arg, draft[arg].trim()]))
+    if (complete) setAsked(declared.args.map((arg) => [arg, draft[arg].trim()]))
   }
   const query = new URLSearchParams(asked ?? [])
   const route = `/folds/${encodeURIComponent(fold)}`
@@ -814,7 +859,7 @@ function FoldLookup({ table, fold, args, onClose }) {
         Fold
         <code style=${{ textTransform: 'none', letterSpacing: 0 }}>${fold}</code>
         <span class="tiny faint" style=${{ textTransform: 'none', letterSpacing: 0 }}>
-          ${column.kind}, kept as <code>${column.name}</code>
+          ${declared.kind}
         </span>
         <div style=${{ flex: 1 }}></div>
         <button type="button" class="btn icon" onClick=${onClose} title="Close" aria-label="Close">
@@ -822,7 +867,7 @@ function FoldLookup({ table, fold, args, onClose }) {
         </button>
       </header>
       <div class="filters">
-        ${column.args.map(
+        ${declared.args.map(
           (arg, index) => html`
             <div class="filter-input" key=${arg}>
               <span class="chip-kind">${arg}</span>
@@ -848,7 +893,7 @@ function FoldLookup({ table, fold, args, onClose }) {
       <div class="body">
         ${asked === null
           ? html`<p class="tiny faint">
-              ${column.args.length
+              ${declared.args.length
                 ? 'Give every argument to read the fold for that key.'
                 : 'This fold takes no arguments.'}
             </p>`
@@ -865,15 +910,15 @@ function FoldLookup({ table, fold, args, onClose }) {
                         <dt>value</dt>
                         <dd>
                           ${found.value === null
-                            ? html`<${Absent} column=${column} />`
-                            : baseKind(column.kind) === 'Json'
+                            ? html`<${Absent} fold=${declared} />`
+                            : baseKind(declared.kind) === 'Json'
                               ? html`<${JsonTree} value=${found.value} />`
                               : html`<span class="mono">${String(found.value)}</span>`}
                         </dd>
                         <dt>position</dt>
                         <dd>${count(found.position)}</dd>
                       </dl>
-                      ${column.history &&
+                      ${declared.history &&
                       html`<${History}
                         key=${JSON.stringify(asked)}
                         load=${(before, signal) => api.foldHistory(fold, asked, { before }, signal)}

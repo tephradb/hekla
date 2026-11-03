@@ -23,8 +23,11 @@ use crate::schema::{FieldKind, FieldMeta, IndexDef, Seal};
 /// One derived table: one key signature, one row per key, one column per fold.
 #[derive(Debug, Clone)]
 pub struct TableDef {
-    /// `layout`'s own name, which is already unique across the program including the
-    /// disambiguate-by-part-type pass, or `_side_<name>` for a collection table.
+    /// The SQLite name: `layout`'s `Table::id`, a hash of the key signature alone, or
+    /// `<id>_side` for a collection table.
+    ///
+    /// **Storage only, never an address.** A reader names folds, and every fold is in one
+    /// table, so nothing outside the store needs this; it is a hash so that nothing tries.
     pub name: String,
     /// The `layout` table this one holds columns of, which is [`TableDef::name`] itself for
     /// a main table and the table it splits for a side table.
@@ -119,8 +122,8 @@ impl TableDef {
             let (scalars, collections) = split(program, &laid, table, defs);
             let sorted = sort_indexes(table, &scalars);
             out.push(TableDef {
-                name: table.name.clone(),
-                source: table.name.clone(),
+                name: table.id.clone(),
+                source: table.id.clone(),
                 key: key_columns(table, defs),
                 indexes: ranged_indexes(table)
                     .into_iter()
@@ -137,8 +140,8 @@ impl TableDef {
             // else.
             if !collections.is_empty() {
                 out.push(TableDef {
-                    name: format!("_side_{}", table.name),
-                    source: table.name.clone(),
+                    name: format!("{}_side", table.id),
+                    source: table.id.clone(),
                     key: key_columns(table, defs),
                     columns: collections,
                     indexes: Vec::new(),

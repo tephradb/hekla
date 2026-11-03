@@ -149,9 +149,9 @@ defaults to `127.0.0.1`.
 | `POST /commands/{Name}` | 200 committed, 400 `invalid`, 422 `reject`, 409 conflict, 404 unknown or internal |
 | `GET /read/{Projector}/{Entity}/{key}` | `{item, position}`, or 404 |
 | `GET /read/{Projector}/{Entity}?<field>=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}` |
-| `GET /tables/{table}/row?<part>=...` | one derived row by its whole key: `{item, position}`, or 404 for a key no event named |
-| `GET /tables/{table}?<part>=&order_by=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}`, filtered on the leading parts of the key, optionally ordered by an `@index` column |
 | `GET /folds/{Fold}?<param>=...` | one named fold's `{value, position}`, its arguments named as the fold declares them |
+| `GET /row?folds=A,B&<param>=...` | several folds of one key: `{item, position}`, or 404 for a key no event named |
+| `GET /rows?folds=A,B&<param>=&order_by=&limit=&cursor=&after=&timeout_ms=` | `{items, next_cursor, position}`, filtered on a set of parameters an index serves, optionally ordered by an `@index` fold |
 | `POST /projectors/{Name}/replay` | 202, schedules a rebuild-and-swap |
 | `POST /effects/{Name}/skip/{position}` | 202, records an operator skip request |
 | `GET /status` | per-module position, lag, readiness, effect state, failure count, last error |
@@ -161,21 +161,24 @@ defaults to `127.0.0.1`.
 | `GET /admin/...` | read-only introspection, or the console when `Accept: text/html` |
 | `POST /admin/projections` | folds an ad-hoc `projector` (body: the source) over the log. Needs `[admin] projections = true`, else 403 |
 
-**A named fold is served as a column of a derived table** with no projector to write it.
-`fold OwnerTickets(org_id: Org, owner_id: Owner)` lands in a table `org__owner` keyed on `org` and
-`owner`, with one column per fold of that key signature. A key part is named for its subject when
-it has one, and otherwise for the parameter with one `_id` off; don't guess, because
-`hekla check --tables <dir>` prints every table, column and derived index. A row is every fold's
-value for its key, collections and sealed columns included, and every table is read at one log
-position. A filter on a key part that is not a leading one is a `400 unindexed_filter`. The part
-right after the pinned ones may also take a range (`?org=1&month.gte=2023-11&month.lt=2024-01`, with
-`.gte`, `.gt`, `.lte`, `.lt`), one part per request. A fold declared `-> n: Int @index = 0` (or
-`@index(game_id)`, naming the key parameters that lead it) lets a scan order by its column:
-`?order_by=-game_units&limit=10` for a top ten, `?game=g1&order_by=-review_helpful` within one
-game. Pin exactly the parts the index names first, and no range; rows whose column is absent are left
-out. An ordering nothing declares is a `400`, never a sort, and `@index` on a `Money` or `Decimal`
-fold is refused at `hekla check`, since the store holds those as text.
-Every row and every fold also has a **history** (`/tables/{table}/history?<key>`,
+**A named fold is served by name**, with no projector to write it. Folds are stored grouped by key,
+but the grouping and its storage names are private: no route takes a table name, so there is nothing
+to learn about one. `/folds/{Fold}` reads one fold; `/row` and `/rows` read several that share a key
+at once (`?folds=OwnerTickets,OwnerAnyClosed`), naming the key with the **first listed fold's own
+parameters** (`org_id=1&owner_id=10`) and answering each fold's value under the fold's name:
+`{"org_id": 1, "owner_id": 10, "OwnerTickets": 3, "OwnerAnyClosed": true}`. Folds of different keys
+in one `folds` list are a `400`. A scan pins a **set** of those parameters; a set the key or an index
+does not serve is a `400 unindexed_filter` whose message names the sets that are served, so read it
+rather than guessing. One parameter may also take a range (`?org_id=1&month.gte=2023-11&month.lt=2024-01`,
+with `.gte`, `.gt`, `.lte`, `.lt`). A fold declared `-> n: Int @index = 0` (or `@index(game_id)`,
+naming the parameters that lead it, in any order) lets a scan order by it:
+`?folds=GameUnits&order_by=-GameUnits&limit=10` for a top ten,
+`?folds=ReviewHelpful&game_id=g1&order_by=-ReviewHelpful` within one game. Pin exactly the
+parameters its `@index` names, and no range; rows whose value is absent are left out. An ordering
+nothing declares is a `400`, never a sort, and `@index` on a `Money` or `Decimal` fold is refused at
+`hekla check`, since the store holds those as text. `hekla check --tables <dir>` prints how the
+folds are grouped and stored, for debugging; nothing in it is something a read names.
+Every row and every fold also has a **history** (`/row/history?folds=A,B&<params>`,
 `/folds/{Fold}/history?<params>`): each record that changed it, newest first, with the value before
 and after. Prefer it to a list fold that pushes an entry per event just to keep a ledger; that list
 is rewritten whole on every write. A fold with a range arm has none (`400 no_history`).

@@ -539,44 +539,7 @@ impl Sources {
             });
         }
 
-        // A derived table's key parts are query parameters of `/tables/{table}`, so one
-        // named like a control parameter could never be filtered on or named in a row read.
-        // Refused here, as an entity column of the same name is, rather than at the first
-        // read that cannot reach it.
         let derived = TableDef::all(&program);
-        for table in crate::table_read::readable(&derived) {
-            for (part, _) in &table.key {
-                if crate::table_read::RESERVED.contains(&part.as_str()) {
-                    // Any fold of the table will do, side table included: a table whose
-                    // folds are all collections has no column of its own.
-                    let fold = table
-                        .columns
-                        .iter()
-                        .chain(
-                            crate::tables::side_of(&derived, table)
-                                .into_iter()
-                                .flat_map(|side| side.columns.iter()),
-                        )
-                        .next()
-                        .map(|column| column.fold.as_str());
-                    let rel = fold
-                        .and_then(|name| program.fold(name))
-                        .and_then(|def| def.module.clone())
-                        .unwrap_or_default();
-                    findings.push(Finding::error(
-                        rel,
-                        format!(
-                            "derived table `{}` has a key part `{part}`, which `/tables/{}` \
-                             reads as a control parameter ({}); rename the fold parameter it \
-                             comes from",
-                            table.name,
-                            table.name,
-                            crate::table_read::RESERVED.join(", ")
-                        ),
-                    ));
-                }
-            }
-        }
         // An `@index` heklang accepts on any type that orders, and the store orders by what it
         // holds: a `Money` is its decimal string, so `@index` on one would sort `"10.00"`
         // under `"9.00"`. The range filters' rule, applied where the declaration is written.
@@ -607,13 +570,14 @@ impl Sources {
                 }
             }
         }
-        // The same for a stored fold's own parameters, which `/folds/{Fold}` takes by the
-        // name the fold declares and which can differ from the part's (`after: Org` is a
-        // part named `org`), so the check above does not cover them.
+        // A stored fold's parameters are the query parameters a read names its key by, so
+        // one named like a control parameter could never be given. Refused here, as an
+        // entity column of the same name is, rather than at the first read that cannot
+        // reach it.
         for table in &derived {
             for column in &table.columns {
                 for arg in &column.args {
-                    if crate::table_read::WAIT.contains(&arg.as_str()) {
+                    if crate::table_read::RESERVED.contains(&arg.as_str()) {
                         let rel = program
                             .fold(&column.fold)
                             .and_then(|def| def.module.clone())
@@ -621,27 +585,10 @@ impl Sources {
                         findings.push(Finding::error(
                             rel,
                             format!(
-                                "fold `{}` has a parameter `{arg}`, which `/folds/{}` reads as \
-                                 its read-your-writes wait ({}); rename the parameter",
+                                "fold `{}` has a parameter `{arg}`, which a read of it takes \
+                                 as a control parameter ({}); rename the parameter",
                                 column.fold,
-                                column.fold,
-                                crate::table_read::WAIT.join(", ")
-                            ),
-                        ));
-                    }
-                    if crate::history::CONTROL.contains(&arg.as_str()) {
-                        let rel = program
-                            .fold(&column.fold)
-                            .and_then(|def| def.module.clone())
-                            .unwrap_or_default();
-                        findings.push(Finding::error(
-                            rel,
-                            format!(
-                                "fold `{}` has a parameter `{arg}`, which `/folds/{}/history` \
-                                 reads as its own ({}); rename the parameter",
-                                column.fold,
-                                column.fold,
-                                crate::history::CONTROL.join(", ")
+                                crate::table_read::RESERVED.join(", ")
                             ),
                         ));
                     }

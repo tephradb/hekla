@@ -20,7 +20,7 @@ which needs `[admin] projections = true` and answers `403` otherwise.
 | `/admin/effects/{name}/invocations` | invocations, newest first |
 | `/admin/effects/{name}/invocations/{position}` | one invocation and every call it journaled |
 | `/admin/projectors`, `/admin/projectors/{name}` | readiness, entity shapes, definition hash |
-| `/admin/tables`, `/admin/tables/{name}` | the derived tables: the store's one position, each table's key and the fold behind every column |
+| `/admin/tables`, `/admin/tables/{id}` | the stored folds grouped by key: the store's one position, each group's key, folds, filters and orderings |
 | `/admin/commands`, `/admin/commands/{name}` | every command and its parameters, internal ones included |
 | `/admin/schema` | the loaded project: every declaration with its hash and signature hash |
 | `/admin/system` | version, uptime, data directory, op-DB schema version, keystore, effective config |
@@ -350,16 +350,18 @@ subject columns decrypted. The selection lives in the query string, so a row is 
 - A projector that is rebuilding, stale or quarantined cannot serve rows at its current definition.
   The section reports the server's own message, which names the fix, rather than an error.
 
-### Browsing a derived table
+### Browsing stored folds
 
-`/admin/tables` lists every derived table with the store's one position; `/admin/tables/{name}`
-shows its key, the fold behind each column (and which are stored in the side table), and its rows,
-fetched through the public `/tables` routes. A filter takes the key parts left to right, so a part
-is offered once the ones before it have a value, or when it leads a derived index. The selection
-lives in the query string:
+`/admin/tables` (the console's **Folds** page) lists every group of folds that share a key, labelled
+by its key and its folds, with the store's one position. `/admin/tables/{id}` shows one group: its
+key, each fold with its parameters and whether it is stored in the row or apart, and its rows, read
+through the public `/rows` and `/row` routes with every fold of the group listed. The `id` is the
+opaque storage name, used only in the URL. Any key parameter can be filtered (a value, or bounds like
+`>=a <b`); a set the store does not serve shows the server's `400 unindexed_filter`, which names the
+sets that are. The selection lives in the query string:
 
 ```
-/admin/tables/org__owner?k.org=1&cursor=<c>&row=[1,10]
+/admin/tables/t_9667d8297c2e8892?k.org_id=1&k.order_by=-OwnerTickets&cursor=<c>&row=[1,10]
 ```
 
 A fold's name, in the column list or beside a value in a row's panel, opens a lookup card that

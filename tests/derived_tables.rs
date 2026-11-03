@@ -49,6 +49,22 @@ fn columns(conn: &Connection, table: &str) -> Vec<(String, String, bool)> {
     rows.map(|row| row.unwrap()).collect()
 }
 
+/// The table a fold's column is kept in. Its name is a hash of the key signature and no
+/// address, so a test reaches it through a fold rather than spelling it.
+fn table_of(tables: &[TableDef], fold: &str) -> String {
+    tables
+        .iter()
+        .find(|table| table.columns.iter().any(|column| column.fold == fold))
+        .unwrap_or_else(|| panic!("no table keeps `{fold}`"))
+        .name
+        .clone()
+}
+
+/// [`table_of`], for a program's source.
+fn stored_in(source: &str, fold: &str) -> String {
+    table_of(&TableDef::all(&program(source)), fold)
+}
+
 const SPEND: &str = "subject Customer(Int)
 
 event @order.placed { customer_id: Customer, order_id: Int, total: Money(2) }
@@ -66,13 +82,31 @@ fold Cancelled(customer_id: Customer) -> Bool = false {
 #[test]
 fn every_derived_table_is_sql_sqlite_takes() {
     let (conn, tables) = opened(SPEND);
-    assert_eq!(
-        tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-        vec!["customer"],
-        "one table per key signature, named for its key"
+    assert_eq!(tables.len(), 1, "one table per key signature");
+    let name = &tables[0].name;
+    assert!(
+        name.len() == 18
+            && name.starts_with("t_")
+            && name[2..].chars().all(|c| c.is_ascii_hexdigit()),
+        "named by a hash, not for its key: {name}"
     );
     assert_eq!(
-        columns(&conn, "customer"),
+        *name,
+        stored_in(
+            "subject Customer(Int)
+
+event @order.placed { customer_id: Customer }
+
+fold Placed(customer_id: Customer) -> Bool = false {
+  on @order.placed(customer_id) => true
+}
+",
+            "Placed"
+        ),
+        "a hash of the key signature alone, so the folds a table holds do not move it"
+    );
+    assert_eq!(
+        columns(&conn, name),
         vec![
             ("customer".to_owned(), "INTEGER".to_owned(), true),
             ("cancelled".to_owned(), "INTEGER".to_owned(), true),
@@ -89,7 +123,7 @@ fn every_derived_table_is_sql_sqlite_takes() {
 /// can hold is an optional fold answering `none` or a sealed column whose subject is gone.
 #[test]
 fn only_an_optional_or_a_sealed_column_is_nullable() {
-    let (conn, _) = opened(
+    let (conn, tables) = opened(
         "subject Shop(Int)
 
 event @shop.connected { shop_id: Shop, token: String @subject(shop_id) }
@@ -104,7 +138,7 @@ fold ShopSeen(shop_id: Shop) -> Bool = false {
 }
 ",
     );
-    let nullable: Vec<(String, bool)> = columns(&conn, "shop")
+    let nullable: Vec<(String, bool)> = columns(&conn, &table_of(&tables, "ShopSeen"))
         .into_iter()
         .map(|(name, _, not_null)| (name, !not_null))
         .collect();
@@ -139,11 +173,17 @@ fold OrderPlaced(shop_id: Shop, order_id: Int) -> Bool = false {
 }
 ",
     );
+    let main = table_of(&tables, "OrderPlaced");
+    let side = table_of(&tables, "OrderLines");
     assert_eq!(
-        tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-        vec!["shop__order", "_side_shop__order"],
-        "the side table sits just after the table it splits, and a leading `_` cannot \
-         collide with a layout name"
+        tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        vec![main.clone(), format!("{main}_side")],
+        "the side table sits just after the table it splits and is named for it"
+    );
+    assert_eq!(
+        side,
+        format!("{main}_side"),
+        "the collection is the side table's"
     );
     // The same key, so a row in either is reached by the same value.
     let key = |table: &str| -> Vec<String> {
@@ -153,9 +193,9 @@ fold OrderPlaced(shop_id: Shop, order_id: Int) -> Bool = false {
             .map(|(name, _, _)| name)
             .collect()
     };
-    assert_eq!(key("shop__order"), key("_side_shop__order"));
+    assert_eq!(key(&main), key(&side));
     assert_eq!(
-        columns(&conn, "_side_shop__order")
+        columns(&conn, &side)
             .into_iter()
             .map(|(name, ty, _)| (name, ty))
             .collect::<Vec<_>>(),
@@ -179,14 +219,16 @@ fold Things() -> n: Int = 0 {
 }
 ",
     );
-    assert_eq!(tables[0].name, "global");
+    assert_eq!(tables.len(), 1);
+    assert!(tables[0].key.is_empty(), "a table with no key");
+    let global = &tables[0].name;
     conn.execute(
-        "INSERT INTO \"global\" (\"_one\", \"things\") VALUES (0, 1)",
+        &format!("INSERT INTO \"{global}\" (\"_one\", \"things\") VALUES (0, 1)"),
         [],
     )
     .expect("the one row");
     let second = conn.execute(
-        "INSERT INTO \"global\" (\"_one\", \"things\") VALUES (1, 2)",
+        &format!("INSERT INTO \"{global}\" (\"_one\", \"things\") VALUES (1, 2)"),
         [],
     );
     assert!(
@@ -333,9 +375,10 @@ fold Placed(customer_id: Customer) -> Bool = false {
 
     // A row the first deploy's column was folded for.
     let path = dir.path().join("tables.db");
+    let customer = stored_in(one_fold, "Placed");
     let conn = Connection::open(&path).unwrap();
     conn.execute(
-        "INSERT INTO \"customer\" (\"customer\", \"placed\") VALUES (7, 1)",
+        &format!("INSERT INTO \"{customer}\" (\"customer\", \"placed\") VALUES (7, 1)"),
         [],
     )
     .unwrap();
@@ -356,7 +399,7 @@ fold LifetimeSpend(customer_id: Customer) -> spend: Money(2) = 0 {{
     let conn = Connection::open(&path).unwrap();
     let seeded: String = conn
         .query_row(
-            "SELECT \"lifetime_spend\" FROM \"customer\" WHERE \"customer\" = 7",
+            &format!("SELECT \"lifetime_spend\" FROM \"{customer}\" WHERE \"customer\" = 7"),
             [],
             |row| row.get(0),
         )
@@ -536,6 +579,7 @@ fn a_filled_column_holds_what_folding_it_returns() {
         "the values and the position commit together"
     );
 
+    let table = table_of(&tables, "LifetimeSpend");
     let conn = Connection::open(&path).unwrap();
     for customer in [7, 9] {
         for (column, fold) in [
@@ -545,7 +589,7 @@ fn a_filled_column_holds_what_folding_it_returns() {
             let stored = cell(
                 &conn,
                 &format!(
-                    "SELECT CAST(\"{column}\" AS TEXT) FROM \"customer\" WHERE \"customer\" = {customer}"
+                    "SELECT CAST(\"{column}\" AS TEXT) FROM \"{table}\" WHERE \"customer\" = {customer}"
                 ),
             );
             let folded = interpreter
@@ -565,7 +609,7 @@ fn a_filled_column_holds_what_folding_it_returns() {
     assert_eq!(
         cell(
             &conn,
-            "SELECT CAST(\"cancelled\" AS TEXT) FROM \"customer\" WHERE \"customer\" = 7"
+            &format!("SELECT CAST(\"cancelled\" AS TEXT) FROM \"{table}\" WHERE \"customer\" = 7")
         ),
         Some("0".to_owned()),
         "a column no arm named holds its seed, which is what folding it would return"
@@ -679,7 +723,10 @@ fold Cancelled(customer_id: Customer) -> Bool = false {
     assert_eq!(
         cell(
             &conn,
-            "SELECT \"lifetime_spend\" FROM \"customer\" WHERE \"customer\" = 7"
+            &format!(
+                "SELECT \"lifetime_spend\" FROM \"{}\" WHERE \"customer\" = 7",
+                stored_in(SPEND, "LifetimeSpend")
+            )
         ),
         Some("4.00".to_owned())
     );
@@ -740,7 +787,13 @@ fn a_batch_fills_a_collection_column_in_its_side_table() {
 
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
-        cell(&conn, "SELECT \"order_lines\" FROM \"_side_shop__order\""),
+        cell(
+            &conn,
+            &format!(
+                "SELECT \"order_lines\" FROM \"{}\"",
+                table_of(&tables, "OrderLines")
+            )
+        ),
         Some("[5]".to_owned()),
         "the list stores as the JSON it goes on the wire as"
     );
@@ -800,7 +853,10 @@ fold ShopGone(shop_id: Shop, surface: String) -> Bool = false {
     assert_eq!(
         cell(
             &conn,
-            "SELECT CAST(\"shop_gone\" AS TEXT) FROM \"shop__surface\" WHERE \"surface\" = 'a'"
+            &format!(
+                "SELECT CAST(\"shop_gone\" AS TEXT) FROM \"{}\" WHERE \"surface\" = 'a'",
+                table_of(&tables, "ShopGone")
+            )
         ),
         Some("1".to_owned()),
         "the uninstall arm ranges over the surface the render arm created in this batch"
@@ -876,7 +932,10 @@ fn changing_only_a_folds_seed_reshapes_its_column() {
     let conn = Connection::open(dir.path().join("tables.db")).unwrap();
     let ddl: String = conn
         .query_row(
-            "SELECT sql FROM sqlite_master WHERE name = 'customer'",
+            &format!(
+                "SELECT sql FROM sqlite_master WHERE name = '{}'",
+                stored_in(SPEND, "Cancelled")
+            ),
             [],
             |row| row.get(0),
         )
@@ -969,7 +1028,10 @@ fn a_sealed_column_keyed_off_its_subject_keeps_what_opens_it() {
     let conn = Connection::open(&path).unwrap();
     let stored = cell(
         &conn,
-        "SELECT \"order_email\" FROM \"order\" WHERE \"order\" = 1",
+        &format!(
+            "SELECT \"order_email\" FROM \"{}\" WHERE \"order\" = 1",
+            table_of(&tables, "OrderEmail")
+        ),
     )
     .expect("the column holds the seal");
     assert_eq!(
@@ -1044,7 +1106,13 @@ fn a_store_in_another_format_is_emptied_and_refolded() {
     );
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
-        cell(&conn, "SELECT CAST(COUNT(*) AS TEXT) FROM \"order\""),
+        cell(
+            &conn,
+            &format!(
+                "SELECT CAST(COUNT(*) AS TEXT) FROM \"{}\"",
+                table_of(&tables, "OrderEmail")
+            )
+        ),
         Some("0".to_owned())
     );
 }
@@ -1089,8 +1157,11 @@ fold OrderFlagged(shop_id: Shop, order_id: Int) -> Bool = false {
     assert_eq!(
         cell(
             &conn,
-            "SELECT CAST(\"order_flagged\" AS TEXT) FROM \"shop__order\" \
-             WHERE \"shop\" = 1 AND \"order\" = 9001"
+            &format!(
+                "SELECT CAST(\"order_flagged\" AS TEXT) FROM \"{}\" \
+                 WHERE \"shop\" = 1 AND \"order\" = 9001",
+                table_of(&tables, "OrderFlagged")
+            )
         ),
         Some("0".to_owned()),
         "the main row exists, holding the other column's seed"
@@ -1132,18 +1203,18 @@ fold OrderFlagged(shop_id: Shop, order_id: Int) -> Bool = false {
     store.apply(&Digest::of(&program), &tables).unwrap();
     apply_batch(&store, &program, &tables, &records, 1).unwrap();
 
-    let main = hekla::table_read::find(&tables, "shop__order").unwrap();
+    let sel = hekla::table_read::pick(&tables, &["OrderFlagged", "OrderLines"]).unwrap();
     let (row, _) = hekla::table_read::get_one(
         &path,
         &tables,
-        main,
+        &sel,
         &["1".to_owned(), "9001".to_owned()],
         None,
     )
     .unwrap();
     let row = row.expect("the key an event named");
-    assert_eq!(row["order_flagged"], true);
-    assert_eq!(row["order_lines"], serde_json::json!([]), "{row}");
+    assert_eq!(row["OrderFlagged"], true);
+    assert_eq!(row["OrderLines"], serde_json::json!([]), "{row}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,7 +1281,10 @@ fold OrdersNumbered(order_id: Int) -> n: Int = 0 {{
     assert_eq!(
         cell(
             &conn,
-            "SELECT CAST(\"orders_numbered\" AS TEXT) FROM \"order\" WHERE \"order\" = 1"
+            &format!(
+                "SELECT CAST(\"orders_numbered\" AS TEXT) FROM \"{}\" WHERE \"order\" = 1",
+                stored_in(&grown, "OrdersNumbered")
+            )
         ),
         Some("3".to_owned()),
         "a table that did not exist before the deploy"
@@ -1218,7 +1292,10 @@ fold OrdersNumbered(order_id: Int) -> n: Int = 0 {{
     assert_eq!(
         cell(
             &conn,
-            "SELECT CAST(\"customer_orders\" AS TEXT) FROM \"customer\" WHERE \"customer\" = 7"
+            &format!(
+                "SELECT CAST(\"customer_orders\" AS TEXT) FROM \"{}\" WHERE \"customer\" = 7",
+                stored_in(&grown, "CustomerOrders")
+            )
         ),
         Some("2".to_owned()),
         "a column added to a table that did"
@@ -1259,7 +1336,10 @@ fold SurfaceCount(shop_id: Shop, surface: String) -> n: Int = 0 {{
     deployed_and_filled(&path, seen, &events);
     redeployed(&path, &counted, &events);
 
-    let sql = "SELECT CAST(\"surface_count\" AS TEXT) FROM \"shop__surface\" WHERE \"surface\" = ";
+    let sql = format!(
+        "SELECT CAST(\"surface_count\" AS TEXT) FROM \"{}\" WHERE \"surface\" = ",
+        stored_in(&counted, "SurfaceCount")
+    );
     for (surface, want) in [("a", "11"), ("b", "1")] {
         let query = format!("{sql}'{surface}'");
         let followed = cell(
@@ -1292,7 +1372,10 @@ fn a_refolded_column_is_replayed_from_its_seed() {
     assert_eq!(
         cell(
             &conn,
-            "SELECT \"lifetime_spend\" FROM \"customer\" WHERE \"customer\" = 7"
+            &format!(
+                "SELECT \"lifetime_spend\" FROM \"{}\" WHERE \"customer\" = 7",
+                stored_in(SPEND, "LifetimeSpend")
+            )
         ),
         Some("10.00".to_owned())
     );
@@ -1332,18 +1415,19 @@ fn a_collection_column_added_later_is_replayed_into_its_side_table() {
     deployed_and_filled(&path, &placed_only, &events);
     redeployed(&path, LINES, &events);
 
+    let side = stored_in(LINES, "OrderLines");
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
         cell(
             &conn,
-            "SELECT \"order_lines\" FROM \"_side_shop__order\" WHERE \"shop\" = 1 AND \"order\" = 9"
+            &format!("SELECT \"order_lines\" FROM \"{side}\" WHERE \"shop\" = 1 AND \"order\" = 9")
         ),
         Some("[3,4]".to_owned())
     );
     assert_eq!(
         cell(
             &conn,
-            "SELECT \"order_lines\" FROM \"_side_shop__order\" WHERE \"shop\" = 2 AND \"order\" = 5"
+            &format!("SELECT \"order_lines\" FROM \"{side}\" WHERE \"shop\" = 2 AND \"order\" = 5")
         ),
         Some("[7]".to_owned())
     );
@@ -1380,8 +1464,10 @@ fold SurfaceTouched(shop_id: Shop, surface: String) -> n: Int = 0 {{
     deployed_and_filled(&path, seen, &events);
     redeployed(&path, &ranged, &events);
 
-    let sql =
-        "SELECT CAST(\"surface_touched\" AS TEXT) FROM \"shop__surface\" WHERE \"surface\" = ";
+    let sql = format!(
+        "SELECT CAST(\"surface_touched\" AS TEXT) FROM \"{}\" WHERE \"surface\" = ",
+        stored_in(&ranged, "SurfaceTouched")
+    );
     for (surface, want) in [("a", "2"), ("b", "1")] {
         let query = format!("{sql}'{surface}'");
         let followed = cell(
@@ -1422,13 +1508,20 @@ fold Ticks() -> n: Int = 0 {{
     deployed_and_filled(&path, doubled, &events);
     redeployed(&path, &counted, &events);
 
+    let global = stored_in(&counted, "Ticks");
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
-        cell(&conn, "SELECT CAST(\"ticks\" AS TEXT) FROM \"global\""),
+        cell(
+            &conn,
+            &format!("SELECT CAST(\"ticks\" AS TEXT) FROM \"{global}\"")
+        ),
         Some("62".to_owned())
     );
     assert_eq!(
-        cell(&conn, "SELECT CAST(\"doubled\" AS TEXT) FROM \"global\""),
+        cell(
+            &conn,
+            &format!("SELECT CAST(\"doubled\" AS TEXT) FROM \"{global}\"")
+        ),
         Some((1i64 << 62).to_string()),
         "and the column left alone is as it was"
     );
@@ -1520,9 +1613,10 @@ fn games() -> Vec<Event> {
 fn genre_units(path: &std::path::Path) -> Vec<(String, String)> {
     let conn = Connection::open(path).unwrap();
     let mut stmt = conn
-        .prepare(
-            "SELECT \"genre\", CAST(\"genre_units\" AS TEXT) FROM \"genre\" ORDER BY \"genre\"",
-        )
+        .prepare(&format!(
+            "SELECT \"genre\", CAST(\"genre_units\" AS TEXT) FROM \"{}\" ORDER BY \"genre\"",
+            stored_in(&format!("{GAMES}{GENRE_UNITS}"), "GenreUnits")
+        ))
         .unwrap();
     stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
@@ -1560,7 +1654,10 @@ fn a_fold_keyed_through_another_is_replayed_as_of_each_record() {
     assert_eq!(
         cell(
             &conn,
-            "SELECT \"game_genre\" FROM \"game\" WHERE \"game\" = 1"
+            &format!(
+                "SELECT \"game_genre\" FROM \"{}\" WHERE \"game\" = 1",
+                stored_in(GAMES, "GameGenre")
+            )
         ),
         Some("sim".to_owned()),
         "and the folds it looked up are where they ended, not where the replay left them"
@@ -1581,8 +1678,11 @@ fn editing_a_looked_up_fold_refolds_what_keys_through_it() {
             "on @game.regenred(game_id) { genre } => \"retired\"",
         ),
     );
+    // In table order, which is the order of two hashes, so sorted to say only which.
+    let mut refolded = verdicts(&edited);
+    refolded.sort_unstable();
     assert_eq!(
-        verdicts(&edited),
+        refolded,
         vec![("game_genre", "refold"), ("genre_units", "refold")]
     );
 
@@ -1658,12 +1758,15 @@ fold EditsRequested() -> n: Int = 0 {{
         requested(1),
     ];
 
-    let sql = "SELECT CAST(\"edits_requested\" AS TEXT) FROM \"global\"";
+    let sql = format!(
+        "SELECT CAST(\"edits_requested\" AS TEXT) FROM \"{}\"",
+        stored_in(&counted, "EditsRequested")
+    );
     let live = tempfile::tempdir().unwrap();
     deployed_and_filled(&live.path().join("tables.db"), &counted, &events);
     let followed = cell(
         &Connection::open(live.path().join("tables.db")).unwrap(),
-        sql,
+        &sql,
     );
     assert_eq!(followed.as_deref(), Some("1"));
 
@@ -1672,7 +1775,7 @@ fold EditsRequested() -> n: Int = 0 {{
     deployed_and_filled(&path, orders, &events);
     redeployed(&path, &counted, &events);
     assert_eq!(
-        cell(&Connection::open(&path).unwrap(), sql),
+        cell(&Connection::open(&path).unwrap(), &sql),
         followed,
         "replayed"
     );
@@ -1702,9 +1805,12 @@ fn an_index_follows_its_declaration_across_deploys() {
     deployed_and_filled(&path, SPEND, &events);
     assert!(index_names(&path).is_empty());
     // One an operator made by hand, which no deploy is to touch.
+    let customer = stored_in(SPEND, "LifetimeSpend");
     Connection::open(&path)
         .unwrap()
-        .execute_batch("CREATE INDEX mine ON customer (lifetime_spend)")
+        .execute_batch(&format!(
+            "CREATE INDEX mine ON \"{customer}\" (lifetime_spend)"
+        ))
         .unwrap();
 
     let indexed = format!(
@@ -1715,7 +1821,10 @@ fold Orders(customer_id: Customer) -> n: Int @index = 0 {{
 "
     );
     redeployed(&path, &indexed, &events);
-    assert_eq!(index_names(&path), vec!["customer_sorts__orders", "mine"]);
+    assert_eq!(
+        index_names(&path),
+        vec!["mine".to_owned(), format!("{customer}_sorts__orders")]
+    );
 
     let unindexed = indexed.replace("-> n: Int @index = 0", "-> n: Int = 0");
     redeployed(&path, &unindexed, &events);
@@ -1767,20 +1876,18 @@ fold ThingSeenAt(id: Int) -> Timestamp? @index = none {
         ],
     );
     let tables = TableDef::all(&program(source));
-    let table = &tables[0];
-    let scan = hekla::table_read::parse_scan(
-        table,
-        &[("order_by".to_owned(), "thing_seen_at".to_owned())],
-    )
-    .unwrap();
-    let page = hekla::table_read::scan(&path, &tables, table, &scan, None).unwrap();
+    let sel = hekla::table_read::pick(&tables, &["ThingSeenAt"]).unwrap();
+    let scan =
+        hekla::table_read::parse_scan(&sel, &[("order_by".to_owned(), "ThingSeenAt".to_owned())])
+            .unwrap();
+    let page = hekla::table_read::scan(&path, &tables, &sel, &scan, None).unwrap();
     let order: Vec<(i64, String)> = page
         .items
         .iter()
         .map(|row| {
             (
                 row["id"].as_i64().unwrap(),
-                row["thing_seen_at"].as_str().unwrap().to_owned(),
+                row["ThingSeenAt"].as_str().unwrap().to_owned(),
             )
         })
         .collect();

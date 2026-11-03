@@ -1,17 +1,22 @@
-//! The derived tables, read: what `GET /tables/{table}` and `GET /tables/{table}/row`
-//! serve.
+//! The stored folds, read: what `GET /rows`, `GET /row` and `GET /folds/{fold}` serve.
 //!
-//! The sibling of [`crate::read_api`] for [`crate::fold_store`]. **A reader sees one row per
-//! key whatever the storage split**: a key signature's main table is joined to its side
-//! table here, so a collection column is just another column of the row, and a sealed cell
-//! is opened on the way out.
+//! The sibling of [`crate::read_api`] for [`crate::fold_store`]. **A reader names folds and
+//! never a table.** Every fold is kept in exactly one table, so a list of folds that share
+//! a key is enough to find their row, and the table stays a storage detail with a hashed
+//! name. A key signature's main table is joined to its side table here, so a collection
+//! fold is just another value of the row, and a sealed cell is opened on the way out.
+//!
+//! **Spoken in the first fold's vocabulary.** A request's key parameters are the first
+//! listed fold's own parameter names, its values are keyed by fold name, and nothing a
+//! caller sees is a name `layout` derived.
 //!
 //! The discipline is `read_api`'s: a scan filters on what an index serves and anything else
-//! is a 400, never a table scan. A derived table has no declared indexes yet, so what serves
-//! a filter is its primary key, whose leading parts are a prefix, and the indexes
-//! [`crate::tables`] derived for range arms, which are the other way in that something
-//! already needed.
+//! is a 400, never a table scan. What serves a filter is the table's primary key, the
+//! indexes [`crate::tables`] derived for range arms, and the ones a fold's `@index`
+//! declares. A filter is a *set* of pinned parameters, so which order the key happens to be
+//! stored in is not something a caller has to know: the refusal names the sets that serve.
 
+use std::iter;
 use std::path::Path;
 use std::time::Duration;
 
@@ -32,17 +37,21 @@ use crate::read_model::{coerce_value, from_sql, quote_ident, reject_double_quote
 use crate::schema::{FieldKind, FieldMeta};
 use crate::tables::{ColumnDef, SortDef, TableDef, main_of, side_of};
 
-/// Query parameters that are not a key part.
+/// Query parameters a row read takes that are not a fold's parameter, which a fold's
+/// parameter therefore may not be named.
 pub const RESERVED: [&str; 8] = [
+    "folds",
     "limit",
     "cursor",
     "after",
     "timeout_ms",
     "order_by",
-    "columns",
     "before",
     "since",
 ];
+
+/// The parameter that lists a row read's folds.
+pub const FOLDS: &str = "folds";
 
 /// How long a read waits on the single writer's lock before failing.
 const BUSY: Duration = Duration::from_secs(5);
@@ -61,22 +70,171 @@ impl Refusal {
             message,
         }
     }
+
+    fn unindexed(message: String) -> Refusal {
+        Refusal {
+            code: "unindexed_filter",
+            message,
+        }
+    }
 }
 
-/// A table a reader can name, which is a main table. A side table is storage, joined in
-/// rather than addressed, so `_side_order` is not a route.
+/// A table a key signature's rows are recorded in, which is a main table. A side table is
+/// storage joined in, never a table of its own.
 pub fn find<'a>(tables: &'a [TableDef], name: &str) -> Option<&'a TableDef> {
-    tables
-        .iter()
-        .find(|table| table.name == name && table.source == table.name)
+    readable(tables).find(|table| table.name == name)
 }
 
-/// The tables a reader can name, in `layout`'s order.
+/// The main tables, in `layout`'s order.
 pub fn readable(tables: &[TableDef]) -> impl Iterator<Item = &TableDef> {
     tables.iter().filter(|table| table.source == table.name)
 }
 
-/// What a scan was asked for.
+/// The folds a row read names, which share one key, and the main table that records it.
+#[derive(Debug, Clone)]
+pub struct Selection<'a> {
+    pub main: &'a TableDef,
+    /// In the order the caller listed them; never empty.
+    pub folds: Vec<&'a ColumnDef>,
+}
+
+/// Why a fold list selects nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unselected {
+    /// A fold no table keeps. Undeclared or unstored is the caller's to tell apart, since
+    /// it needs the program and this needs only the tables.
+    Missing(String),
+    Refused(Refusal),
+}
+
+impl<'a> Selection<'a> {
+    /// What the query string calls each key part, in key order: the first fold's own
+    /// parameter names.
+    pub fn params(&self) -> &'a [String] {
+        &self.folds[0].args
+    }
+
+    /// The fold whose parameters a request speaks in.
+    pub fn first(&self) -> &'a str {
+        &self.folds[0].fold
+    }
+
+    /// The key part a parameter names.
+    fn part(&self, param: &str) -> Option<&'a str> {
+        let at = self.params().iter().position(|name| name == param)?;
+        Some(self.main.key[at].0.as_str())
+    }
+
+    /// The parameter a key part is called.
+    fn spoken(&self, part: &str) -> &'a str {
+        let at = self
+            .main
+            .key
+            .iter()
+            .position(|(name, _)| name == part)
+            .expect("a key part of the selection's table");
+        &self.params()[at]
+    }
+
+    fn spoken_list<'b>(&self, parts: impl IntoIterator<Item = &'b str>) -> String {
+        parts
+            .into_iter()
+            .map(|part| self.spoken(part))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The fold kept in a column of the main table.
+    fn fold_of<'b>(&'b self, column: &'b str) -> &'b str {
+        self.main
+            .columns
+            .iter()
+            .find(|held| held.name == column)
+            .map_or(column, |held| held.fold.as_str())
+    }
+}
+
+/// Where a stored fold is kept: the main table of its key signature, and its own column,
+/// which may be in the side table.
+fn locate<'a>(tables: &'a [TableDef], fold: &str) -> Option<(&'a TableDef, &'a ColumnDef)> {
+    let (table, column) = tables.iter().find_map(|table| {
+        table
+            .columns
+            .iter()
+            .find(|column| column.fold == fold)
+            .map(|column| (table, column))
+    })?;
+    Some((main_of(tables, &table.source)?, column))
+}
+
+/// The folds named, checked to share one key.
+pub fn pick<'a>(tables: &'a [TableDef], folds: &[&str]) -> Result<Selection<'a>, Unselected> {
+    let Some((first, rest)) = folds.split_first() else {
+        return Err(Unselected::Refused(Refusal::invalid(format!(
+            "`{FOLDS}` names no fold; list the folds to read, comma separated"
+        ))));
+    };
+    let (main, column) =
+        locate(tables, first).ok_or_else(|| Unselected::Missing((*first).into()))?;
+    let mut selection = Selection {
+        main,
+        folds: vec![column],
+    };
+    for fold in rest {
+        let (held, column) =
+            locate(tables, fold).ok_or_else(|| Unselected::Missing((*fold).into()))?;
+        if selection.folds.iter().any(|kept| kept.fold == *fold) {
+            return Err(Unselected::Refused(Refusal::invalid(format!(
+                "`{fold}` is listed twice"
+            ))));
+        }
+        if held.name != main.name {
+            return Err(Unselected::Refused(Refusal::invalid(format!(
+                "`{fold}` is not keyed like `{first}`, so the two have no row in common; \
+                 read them separately"
+            ))));
+        }
+        selection.folds.push(column);
+    }
+    Ok(selection)
+}
+
+/// A query string, as name and value pairs in the order given.
+pub type Params = Vec<(String, String)>;
+
+/// The `folds` parameter split off a query string: the folds it lists, and the rest.
+pub fn split_folds(params: &[(String, String)]) -> Result<(Vec<String>, Params), Refusal> {
+    let mut folds = None;
+    let mut rest = Vec::new();
+    for (name, value) in params {
+        if name != FOLDS {
+            rest.push((name.clone(), value.clone()));
+            continue;
+        }
+        if folds.is_some() {
+            return Err(Refusal::invalid(format!(
+                "`{FOLDS}` is given twice; list every fold in one, comma separated"
+            )));
+        }
+        folds = Some(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|fold| !fold.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let folds = folds.ok_or_else(|| {
+        Refusal::invalid(format!(
+            "`{FOLDS}` is required: name the folds to read, comma separated, e.g. \
+             `?{FOLDS}=OrderTotal,OrderClosed`"
+        ))
+    })?;
+    Ok((folds, rest))
+}
+
+/// What a scan was asked for, in the table's own part and column names.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scan {
     /// Key parts pinned to a value, as the texts the store binds.
@@ -99,7 +257,7 @@ pub struct Order {
 }
 
 impl Order {
-    /// The `order_by` spelling, which a cursor records so it is not read under another.
+    /// What a cursor records, so it is not read under another ordering.
     fn token(&self) -> String {
         format!("{}{}", if self.descending { "-" } else { "" }, self.column)
     }
@@ -113,9 +271,9 @@ pub struct After {
     pub key: Vec<String>,
 }
 
-/// A page cursor. Carries its table so one taken over another table, whose key compares
-/// different columns, is refused rather than read as a position in this one, and the
-/// ordering it was taken under for the same reason.
+/// A page cursor. Carries its table so one taken over another key, whose parts compare
+/// differently, is refused rather than read as a position in this one, and the ordering it
+/// was taken under for the same reason.
 #[derive(Debug, Serialize, Deserialize)]
 struct Cursor {
     #[serde(rename = "t")]
@@ -138,7 +296,8 @@ fn encode_cursor(table: &str, order: Option<&Order>, after: After) -> String {
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).expect("a cursor serializes"))
 }
 
-fn decode_cursor(table: &TableDef, raw: &str, order: Option<&Order>) -> Result<After, Refusal> {
+fn decode_cursor(sel: &Selection, raw: &str, order: Option<&Order>) -> Result<After, Refusal> {
+    let table = sel.main;
     let bad = || Refusal::invalid("cursor is not valid".to_owned());
     // A one-row table never hands out a cursor, so one for it was not this server's.
     if table.key.is_empty() {
@@ -148,25 +307,29 @@ fn decode_cursor(table: &TableDef, raw: &str, order: Option<&Order>) -> Result<A
     let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| bad())?;
     if cursor.table != table.name || cursor.key.len() != table.key.len() {
         return Err(Refusal::invalid(format!(
-            "this cursor was taken over another table than `{}`",
-            table.name
+            "this cursor was taken over folds keyed otherwise than `{}`",
+            sel.first()
         )));
     }
     let asked = order.map(Order::token);
     if cursor.order != asked {
+        let spelled = |token: Option<&str>, unordered: &str| match token {
+            None => unordered.to_owned(),
+            Some(token) => {
+                let (sign, column) = match token.strip_prefix('-') {
+                    Some(column) => ("-", column),
+                    None => ("", token),
+                };
+                format!("`order_by={sign}{}`", sel.fold_of(column))
+            }
+        };
         return Err(Refusal::invalid(format!(
             "this cursor was taken {} and this request asks for {}",
-            cursor
-                .order
-                .as_deref()
-                .map_or("in key order".to_owned(), |token| format!(
-                    "under `order_by={token}`"
-                )),
-            asked
-                .as_deref()
-                .map_or("key order".to_owned(), |token| format!(
-                    "`order_by={token}`"
-                ))
+            match cursor.order.as_deref() {
+                None => "in key order".to_owned(),
+                token => format!("under {}", spelled(token, "")),
+            },
+            spelled(asked.as_deref(), "key order")
         )));
     }
     // Each part through the same check a filter takes, so a cursor somebody edited is a
@@ -175,7 +338,7 @@ fn decode_cursor(table: &TableDef, raw: &str, order: Option<&Order>) -> Result<A
         .key
         .iter()
         .zip(&cursor.key)
-        .map(|((part, _), value)| bound(table, part, value).map_err(|_| bad()))
+        .map(|((part, _), value)| bound(table, part, part, value).map_err(|_| bad()))
         .collect::<Result<Vec<_>, _>>()?;
     let value = match (order, cursor.value) {
         (None, None) => None,
@@ -197,8 +360,9 @@ fn decode_cursor(table: &TableDef, raw: &str, order: Option<&Order>) -> Result<A
 /// to the server rather than reading as key parts.
 pub const WAIT: [&str; 2] = ["after", "timeout_ms"];
 
-/// Read a scan off the query string, or say why it is not one.
-pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan, Refusal> {
+/// Read a scan off the query string, `folds` already taken off it, or say why it is not
+/// one.
+pub fn parse_scan(sel: &Selection, params: &[(String, String)]) -> Result<Scan, Refusal> {
     let mut scan = Scan {
         limit: crate::read_api::DEFAULT_LIMIT,
         ..Scan::default()
@@ -218,75 +382,79 @@ pub fn parse_scan(table: &TableDef, params: &[(String, String)]) -> Result<Scan,
             "cursor" => cursor = Some(value.as_str()),
             "order_by" => order_by = Some(value.as_str()),
             wait if WAIT.contains(&wait) => {}
-            ranged if ranged.contains('.') => ranged_bound(table, &mut scan, ranged, value)?,
-            part => {
+            ranged if ranged.contains('.') => ranged_bound(sel, &mut scan, ranged, value)?,
+            param => {
+                let part = sel.part(param).ok_or_else(|| not_a_param(sel, param))?;
                 if scan.equals.iter().any(|(given, _)| given == part) {
-                    return Err(Refusal::invalid(format!("`{part}` is given twice")));
-                }
-                if !table.key.iter().any(|(name, _)| name == part) {
-                    return Err(Refusal {
-                        code: "unindexed_filter",
-                        message: format!(
-                            "`{part}` is not a key part of `{}`; its key is ({}), and a \
-                             derived table filters on its key",
-                            table.name,
-                            key_names(table)
-                        ),
-                    });
+                    return Err(Refusal::invalid(format!("`{param}` is given twice")));
                 }
                 scan.equals
-                    .push((part.to_owned(), bound(table, part, value)?));
+                    .push((part.to_owned(), bound(sel.main, part, param, value)?));
             }
         }
     }
     let ranged = scan.range.as_ref().map(|(part, _)| part.as_str());
-    if ranged.is_some_and(|part| scan.equals.iter().any(|(given, _)| given == part)) {
+    if let Some(part) = ranged
+        && scan.equals.iter().any(|(given, _)| given == part)
+    {
         return Err(Refusal::invalid(format!(
             "`{}` is pinned and bounded at once; filter it one way",
-            ranged.unwrap_or_default()
+            sel.spoken(part)
         )));
     }
-    if !servable(table, &scan.equals, ranged) {
-        return Err(Refusal {
-            code: "unindexed_filter",
-            message: unindexed(table, &scan.equals, ranged),
-        });
+    if !servable(sel.main, &scan.equals, ranged) {
+        return Err(Refusal::unindexed(unindexed(sel, &scan.equals, ranged)));
     }
     if let Some(raw) = order_by {
-        scan.order = Some(ordered(table, &scan, raw)?);
+        scan.order = Some(ordered(sel, &scan, raw)?);
     }
     if let Some(raw) = cursor {
-        scan.after = Some(decode_cursor(table, raw, scan.order.as_ref())?);
+        scan.after = Some(decode_cursor(sel, raw, scan.order.as_ref())?);
     }
     Ok(scan)
 }
 
-/// An `order_by` against what the table declares: a column an `@index` names, `-` before
-/// it to reverse, with exactly the key parts that lead that index pinned. Anything else
-/// would be a sort over the rows the filter matched rather than a walk of one index.
-fn ordered(table: &TableDef, scan: &Scan, raw: &str) -> Result<Order, Refusal> {
-    let (descending, column) = match raw.strip_prefix('-') {
+fn not_a_param(sel: &Selection, param: &str) -> Refusal {
+    Refusal::invalid(format!(
+        "`{param}` is not a parameter of `{}`, which takes ({}); a read names the key in the \
+         first listed fold's parameters",
+        sel.first(),
+        sel.params().join(", ")
+    ))
+}
+
+/// An `order_by` against what the folds declare: a fold whose `@index` orders this key,
+/// `-` before it to reverse, with exactly the parameters that lead that index pinned.
+/// Anything else would be a sort over the rows the filter matched rather than a walk of one
+/// index.
+fn ordered(sel: &Selection, scan: &Scan, raw: &str) -> Result<Order, Refusal> {
+    let (descending, fold) = match raw.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, raw),
     };
+    let table = sel.main;
     let declared: Vec<&SortDef> = table
         .sorts
         .iter()
-        .filter(|sort| sort.column == column)
+        .filter(|sort| sel.fold_of(&sort.column) == fold)
         .collect();
     if declared.is_empty() {
-        let known: Vec<String> = table.sorts.iter().map(spelled_sort).collect();
+        let known: Vec<String> = table
+            .sorts
+            .iter()
+            .map(|sort| spelled_sort(sel, sort))
+            .collect();
         return Err(Refusal::invalid(if known.is_empty() {
             format!(
-                "`{column}` is not an ordering of `{}`, which declares none; a fold orders \
-                 its table with `@index`",
-                table.name
+                "`{fold}` does not order rows keyed like `{}`, and nothing does; a fold \
+                 orders its rows with `@index`",
+                sel.first()
             )
         } else {
             format!(
-                "`{column}` is not an ordering of `{}`; it orders by {}, each optionally \
-                 prefixed with `-` to reverse it",
-                table.name,
+                "`{fold}` does not order rows keyed like `{}`; they order by {}, each \
+                 optionally prefixed with `-` to reverse it",
+                sel.first(),
                 known.join(", ")
             )
         }));
@@ -297,62 +465,62 @@ fn ordered(table: &TableDef, scan: &Scan, raw: &str) -> Result<Order, Refusal> {
             && sort.lead.iter().all(|part| pinned.contains(&part.as_str()))
     };
     if scan.range.is_some() || !declared.iter().any(fits) {
-        let ways: Vec<String> = declared.iter().map(|sort| spelled_sort(sort)).collect();
-        return Err(Refusal {
-            code: "unindexed_filter",
-            message: format!(
-                "ordering `{}` by `{column}` with ({}) pinned{} is not one index walk: {}. Pin \
-                 exactly the parts before the column, and no range.",
-                table.name,
-                pinned.join(", "),
-                if scan.range.is_some() {
-                    " and a range"
-                } else {
-                    ""
-                },
-                ways.join(", ")
-            ),
-        });
+        let ways: Vec<String> = declared
+            .iter()
+            .map(|sort| spelled_sort(sel, sort))
+            .collect();
+        return Err(Refusal::unindexed(format!(
+            "ordering by `{fold}` with ({}) pinned{} is not one index walk: {}. Pin exactly the \
+             parameters its `@index` names, and no range.",
+            sel.spoken_list(pinned.iter().copied()),
+            if scan.range.is_some() {
+                " and a range"
+            } else {
+                ""
+            },
+            ways.join(", ")
+        )));
     }
+    let column = &declared[0].column;
     Ok(Order {
-        column: column.to_owned(),
+        column: column.clone(),
         descending,
     })
 }
 
-fn spelled_sort(sort: &SortDef) -> String {
+fn spelled_sort(sel: &Selection, sort: &SortDef) -> String {
+    let fold = sel.fold_of(&sort.column);
     if sort.lead.is_empty() {
-        format!("`{}`", sort.column)
+        format!("`{fold}`")
     } else {
-        format!("`{}` with ({}) pinned", sort.column, sort.lead.join(", "))
+        format!(
+            "`{fold}` with ({}) pinned",
+            sel.spoken_list(sort.lead.iter().map(String::as_str))
+        )
     }
 }
 
-/// One end of a range, `part.gte=` and its siblings, onto the scan's one ranged part.
-fn ranged_bound(table: &TableDef, scan: &mut Scan, name: &str, value: &str) -> Result<(), Refusal> {
-    let (part, op) = name.rsplit_once('.').expect("checked to hold a dot");
+/// One end of a range, `param.gte=` and its siblings, onto the scan's one ranged part.
+fn ranged_bound(sel: &Selection, scan: &mut Scan, name: &str, value: &str) -> Result<(), Refusal> {
+    let (param, op) = name.rsplit_once('.').expect("checked to hold a dot");
     let Some(&(_, lower, bound_kind)) = RANGE_OPERATORS.iter().find(|(word, ..)| *word == op)
     else {
         let words: Vec<&str> = RANGE_OPERATORS.iter().map(|(word, ..)| *word).collect();
         return Err(Refusal::invalid(format!(
-            "`{name}` is not a filter: a range is `{part}.` followed by one of {}",
+            "`{name}` is not a filter: a range is `{param}.` followed by one of {}",
             words.join(", ")
         )));
     };
-    let Some((_, meta)) = table.key.iter().find(|(known, _)| known == part) else {
-        return Err(Refusal {
-            code: "unindexed_filter",
-            message: format!(
-                "`{part}` is not a key part of `{}`; its key is ({}), and a derived table \
-                 filters on its key",
-                table.name,
-                key_names(table)
-            ),
-        });
-    };
+    let part = sel.part(param).ok_or_else(|| not_a_param(sel, param))?;
+    let (_, meta) = sel
+        .main
+        .key
+        .iter()
+        .find(|(known, _)| known == part)
+        .expect("a key part of the selection's table");
     if !meta.kind.base().is_comparable() {
         return Err(Refusal::invalid(format!(
-            "`{part}` is {}, which has no order a range could use; filter it for equality \
+            "`{param}` is {}, which has no order a range could use; filter it for equality \
              instead",
             meta.kind.describe()
         )));
@@ -362,7 +530,8 @@ fn ranged_bound(table: &TableDef, scan: &mut Scan, name: &str, value: &str) -> R
         .get_or_insert_with(|| (part.to_owned(), Range::default()));
     if given != part {
         return Err(Refusal::invalid(format!(
-            "a scan bounds one key part, and `{given}` is already bounded"
+            "a scan bounds one parameter, and `{}` is already bounded",
+            sel.spoken(given)
         )));
     }
     let end = if lower {
@@ -372,29 +541,20 @@ fn ranged_bound(table: &TableDef, scan: &mut Scan, name: &str, value: &str) -> R
     };
     if end.is_some() {
         return Err(Refusal::invalid(format!(
-            "`{part}` has two {} bounds",
+            "`{param}` has two {} bounds",
             if lower { "lower" } else { "upper" }
         )));
     }
-    *end = Some((bound_kind, bound(table, part, value)?));
+    *end = Some((bound_kind, bound(sel.main, part, param, value)?));
     Ok(())
 }
 
-/// Read a whole key off the query string: every key part, once, and nothing else.
-pub fn parse_key(table: &TableDef, params: &[(String, String)]) -> Result<Vec<String>, Refusal> {
-    let parts: Vec<&str> = table.key.iter().map(|(part, _)| part.as_str()).collect();
-    parse_whole(table, &parts, &format!("a row of `{}`", table.name), params)
-}
-
-/// Read a whole key under the names a caller gives it: `names[i]` is what the query string
-/// calls `table.key[i]`, which is the part's own name for a row read and the fold's
-/// parameter name for a fold read. `owner` is what the names belong to, for a message.
-fn parse_whole(
-    table: &TableDef,
-    names: &[&str],
-    owner: &str,
-    params: &[(String, String)],
-) -> Result<Vec<String>, Refusal> {
+/// Read a whole key off the query string, `folds` already taken off it: every parameter
+/// of the first fold, once, and nothing else.
+pub fn parse_key(sel: &Selection, params: &[(String, String)]) -> Result<Vec<String>, Refusal> {
+    let table = sel.main;
+    let names = sel.params();
+    let owner = format!("`{}`", sel.first());
     let mut given: Vec<Option<String>> = vec![None; names.len()];
     for (name, value) in params {
         if WAIT.contains(&name.as_str()) {
@@ -402,7 +562,8 @@ fn parse_whole(
         }
         let Some(index) = names.iter().position(|known| known == name) else {
             return Err(Refusal::invalid(format!(
-                "`{name}` is not one of {owner}'s ({}), which is all it is named by",
+                "`{name}` is not one of {owner}'s parameters ({}), which are all it is named \
+                 by",
                 names.join(", ")
             )));
         };
@@ -410,14 +571,7 @@ fn parse_whole(
             return Err(Refusal::invalid(format!("`{name}` is given twice")));
         }
         let (part, _) = &table.key[index];
-        let text = bound(table, part, value).map_err(|refusal| Refusal {
-            // The part's name means nothing to a caller who named the parameter.
-            message: refusal
-                .message
-                .replace(&format!("`{part}`"), &format!("`{name}`")),
-            ..refusal
-        })?;
-        given[index] = Some(text);
+        given[index] = Some(bound(table, part, name, value)?);
     }
     given
         .into_iter()
@@ -437,13 +591,15 @@ fn parse_whole(
 /// than a row that silently is not there. A timestamp is also respelled the way the store
 /// holds it, since one instant has many RFC 3339 spellings; a UUID is not, since the store
 /// holds it as the event spelled it and a case-folded compare could not use the key.
-fn bound(table: &TableDef, part: &str, value: &str) -> Result<String, Refusal> {
+///
+/// `named` is what the caller called the part, for the message.
+fn bound(table: &TableDef, part: &str, named: &str, value: &str) -> Result<String, Refusal> {
     let (_, meta) = table
         .key
         .iter()
         .find(|(name, _)| name == part)
         .expect("checked to be a key part by the caller");
-    let wrong = |what: &str| Refusal::invalid(format!("`{part}` must be {what}"));
+    let wrong = |what: &str| Refusal::invalid(format!("`{named}` must be {what}"));
     match meta.kind.base() {
         // Checked and kept as spelled: heklang keeps a UUID the way it arrived, so the
         // store holds whatever case the event carried.
@@ -468,102 +624,89 @@ fn bound(table: &TableDef, part: &str, value: &str) -> Result<String, Refusal> {
         }
         kind => coerce_value(kind, value)
             .map(|_| value.to_owned())
-            .map_err(|why| Refusal::invalid(format!("`{part}`: {why}"))),
+            .map_err(|why| Refusal::invalid(format!("`{named}`: {why}"))),
     }
 }
 
-/// Whether the key or an index serves the filter: the pinned parts are a leading run of
-/// it, and a ranged part, if any, is the column right after them.
-fn servable(table: &TableDef, equals: &[(String, String)], ranged: Option<&str>) -> bool {
-    let asked: Vec<&str> = equals.iter().map(|(name, _)| name.as_str()).collect();
-    let leading = |columns: Vec<&str>| {
-        asked.len() <= columns.len()
-            && columns[..asked.len()].iter().all(|c| asked.contains(c))
-            && ranged.is_none_or(|part| columns.get(asked.len()) == Some(&part))
-    };
-    leading(table.key.iter().map(|(name, _)| name.as_str()).collect())
-        || table
-            .indexes
-            .iter()
-            .any(|index| leading(index.columns.iter().map(String::as_str).collect()))
-}
-
-fn unindexed(table: &TableDef, equals: &[(String, String)], ranged: Option<&str>) -> String {
-    let asked: Vec<&str> = equals.iter().map(|(name, _)| name.as_str()).collect();
-    if let Some(part) = ranged {
-        let mut ways = vec![format!("the key ({})", key_names(table))];
-        ways.extend(
-            table
-                .indexes
-                .iter()
-                .map(|index| format!("index ({})", index.columns.join(", "))),
-        );
-        return format!(
-            "a range on `{part}` after ({}) is not served by any index of `{}`: {}. Pin a \
-             leading run of one of them and range the column right after it.",
-            asked.join(", "),
-            table.name,
-            ways.join(", ")
-        );
-    }
-    let mut ways = vec![format!("the key ({})", key_names(table))];
-    ways.extend(
+/// The column orders a filter can lead: the key, then every index.
+fn leads(table: &TableDef) -> impl Iterator<Item = Vec<&str>> {
+    iter::once(table.key.iter().map(|(name, _)| name.as_str()).collect()).chain(
         table
             .indexes
             .iter()
-            .map(|index| format!("index ({})", index.columns.join(", "))),
-    );
-    format!(
-        "filter on ({}) is not a leading run of any index of `{}`: {}. Filter on the first \
-         parts of one of them.",
-        asked.join(", "),
-        table.name,
-        ways.join(", ")
+            .map(|index| index.columns.iter().map(String::as_str).collect()),
     )
 }
 
-fn key_names(table: &TableDef) -> String {
-    table
-        .key
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Where a named fold is kept: the main table of its key signature, which is what its key
-/// is read against, and its own column, which may be in the side table.
-#[derive(Debug, Clone, Copy)]
-pub struct FoldAt<'a> {
-    pub main: &'a TableDef,
-    pub column: &'a ColumnDef,
-}
-
-/// The stored fold named `fold`, or `None` for one nothing keeps: undeclared, or with a
-/// parameter no arm matches. Telling those apart is the caller's, since it needs the program
-/// and this needs only the tables.
-pub fn find_fold<'a>(tables: &'a [TableDef], fold: &str) -> Option<FoldAt<'a>> {
-    let (table, column) = tables.iter().find_map(|table| {
-        table
-            .columns
-            .iter()
-            .find(|column| column.fold == fold)
-            .map(|column| (table, column))
-    })?;
-    Some(FoldAt {
-        main: main_of(tables, &table.source)?,
-        column,
+/// Whether the key or an index serves the filter: the pinned parts are a leading run of
+/// it, in any order, and a ranged part, if any, is the column right after them.
+fn servable(table: &TableDef, equals: &[(String, String)], ranged: Option<&str>) -> bool {
+    let asked: Vec<&str> = equals.iter().map(|(name, _)| name.as_str()).collect();
+    leads(table).any(|columns| {
+        asked.len() <= columns.len()
+            && columns[..asked.len()].iter().all(|c| asked.contains(c))
+            && ranged.is_none_or(|part| columns.get(asked.len()) == Some(&part))
     })
 }
 
-/// Read a fold's arguments off the query string, as the key texts the store binds.
-///
-/// **Named as the fold declares its parameters**, `customer_id` and not the key part
-/// `customer` the table spells it as: a caller asking for a fold by name has its signature
-/// in front of them and nothing else. `ColumnDef::args` is that mapping, in key order.
-pub fn parse_args(at: FoldAt, params: &[(String, String)]) -> Result<Vec<String>, Refusal> {
-    let args: Vec<&str> = at.column.args.iter().map(String::as_str).collect();
-    parse_whole(at.main, &args, &format!("`{}`", at.column.fold), params)
+/// Why a filter is refused, naming what would be served instead as sets of parameters: a
+/// caller pins a set, and which order the store keeps it in is not theirs to know.
+fn unindexed(sel: &Selection, equals: &[(String, String)], ranged: Option<&str>) -> String {
+    let table = sel.main;
+    let is_part = |column: &&str| table.key.iter().any(|(part, _)| part == column);
+    let asked = sel.spoken_list(equals.iter().map(|(name, _)| name.as_str()));
+    // Every leading run of key parts, as a sorted set so two orders of one set are one way.
+    let mut sets: Vec<(Vec<&str>, Option<&str>)> = Vec::new();
+    for columns in leads(table) {
+        let parts: Vec<&str> = columns.iter().copied().take_while(is_part).collect();
+        // Pinning nothing is a scan in key order, not a fix for a filter, so an equality
+        // refusal starts at one part; a range may still lead a key with nothing pinned.
+        let shortest = usize::from(ranged.is_none());
+        for len in shortest..=parts.len() {
+            let mut set: Vec<&str> = parts[..len].iter().map(|part| sel.spoken(part)).collect();
+            set.sort_unstable();
+            let next = match ranged {
+                Some(_) => match parts.get(len) {
+                    Some(part) => Some(sel.spoken(part)),
+                    None => continue,
+                },
+                None => None,
+            };
+            if !sets.contains(&(set.clone(), next)) {
+                sets.push((set, next));
+            }
+        }
+    }
+    let ways: Vec<String> = sets
+        .iter()
+        .map(|(set, next)| match next {
+            Some(next) => format!("`{next}` with ({}) pinned", set.join(", ")),
+            None => format!("({})", set.join(", ")),
+        })
+        .collect();
+    match ranged {
+        Some(part) => format!(
+            "a range on `{}` with ({asked}) pinned is not one index seek for folds keyed like \
+             `{}`; one of these is: {}",
+            sel.spoken(part),
+            sel.first(),
+            ways.join(", ")
+        ),
+        None => format!(
+            "pinning ({asked}) is not one index seek for folds keyed like `{}`; pin one of \
+             these sets instead: {}",
+            sel.first(),
+            ways.join(", ")
+        ),
+    }
+}
+
+/// One page of rows, plus the position every row of it was read at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page {
+    pub items: Vec<Value>,
+    pub next_cursor: Option<String>,
+    pub position: u64,
 }
 
 /// One fold's value for one key, plus the store's position, in one read snapshot.
@@ -573,37 +716,30 @@ pub fn parse_args(at: FoldAt, params: &[(String, String)]) -> Result<Vec<String>
 pub fn get_fold(
     path: &Path,
     tables: &[TableDef],
-    at: FoldAt,
+    sel: &Selection,
     key: &[String],
     keystore: Option<&KeyStore>,
 ) -> anyhow::Result<(Option<Value>, u64)> {
-    let (row, position) = get_one(path, tables, at.main, key, keystore)?;
+    let (row, position) = get_one(path, tables, sel, key, keystore)?;
     Ok((
-        row.map(|row| row.get(&at.column.name).cloned().unwrap_or(Value::Null)),
+        row.map(|row| row.get(sel.first()).cloned().unwrap_or(Value::Null)),
         position,
     ))
-}
-
-/// One page of a table, plus the position every row of it was read at.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Page {
-    pub items: Vec<Value>,
-    pub next_cursor: Option<String>,
-    pub position: u64,
 }
 
 /// Read one row by its whole key, plus the store's position, in one read snapshot.
 pub fn get_one(
     path: &Path,
     tables: &[TableDef],
-    table: &TableDef,
+    sel: &Selection,
     key: &[String],
     keystore: Option<&KeyStore>,
 ) -> anyhow::Result<(Option<Value>, u64)> {
     let mut conn = open(path)?;
     let tx = conn.transaction()?;
     let position = checkpoint(&tx)?;
-    let equals: Vec<(String, String)> = table
+    let equals: Vec<(String, String)> = sel
+        .main
         .key
         .iter()
         .map(|(name, _)| name.clone())
@@ -614,15 +750,15 @@ pub fn get_one(
         limit: 1,
         ..Scan::default()
     };
-    let mut rows = select(&tx, tables, table, &scan, keystore)?;
+    let mut rows = select(&tx, tables, sel, &scan, keystore)?;
     Ok((rows.pop().map(|(row, _)| row), position))
 }
 
-/// A page of a table in key order, filtered and resumed, in one read snapshot.
+/// A page of rows in key order, filtered and resumed, in one read snapshot.
 pub fn scan(
     path: &Path,
     tables: &[TableDef],
-    table: &TableDef,
+    sel: &Selection,
     scan: &Scan,
     keystore: Option<&KeyStore>,
 ) -> anyhow::Result<Page> {
@@ -634,11 +770,11 @@ pub fn scan(
         limit: scan.limit + 1,
         ..scan.clone()
     };
-    let mut rows = select(&tx, tables, table, &probe, keystore)?;
+    let mut rows = select(&tx, tables, sel, &probe, keystore)?;
     let next_cursor = if rows.len() > scan.limit {
         rows.truncate(scan.limit);
         rows.last()
-            .map(|(_, after)| encode_cursor(&table.name, scan.order.as_ref(), after.clone()))
+            .map(|(_, after)| encode_cursor(&sel.main.name, scan.order.as_ref(), after.clone()))
     } else {
         None
     };
@@ -687,7 +823,11 @@ fn checkpoint(tx: &Transaction) -> anyhow::Result<u64> {
 /// What one output column is: a key part, or a fold's column from the main or side table.
 struct Out<'a> {
     alias: &'static str,
-    name: &'a str,
+    /// The stored column.
+    column: &'a str,
+    /// What the reader gets it as: the parameter for a key part, the fold for a value.
+    /// `None` for a sort column read only for the cursor.
+    shown: Option<&'a str>,
     meta: &'a FieldMeta,
     key: bool,
     /// The seed a side column reads as when its key has no side row yet.
@@ -698,42 +838,67 @@ struct Out<'a> {
 fn select(
     tx: &Transaction,
     tables: &[TableDef],
-    table: &TableDef,
+    sel: &Selection,
     scan: &Scan,
     keystore: Option<&KeyStore>,
 ) -> anyhow::Result<Vec<(Value, After)>> {
+    let table = sel.main;
     let side = side_of(tables, table);
     let mut outs: Vec<Out> = table
         .key
         .iter()
-        .map(|(name, meta)| Out {
+        .zip(sel.params())
+        .map(|((name, meta), param)| Out {
             alias: "m",
-            name,
+            column: name,
+            shown: Some(param),
             meta,
             key: true,
             seed: None,
         })
         .collect();
-    outs.extend(table.columns.iter().map(|column| Out {
-        alias: "m",
-        name: &column.name,
-        meta: &column.meta,
-        key: false,
-        seed: None,
-    }));
-    if let Some(side) = side {
-        outs.extend(side.columns.iter().map(|column| Out {
-            alias: "s",
-            name: &column.name,
-            meta: &column.meta,
+    let mut joins_side = false;
+    for fold in &sel.folds {
+        let in_main = table.columns.iter().any(|held| held.name == fold.name);
+        joins_side |= !in_main;
+        outs.push(Out {
+            alias: if in_main { "m" } else { "s" },
+            column: &fold.name,
+            shown: Some(&fold.fold),
+            meta: &fold.meta,
             key: false,
-            seed: column.default.as_deref(),
-        }));
+            seed: if in_main {
+                None
+            } else {
+                fold.default.as_deref()
+            },
+        });
     }
+    let sorted = match &scan.order {
+        Some(order) => {
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.name == order.column)
+                .with_context(|| format!("no column `{}`", order.column))?;
+            if !sel.folds.iter().any(|fold| fold.name == column.name) {
+                outs.push(Out {
+                    alias: "m",
+                    column: &column.name,
+                    shown: None,
+                    meta: &column.meta,
+                    key: false,
+                    seed: None,
+                });
+            }
+            Some((order, &column.meta))
+        }
+        None => None,
+    };
     let selected: Vec<String> = outs
         .iter()
         .map(|out| {
-            let cell = format!("{}.{}", out.alias, quote_ident(out.name));
+            let cell = format!("{}.{}", out.alias, quote_ident(out.column));
             // A key a collection was never written for has no side row, and the left join
             // reads that as NULL; the fold's answer for it is the seed, as it is for a
             // main-table column the `DEFAULT` filled.
@@ -756,14 +921,10 @@ fn select(
     };
     let mut sql = format!(
         "SELECT {} FROM {} AS m",
-        if selected.is_empty() {
-            "1".to_owned()
-        } else {
-            selected.join(", ")
-        },
+        selected.join(", "),
         quote_ident(&table.name)
     );
-    if let Some(side) = side {
+    if joins_side && let Some(side) = side {
         let on: Vec<String> = joined
             .iter()
             .map(|column| format!("m.{column} = s.{column}"))
@@ -807,19 +968,9 @@ fn select(
     // An ordering by a declared column: its absent rows are left out, since a row-value
     // comparison against NULL matches nothing and a page boundary would drop them, and
     // the key breaks ties so every row has one place in the order.
-    let sorted = match &scan.order {
-        Some(order) => {
-            let meta = &table
-                .columns
-                .iter()
-                .find(|column| column.name == order.column)
-                .with_context(|| format!("no column `{}`", order.column))?
-                .meta;
-            wheres.push(format!("m.{} IS NOT NULL", quote_ident(&order.column)));
-            Some((order, meta))
-        }
-        None => None,
-    };
+    if let Some((order, _)) = sorted {
+        wheres.push(format!("m.{} IS NOT NULL", quote_ident(&order.column)));
+    }
     if let Some(after) = &scan.after {
         // A row value comparison, so a page resumes after a whole key in key order rather
         // than after its first part.
@@ -875,15 +1026,18 @@ fn select(
             let raw = row.get_ref(at)?;
             if column.key {
                 after.key.push(key_text(raw));
-            } else if sorted.is_some_and(|(sort, _)| sort.column == column.name) {
+            } else if sorted.is_some_and(|(sort, _)| sort.column == column.column) {
                 after.value = Some(key_text(raw));
             }
+            let Some(shown) = column.shown else {
+                continue;
+            };
             let value = rendered(column.meta, raw, keystore)
-                .with_context(|| format!("reading `{}`.`{}`", table.name, column.name))?;
+                .with_context(|| format!("reading `{shown}`"))?;
             // Absent rather than `null`, as a projector's row serves it: an optional fold
             // answering `none` and an erased seal read the same, which is the point.
             if !value.is_null() {
-                item.insert(column.name.to_owned(), value);
+                item.insert(shown.to_owned(), value);
             }
         }
         out.push((Value::Object(item), after));
