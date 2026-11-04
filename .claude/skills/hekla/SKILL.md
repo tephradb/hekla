@@ -185,6 +185,9 @@ folds are grouped and stored, for debugging; nothing in it is something a read n
 **A sealed fold is not served** by any read route (`404 sealed`) unless `hekla.toml` lists it under
 `[folds] serve_sealed`, so a token or refresh token an effect reads never reaches a client by
 accident. Commands and effects still read it; only the HTTP routes and OpenAPI leave it out.
+**A `404` from `/row` means no event has named that key, not that it does not exist**: any arm
+touching a key makes its row, so ask a fold that says whether the thing exists (`OrderKnown`) when
+that is the question.
 Every row and every fold also has a **history** (`/row/history?folds=A,B&<params>`,
 `/folds/{Fold}/history?<params>`): each record that changed it, newest first, with the value before
 and after. Prefer it to a list fold that pushes an entry per event just to keep a ledger; that list
