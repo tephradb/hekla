@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://git.tqwewe.com/tephra/hekla/compare/v0.7.2...v0.8.0) - 2026-11-04
+
+### Added
+
+- a sealed fold is not served over HTTP unless hekla.toml names it in [folds] serve_sealed
+- [**breaking**] stored folds are read by name through /rows, /row and /row/history, and a table's name is a hash nothing addresses
+- a derived row and a stored fold serve their history, each change with its value before and after
+- a derived table scan orders by a column a fold's @index declares, and a timestamp is stored so its text order is its time order
+- a derived table scan ranges on the key part after its pinned ones, over HTTP and in the console
+- a backfill replays the folds a column looks up beside it, so a lookup reads each one as of its record
+- the events page follows the log's head while at the top, and holds new events back while you read
+- a named fold is read by its own name and parameters at /folds/{fold}, and looked up from the console
+- a derived table is read over HTTP at /tables and browsed in the console
+- a record is applied to the value already in a derived column, instead of refolding it over the log
+- a deployment follows the log into its derived tables, and status says how far behind they are
+- a batch folds every column its records touch, at one head, and a column behind the store is backfilled
+- changing one fold rebuilds one column, and a new column arrives holding its fold's seed
+- a named fold's table is real SQLite, and a collection-typed fold is split off from the start
+- a named fold is a declaration a deployment records, and a compound entity key is refused
+
+### Fixed
+
+- *(deps)* update rustls, rustls-webpki, webpki-roots, ctutils and tokio past their advisories
+- a column keyed through a ranged fold has no history, and the refusal names the fold that ranges
+- tephra 0.4.1, whose same-batch conflict check matches by event type and per event
+- hekla asks for HEKLA_MASTER_KEY only when a field seals or keys are stored, and names which
+- a backfill replays the log into the columns it rebuilds, so a fold added over existing history fills keys no row held yet
+- a sealed derived cell carries the subject, id and field that open it, and a store of another format is refolded
+
+### Other
+
+- the served column's doc links TableDef::served, which replaced serve_sealed
+- depend on heklang 0.13.0 from crates.io
+- merge stored folds into main
+- depend on heklang 0.12.0 from crates.io
+- fold arms with no filter drop the empty list, as heklang now writes them
+- a fold whose value reads another fold is replayed as of each record
+- the derived store's comments name the sink as what fills a column, not fold_stored
+- a backfill replays only the columns it rebuilds and the ones that mint their keys
+- a fold with a computed key part is stored and read over /tables and /folds
+- a uniqueness claim is current state, not history
+
 ## [0.7.2](https://git.tqwewe.com/tephra/hekla/compare/v0.7.1...v0.7.2) - 2026-10-03
 
 ### Added
