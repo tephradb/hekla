@@ -2204,3 +2204,57 @@ fold HoldChangedAt(shop_id: Shop, hold_id: Int) -> Timestamp? @index(shop_id, Ho
         "lead, sibling, the fold, the rest of the key"
     );
 }
+
+/// A sibling is matched by value and never ordered on, so a `Bool` can lead an index: a
+/// list of the orders known to exist, by deadline, is one seek on a known-flag fold.
+#[test]
+fn a_bool_fold_can_lead_an_index_as_a_sibling() {
+    let source = "event @order.placed { shop_id: Int, order_id: Int, due: Timestamp }
+event @order.unknown { shop_id: Int, order_id: Int, due: Timestamp }
+
+fold OrderKnown(shop_id: Int, order_id: Int) -> Bool = false {
+  on @order.placed(shop_id, order_id) => true
+}
+
+fold OrderDue(shop_id: Int, order_id: Int) -> Timestamp? @index(shop_id, OrderKnown) = none {
+  on @order.placed(shop_id, order_id) { due } => due
+  on @order.unknown(shop_id, order_id) { due } => due
+}
+";
+    let event = |path: &str, order: i64, due: i64| {
+        Event::new(
+            EventPath::new(["order", path]),
+            [
+                ("shop_id".to_owned(), Value::Int(1)),
+                ("order_id".to_owned(), Value::Int(order)),
+                ("due".to_owned(), Value::Timestamp(due)),
+            ],
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    deployed_and_filled(
+        &path,
+        source,
+        &[
+            event("placed", 1, 1_700_000_002_000_000),
+            event("unknown", 2, 1_700_000_001_000_000),
+            event("placed", 3, 1_700_000_001_500_000),
+        ],
+    );
+    let tables = TableDef::all(&program(source));
+    let sel = hekla::table_read::pick(&tables, &["OrderDue", "OrderKnown"]).unwrap();
+    let params: Vec<(String, String)> = [("shop_id", "1"), ("OrderKnown", "true")]
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect();
+    let scan = hekla::table_read::parse_scan(&sel, &params)
+        .unwrap_or_else(|refusal| panic!("{}", refusal.message));
+    let orders: Vec<i64> = hekla::table_read::scan(&path, &tables, &sel, &scan, None)
+        .unwrap()
+        .items
+        .iter()
+        .map(|row| row["order_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(orders, vec![3, 1], "the known orders, soonest due first");
+}

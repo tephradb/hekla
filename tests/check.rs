@@ -1352,7 +1352,8 @@ fn a_fold_keyed_on_several_ids_is_not_a_copied_emit() {
 }
 
 /// An `@index` led by a `Money` sibling would pin a value the store holds as text a request
-/// could not match, so it is refused where it is declared.
+/// could not match, so it is refused where it is declared: by heklang, which keys no `Money`,
+/// and by hekla's own rule behind it.
 #[test]
 fn an_index_led_by_a_money_fold_is_refused() {
     assert_error(
@@ -1364,6 +1365,6 @@ fn an_index_led_by_a_money_fold_is_refused() {
              fold ItemSeen(shop_id: Int, item_id: Int) -> n: Int @index(shop_id, ItemPrice) = 0 {\n  \
              on @item.priced(shop_id, item_id) => n + 1\n}\n",
         )],
-        "leading with `ItemPrice`",
+        "cannot be matched by value",
     );
 }

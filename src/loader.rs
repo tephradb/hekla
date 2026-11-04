@@ -21,7 +21,9 @@ use heklang::{Diagnostic, Digest, Entry, Kind, Program, Severity as HekSeverity}
 use walkdir::WalkDir;
 
 use crate::config::Config;
-use crate::schema::{self, EntityDef, EventDef, EventDefs, InputSchema, ModuleDef, ModuleKind};
+use crate::schema::{
+    self, EntityDef, EventDef, EventDefs, FieldKind, InputSchema, ModuleDef, ModuleKind,
+};
 use crate::tables::TableDef;
 
 /// How severe a [`Finding`] is. Only errors fail `hek check`.
@@ -568,14 +570,16 @@ impl Sources {
                         ),
                     ));
                 }
-                // A sibling is pinned by value, and the store holds a `Money` as text a
-                // request's `10` would not equal, so it is held to the same rule.
+                // A sibling is pinned by value, never ranged or sorted on, so it needs only to
+                // match: anything a key part can be, or a `Bool`. Not a `Money`, which the store
+                // holds as text a request's `10` would not equal.
                 for value in &sort.values {
                     let Some(sibling) = table.columns.iter().find(|held| held.name == *value)
                     else {
                         continue;
                     };
-                    if !sibling.meta.kind.base().is_comparable() {
+                    let kind = sibling.meta.kind.base();
+                    if !(kind.is_keyable() || matches!(kind, FieldKind::Bool)) {
                         let rel = program
                             .fold(&column.fold)
                             .and_then(|def| def.module.clone())
@@ -585,8 +589,8 @@ impl Sources {
                             format!(
                                 "fold `{}` declares `@index` leading with `{}`, which is {}, \
                                  and the store does not hold one in a form a filter could \
-                                 match; lead with an `Int`, `String`, `Uuid` or `Timestamp` \
-                                 fold instead",
+                                 match; lead with an `Int`, `String`, `Uuid`, `Timestamp`, \
+                                 `Bool` or enum fold instead",
                                 column.fold,
                                 sibling.fold,
                                 sibling.meta.kind.describe()

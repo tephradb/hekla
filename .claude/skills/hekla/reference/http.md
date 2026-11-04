@@ -158,8 +158,10 @@ GET /rows?folds=OwnerTickets&org_id=1&limit=50
 - **`404 not_found` on `/row` means no event has named that key, not that the thing does not
   exist.** Any arm of any fold that touches a key makes its row, so a webhook about an unknown order
   or a resolution with nothing to resolve makes one too, and `/row` then answers `200` with seeds.
-  When "does this order exist" matters, ask a fold that says so (`OrderKnown`), and filter a list on
-  it with its `@index` (`?folds=OrderKnown&shop_id=1&OrderKnown=true`).
+  When "does this order exist" matters, ask a fold that says so (`OrderKnown`), and list by it with
+  an `@index` it leads as a sibling: `OrderDue -> Timestamp? @index(shop_id, OrderKnown)` serves
+  `?folds=OrderDue,OrderKnown&shop_id=1&OrderKnown=true`. A sibling is matched by value, so a `Bool`
+  or an enum can be one.
   An undeclared fold in `folds` is a 404 too; a declared one nothing stores is `400 not_stored`.
 - A malformed value, a parameter the first fold does not take, or a cursor from elsewhere is `400
   invalid_input`. A pinned set no index serves is `400 unindexed_filter`, and its message names the
