@@ -78,10 +78,10 @@ pub struct ColumnDef {
     ///
     /// **Both paths onto a column need it, for one reason.** `ALTER TABLE ... ADD COLUMN`
     /// needs a default to give the rows already there, and a `CREATE TABLE` column needs
-    /// one because the writer inserts a row one column at a time: two folds of one key are
-    /// two columns an event may touch separately, so the columns it did not touch have to
-    /// come into being holding something. For both, the something is the seed, which is
-    /// what folding that column for that key would return.
+    /// one because the writer inserts a row with only the columns a batch set: two folds of
+    /// one key are two columns an event may touch separately, so the columns it did not
+    /// touch have to come into being holding something. For both, the something is the
+    /// seed, which is what folding that column for that key would return.
     pub default: Option<String>,
     /// The fold's declared return type, which is the column's.
     ///
@@ -192,7 +192,7 @@ impl TableDef {
             } else {
                 " NOT NULL"
             };
-            // The writer inserts a row one column at a time, so a column this write did
+            // The writer inserts a row with only the columns a batch set, so a column it did
             // not touch has to come into being holding its fold's seed.
             let default = match &column.default {
                 Some(literal) => format!(" DEFAULT {literal}"),

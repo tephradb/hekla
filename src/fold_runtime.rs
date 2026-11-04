@@ -68,12 +68,14 @@ pub fn apply_batch(
         written: 0,
         ensured: BTreeSet::new(),
         replay: None,
+        pending: BTreeMap::new(),
     };
     for record in records {
         derived
             .apply(record, &mut writer)
             .with_context(|| format!("applying the record at {}", record.position))?;
     }
+    writer.flush()?;
     let filled = Filled {
         columns: writer.written,
         records: records.len(),
@@ -157,6 +159,7 @@ pub fn backfill<H: Host>(
         written: 0,
         ensured: BTreeSet::new(),
         replay: Some(replay),
+        pending: BTreeMap::new(),
     };
     let mut records = 0;
     if head > 0 {
@@ -173,6 +176,7 @@ pub fn backfill<H: Host>(
             })
             .map_err(|err| anyhow::anyhow!("replaying the log into the derived tables: {err}"))?;
     }
+    writer.flush()?;
     let filled = Filled {
         columns: writer.written,
         records,

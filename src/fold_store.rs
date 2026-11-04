@@ -593,47 +593,46 @@ impl FoldStore {
         Ok(())
     }
 
-    /// Write one column of one row, creating the row if no event had matched its key yet.
+    /// Write the cells a batch set in one row, creating the row if no event had matched its
+    /// key yet.
     ///
-    /// Per column rather than per row, because that is the unit a fold is: two folds of
-    /// one key are two columns one event may touch separately, and rewriting the row would
-    /// put back whatever the other column held when this batch started. A row created here
-    /// gets its other columns' seeds from their `DEFAULT`, which is what folding each of
-    /// them for this key would return.
-    pub fn write(
+    /// **One statement per row, not per cell.** An event moving ten folds of one key used
+    /// to rewrite that row ten times, and SQLite rewrites a whole row record for any
+    /// column of it, so a wide row paid for its width on every cell. Only the columns
+    /// named are set: two folds of one key are two columns, and rewriting the others
+    /// would put back whatever they held when this batch started. A row created here gets
+    /// its other columns' seeds from their `DEFAULT`, which is what folding each of them
+    /// for this key would return.
+    pub fn write_row(
         &self,
         tx: &Transaction,
         table: &TableDef,
         key: &[String],
-        column: &ColumnDef,
-        value: &Value,
+        cells: &BTreeMap<&str, rusqlite::types::Value>,
     ) -> anyhow::Result<()> {
         let (mut names, mut binds) = key_binds(table, key)?;
-        names.push(quote_ident(&column.name));
-        binds.push(cell_of(&table.name, column, value)?);
+        // The keyless table's guard column is among the key's names, so one conflict
+        // target covers both shapes.
+        let conflict = names.join(", ");
+        let mut sets = Vec::new();
+        for (column, cell) in cells {
+            let column = quote_ident(column);
+            sets.push(format!("{column} = excluded.{column}"));
+            names.push(column);
+            binds.push(cell.clone());
+        }
         let holders: Vec<String> = (1..=names.len()).map(|at| format!("?{at}")).collect();
-        let conflict: Vec<String> = if table.key.is_empty() {
-            vec![quote_ident("_one")]
-        } else {
-            table
-                .key
-                .iter()
-                .map(|(name, _)| quote_ident(name))
-                .collect()
-        };
         tx.execute(
             &format!(
-                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) DO UPDATE SET {} = ?{}",
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({conflict}) DO UPDATE SET {}",
                 quote_ident(&table.name),
                 names.join(", "),
                 holders.join(", "),
-                conflict.join(", "),
-                quote_ident(&column.name),
-                names.len()
+                sets.join(", ")
             ),
             rusqlite::params_from_iter(binds),
         )
-        .with_context(|| format!("writing `{}`.`{}`", table.name, column.name))?;
+        .with_context(|| format!("writing a row of `{}`", table.name))?;
         Ok(())
     }
 
@@ -700,10 +699,9 @@ fn render(value: rusqlite::types::Value) -> String {
 }
 
 impl FoldStore {
-    /// One cell as it stands inside `tx`, including writes this batch has already made.
-    ///
-    /// Read through the transaction rather than the connection so that two arms of one
-    /// event accumulate onto each other: the second has to see what the first wrote.
+    /// One cell as it stands inside `tx`: what the batch has written so far, not what it
+    /// still holds pending. `ColumnWriter` reads its own pending cells before this, which is
+    /// what lets two arms of one event accumulate onto each other.
     pub fn cell(
         &self,
         tx: &Transaction,

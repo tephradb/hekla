@@ -966,6 +966,7 @@ fn a_column_whose_fold_has_no_digest_entry_is_loud() {
 // ---------------------------------------------------------------------------
 
 use hekla::fold_store::SealedCell;
+use heklang::host::Columns;
 
 /// Keyed on an order and sealed under a customer, which is the shape four of the ported
 /// application's sealed columns have: no column of the row is a customer id.
@@ -1047,7 +1048,7 @@ fn a_sealed_column_keyed_off_its_subject_keeps_what_opens_it() {
 
 /// Plaintext in a sealed column would be personal data at rest in the clear, and nothing
 /// would ever erase it. heklang seals an arm's value before it reaches a host, so this is
-/// the store's own backstop, written to directly.
+/// the store's own backstop, met by a write the way an arm makes one.
 #[test]
 fn a_sealed_column_refuses_plaintext() {
     let dir = tempfile::tempdir().unwrap();
@@ -1063,13 +1064,25 @@ fn a_sealed_column_refuses_plaintext() {
         value: Some(Box::new(Value::str("ann@example.com"))),
     };
     let tx = store.begin().unwrap();
-    let why = store
-        .write(&tx, table, &["1".to_owned()], column, &plain)
+    let mut writer = hekla::fold_sink::ColumnWriter {
+        store: &store,
+        tx: &tx,
+        program: &program,
+        tables: &tables,
+        written: 0,
+        ensured: Default::default(),
+        replay: None,
+        pending: Default::default(),
+    };
+    let key = || vec![heklang::Key::from_value(&Value::Int(1)).unwrap()];
+    let why = writer
+        .set(&table.source, key(), &column.name, plain)
         .expect_err("refused");
-    assert!(format!("{why:#}").contains("handed plaintext"), "{why:#}");
-    store
-        .write(&tx, table, &["1".to_owned()], column, &sealed_email())
+    assert!(why.to_string().contains("handed plaintext"), "{why}");
+    writer
+        .set(&table.source, key(), &column.name, sealed_email())
         .expect("a seal is what the column holds");
+    writer.flush().expect("and it is written");
 }
 
 /// A store written before sealed cells were wrapped holds bare ciphertext that reads back
@@ -1948,5 +1961,126 @@ fold Orders(customer_id: Customer) -> n: Int = 0 {
             ("Orders".to_owned(), true),
         ],
         "naming one serves that one only"
+    );
+}
+
+/// A batch holds the cells it set until it writes each row once, and holds no more than ten
+/// thousand rows before writing them. A batch over that many keys writes part of itself
+/// mid-way, and a key written before that point and again after it must read back its own
+/// first write, not its seed.
+#[test]
+fn a_batch_wider_than_one_write_reads_back_what_it_wrote() {
+    const KEYS: i64 = 10_050;
+    let source = "event @hit { n: Int }
+
+fold Hits(n: Int) -> c: Int = 0 {
+  on @hit(n) => c + 1
+}
+
+fold Total() -> t: Int = 0 {
+  on @hit => t + 1
+}
+";
+    let hit = |n: i64| Event::new(EventPath::new(["hit"]), [("n".to_owned(), Value::Int(n))]);
+    let mut events: Vec<Event> = (0..KEYS).map(hit).collect();
+    // Twice before any write, so the second reads the first from what is held.
+    events.insert(8, hit(7));
+    events.push(hit(0));
+    events.push(hit(KEYS - 1));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    deployed_and_filled(&path, source, &events);
+
+    let tables = TableDef::all(&program(source));
+    let hits = table_of(&tables, "Hits");
+    let total = table_of(&tables, "Total");
+    let conn = Connection::open(&path).unwrap();
+    let count = |n: i64| {
+        cell(
+            &conn,
+            &format!("SELECT CAST(\"hits\" AS TEXT) FROM \"{hits}\" WHERE \"n\" = {n}"),
+        )
+    };
+    assert_eq!(
+        count(0),
+        Some("2".to_owned()),
+        "written before the mid-way write and after it"
+    );
+    assert_eq!(count(KEYS - 1), Some("2".to_owned()));
+    assert_eq!(
+        count(7),
+        Some("2".to_owned()),
+        "read back before it was written"
+    );
+    assert_eq!(count(5_000), Some("1".to_owned()));
+    assert_eq!(
+        cell(
+            &conn,
+            &format!("SELECT CAST(COUNT(*) AS TEXT) FROM \"{hits}\"")
+        ),
+        Some(KEYS.to_string())
+    );
+    assert_eq!(
+        cell(
+            &conn,
+            &format!("SELECT CAST(\"total\" AS TEXT) FROM \"{total}\"")
+        ),
+        Some((KEYS + 3).to_string())
+    );
+}
+
+/// The same through a backfill, which replays the whole log in one writer, and for a
+/// collection, whose cells go to the side table: a fold added over a log wider than one
+/// write is rebuilt for every key, and a key the replay wrote twice holds both.
+#[test]
+fn a_backfill_wider_than_one_write_rebuilds_every_key() {
+    const KEYS: i64 = 10_050;
+    let first = "event @hit { n: Int }
+
+fold Hits(n: Int) -> c: Int = 0 {
+  on @hit(n) => c + 1
+}
+";
+    let grown = format!(
+        "{first}
+fold Seen(n: Int) -> seen: List(Int) = [] {{
+  on @hit(n) => seen.push(n)
+}}
+"
+    );
+    let hit = |n: i64| Event::new(EventPath::new(["hit"]), [("n".to_owned(), Value::Int(n))]);
+    let mut events: Vec<Event> = (0..KEYS).map(hit).collect();
+    events.push(hit(0));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    deployed_and_filled(&path, first, &events);
+    redeployed(&path, &grown, &events);
+
+    let tables = TableDef::all(&program(&grown));
+    let side = tables
+        .iter()
+        .find(|table| table.columns.iter().any(|column| column.fold == "Seen"))
+        .unwrap()
+        .name
+        .clone();
+    assert!(
+        side.ends_with("_side"),
+        "a list lives in the side table: {side}"
+    );
+    let conn = Connection::open(&path).unwrap();
+    let seen = |n: i64| {
+        cell(
+            &conn,
+            &format!("SELECT \"seen\" FROM \"{side}\" WHERE \"n\" = {n}"),
+        )
+    };
+    assert_eq!(seen(0), Some("[0,0]".to_owned()), "both of its records");
+    assert_eq!(seen(KEYS - 1), Some(format!("[{}]", KEYS - 1)));
+    assert_eq!(
+        cell(
+            &conn,
+            &format!("SELECT CAST(COUNT(*) AS TEXT) FROM \"{side}\"")
+        ),
+        Some(KEYS.to_string())
     );
 }

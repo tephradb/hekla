@@ -10,6 +10,7 @@
 //! interpreting heklang. So the interpreter does it and this holds the cells.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem;
 
 use heklang::host::Columns;
 use heklang::interp::{Error, ErrorKind, key_as_value};
@@ -17,17 +18,19 @@ use heklang::ir::Type;
 use heklang::value::{Defs, Value};
 use heklang::{Key, Program};
 use rusqlite::Transaction;
+use rusqlite::types::{Value as SqlValue, ValueRef};
 
-use crate::fold_store::{FoldStore, SealedCell, stored_text};
+use crate::fold_store::{FoldStore, SealedCell, cell_of, stored_text};
 use crate::heklang_host::{to_heklang_json, wire_form};
+use crate::read_model::from_sql;
 use crate::tables::{ColumnDef, TableDef, holding, main_of};
 
 /// One batch's writes into the derived tables.
 ///
 /// Holds the transaction, so every column a batch touches commits with the checkpoint or
-/// not at all, and reads through it: `Columns::value` owes the value *including* writes
-/// this record has already made, which is what lets two arms of one event accumulate onto
-/// each other.
+/// not at all. `Columns::value` owes the value *including* writes this record has already
+/// made, which is what lets two arms of one event accumulate onto each other, so it reads a
+/// pending cell before the store.
 pub struct ColumnWriter<'a> {
     pub store: &'a FoldStore,
     pub tx: &'a Transaction<'a>,
@@ -40,6 +43,21 @@ pub struct ColumnWriter<'a> {
     pub ensured: BTreeSet<(String, Vec<String>)>,
     /// Set while a backfill replays the log, and `None` while following it.
     pub replay: Option<Replay>,
+    /// Cells set and not yet written, per table and key, each column as the cell the store
+    /// will hold. [`ColumnWriter::flush`] writes each row once; until then
+    /// `Columns::value` reads a cell from here before the store, and `Columns::keys` counts
+    /// a pending row's key as one the table has.
+    pub pending: BTreeMap<(&'a str, Vec<String>), Pending<'a>>,
+}
+
+/// How many rows a writer holds before it writes them, which bounds a backfill's memory:
+/// it replays the whole log in one writer, and a flush mid-way reads back the same.
+const FLUSH_ROWS: usize = 10_000;
+
+/// One row's cells a batch has set, and the table they are for.
+pub struct Pending<'a> {
+    table: &'a TableDef,
+    cells: BTreeMap<&'a str, SqlValue>,
 }
 
 /// What a backfill replays the log under.
@@ -73,6 +91,15 @@ pub struct Replay {
 }
 
 impl<'a> ColumnWriter<'a> {
+    /// Write every pending row, one statement each, and empty the buffer. Owed before the
+    /// transaction commits: a cell still pending is a write the store never saw.
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        for ((_, key), row) in mem::take(&mut self.pending) {
+            self.store.write_row(self.tx, row.table, &key, &row.cells)?;
+        }
+        Ok(())
+    }
+
     /// The table that holds `column` of the layout table `source`, and the column itself.
     ///
     /// `Tables::apply` names a layout table, and a collection-typed column of it lives in
@@ -90,7 +117,7 @@ impl<'a> ColumnWriter<'a> {
     }
 }
 
-impl Columns for ColumnWriter<'_> {
+impl<'a> Columns for ColumnWriter<'a> {
     fn value(&self, table: &str, key: &[Key], column: &str) -> Result<Option<Value>, Error> {
         let (def, held) = self.cell(table, column)?;
         let texts = key_texts(def, key)?;
@@ -104,10 +131,23 @@ impl Columns for ColumnWriter<'_> {
                     .cloned());
             }
         }
-        let found = self
-            .store
-            .cell(self.tx, def, &texts, &held.name)
-            .map_err(|why| host_error(format!("{why:#}")))?;
+        let at = (def.name.as_str(), texts);
+        let pending = self
+            .pending
+            .get(&at)
+            .and_then(|row| row.cells.get(held.name.as_str()));
+        // A pending cell goes through the decoding a stored one does, so what an arm reads
+        // back is the same whether or not this batch has flushed yet.
+        let found = match pending {
+            Some(cell) => Some(
+                from_sql(&held.meta, ValueRef::from(cell))
+                    .map_err(|why| host_error(format!("{why:#}")))?,
+            ),
+            None => self
+                .store
+                .cell(self.tx, def, &at.1, &held.name)
+                .map_err(|why| host_error(format!("{why:#}")))?,
+        };
         let Some(stored) = found else {
             return Ok(None);
         };
@@ -166,10 +206,20 @@ impl Columns for ColumnWriter<'_> {
                 .ensure_row(self.tx, main, &texts)
                 .map_err(|why| host_error(format!("{why:#}")))?;
         }
-        self.store
-            .write(self.tx, def, &texts, held, &value)
-            .map_err(|why| host_error(format!("{why:#}")))?;
+        let cell =
+            cell_of(&def.name, held, &value).map_err(|why| host_error(format!("{why:#}")))?;
+        self.pending
+            .entry((def.name.as_str(), texts))
+            .or_insert_with(|| Pending {
+                table: def,
+                cells: BTreeMap::new(),
+            })
+            .cells
+            .insert(held.name.as_str(), cell);
         self.written += 1;
+        if self.pending.len() >= FLUSH_ROWS {
+            self.flush().map_err(|why| host_error(format!("{why:#}")))?;
+        }
         Ok(())
     }
 
@@ -194,10 +244,24 @@ impl Columns for ColumnWriter<'_> {
                 .get(&over.name)
                 .map(|minted| minted_matching(minted, &parts))
                 .unwrap_or_default(),
-            None => self
-                .store
-                .keys_pinned(self.tx, over, &parts)
-                .map_err(|why| host_error(format!("{why:#}")))?,
+            None => {
+                let mut rows: BTreeSet<Vec<String>> = self
+                    .store
+                    .keys_pinned(self.tx, over, &parts)
+                    .map_err(|why| host_error(format!("{why:#}")))?
+                    .into_iter()
+                    .collect();
+                // A key this batch minted and has not written yet is still one the table
+                // has. Both sides spell a key through `stored_text`, so one key is one text.
+                let minted: BTreeSet<Vec<String>> = self
+                    .pending
+                    .keys()
+                    .filter(|(held, _)| *held == over.name)
+                    .map(|(_, key)| key.clone())
+                    .collect();
+                rows.extend(minted_matching(&minted, &parts));
+                rows.into_iter().collect()
+            }
         };
         rows.iter()
             .map(|row| {
