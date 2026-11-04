@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://git.tqwewe.com/tephra/hekla/compare/v0.8.0...v0.9.0) - 2026-11-04
+
+### Added
+
+- an @index sibling may be a Bool or an enum, since a scan only matches it by value
+- a scan filters on an indexed fold's value, and an @index may lead with a sibling fold pinned by value
+
+### Fixed
+
+- a command reading a fold keyed on several ids is not warned as a copied emit
+
+### Other
+
+- depend on heklang 0.14.0 from crates.io
+- the roadmap defers dropping rows at their seeds, with why and what would bring it back
+- a 404 from /row means no event named the key, and existence is a fold's question
+- a batch writes each row it touches once, not once per fold it moves
+
 ## [0.8.0](https://git.tqwewe.com/tephra/hekla/compare/v0.7.2...v0.8.0) - 2026-11-04
 
 ### Added
