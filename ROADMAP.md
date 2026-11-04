@@ -3518,6 +3518,18 @@ warranted.
   hekla's and nothing here is designed around it in the meantime. What makes it deferrable rather
   than missing is that a caller with a clock can invoke the command itself, and hekla's guarantees
   (idempotency by tag, at-least-once effects) already cover one that fires twice.
+- **Dropping a row whose every fold is back at its seed**, so a work queue's storage follows its
+  open work rather than every item it ever held: when a deployment's finished-item rows measurably
+  hurt, and a read semantics for it is chosen first. Asked for by the order-editing port and tried
+  (kept as a stash), then declined after three reviews, because every rule tried changes what a scan
+  lists. Dropping on any write that leaves a row at its seeds empties a `Status=pending` scan whose
+  seed is `"pending"`; dropping only on a *return* to the seed loses a requeued item from that scan
+  while keeping a new one. And a table with a fold that ranges, the keyless table, a sealed fold or an
+  optional fold seeded with a value cannot drop rows soundly at all, so whether a key is listed would
+  depend on how folds are grouped, which no reader is meant to see. Reads do not need it: a value
+  filter on a deadline (`Deadline.lte=<now>`) already skips the finished items whose deadline is
+  `none`. A version worth building probably starts from a scan rule that does not depend on the
+  grouping, such as listing only keys where a listed fold is off its seed, and only then drops rows.
 
 ### Carried-forward gaps from earlier phases
 
