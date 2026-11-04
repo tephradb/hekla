@@ -11,7 +11,9 @@
 //! The rest is advice: a judgement about a design that parses perfectly well and that
 //! hekla has no business refusing, which is why those stay warnings.
 
-use heklang::ir::{Command, Filter, Slice, Type};
+use std::collections::BTreeSet;
+
+use heklang::ir::{Command, EventPath, Expr, Filter, Ident, Slice, Slot, Type};
 use heklang::{Defs, Program};
 use serde_json::{Value, json};
 
@@ -117,9 +119,17 @@ pub fn check(project: &LoadedProject) -> Vec<Finding> {
     check_secrets(project, &mut findings);
     check_served(project, &mut findings);
     let defs = Defs::of(&project.program);
+    let keyed = KeyedArms::of(&project.program);
     for command in &project.program.commands {
         let location = command.module.clone().unwrap_or_default();
-        check_boundary(command, &project.program, defs, &location, &mut findings);
+        check_boundary(
+            command,
+            &project.program,
+            defs,
+            &keyed,
+            &location,
+            &mut findings,
+        );
     }
     findings
 }
@@ -266,6 +276,7 @@ fn check_boundary(
     command: &Command,
     program: &Program,
     defs: Defs<'_>,
+    keyed: &KeyedArms,
     location: &str,
     findings: &mut Vec<Finding>,
 ) {
@@ -341,7 +352,7 @@ fn check_boundary(
             ));
         }
 
-        if over_constrained(declared, slice) {
+        if over_constrained(declared, slice, keyed) {
             findings.push(Finding::warning(
                 location,
                 format!(
@@ -478,7 +489,7 @@ fn is_selective(declared: &heklang::ir::EventDef, field: &str, defs: Defs<'_>) -
     ) && !matches!(def.ty, Type::Bool)
 }
 
-fn over_constrained(declared: &heklang::ir::EventDef, slice: &Slice) -> bool {
+fn over_constrained(declared: &heklang::ir::EventDef, slice: &Slice, keyed: &KeyedArms) -> bool {
     let fields = declared.fields.len();
     if fields < 4 {
         return false;
@@ -486,10 +497,68 @@ fn over_constrained(declared: &heklang::ir::EventDef, slice: &Slice) -> bool {
     // Field filters only, the way the two checks above count them. A rule 13 key conjunct
     // constrains no field of the event, so counting one would call a slice a copied `emit`
     // for narrowing fewer fields than the warning accuses it of.
+    //
+    // Nor does a field a named fold's arm pins to one of its own parameters: that is the
+    // fold's key, so a fold keyed on three ids of a five-field event pins three on purpose.
+    let keys = keyed.pinned(slice);
     let constrained = slice
         .filters
         .iter()
-        .filter(|filter| matches!(filter, Filter::Field { .. }))
+        .filter(|filter| match filter {
+            Filter::Field { field, .. } => !keys.contains(field),
+            Filter::Key { .. } => false,
+        })
         .count();
     constrained as f64 / fields as f64 >= OVER_CONSTRAINT_RATIO
+}
+
+/// Every named fold arm's event, the fields it filters on, and which of those it pins to
+/// one of the fold's own parameters, which are its key.
+///
+/// A command that reads a named fold carries the fold's arms as its own slices, and the
+/// splice keeps no note of where a slice came from, so an arm is recognised by its event
+/// and the set of fields it filters. Two arms alike in both are the same shape, which is
+/// all the lint asks about.
+struct KeyedArms(Vec<(EventPath, BTreeSet<Ident>, BTreeSet<Ident>)>);
+
+impl KeyedArms {
+    fn of(program: &Program) -> KeyedArms {
+        let mut arms = Vec::new();
+        for fold in &program.folds {
+            let params: Vec<Slot> = fold.params.iter().map(|param| param.slot).collect();
+            for slice in &fold.stage.slices {
+                let mut filtered = BTreeSet::new();
+                let mut pinned = BTreeSet::new();
+                for filter in &slice.filters {
+                    let Filter::Field { field, value } = filter else {
+                        continue;
+                    };
+                    filtered.insert(field.clone());
+                    if matches!(fold.exprs.get(*value), Some(Expr::Load(slot)) if params.contains(slot))
+                    {
+                        pinned.insert(field.clone());
+                    }
+                }
+                arms.push((slice.event.clone(), filtered, pinned));
+            }
+        }
+        KeyedArms(arms)
+    }
+
+    /// The fields `slice` pins as a named fold's key, or none when no fold arm has its shape.
+    fn pinned(&self, slice: &Slice) -> BTreeSet<Ident> {
+        let filtered: BTreeSet<Ident> = slice
+            .filters
+            .iter()
+            .filter_map(|filter| match filter {
+                Filter::Field { field, .. } => Some(field.clone()),
+                Filter::Key { .. } => None,
+            })
+            .collect();
+        self.0
+            .iter()
+            .find(|(event, fields, _)| *event == slice.event && *fields == filtered)
+            .map(|(_, _, pinned)| pinned.clone())
+            .unwrap_or_default()
+    }
 }

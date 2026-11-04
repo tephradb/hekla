@@ -1302,3 +1302,51 @@ fold Never(customer_id: Customer, coupon: Int) -> n: Int = 0 {
     assert!(about("Never")[0].contains("not stored"), "{errs:?}");
     assert!(about("Nope")[0].contains("does not declare"), "{errs:?}");
 }
+
+/// A named fold keyed on several ids pins each of them to one of its own parameters, which
+/// is its key and not a copied `emit`, so a command reading it is not warned. A command
+/// that pins the same fields to literals, which is what a copied `emit` looks like, still
+/// is.
+#[test]
+fn a_fold_keyed_on_several_ids_is_not_a_copied_emit() {
+    let event = (
+        "events/escalation.hk",
+        "subject Shop(Int)\n\nevent @address.escalated { shop_id: Shop, order_id: Int, request_id: Uuid, \
+         note: String @max(100) }\n",
+    );
+    let keyed = write_project(&[
+        event,
+        (
+            "lib/folds.hk",
+            "fold Escalated(shop_id: Shop, order_id: Int, request_id: Uuid) -> Bool = false {\n  \
+             on @address.escalated(shop_id, order_id, request_id) => true\n}\n",
+        ),
+        (
+            "commands/approve.hk",
+            "command Approve(shop_id: Shop, order_id: Int, request_id: Uuid) {\n  \
+             fold escalated = Escalated { shop_id, order_id, request_id }\n  \
+             emit @address.escalated { shop_id, order_id, request_id, note: \"approved\" }\n}\n",
+        ),
+    ]);
+    let warns = warnings(&LoadedProject::load(keyed.path()));
+    assert!(
+        !warns.iter().any(|warn| warn.contains("copied `emit`")),
+        "{warns:?}"
+    );
+
+    let copied = write_project(&[
+        event,
+        (
+            "commands/approve.hk",
+            "command Approve(shop_id: Shop, order_id: Int, request_id: Uuid) {\n  \
+             fold seen: Bool = false\n    \
+             on @address.escalated(shop_id, order_id, request_id, note: \"approved\") => true\n  \
+             emit @address.escalated { shop_id, order_id, request_id, note: \"approved\" }\n}\n",
+        ),
+    ]);
+    let warns = warnings(&LoadedProject::load(copied.path()));
+    assert!(
+        warns.iter().any(|warn| warn.contains("copied `emit`")),
+        "{warns:?}"
+    );
+}
