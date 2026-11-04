@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::crypto::KeyStore;
 use crate::fold_store::SealedCell;
 use crate::heklang_host::{column_form, unsealed_json};
-use crate::read_api::{RANGE_OPERATORS, Range};
+use crate::read_api::{Bound, RANGE_OPERATORS, Range};
 use crate::read_model::{coerce_value, from_sql, quote_ident, reject_double_quoted_strings};
 use crate::schema::{FieldKind, FieldMeta};
 use crate::tables::{ColumnDef, SortDef, TableDef, main_of, side_of};
@@ -94,6 +94,8 @@ pub fn readable(tables: &[TableDef]) -> impl Iterator<Item = &TableDef> {
 #[derive(Debug, Clone)]
 pub struct Selection<'a> {
     pub main: &'a TableDef,
+    /// The main table's collections, if it has any.
+    pub side: Option<&'a TableDef>,
     /// In the order the caller listed them; never empty.
     pub folds: Vec<&'a ColumnDef>,
 }
@@ -183,6 +185,7 @@ pub fn pick<'a>(tables: &'a [TableDef], folds: &[&str]) -> Result<Selection<'a>,
     }
     let mut selection = Selection {
         main,
+        side: side_of(tables, main),
         folds: vec![column],
     };
     for fold in rest {
@@ -250,6 +253,12 @@ pub struct Scan {
     /// At most one key part bounded at either end or both: the part right after the
     /// pinned ones, in the key or in an index, which is what keeps it a seek.
     pub range: Option<(String, Range)>,
+    /// Folds' columns pinned to a value, as the texts the store binds: the indexed fold's
+    /// own, and the sibling folds its `@index` leads with.
+    pub values: Vec<(String, String)>,
+    /// The indexed fold's own column bounded at either end or both, which is a seek along
+    /// the index it orders by.
+    pub value_range: Option<(String, Range)>,
     /// A column a fold's `@index` declares, to order by instead of the key.
     pub order: Option<Order>,
     /// Where the previous page ended.
@@ -390,16 +399,48 @@ pub fn parse_scan(sel: &Selection, params: &[(String, String)]) -> Result<Scan, 
             "cursor" => cursor = Some(value.as_str()),
             "order_by" => order_by = Some(value.as_str()),
             wait if WAIT.contains(&wait) => {}
-            ranged if ranged.contains('.') => ranged_bound(sel, &mut scan, ranged, value)?,
-            param => {
-                let part = sel.part(param).ok_or_else(|| not_a_param(sel, param))?;
-                if scan.equals.iter().any(|(given, _)| given == part) {
-                    return Err(Refusal::invalid(format!("`{param}` is given twice")));
+            ranged if ranged.contains('.') => {
+                let (named, _) = ranged.rsplit_once('.').expect("checked to hold a dot");
+                match filtered_fold(sel, named)? {
+                    Some(column) => value_bound(&mut scan, column, ranged, value)?,
+                    None => ranged_bound(sel, &mut scan, ranged, value)?,
                 }
-                scan.equals
-                    .push((part.to_owned(), bound(sel.main, part, param, value)?));
             }
+            param => match filtered_fold(sel, param)? {
+                Some(column) => {
+                    if scan.values.iter().any(|(given, _)| *given == column.name) {
+                        return Err(Refusal::invalid(format!("`{param}` is given twice")));
+                    }
+                    scan.values
+                        .push((column.name.clone(), bound_meta(&column.meta, param, value)?));
+                }
+                None => {
+                    let part = sel.part(param).ok_or_else(|| not_a_param(sel, param))?;
+                    if scan.equals.iter().any(|(given, _)| given == part) {
+                        return Err(Refusal::invalid(format!("`{param}` is given twice")));
+                    }
+                    scan.equals
+                        .push((part.to_owned(), bound(sel.main, part, param, value)?));
+                }
+            },
         }
+    }
+    if let Some((column, _)) = &scan.value_range
+        && scan.values.iter().any(|(given, _)| given == column)
+    {
+        return Err(Refusal::invalid(format!(
+            "`{}` is pinned and bounded at once; filter it one way",
+            sel.fold_of(column)
+        )));
+    }
+    if let Some((column, _)) = &scan.value_range
+        && !sel.main.sorts.iter().any(|sort| sort.column == *column)
+    {
+        return Err(Refusal::invalid(format!(
+            "`{}` only leads an index beside another fold, so it can be pinned to a value but \
+             not bounded; a range goes on the fold its `@index` orders by",
+            sel.fold_of(column)
+        )));
     }
     let ranged = scan.range.as_ref().map(|(part, _)| part.as_str());
     if let Some(part) = ranged
@@ -413,13 +454,202 @@ pub fn parse_scan(sel: &Selection, params: &[(String, String)]) -> Result<Scan, 
     if !servable(sel.main, &scan.equals, ranged) {
         return Err(Refusal::unindexed(unindexed(sel, &scan.equals, ranged)));
     }
-    if let Some(raw) = order_by {
-        scan.order = Some(ordered(sel, &scan, raw)?);
+    // A value filter is a seek along the index that orders by the fold, so it orders the
+    // page by that fold too; `order_by` only says which way, or which fold when siblings
+    // are pinned beside it.
+    let implied = match order_by {
+        Some(_) => None,
+        None => implied_order(sel, &scan)?,
+    };
+    if let Some(raw) = order_by.map(str::to_owned).or(implied) {
+        scan.order = Some(ordered(sel, &scan, &raw, order_by.is_none())?);
     }
     if let Some(raw) = cursor {
         scan.after = Some(decode_cursor(sel, raw, scan.order.as_ref())?);
     }
     Ok(scan)
+}
+
+/// The column of the fold a scan parameter names, when it names one rather than a key
+/// parameter: a fold of these rows that an `@index` orders by or leads with.
+///
+/// A fold name is capitalised and a parameter is not, so the two cannot be confused, and a
+/// capitalised name that is no such fold is refused here rather than read as a parameter
+/// the first fold does not take.
+fn filtered_fold<'a>(sel: &Selection<'a>, name: &str) -> Result<Option<&'a ColumnDef>, Refusal> {
+    if !name.starts_with(|first: char| first.is_ascii_uppercase()) {
+        return Ok(None);
+    }
+    let indexed = |column: &str| {
+        sel.main
+            .sorts
+            .iter()
+            .any(|sort| sort.column == column || sort.values.iter().any(|value| value == column))
+    };
+    let held = |table: &'a TableDef| table.columns.iter().find(|column| column.fold == name);
+    match held(sel.main) {
+        // As a read of it would be: its value is not to be learned one filter at a time.
+        Some(column) if !column.served => Err(Refusal {
+            code: "sealed",
+            message: format!(
+                "`{name}` is sealed, so no read filters on it: a filter would learn its value \
+                 one guess at a time, and a sealed fold cannot be indexed"
+            ),
+        }),
+        Some(column) if indexed(&column.name) => Ok(Some(column)),
+        Some(_) => Err(Refusal::unindexed(format!(
+            "`{name}` is not indexed, so filtering on its value would be a table scan; declare \
+             `@index` on it, or on a fold that leads with it"
+        ))),
+        None if sel.side.and_then(held).is_some() => Err(Refusal::unindexed(format!(
+            "`{name}` is a collection, which no index orders, so a scan cannot filter on it"
+        ))),
+        None => Err(Refusal::invalid(format!(
+            "`{name}` is not a fold of the rows `{}` is kept in, so a scan of them cannot filter \
+             on it",
+            sel.first()
+        ))),
+    }
+}
+
+/// One end of a range on a fold's own value, `Fold.gte=` and its siblings.
+fn value_bound(
+    scan: &mut Scan,
+    column: &ColumnDef,
+    name: &str,
+    value: &str,
+) -> Result<(), Refusal> {
+    let (fold, lower, kind) = range_op(name)?;
+    orderable(&column.meta, fold)?;
+    let (given, range) = scan
+        .value_range
+        .get_or_insert_with(|| (column.name.clone(), Range::default()));
+    if *given != column.name {
+        return Err(Refusal::invalid(
+            "a scan bounds one fold's value, and another is already bounded".to_owned(),
+        ));
+    }
+    set_end(
+        range,
+        fold,
+        lower,
+        (kind, bound_meta(&column.meta, fold, value)?),
+    )
+}
+
+/// What a range parameter bounds, which end, and how: `fold.gte` is `fold`'s lower end,
+/// inclusive.
+fn range_op(name: &str) -> Result<(&str, bool, Bound), Refusal> {
+    let (subject, op) = name.rsplit_once('.').expect("checked to hold a dot");
+    match RANGE_OPERATORS.iter().find(|(word, ..)| *word == op) {
+        Some(&(_, lower, kind)) => Ok((subject, lower, kind)),
+        None => {
+            let words: Vec<&str> = RANGE_OPERATORS.iter().map(|(word, ..)| *word).collect();
+            Err(Refusal::invalid(format!(
+                "`{name}` is not a filter: a range is `{subject}.` followed by one of {}",
+                words.join(", ")
+            )))
+        }
+    }
+}
+
+/// Refuse a range over a value with no order, which a seek could not bound.
+fn orderable(meta: &FieldMeta, named: &str) -> Result<(), Refusal> {
+    if meta.kind.base().is_comparable() {
+        return Ok(());
+    }
+    Err(Refusal::invalid(format!(
+        "`{named}` is {}, which has no order a range could use; filter it for equality instead",
+        meta.kind.describe()
+    )))
+}
+
+/// Set one end of a range, refusing a second bound at the same end.
+fn set_end(
+    range: &mut Range,
+    named: &str,
+    lower: bool,
+    bound: (Bound, String),
+) -> Result<(), Refusal> {
+    let end = if lower {
+        &mut range.lower
+    } else {
+        &mut range.upper
+    };
+    if end.is_some() {
+        return Err(Refusal::invalid(format!(
+            "`{named}` has two {} bounds",
+            if lower { "lower" } else { "upper" }
+        )));
+    }
+    *end = Some(bound);
+    Ok(())
+}
+
+/// The ordering a value filter with no `order_by` walks: the fold it bounds, since only the
+/// indexed fold itself takes a range, or else the fold whose `@index` leads with what the
+/// request pinned, which also orders a filter on its siblings alone.
+///
+/// When no index fits, the nearest one is named, so [`ordered`] can say what it leads with;
+/// only two that fit equally need `order_by` to choose.
+fn implied_order(sel: &Selection, scan: &Scan) -> Result<Option<String>, Refusal> {
+    if let Some((column, _)) = &scan.value_range {
+        return Ok(Some(sel.fold_of(column).to_owned()));
+    }
+    // A pinned value or part is in the request once: `parse_scan` refuses a second.
+    let filtered: Vec<&str> = scan
+        .values
+        .iter()
+        .map(|(column, _)| column.as_str())
+        .collect();
+    if filtered.is_empty() {
+        return Ok(None);
+    }
+    let pinned: Vec<&str> = scan.equals.iter().map(|(part, _)| part.as_str()).collect();
+    // Every sibling pinned, and the fold itself pinned too or walked from there.
+    let covers = |sort: &&SortDef| {
+        let itself = usize::from(filtered.contains(&sort.column.as_str()));
+        sort.values.len() + itself == filtered.len()
+            && sort
+                .values
+                .iter()
+                .all(|value| filtered.contains(&value.as_str()))
+    };
+    let leads = |sort: &&SortDef| {
+        sort.lead.len() == pinned.len()
+            && sort.lead.iter().all(|part| pinned.contains(&part.as_str()))
+    };
+    let mut fitting: Vec<&str> = sel
+        .main
+        .sorts
+        .iter()
+        .filter(covers)
+        .filter(leads)
+        .map(|sort| sort.column.as_str())
+        .collect();
+    fitting.dedup();
+    match fitting.as_slice() {
+        [column] => Ok(Some(sel.fold_of(column).to_owned())),
+        [] => {
+            let nearest = sel
+                .main
+                .sorts
+                .iter()
+                .find(covers)
+                .map(|sort| sort.column.as_str())
+                .unwrap_or(filtered[0]);
+            Ok(Some(sel.fold_of(nearest).to_owned()))
+        }
+        _ => Err(Refusal::invalid(format!(
+            "filtering on {} walks more than one index; add `order_by` naming the fold to \
+             order by",
+            filtered
+                .iter()
+                .map(|column| format!("`{}`", sel.fold_of(column)))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ))),
+    }
 }
 
 fn not_a_param(sel: &Selection, param: &str) -> Refusal {
@@ -435,7 +665,10 @@ fn not_a_param(sel: &Selection, param: &str) -> Refusal {
 /// `-` before it to reverse, with exactly the parameters that lead that index pinned.
 /// Anything else would be a sort over the rows the filter matched rather than a walk of one
 /// index.
-fn ordered(sel: &Selection, scan: &Scan, raw: &str) -> Result<Order, Refusal> {
+///
+/// `filtering` is an ordering a value filter implies rather than one `order_by` asked for,
+/// which only changes what a refusal calls it.
+fn ordered(sel: &Selection, scan: &Scan, raw: &str, filtering: bool) -> Result<Order, Refusal> {
     let (descending, fold) = match raw.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, raw),
@@ -468,19 +701,45 @@ fn ordered(sel: &Selection, scan: &Scan, raw: &str) -> Result<Order, Refusal> {
         }));
     }
     let pinned: Vec<&str> = scan.equals.iter().map(|(part, _)| part.as_str()).collect();
+    let valued: Vec<&str> = scan
+        .values
+        .iter()
+        .map(|(column, _)| column.as_str())
+        .collect();
     let fits = |sort: &&SortDef| {
         sort.lead.len() == pinned.len()
             && sort.lead.iter().all(|part| pinned.contains(&part.as_str()))
+            // Every sibling the index leads with pinned, and nothing pinned it does not hold.
+            && sort.values.iter().all(|value| valued.contains(&value.as_str()))
+            && valued.iter().all(|column| {
+                *column == sort.column || sort.values.iter().any(|value| value == column)
+            })
+            // A range is on the fold itself, and not after pinning it to one value.
+            && scan.value_range.as_ref().is_none_or(|(column, _)| {
+                *column == sort.column && !valued.contains(&sort.column.as_str())
+            })
     };
     if scan.range.is_some() || !declared.iter().any(fits) {
         let ways: Vec<String> = declared
             .iter()
             .map(|sort| spelled_sort(sel, sort))
             .collect();
+        let mut asked: Vec<&str> = pinned.iter().map(|part| sel.spoken(part)).collect();
+        asked.extend(
+            valued
+                .iter()
+                .filter(|column| sel.fold_of(column) != fold)
+                .map(|column| sel.fold_of(column)),
+        );
         return Err(Refusal::unindexed(format!(
-            "ordering by `{fold}` with ({}) pinned{} is not one index walk: {}. Pin exactly the \
-             parameters its `@index` names, and no range.",
-            sel.spoken_list(pinned.iter().copied()),
+            "{} `{fold}` with ({}) pinned{} is not one index walk: {}. Pin exactly what its \
+             `@index` leads with, and no range on a parameter.",
+            if filtering {
+                "filtering on"
+            } else {
+                "ordering by"
+            },
+            asked.join(", "),
             if scan.range.is_some() {
                 " and a range"
             } else {
@@ -498,27 +757,26 @@ fn ordered(sel: &Selection, scan: &Scan, raw: &str) -> Result<Order, Refusal> {
 
 fn spelled_sort(sel: &Selection, sort: &SortDef) -> String {
     let fold = sel.fold_of(&sort.column);
-    if sort.lead.is_empty() {
+    let mut pins: Vec<String> = sort
+        .lead
+        .iter()
+        .map(|part| sel.spoken(part).to_owned())
+        .collect();
+    pins.extend(
+        sort.values
+            .iter()
+            .map(|value| sel.fold_of(value).to_owned()),
+    );
+    if pins.is_empty() {
         format!("`{fold}`")
     } else {
-        format!(
-            "`{fold}` with ({}) pinned",
-            sel.spoken_list(sort.lead.iter().map(String::as_str))
-        )
+        format!("`{fold}` with ({}) pinned", pins.join(", "))
     }
 }
 
 /// One end of a range, `param.gte=` and its siblings, onto the scan's one ranged part.
 fn ranged_bound(sel: &Selection, scan: &mut Scan, name: &str, value: &str) -> Result<(), Refusal> {
-    let (param, op) = name.rsplit_once('.').expect("checked to hold a dot");
-    let Some(&(_, lower, bound_kind)) = RANGE_OPERATORS.iter().find(|(word, ..)| *word == op)
-    else {
-        let words: Vec<&str> = RANGE_OPERATORS.iter().map(|(word, ..)| *word).collect();
-        return Err(Refusal::invalid(format!(
-            "`{name}` is not a filter: a range is `{param}.` followed by one of {}",
-            words.join(", ")
-        )));
-    };
+    let (param, lower, kind) = range_op(name)?;
     let part = sel.part(param).ok_or_else(|| not_a_param(sel, param))?;
     let (_, meta) = sel
         .main
@@ -526,13 +784,7 @@ fn ranged_bound(sel: &Selection, scan: &mut Scan, name: &str, value: &str) -> Re
         .iter()
         .find(|(known, _)| known == part)
         .expect("a key part of the selection's table");
-    if !meta.kind.base().is_comparable() {
-        return Err(Refusal::invalid(format!(
-            "`{param}` is {}, which has no order a range could use; filter it for equality \
-             instead",
-            meta.kind.describe()
-        )));
-    }
+    orderable(meta, param)?;
     let (given, range) = scan
         .range
         .get_or_insert_with(|| (part.to_owned(), Range::default()));
@@ -542,19 +794,12 @@ fn ranged_bound(sel: &Selection, scan: &mut Scan, name: &str, value: &str) -> Re
             sel.spoken(given)
         )));
     }
-    let end = if lower {
-        &mut range.lower
-    } else {
-        &mut range.upper
-    };
-    if end.is_some() {
-        return Err(Refusal::invalid(format!(
-            "`{param}` has two {} bounds",
-            if lower { "lower" } else { "upper" }
-        )));
-    }
-    *end = Some((bound_kind, bound(sel.main, part, param, value)?));
-    Ok(())
+    set_end(
+        range,
+        param,
+        lower,
+        (kind, bound(sel.main, part, param, value)?),
+    )
 }
 
 /// Read a whole key off the query string, `folds` already taken off it: every parameter
@@ -607,6 +852,11 @@ fn bound(table: &TableDef, part: &str, named: &str, value: &str) -> Result<Strin
         .iter()
         .find(|(name, _)| name == part)
         .expect("checked to be a key part by the caller");
+    bound_meta(meta, named, value)
+}
+
+/// [`bound`] for any stored value: a key part, or a fold's column a scan filters on.
+fn bound_meta(meta: &FieldMeta, named: &str, value: &str) -> Result<String, Refusal> {
     let wrong = |what: &str| Refusal::invalid(format!("`{named}` must be {what}"));
     match meta.kind.base() {
         // Checked and kept as spelled: heklang keeps a UUID the way it arrived, so the
@@ -961,17 +1211,28 @@ fn select(
             .iter()
             .find(|(part, _)| part == name)
             .with_context(|| format!("no key part `{name}`"))?;
-        for (lower, end) in [(true, &range.lower), (false, &range.upper)] {
-            if let Some((bound, text)) = end {
-                binds.push(coerce_value(&meta.kind, text)?);
-                wheres.push(format!(
-                    "m.{} {} ?{}",
-                    quote_ident(name),
-                    bound.operator(lower),
-                    binds.len()
-                ));
-            }
-        }
+        bounded(name, &meta.kind, range, &mut wheres, &mut binds)?;
+    }
+    let column_meta = |name: &str| {
+        table
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .map(|column| &column.meta)
+            .with_context(|| format!("no column `{name}`"))
+    };
+    for (name, text) in &scan.values {
+        binds.push(coerce_value(&column_meta(name)?.kind, text)?);
+        wheres.push(format!("m.{} = ?{}", quote_ident(name), binds.len()));
+    }
+    if let Some((name, range)) = &scan.value_range {
+        bounded(
+            name,
+            &column_meta(name)?.kind,
+            range,
+            &mut wheres,
+            &mut binds,
+        )?;
     }
     // An ordering by a declared column: its absent rows are left out, since a row-value
     // comparison against NULL matches nothing and a page boundary would drop them, and
@@ -1097,4 +1358,26 @@ pub(crate) fn rendered(
             None => Value::Null,
         },
     )
+}
+
+/// A range on one stored column as the conditions a select adds, each end bound.
+fn bounded(
+    column: &str,
+    kind: &FieldKind,
+    range: &Range,
+    wheres: &mut Vec<String>,
+    binds: &mut Vec<SqlValue>,
+) -> anyhow::Result<()> {
+    for (lower, end) in [(true, &range.lower), (false, &range.upper)] {
+        if let Some((bound, text)) = end {
+            binds.push(coerce_value(kind, text)?);
+            wheres.push(format!(
+                "m.{} {} ?{}",
+                quote_ident(column),
+                bound.operator(lower),
+                binds.len()
+            ));
+        }
+    }
+    Ok(())
 }

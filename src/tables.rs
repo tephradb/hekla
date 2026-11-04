@@ -56,6 +56,9 @@ pub struct SortDef {
     pub column: String,
     /// The key parts a scan pins to use it, in key order. Empty for a whole-table order.
     pub lead: Vec<String>,
+    /// The columns of sibling folds a scan pins by value to use it, after the lead. Empty
+    /// for an index over this fold alone.
+    pub values: Vec<String>,
     /// The index that serves it, in [`TableDef::indexes`].
     pub index: String,
 }
@@ -456,8 +459,8 @@ pub fn side_of<'a>(tables: &'a [TableDef], main: &TableDef) -> Option<&'a TableD
 
 /// One ordering and its index per `@index` a fold of `table` declares.
 ///
-/// The index is the parts that lead it, then the column, then the rest of the key, so the
-/// key that breaks a tie between equal values is in the index too and a page of an
+/// The index is the parts that lead it, then the sibling folds' columns it names, then the
+/// column, then the rest of the key, so the key that breaks a tie between equal values is in the index too and a page of an
 /// ordering is one walk with no sort. Only a column of the main table can be one: heklang
 /// refuses `@index` on a collection, which is what a side table holds.
 fn sort_indexes(table: &Table, scalars: &[ColumnDef]) -> Vec<(SortDef, IndexDef)> {
@@ -466,9 +469,25 @@ fn sort_indexes(table: &Table, scalars: &[ColumnDef]) -> Vec<(SortDef, IndexDef)
         if !scalars.iter().any(|kept| kept.name == column.name) {
             continue;
         }
-        for lead in &column.indexes {
-            let lead: Vec<String> = lead.iter().map(|&at| table.key[at].name.clone()).collect();
+        for index in &column.indexes {
+            let lead: Vec<String> = index
+                .parts
+                .iter()
+                .map(|&at| table.key[at].name.clone())
+                .collect();
+            let values: Vec<String> = index
+                .folds
+                .iter()
+                .map(|fold| {
+                    scalars
+                        .iter()
+                        .find(|kept| kept.fold == *fold)
+                        .map(|kept| kept.name.clone())
+                        .expect("heklang keeps an index's sibling to a scalar column of its table")
+                })
+                .collect();
             let mut columns = lead.clone();
+            columns.extend(values.iter().cloned());
             columns.push(column.name.clone());
             columns.extend(
                 table
@@ -480,15 +499,21 @@ fn sort_indexes(table: &Table, scalars: &[ColumnDef]) -> Vec<(SortDef, IndexDef)
             // `__` between the parts, which a column cannot contain: a fold name has no `_`,
             // so its snake case never doubles one, and `sorts_score_by_game` could otherwise
             // be `ScoreByGame` or `Score` led by `game`.
-            let name = if lead.is_empty() {
+            // And `+` before each sibling, which neither a column nor a part can contain.
+            let mut name = if lead.is_empty() {
                 format!("sorts__{}", column.name)
             } else {
                 format!("sorts__{}__{}", column.name, lead.join("__"))
             };
+            for value in &values {
+                name.push('+');
+                name.push_str(value);
+            }
             out.push((
                 SortDef {
                     column: column.name.clone(),
                     lead,
+                    values,
                     index: name.clone(),
                 },
                 IndexDef { name, columns },

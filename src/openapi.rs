@@ -719,8 +719,11 @@ fn key_param(required: bool, scan: bool) -> Value {
                 "The first listed fold's parameters to filter on, each `<param>=<value>`. \
                  Equality on any set of them that the key or an index serves, plus at most one \
                  range, `<param>.<op>=<value>` with `<op>` one of {}, on the parameter the \
-                 key or an index orders right after the pinned ones. Anything else would be a \
-                 table scan, so it is a 400 whose message names the sets that are served.",
+                 key or an index orders right after the pinned ones. A fold an `@index` covers \
+                 is filtered by its own name the same way, `<Fold>=<value>` or \
+                 `<Fold>.<op>=<value>`, with what its `@index` leads with pinned: a seek along \
+                 the index that orders by it, so the page comes back in that order. Anything \
+                 else would be a table scan, so it is a 400 whose message names what is served.",
                 read_api::RANGE_OPERATORS
                     .iter()
                     .map(|(word, ..)| format!("`{word}`"))
@@ -776,7 +779,7 @@ fn rows_path(surface: &Surface) -> Value {
             let Some(column) = table.columns().find(|column| column.name == sort.column) else {
                 continue;
             };
-            let lead: Vec<&str> = sort
+            let mut lead: Vec<&str> = sort
                 .lead
                 .iter()
                 .filter_map(|part| {
@@ -784,6 +787,12 @@ fn rows_path(surface: &Surface) -> Value {
                     column.args.get(at).map(String::as_str)
                 })
                 .collect();
+            lead.extend(sort.values.iter().filter_map(|value| {
+                table
+                    .columns()
+                    .find(|held| held.name == *value)
+                    .map(|held| held.fold.as_str())
+            }));
             orderings.push(if lead.is_empty() {
                 format!("`{}`", column.fold)
             } else {
@@ -798,8 +807,9 @@ fn rows_path(surface: &Surface) -> Value {
                 "Order by a fold whose `@index` orders this key instead of by the key, `-` \
                  first to reverse it: {}. Each is spelled in that fold's own parameters, which \
                  is how to pin it when it is listed first in `folds`; listed later, pin the same \
-                 key parts by the first fold's names. Pin exactly the parameters its `@index` \
-                 names, and no range. Rows whose value is absent are left out, and the key breaks ties.",
+                 key parts by the first fold's names. Pin exactly what its `@index` leads with, \
+                 and no range on a parameter; a range on the fold itself (`<Fold>.lte=`) is \
+                 fine. Rows whose value is absent are left out, and the key breaks ties.",
                 orderings.join(", ")
             ),
             json!({ "type": "string" }),
@@ -2404,8 +2414,14 @@ fn table_detail_schema() -> Value {
                     "properties": {
                         "fold": { "type": "string" },
                         "lead": names,
+                        "values": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Sibling folds the index leads with after `lead`, \
+                                pinned by value: `HoldState=held`.",
+                        },
                     },
-                    "required": ["fold", "lead"],
+                    "required": ["fold", "lead", "values"],
                     "additionalProperties": false,
                 },
             },

@@ -568,6 +568,32 @@ impl Sources {
                         ),
                     ));
                 }
+                // A sibling is pinned by value, and the store holds a `Money` as text a
+                // request's `10` would not equal, so it is held to the same rule.
+                for value in &sort.values {
+                    let Some(sibling) = table.columns.iter().find(|held| held.name == *value)
+                    else {
+                        continue;
+                    };
+                    if !sibling.meta.kind.base().is_comparable() {
+                        let rel = program
+                            .fold(&column.fold)
+                            .and_then(|def| def.module.clone())
+                            .unwrap_or_default();
+                        findings.push(Finding::error(
+                            rel,
+                            format!(
+                                "fold `{}` declares `@index` leading with `{}`, which is {}, \
+                                 and the store does not hold one in a form a filter could \
+                                 match; lead with an `Int`, `String`, `Uuid` or `Timestamp` \
+                                 fold instead",
+                                column.fold,
+                                sibling.fold,
+                                sibling.meta.kind.describe()
+                            ),
+                        ));
+                    }
+                }
             }
         }
         // A stored fold's parameters are the query parameters a read names its key by, so

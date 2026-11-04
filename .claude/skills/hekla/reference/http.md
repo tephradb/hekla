@@ -165,11 +165,23 @@ GET /rows?folds=OwnerTickets&org_id=1&limit=50
   else is `400 unindexed_filter`; an unknown operator, two bounds at one end, a parameter both pinned
   and ranged, or ranges on two parameters are `400 invalid_input`.
 - `order_by=<Fold>` (or `-<Fold>` descending) orders by a fold whose `@index` orders this key. Pin
-  exactly the parameters `@index(..)` names (in any order), and no range, or it is `400
-  unindexed_filter`; a fold nothing indexes is `400 invalid_input` naming the orderings there are.
+  exactly the parameters `@index(..)` names (in any order), and no range on a parameter, or it is
+  `400 unindexed_filter`; a fold nothing indexes is `400 invalid_input` naming the orderings there are.
   The ordering fold need not be listed in `folds`. Rows whose value is absent (an optional fold
   answering `none`) are left out of an ordered scan. The cursor records its ordering, so one taken
   under another `order_by` is a 400. `GET /admin/tables/{id}` lists them as `sorts`.
+- **A fold an `@index` covers can be filtered by its value**, named as the fold: `HoldState=held`
+  for equality, or `Deadline.lte=2026-11-04T00:00:00Z` (and `.gte`, `.gt`, `.lt`) for a range, with
+  what its `@index` leads with pinned. That is a seek along the index that orders by the fold, so
+  the page comes back ordered by it, and `order_by` only turns it round:
+  `?folds=Deadline&shop_id=1&Deadline.lte=<now>` is a due-work queue in one read. A fold no
+  `@index` covers is `400 unindexed_filter`, and a fold of other rows is `400 invalid_input`.
+- **An `@index` may lead with a sibling fold of the same key** as well as parameters:
+  `HoldChangedAt -> Timestamp? @index(shop_id, HoldState)` indexes (shop, HoldState, HoldChangedAt),
+  so `?folds=HoldChangedAt,HoldState&shop_id=1&HoldState=held&order_by=-HoldChangedAt` lists the
+  holds in one state, latest first, as one seek. Pinning the sibling alone walks the indexed fold's
+  order; a range goes on the indexed fold itself. A sealed fold that is not served is `400 sealed`
+  as a filter too, and a collection is `400 unindexed_filter`.
 - `folds`, `limit`, `cursor`, `after`, `timeout_ms`, `order_by`, `before` and `since` are reserved:
   `hekla check` refuses a fold parameter with one of those names.
 

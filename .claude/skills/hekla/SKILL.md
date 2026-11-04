@@ -174,9 +174,13 @@ with `.gte`, `.gt`, `.lte`, `.lt`). A fold declared `-> n: Int @index = 0` (or `
 naming the parameters that lead it, in any order) lets a scan order by it:
 `?folds=GameUnits&order_by=-GameUnits&limit=10` for a top ten,
 `?folds=ReviewHelpful&game_id=g1&order_by=-ReviewHelpful` within one game. Pin exactly the
-parameters its `@index` names, and no range; rows whose value is absent are left out. An ordering
-nothing declares is a `400`, never a sort, and `@index` on a `Money` or `Decimal` fold is refused at
-`hekla check`, since the store holds those as text. `hekla check --tables <dir>` prints how the
+parameters its `@index` names, and no range on a parameter; rows whose value is absent are left
+out. The indexed fold can also be filtered by its own value (`Deadline.lte=<now>`, `Score=5`),
+which is the same index walk, so a due-work queue is one read, and an `@index` may lead with a
+sibling fold pinned by value: `-> Timestamp? @index(shop_id, HoldState)` serves
+`?shop_id=1&HoldState=held&order_by=-HoldChangedAt`. An ordering nothing declares is a `400`, never
+a sort, and `@index` on (or led by) a `Money` or `Decimal` fold is refused at `hekla check`, since
+the store holds those as text. `hekla check --tables <dir>` prints how the
 folds are grouped and stored, for debugging; nothing in it is something a read names.
 **A sealed fold is not served** by any read route (`404 sealed`) unless `hekla.toml` lists it under
 `[folds] serve_sealed`, so a token or refresh token an effect reads never reaches a client by

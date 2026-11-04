@@ -1481,41 +1481,8 @@ async fn a_derived_table_is_ranged_on_the_part_after_its_pinned_ones() {
 #[tokio::test]
 async fn a_derived_table_is_ordered_by_a_column_its_fold_indexes() {
     let harness = boot();
-    // Owner 10 opens three tickets in org 1, owner 11 one, owner 12 two.
-    let mut position = 0;
-    for (ticket, owner) in [
-        (ALICE, 10),
-        (BOB, 10),
-        (CAROL, 10),
-        (UUID_A, 11),
-        (support::UUID_B, 12),
-        (support::UUID_C, 12),
-    ] {
-        position = position.max(open(&harness, ticket, 1, owner, None));
-    }
-    // Two tickets closed, BOB first; the rest stay open and have no `ticket_closed_at`.
-    for ticket in [BOB, ALICE] {
-        let result = harness
-            .rt
-            .execute(
-                "CloseTicket",
-                json!({ "ticket_id": ticket, "org_id": 1 }),
-                &ctx(),
-                None,
-            )
-            .unwrap();
-        assert_eq!(result.status, 200, "{:?}", result.body);
-        position = position.max(result.body["positions"]["last"].as_u64().unwrap());
-    }
+    let position = owners_and_closes(&harness);
     let app = harness.app();
-    let column = |body: &Value, name: &str| -> Vec<Value> {
-        body["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| row[name].clone())
-            .collect()
-    };
 
     let (status, body) = support::get(
         &app,
@@ -1878,5 +1845,167 @@ async fn a_sealed_fold_is_not_served_unless_the_project_names_it() {
         "the console still lists it: {listed:?}"
     );
 
+    harness.shutdown();
+}
+
+/// Owner 10 opens three tickets in org 1, owner 11 one and owner 12 two; BOB's ticket is
+/// closed and then ALICE's, and the rest stay open. The position the last of it is at.
+fn owners_and_closes(harness: &Harness) -> u64 {
+    let mut position = 0;
+    for (ticket, owner) in [
+        (ALICE, 10),
+        (BOB, 10),
+        (CAROL, 10),
+        (UUID_A, 11),
+        (support::UUID_B, 12),
+        (support::UUID_C, 12),
+    ] {
+        position = position.max(open(harness, ticket, 1, owner, None));
+    }
+    for ticket in [BOB, ALICE] {
+        let result = harness
+            .rt
+            .execute(
+                "CloseTicket",
+                json!({ "ticket_id": ticket, "org_id": 1 }),
+                &ctx(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.status, 200, "{:?}", result.body);
+        position = position.max(result.body["positions"]["last"].as_u64().unwrap());
+    }
+    position
+}
+
+/// One column of a page, row by row.
+fn column(body: &Value, name: &str) -> Vec<Value> {
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[name].clone())
+        .collect()
+}
+
+/// A scan filters on an indexed fold's own value, by the fold's name: equal to one value or
+/// within a range, which is a seek along the index that orders by it, so the page comes
+/// back in that order and `order_by` only turns it round. Anything an index does not serve
+/// is still a 400.
+#[tokio::test]
+async fn a_scan_filters_on_the_value_of_a_fold_it_could_order_by() {
+    let harness = boot();
+    let position = owners_and_closes(&harness);
+    let app = harness.app();
+
+    let (status, body) = support::get(
+        &app,
+        &format!("/rows?folds=OwnerTickets&org_id=1&OwnerTickets.gte=2&after={position}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(column(&body, "owner_id"), vec![json!(12), json!(10)]);
+
+    let (status, body) = support::get(
+        &app,
+        "/rows?folds=OwnerTickets&org_id=1&OwnerTickets.lte=2&order_by=-OwnerTickets",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        column(&body, "owner_id"),
+        vec![json!(12), json!(11)],
+        "a deadline queue: due by now, latest first"
+    );
+
+    let (status, body) =
+        support::get(&app, "/rows?folds=OwnerTickets&org_id=1&OwnerTickets=1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(column(&body, "owner_id"), vec![json!(11)]);
+
+    // A page at a time, the cursor carrying the range's order.
+    let (_, first) = support::get(
+        &app,
+        "/rows?folds=OwnerTickets&org_id=1&OwnerTickets.gte=1&limit=2",
+    )
+    .await;
+    assert_eq!(column(&first, "owner_id"), vec![json!(11), json!(12)]);
+    let cursor = first["next_cursor"].as_str().expect("another page follows");
+    let (status, rest) = support::get(
+        &app,
+        &format!("/rows?folds=OwnerTickets&org_id=1&OwnerTickets.gte=1&cursor={cursor}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{rest}");
+    assert_eq!(column(&rest, "owner_id"), vec![json!(10)]);
+
+    // A timestamp range on a whole-table index.
+    let (status, body) = support::get(
+        &app,
+        "/rows?folds=TicketClosedAt&TicketClosedAt.gte=2000-01-01T00:00:00Z",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(column(&body, "ticket_id"), vec![json!(BOB), json!(ALICE)]);
+
+    for (uri, code, why) in [
+        (
+            "/rows?folds=OwnerTickets&OwnerTickets.gte=1",
+            "unindexed_filter",
+            "the lead not pinned",
+        ),
+        (
+            "/rows?folds=OwnerTickets&org_id=1&OwnerAnyClosed=true",
+            "unindexed_filter",
+            "a fold no index holds",
+        ),
+        (
+            "/rows?folds=OwnerTickets&org_id=1&TicketOpened=true",
+            "invalid_input",
+            "a fold of other rows",
+        ),
+        (
+            "/rows?folds=OwnerTickets&org_id=1&OwnerTickets=1&OwnerTickets.gte=1",
+            "invalid_input",
+            "pinned and bounded at once",
+        ),
+        (
+            "/rows?folds=OwnerTickets&org_id=1&OwnerTickets.gte=x",
+            "invalid_input",
+            "a bound of the wrong type",
+        ),
+    ] {
+        let (status, body) = support::get(&app, uri).await;
+        assert_eq!(status, 400, "{why}: {body}");
+        assert_eq!(body["error"]["code"], code, "{why}: {body}");
+    }
+
+    harness.shutdown();
+}
+
+/// A scan cannot filter on a sealed fold the project does not serve, since a filter would
+/// learn its value one guess at a time, nor on a collection, which no index orders.
+#[tokio::test]
+async fn a_scan_does_not_filter_on_a_sealed_fold_or_a_collection() {
+    let project = tickets_serving(&[]);
+    let harness = Boot::new(project.path())
+        .with_master_key()
+        .http_status(200)
+        .start();
+    let app = harness.app();
+    for (uri, code) in [
+        (
+            "/rows?folds=TicketClosedAt&TicketContact=ada@example.com",
+            "sealed",
+        ),
+        (
+            "/rows?folds=TicketClosedAt&TicketReporter=x",
+            "unindexed_filter",
+        ),
+    ] {
+        let (status, body) = support::get(&app, uri).await;
+        assert_eq!(status, 400, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], code, "{uri}: {body}");
+    }
     harness.shutdown();
 }

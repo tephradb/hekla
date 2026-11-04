@@ -258,8 +258,8 @@ function TableDetail({ id, search }) {
                     (sort) => html`
                       <code>${sort.fold}</code>
                       <span class="note">
-                        ${sort.lead.length
-                          ? `an @index orders by it, with (${sort.lead.join(', ')}) pinned`
+                        ${sort.lead.length + sort.values.length
+                          ? `an @index orders by it, with (${[...sort.lead, ...sort.values].join(', ')}) pinned`
                           : 'an @index orders by it'}
                       </span>
                     `,
@@ -434,6 +434,16 @@ function parsed(part, value) {
   return bounds.every(Boolean) ? bounds : [[part, value]]
 }
 
+/* What a scan can filter on: the key's parameters, then each fold an @index orders by or
+ * leads with, which is filtered by its value under its own name. */
+function filterable(table) {
+  const folds = [...new Set(table.sorts.flatMap((sort) => [...sort.values, sort.fold]))]
+    .map((name) => table.folds.find((fold) => fold.fold === name))
+    .filter((fold) => fold?.served)
+    .map((fold) => ({ name: fold.fold, kind: fold.kind }))
+  return [...table.key, ...folds]
+}
+
 /* The inputs' text back from the query string, so a reload shows what was asked. */
 function draftOf(filters) {
   const draft = {}
@@ -470,7 +480,7 @@ function Rows({ table, filters, cursor, openRow }) {
   const apply = () => {
     setTrail([])
     const chosen = []
-    for (const part of table.key) {
+    for (const part of filterable(table)) {
       const value = (draft[part.name] ?? '').trim()
       if (value) chosen.push(...parsed(part.name, value))
     }
@@ -545,10 +555,10 @@ function Rows({ table, filters, cursor, openRow }) {
         </button>
       </header>
 
-      ${table.key.length > 0 &&
+      ${filterable(table).length > 0 &&
       html`
         <div class="filters">
-          ${table.key.map(
+          ${filterable(table).map(
             (part) => html`
               <div class="filter-input" key=${part.name}>
                 <span class="chip-kind">${part.name}</span>
@@ -581,7 +591,8 @@ function Rows({ table, filters, cursor, openRow }) {
             >
               <option value="">key order</option>
               ${table.sorts.flatMap((sort) => {
-                const within = sort.lead.length ? ` per ${sort.lead.join(', ')}` : ''
+                const pins = [...sort.lead, ...sort.values]
+                const within = pins.length ? ` per ${pins.join(', ')}` : ''
                 return [
                   html`<option value=${sort.fold}>${sort.fold} ↑${within}</option>`,
                   html`<option value=${`-${sort.fold}`}>${sort.fold} ↓${within}</option>`,

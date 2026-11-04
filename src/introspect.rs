@@ -650,6 +650,7 @@ pub fn table_detail(tables: &[TableDef], main: &TableDef, rows: Option<u64>) -> 
         "sorts": main.sorts.iter().map(|sort| json!({
             "fold": fold_of(&sort.column),
             "lead": sort.lead.iter().map(|part| spoken(part)).collect::<Vec<_>>(),
+            "values": sort.values.iter().map(|value| fold_of(value)).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "rows": rows,
     })

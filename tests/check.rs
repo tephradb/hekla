@@ -1350,3 +1350,20 @@ fn a_fold_keyed_on_several_ids_is_not_a_copied_emit() {
         "{warns:?}"
     );
 }
+
+/// An `@index` led by a `Money` sibling would pin a value the store holds as text a request
+/// could not match, so it is refused where it is declared.
+#[test]
+fn an_index_led_by_a_money_fold_is_refused() {
+    assert_error(
+        &[(
+            "lib/folds.hk",
+            "event @item.priced { shop_id: Int, item_id: Int, price: Money(2) }\n\n\
+             fold ItemPrice(shop_id: Int, item_id: Int) -> Money(2) = 0 {\n  \
+             on @item.priced(shop_id, item_id) { price } => price\n}\n\n\
+             fold ItemSeen(shop_id: Int, item_id: Int) -> n: Int @index(shop_id, ItemPrice) = 0 {\n  \
+             on @item.priced(shop_id, item_id) => n + 1\n}\n",
+        )],
+        "leading with `ItemPrice`",
+    );
+}

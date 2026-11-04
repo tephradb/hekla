@@ -2084,3 +2084,123 @@ fold Seen(n: Int) -> seen: List(Int) = [] {{
         Some(KEYS.to_string())
     );
 }
+
+/// An `@index` that names a sibling fold leads with that fold's value, so a scan pins it by
+/// value and walks the indexed fold in order: "holds that are held, latest first" is one
+/// seek. Ordering by it without the sibling and the lead pinned is not.
+#[test]
+fn an_index_led_by_a_sibling_fold_filters_on_its_value() {
+    let source = "subject Shop(Int)
+
+event @hold.placed { shop_id: Shop, hold_id: Int, at: Timestamp }
+event @hold.released { shop_id: Shop, hold_id: Int, at: Timestamp }
+
+fold HoldState(shop_id: Shop, hold_id: Int) -> String = \"\" {
+  on @hold.placed(shop_id, hold_id) => \"held\"
+  on @hold.released(shop_id, hold_id) => \"released\"
+}
+
+fold HoldChangedAt(shop_id: Shop, hold_id: Int) -> Timestamp? @index(shop_id, HoldState) = none {
+  on @hold.placed(shop_id, hold_id) { at } => at
+  on @hold.released(shop_id, hold_id) { at } => at
+}
+";
+    let event = |path: &str, hold: i64, at: i64| {
+        Event::new(
+            EventPath::new(["hold", path]),
+            [
+                ("shop_id".to_owned(), Value::Int(1)),
+                ("hold_id".to_owned(), Value::Int(hold)),
+                ("at".to_owned(), Value::Timestamp(at)),
+            ],
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tables.db");
+    deployed_and_filled(
+        &path,
+        source,
+        &[
+            event("placed", 1, 1_700_000_001_000_000),
+            event("placed", 2, 1_700_000_002_000_000),
+            event("placed", 3, 1_700_000_003_000_000),
+            event("released", 2, 1_700_000_004_000_000),
+        ],
+    );
+    let tables = TableDef::all(&program(source));
+    let sel = hekla::table_read::pick(&tables, &["HoldChangedAt", "HoldState"]).unwrap();
+    let params = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    };
+    let holds = |pairs: &[(&str, &str)]| -> Vec<i64> {
+        let scan = hekla::table_read::parse_scan(&sel, &params(pairs))
+            .unwrap_or_else(|refusal| panic!("{pairs:?}: {}", refusal.message));
+        hekla::table_read::scan(&path, &tables, &sel, &scan, None)
+            .unwrap()
+            .items
+            .iter()
+            .map(|row| row["hold_id"].as_i64().unwrap())
+            .collect()
+    };
+
+    assert_eq!(
+        holds(&[
+            ("shop_id", "1"),
+            ("HoldState", "held"),
+            ("order_by", "-HoldChangedAt")
+        ]),
+        vec![3, 1],
+        "held only, latest first"
+    );
+    assert_eq!(
+        holds(&[
+            ("shop_id", "1"),
+            ("HoldState", "held"),
+            ("HoldChangedAt.lte", "2023-11-14T22:13:21Z")
+        ]),
+        vec![1],
+        "and a range on the indexed fold beside the sibling"
+    );
+
+    assert_eq!(
+        holds(&[("shop_id", "1"), ("HoldState", "held")]),
+        vec![1, 3],
+        "the sibling alone, walked in the indexed fold's order"
+    );
+
+    for (pairs, code) in [
+        (
+            &[("shop_id", "1"), ("order_by", "HoldChangedAt")][..],
+            "unindexed_filter",
+        ),
+        (
+            &[("HoldState", "held"), ("order_by", "HoldChangedAt")][..],
+            "unindexed_filter",
+        ),
+    ] {
+        let refusal =
+            hekla::table_read::parse_scan(&sel, &params(pairs)).expect_err("not one index walk");
+        assert_eq!(refusal.code, code, "{pairs:?}: {}", refusal.message);
+    }
+
+    let conn = Connection::open(&path).unwrap();
+    let main = table_of(&tables, "HoldChangedAt");
+    let indexed: Vec<String> = conn
+        .prepare(&format!(
+            "SELECT name FROM pragma_index_info((SELECT name FROM sqlite_master WHERE type = \
+             'index' AND tbl_name = '{main}' AND name LIKE '%+%')) ORDER BY seqno"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        indexed,
+        vec!["shop", "hold_state", "hold_changed_at", "hold"],
+        "lead, sibling, the fold, the rest of the key"
+    );
+}
